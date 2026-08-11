@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | NEMR-SPEC-001 |
-| Version | 1.16 |
+| Version | 1.19 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -32,6 +32,9 @@
 | 1.14 | Correction | AUTH-02 was mis-scoped, not merely broad: it required mounting the whole `~/.claude` *directory*, which on a real host also contains `projects/`, `history.jsonl`, caches and plugin state. Mounting all of it would expose every project's history to every container — defeating the isolation this product exists to provide — and would break Claude Code regardless, since AUTH-02 mandates a read-only mount and Claude Code writes session state under `~/.claude`. Narrowed to the credentials file alone, with other `~/.claude` content explicitly container-local. Recorded as a correction to the requirement rather than an implementation deviation, per Product Owner instruction. The filename is `.credentials.json` with a leading dot, verified on the reference host; the instruction's wording omitted it and was corrected in both the host and container paths. | Claude Code, per Product Owner instruction |
 | 1.15 | Correction | Corrected the Milestone 4 "Note carried forward" now that `create_container()` has actually been run. The engine does **not** need to enter rootlesskit's namespaces: `nemr create` succeeded from the host mount namespace with no `nsenter` and no `sudo`. The constraint is specific to `ctr`, which mounts the image snapshot client-side to read the image config; the engine reads that config from the content store over gRPC and has containerd prepare the snapshot server-side, so nothing is mounted in the engine's own namespace. The `ctr`-specific guidance is retained because Milestones 2 and 6 invoke `ctr` directly. Milestone 5 is explicitly not settled by this — starting a task runs runc, which does mount. Recorded under the 4A.5 delegation, on evidence rather than assumption. | Claude Code |
 | 1.16 | Revision | Project renamed from "AI Hub" to "Nemr" throughout, on Product Owner instruction. Document ID NEMR-SPEC-001 (was AIHUB-SPEC-001); crate `nemr-engine`; CLI binary `nemr`; container ID prefix `nemr-`; container labels `nemr.project`/`nemr.size`/`nemr.volume`; managed storage `~/.local/share/nemr/`; privileged helper `/usr/local/libexec/nemr-volume` and its sudoers rule. Revision history before this entry refers to the same document under its former name. Requires a root reinstall of the helper at its new path and recreation of any existing project, since container IDs, labels and volume paths all carry the name. | Claude Code, per Product Owner instruction |
+| 1.17 | Revision | Added Section 3.8 (Container Process Model, PROC-01..04): PID 1 is a long-lived supervisor (`sleep infinity`), `attach` performs a task exec with a fresh TTY per call, and the supervisor command is written explicitly into the runtime spec rather than inherited from the base image. Chosen so container liveness and stop/start state do not depend on shell state, and concurrent attaches do not collide on a shared PTY. Supersedes an implicit assumption in Milestone 4's original create() work; a note in Milestone 4 records the retroactive correction, and non-conforming containers are to be recreated rather than migrated. Sections 1–3 are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction. | Claude Code, per Product Owner instruction |
+| 1.18 | Revision | Added Section 3.9 (Container Network Model, NET-01/NET-02): project containers share rootlesskit's network namespace, equivalent to `nerdctl run --net=host` under rootless; per-project network isolation is explicitly out of scope for Phase 1, with rootless CNI via `rootlesskit --detach-netns` (requires rootlesskit >= 2.0) recorded as the Phase 2 path. Found at Milestone 5: a container given its own network namespace receives an empty one — loopback only, no egress — and Claude Code failed with `ENOTIMP` against api.anthropic.com. Added risk R-07 for port collisions between projects under a shared namespace. Sections 1–3 are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction. | Claude Code, per Product Owner instruction |
+| 1.19 | Revision | Section 3.4's repository diagram brought back in step with the actual repository, which had drifted: it was missing `src/lib.rs`, both `mod.rs` files, the two Milestone 1 baseline binaries, the whole `deploy/` tree from Milestone 3, and `src/engine/tty.rs` from Milestone 5. All of these were already recorded as deviations in Section 11; the diagram simply had not been updated alongside them. Added a note that the diagram states current reality rather than an aspiration. Section 11 gained entries for `tty.rs` and `deploy/`. Structural fact rather than a new decision, edited directly on Product Owner instruction. | Claude Code, per Product Owner instruction |
 
 ---
 
@@ -182,18 +185,30 @@ this document alone.
 nemr-engine/
 ├── SPEC.md                    # This document — tracked in-repo per 4A.5
 ├── src/
+│   ├── lib.rs                 # Crate root; declares the modules below
 │   ├── bin/
-│   │   └── nemr.rs           # CLI entrypoint; sole interface for Phase 1
+│   │   ├── nemr.rs            # CLI entrypoint; sole interface for Phase 1
+│   │   ├── raw_connectivity.rs    # M1 baseline: containerd-client, no wrapper
+│   │   └── wrapper_connectivity.rs # M1: same output via the wrapper (AC-1.2)
 │   ├── containerd/            # Wrapper layer over containerd-client (3.2)
+│   │   ├── mod.rs
 │   │   ├── client.rs          # Connection management, shared client handle
 │   │   ├── images.rs          # Image pull/import operations
-│   │   └── containers.rs      # Container create/start/stop/delete operations
+│   │   └── containers.rs      # Container + task + exec operations
 │   ├── engine/                # Product logic; depends only on src/containerd/
+│   │   ├── mod.rs
 │   │   ├── image.rs           # Base image build/import orchestration
 │   │   ├── project.rs         # Project lifecycle: create/start/stop/list/delete
+│   │   ├── tty.rs             # Terminal handling for attach sessions (3.8)
 │   │   └── volume.rs          # Quota-bounded storage volume management
 │   ├── config.rs              # Paths, defaults, constants
 │   └── auth.rs                # Claude Code credential injection (3.5)
+├── deploy/                    # Privileged half of volume provisioning (3.7)
+│   ├── nemr-volume/           # Root-owned helper crate (PRIV-03), standalone
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs
+│   └── sudoers.d/
+│       └── nemr-volume        # NOPASSWD grant to exactly one fixed path
 ├── image/
 │   └── Dockerfile             # OCI image definition (build tool per 3.1)
 ├── scripts/
@@ -202,6 +217,11 @@ nemr-engine/
 ├── README.md
 └── Cargo.toml
 ```
+
+This tree is the current state of the repository, not an aspiration. Files
+added beyond the original Phase 1 sketch are recorded in Section 11 with
+their rationale; keeping this diagram in step with reality is part of that
+record.
 
 ### 3.5 Authentication Handling (Normative)
 
@@ -252,6 +272,53 @@ position to defend when this project's output is reviewed externally.
 Rootless containerd removes that requirement for the majority of the
 engine's operations; the volume-provisioning exception is real but is
 bounded, explicit, and auditable rather than implicit.
+
+### 3.8 Container Process Model (Normative)
+
+This section fixes what runs as PID 1 inside a project's container and how
+an interactive session is obtained. It is recorded here rather than left to
+Milestone 5 because it determines the meaning of "running" for a project,
+and every lifecycle operation in Milestones 5 and 6 depends on it.
+
+| Requirement ID | Requirement |
+|---|---|
+| PROC-01 | A project container's PID 1 shall be a **long-lived supervisor process** (`sleep infinity`), not an interactive shell. The container's liveness is therefore a property of the project, independent of whatever any user session is doing. |
+| PROC-02 | `attach` shall obtain an interactive session by performing a **task exec with a fresh TTY per call**, not by connecting to PID 1's terminal. Each attach is an independent process; exiting one leaves the container running. |
+| PROC-03 | The supervisor command shall be written **explicitly into the container's runtime spec at creation time**. It shall not be inherited from the base image's default command, so that a change to `image/Dockerfile` cannot silently alter the process model. |
+| PROC-04 | `stop` shall terminate the task, including any live exec sessions, and return the project to the stopped-but-ready state of AC-4.1. A project's stopped/started state shall not depend on shell state. |
+
+**Rationale.** The alternative — PID 1 being the image's shell, attached to
+a TTY, with `attach` joining that same terminal — is a more literal reading
+of "attach an interactive session," but it couples two things that should
+be independent. The container would stay alive only as long as the shell
+did, so exiting the shell would stop the project; and concurrent attaches
+would share one PTY, with both sessions receiving each other's input and
+output. Making PID 1 a supervisor decouples project liveness from session
+lifetime and gives each attach its own terminal.
+
+**Retroactive effect on Milestone 4.** This supersedes an implicit
+assumption in Milestone 4's original `create()` work, which relied on the
+base image's default command (`docker-entrypoint.sh /bin/bash`) as the
+container's process. A container created under that assumption exits
+immediately when started detached, because the shell reaches EOF on stdin.
+Milestone 4's create path shall write the supervisor command explicitly per
+PROC-03. Containers created before this section was added do not conform
+and shall be recreated rather than migrated.
+
+### 3.9 Container Network Model (Normative)
+
+| Requirement ID | Requirement |
+|---|---|
+| NET-01 | Project containers shall share rootlesskit's network namespace (equivalent to `nerdctl run --net=host` under rootless); no per-project network namespace isolation exists in Phase 1. |
+| NET-02 | Per-project network isolation is explicitly out of scope for Phase 1 (extends Section 1.4). The Phase 2 path is rootless CNI via `rootlesskit --detach-netns` (requires rootlesskit >= 2.0, not present in the Ubuntu archive version currently installed), which changes host setup and the container spec, not the engine's architecture. |
+
+**Background.** A container given its own network namespace receives an
+empty one: only loopback, no route, no egress. Nothing wires it up, because
+rootless CNI is not configured. This was observed at Milestone 5 as Claude
+Code failing with `ENOTIMP` against `api.anthropic.com` while otherwise
+running correctly — `/proc/net/dev` inside the container listed `lo` alone.
+Inheriting rootlesskit's namespace instead gives the container the `tap0`
+device slirp4netns already provides, and DNS and TLS then work.
 
 ---
 
@@ -344,6 +411,16 @@ creates a volume (Milestone 3) and a container from the base image
 registers a discoverable named reference. Extends the wrapper module with a
 general-purpose `create_container()` operation — implemented as reusable
 wrapper infrastructure, not logic specific to this call site.
+
+**Retroactive correction from Section 3.8 (container process model):**
+this milestone's original `create()` relied on the base image's default
+command as the container's process. Section 3.8 (PROC-03) supersedes that:
+the create path shall write the supervisor command (`sleep infinity`)
+explicitly into the runtime spec. A container created under the original
+assumption exits immediately when started detached, so it is not in fact
+"stopped-but-ready" in the sense AC-4.1 intends — it is startable but not
+survivable. Projects created before this correction shall be recreated,
+not migrated.
 
 **Note carried forward from Milestone 1 (rootless namespace boundary):**
 gRPC-only containerd operations (list/pull/version) connect directly to the
@@ -672,6 +749,7 @@ engine, not run continuously outside active development sessions.
 | R-04 | Base image size or startup time exceeds "lightweight" expectations | Medium | Medium | Measured and recorded at Milestone 2 and validated against NFR-02; not a blocking defect at Phase 1 but must be visible for Phase 2 planning |
 | R-05 | Credential mount approach (AUTH-02) has unintended host filesystem permission implications | Low | Medium | Read-only mount is a hard requirement; review at Milestone 4 |
 | R-06 | Rootless containerd (PRIV-01) introduces setup friction or feature gaps (e.g., storage driver limitations, networking constraints) not present in a root-owned daemon | Medium | Medium | Validated directly at Milestone 1, before any engine logic depends on it; escalate per E-03 pattern (Section 9) if a required capability turns out to be unavailable rootless |
+| R-07 | Two projects binding the same port collide: with a shared network namespace (NET-01) the second bind fails | Medium once containers run real services | Low for Phase 1 — nothing in scope runs a service; the base image ships no server and the engine starts only a supervisor | Accepted for Phase 1 and tracked here rather than mitigated. It is the first problem Phase 2 must solve, and the fix is the rootless CNI path in NET-02 |
 
 ---
 
@@ -760,6 +838,8 @@ Product Owner sign-off status.)*
 | 2026-08-10 | 3.4 | Added `src/containerd/mod.rs`, `src/engine/mod.rs` | Rust requires a `mod.rs` for a directory to form a module. Declares submodules only. | Pending |
 | 2026-08-10 | 3.4 | Added `src/bin/raw_connectivity.rs` | Section 3.4's tree lists only `nemr.rs` under `src/bin/`, but Milestone 1 scope item 1 requires a raw baseline program. Kept separate from the CLI so `nemr` never links the raw `containerd-client` path. | Pending |
 | 2026-08-11 | 3.4 | Added `src/bin/wrapper_connectivity.rs` | AC-1.2 requires showing wrapper output identical to the baseline's, which needs a runnable harness using only the wrapper. Adding a flag to `raw_connectivity` instead would have made the "raw" binary link the wrapper, destroying its independence as a baseline. | Pending |
+| 2026-08-11 | 3.4 | Added `src/engine/tty.rs` | Interactive attach (PROC-02) needs local terminal handling: raw mode as an RAII guard, FIFO creation and opening, and IO pumps. Kept out of `project.rs` because it is host-terminal mechanics rather than project logic, and out of `src/containerd/` because it is not a containerd concern. Section 3.4's diagram updated to match. | Pending |
+| 2026-08-11 | 3.4 | Added `deploy/` (helper crate + sudoers rule) | The PRIV-03 privileged helper is a separate privilege domain and a standalone crate; Section 3.4's original tree predates Section 3.7. Now reflected in the diagram. | Pending |
 | 2026-08-11 | 3.3 | `PREREQUISITES.md` documents rootless tooling (`uidmap`, `rootlesskit`, `slirp4netns`) not enumerated in Section 3.3 | Section 3.7 (PRIV-01) requires rootless containerd, which needs this tooling; Section 3.3's list predates 3.7 and was not updated alongside it. Documented rather than silently assumed, since 3.3 designates `PREREQUISITES.md` as the clean-host provisioning source. Section 3.3 itself left unedited — Sections 1–3 are Product Owner territory per 4A.5. | Pending |
 
 This table is the single source of truth for deviations (Section 8, 4A.5).

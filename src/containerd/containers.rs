@@ -4,17 +4,23 @@
 //! stop and delete arrive in Milestones 4–5 and extend this module.
 
 use std::collections::HashMap;
+use std::time::Duration;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use containerd_client::services::v1::snapshots::{PrepareSnapshotRequest, RemoveSnapshotRequest};
+use containerd_client::services::v1::snapshots::{
+    MountsRequest, PrepareSnapshotRequest, RemoveSnapshotRequest,
+};
 use containerd_client::services::v1::{
-    container::Runtime, Container, CreateContainerRequest, DeleteContainerRequest,
-    ListContainersRequest,
+    container::Runtime, Container, CreateContainerRequest, CreateTaskRequest,
+    CloseIoRequest, DeleteContainerRequest, DeleteProcessRequest, DeleteTaskRequest,
+    ExecProcessRequest, GetRequest, KillRequest, ListContainersRequest, ResizePtyRequest,
+    StartRequest, WaitRequest,
 };
 use containerd_client::tonic::{Code, Request};
 use containerd_client::with_namespace;
 use prost_types::Any;
+use tokio::time::timeout;
 
 use super::client::ContainerdClient;
 use super::images::ImageConfig;
@@ -107,6 +113,17 @@ pub struct ContainerSpec {
     pub working_dir: Option<String>,
     /// Appended after the image's environment, so these win on duplicates.
     pub extra_env: Vec<String>,
+    /// Process to run as PID 1, overriding the image's default command.
+    ///
+    /// Required by PROC-03: the process model must be explicit in the runtime
+    /// spec, so a change to the base image's `CMD` cannot silently alter it.
+    /// `None` falls back to the image's own entrypoint + cmd.
+    pub args: Option<Vec<String>>,
+    /// Name used for the systemd cgroup scope, if it should differ from `id`.
+    ///
+    /// The scope is named `<prefix>-<name>.scope`, so passing an id that
+    /// already carries the prefix yields a doubled name. `None` uses `id`.
+    pub cgroup_name: Option<String>,
     /// Labels stored on the container record.
     ///
     /// containerd persists these and returns them from its listing API, so
@@ -206,7 +223,7 @@ impl ContainerdClient {
         spec: &ContainerSpec,
         image_config: &ImageConfig,
     ) -> Result<()> {
-        let oci = oci_spec(spec, image_config, self.namespace());
+        let oci = oci_spec(spec, image_config);
         let oci_bytes = serde_json::to_vec(&oci).context("failed to serialise the OCI spec")?;
 
         let container = Container {
@@ -214,7 +231,7 @@ impl ContainerdClient {
             image: spec.image.clone(),
             runtime: Some(Runtime {
                 name: crate::config::RUNTIME.to_string(),
-                options: None,
+                options: Some(systemd_cgroup_options()),
             }),
             spec: Some(Any {
                 type_url: "types.containerd.io/opencontainers/runtime-spec/1/Spec".to_string(),
@@ -272,11 +289,7 @@ impl ContainerdClient {
 /// Note there is no `user` namespace entry: under PRIV-01 the container
 /// inherits rootlesskit's existing user namespace. Adding one here would ask
 /// runc to nest a second namespace and require its own uid mappings.
-fn oci_spec(
-    spec: &ContainerSpec,
-    image_config: &ImageConfig,
-    namespace: &str,
-) -> serde_json::Value {
+fn oci_spec(spec: &ContainerSpec, image_config: &ImageConfig) -> serde_json::Value {
     let mut env = image_config.env.clone();
     env.extend(spec.extra_env.iter().cloned());
 
@@ -301,7 +314,7 @@ fn oci_spec(
         "process": {
             "terminal": false,
             "user": { "uid": 0, "gid": 0, "additionalGids": [0] },
-            "args": image_config.args(),
+            "args": spec.args.clone().unwrap_or_else(|| image_config.args()),
             "env": env,
             "cwd": cwd,
             "capabilities": {
@@ -316,14 +329,19 @@ fn oci_spec(
         "mounts": mounts,
         "linux": {
             "resources": { "devices": [ { "allow": false, "access": "rwm" } ] },
-            // Non-systemd form, matching containerd's default. Task start
-            // (Milestone 5) needs the systemd driver and a slice-qualified
-            // path instead; Milestone 4 creates no task, so this is not
-            // exercised yet. See the Milestone 5 note in SPEC.md.
-            "cgroupsPath": format!("/{namespace}/{}", spec.id),
+            // systemd driver form, "slice:prefix:name". Under PRIV-01 runc's
+            // default path (/{namespace}/{id}) is unwritable: containerd inside
+            // rootlesskit still sees the host /sys/fs/cgroup, so creating a
+            // cgroup at the root fails with EPERM. Placing the task in a scope
+            // under the delegated user slice is what works.
+            "cgroupsPath": format!(
+                "user.slice:{}:{}",
+                crate::config::CGROUP_PREFIX,
+                spec.cgroup_name.as_deref().unwrap_or(&spec.id)
+            ),
             "namespaces": [
                 { "type": "pid" }, { "type": "ipc" }, { "type": "uts" },
-                { "type": "mount" }, { "type": "network" }
+                { "type": "mount" }
             ],
             "maskedPaths": [
                 "/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys",
@@ -365,4 +383,382 @@ fn default_mounts() -> Vec<serde_json::Value> {
     .as_array()
     .cloned()
     .unwrap_or_default()
+}
+
+/// Runtime options selecting runc's systemd cgroup driver.
+///
+/// `containerd-client` does not generate the `containerd.runc.v1.Options`
+/// type: the proto ships in the crate's `vendor/` directory but is absent from
+/// its `build.rs` compile list, so there is no Rust struct to populate.
+///
+/// The message is therefore encoded by hand. It is a single field —
+/// `bool systemd_cgroup = 9` — so the encoding is tag `(9 << 3) | 0 = 0x48`
+/// followed by varint `0x01`.
+///
+/// These exact bytes were not derived and hoped for: `ctr` was asked to create
+/// a container with `--runc-systemd-cgroup`, and the options it sent were read
+/// back off the container record. They were `type_url =
+/// "containerd.runc.v1.Options"`, `value = [0x48, 0x01]`. Worth noting the
+/// field number is 9, not the 5 its position in the proto might suggest — the
+/// numbering is not contiguous, and a wrong guess encodes cleanly while
+/// setting an entirely different option.
+fn systemd_cgroup_options() -> Any {
+    Any {
+        type_url: "containerd.runc.v1.Options".to_string(),
+        value: vec![0x48, 0x01],
+    }
+}
+
+/// Lifecycle state of a container's task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    /// No task exists — the container is created but not started.
+    None,
+    Created,
+    Running,
+    Stopped,
+    Paused,
+    Unknown,
+}
+
+impl TaskState {
+    pub fn is_running(self) -> bool {
+        matches!(self, Self::Running | Self::Created)
+    }
+}
+
+impl ContainerdClient {
+    /// Current task state for a container.
+    ///
+    /// A missing task is [`TaskState::None`] rather than an error: "created but
+    /// never started" is a legitimate state (AC-4.1), and callers need to
+    /// distinguish it from a failure to ask.
+    pub async fn task_state(&self, id: &str) -> Result<TaskState> {
+        let request = GetRequest {
+            container_id: id.to_string(),
+            exec_id: String::new(),
+        };
+
+        match self
+            .raw()
+            .tasks()
+            .get(with_namespace!(request, self.namespace()))
+            .await
+        {
+            Ok(response) => {
+                let status = response.into_inner().process.map(|p| p.status);
+                // Values from containerd.v1.types.Status.
+                Ok(match status {
+                    Some(1) => TaskState::Created,
+                    Some(2) => TaskState::Running,
+                    Some(3) => TaskState::Stopped,
+                    Some(4) => TaskState::Paused,
+                    Some(_) | None => TaskState::Unknown,
+                })
+            }
+            Err(status) if status.code() == Code::NotFound => Ok(TaskState::None),
+            Err(status) => Err(anyhow::Error::from(status))
+                .with_context(|| format!("failed to query task state for {id:?}")),
+        }
+    }
+
+    /// Rootfs mounts for a container's snapshot.
+    ///
+    /// Task creation needs these: containerd does not infer them from the
+    /// container's snapshot key, the client supplies them.
+    async fn snapshot_mounts(&self, key: &str) -> Result<Vec<containerd_client::types::Mount>> {
+        let request = MountsRequest {
+            snapshotter: self.snapshotter().to_string(),
+            key: key.to_string(),
+        };
+
+        let response = self
+            .raw()
+            .snapshots()
+            .mounts(with_namespace!(request, self.namespace()))
+            .await
+            .with_context(|| format!("failed to get mounts for snapshot {key:?}"))?;
+
+        Ok(response.into_inner().mounts)
+    }
+
+    /// Start a container's task (PID 1).
+    ///
+    /// IO is left unattached: PID 1 is a supervisor (PROC-01), not something a
+    /// user talks to. Interactive sessions are separate execs with their own
+    /// terminals (PROC-02).
+    pub async fn start_task(&self, id: &str) -> Result<u32> {
+        let mounts = self.snapshot_mounts(id).await?;
+
+        let create = CreateTaskRequest {
+            container_id: id.to_string(),
+            rootfs: mounts,
+            terminal: false,
+            stdin: String::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            ..Default::default()
+        };
+
+        self.raw()
+            .tasks()
+            .create(with_namespace!(create, self.namespace()))
+            .await
+            .with_context(|| format!("failed to create task for container {id:?}"))?;
+
+        let start = StartRequest {
+            container_id: id.to_string(),
+            exec_id: String::new(),
+        };
+
+        let response = self
+            .raw()
+            .tasks()
+            .start(with_namespace!(start, self.namespace()))
+            .await
+            .with_context(|| format!("failed to start task for container {id:?}"))?;
+
+        Ok(response.into_inner().pid)
+    }
+
+    /// Stop a container's task: signal it, wait for exit, then delete it.
+    ///
+    /// Deleting the task is what returns the container to the stopped-but-ready
+    /// state of AC-4.1 (PROC-04). Leaving a stopped-but-undeleted task behind
+    /// would make a later `start` fail with "already exists".
+    ///
+    /// # Why this escalates to SIGKILL
+    ///
+    /// The task's PID 1 is a supervisor (PROC-01). Per `pid_namespaces(7)`, the
+    /// kernel delivers a signal to a namespace's PID 1 **only if that process
+    /// has installed a handler for it** — SIGKILL and SIGSTOP from an ancestor
+    /// namespace being the exceptions. `sleep infinity` installs no handlers
+    /// (`SigCgt` is all zeroes), so SIGTERM against it is silently discarded and
+    /// waiting for exit blocks forever.
+    ///
+    /// SIGTERM is still sent first, and still worth sending: a future
+    /// supervisor that does trap it gets its chance to shut down cleanly. But
+    /// the wait is bounded, and SIGKILL follows, because with the current
+    /// supervisor the graceful path cannot succeed by construction.
+    pub async fn stop_task(&self, id: &str) -> Result<()> {
+        const GRACE: Duration = Duration::from_secs(5);
+        const KILL_TIMEOUT: Duration = Duration::from_secs(10);
+
+        self.signal_task(id, 15).await?;
+
+        if timeout(GRACE, self.wait_task(id)).await.is_err() {
+            self.signal_task(id, 9).await?;
+            timeout(KILL_TIMEOUT, self.wait_task(id))
+                .await
+                .with_context(|| {
+                    format!("task for {id:?} did not exit within {KILL_TIMEOUT:?} of SIGKILL")
+                })??;
+        }
+
+        let delete = DeleteTaskRequest {
+            container_id: id.to_string(),
+        };
+        match self
+            .raw()
+            .tasks()
+            .delete(with_namespace!(delete, self.namespace()))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == Code::NotFound => Ok(()),
+            Err(status) => Err(anyhow::Error::from(status))
+                .with_context(|| format!("failed to delete task for {id:?}")),
+        }
+    }
+
+    /// Send a signal to a task's whole process group. A missing task is not an
+    /// error, so cleanup paths can call this unconditionally.
+    async fn signal_task(&self, id: &str, signal: u32) -> Result<()> {
+        let kill = KillRequest {
+            container_id: id.to_string(),
+            exec_id: String::new(),
+            signal,
+            all: true,
+        };
+        match self
+            .raw()
+            .tasks()
+            .kill(with_namespace!(kill, self.namespace()))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == Code::NotFound => Ok(()),
+            Err(status) => Err(anyhow::Error::from(status))
+                .with_context(|| format!("failed to send signal {signal} to task {id:?}")),
+        }
+    }
+
+    /// Block until a task exits.
+    async fn wait_task(&self, id: &str) -> Result<()> {
+        let wait = WaitRequest {
+            container_id: id.to_string(),
+            exec_id: String::new(),
+        };
+        match self
+            .raw()
+            .tasks()
+            .wait(with_namespace!(wait, self.namespace()))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == Code::NotFound => Ok(()),
+            Err(status) => Err(anyhow::Error::from(status))
+                .with_context(|| format!("failed waiting for task {id:?}")),
+        }
+    }
+}
+
+/// How an exec's IO is wired up.
+#[derive(Debug, Clone)]
+pub struct ExecIo {
+    /// FIFO the caller writes the process's stdin into.
+    pub stdin: PathBuf,
+    /// FIFO the caller reads the process's output from.
+    pub stdout: PathBuf,
+    /// Allocate a pseudo-terminal for the process.
+    pub terminal: bool,
+}
+
+impl ContainerdClient {
+    /// Run a process inside a container's existing task.
+    ///
+    /// This is how an interactive session is obtained (PROC-02): a fresh
+    /// process with its own terminal, independent of PID 1. Several execs can
+    /// coexist; each has its own `exec_id` and its own IO.
+    ///
+    /// The FIFOs must already exist — containerd's shim opens them, it does not
+    /// create them. They are opened when the process starts, so create them
+    /// before calling and open them O_RDWR to avoid the blocking-open deadlock.
+    ///
+    /// With `terminal: true` no stderr FIFO is passed: a pty merges the two
+    /// streams, and containerd rejects a spec that sets both.
+    pub async fn exec_process(
+        &self,
+        container_id: &str,
+        exec_id: &str,
+        process: serde_json::Value,
+        io: &ExecIo,
+    ) -> Result<()> {
+        let spec_bytes = serde_json::to_vec(&process)
+            .context("failed to serialise the exec process spec")?;
+
+        let request = ExecProcessRequest {
+            container_id: container_id.to_string(),
+            exec_id: exec_id.to_string(),
+            terminal: io.terminal,
+            stdin: io.stdin.to_string_lossy().to_string(),
+            stdout: io.stdout.to_string_lossy().to_string(),
+            stderr: String::new(),
+            spec: Some(Any {
+                type_url: "types.containerd.io/opencontainers/runtime-spec/1/Process".to_string(),
+                value: spec_bytes,
+            }),
+        };
+
+        self.raw()
+            .tasks()
+            .exec(with_namespace!(request, self.namespace()))
+            .await
+            .with_context(|| {
+                format!("failed to create exec {exec_id:?} in container {container_id:?}")
+            })?;
+        Ok(())
+    }
+
+    /// Start a previously created exec process.
+    pub async fn start_exec(&self, container_id: &str, exec_id: &str) -> Result<u32> {
+        let request = StartRequest {
+            container_id: container_id.to_string(),
+            exec_id: exec_id.to_string(),
+        };
+        let response = self
+            .raw()
+            .tasks()
+            .start(with_namespace!(request, self.namespace()))
+            .await
+            .with_context(|| format!("failed to start exec {exec_id:?}"))?;
+        Ok(response.into_inner().pid)
+    }
+
+    /// Resize an exec's pseudo-terminal.
+    ///
+    /// Without this the process believes the terminal is whatever size it was
+    /// at creation, so full-screen output wraps wrongly after a window resize.
+    pub async fn resize_pty(
+        &self,
+        container_id: &str,
+        exec_id: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let request = ResizePtyRequest {
+            container_id: container_id.to_string(),
+            exec_id: exec_id.to_string(),
+            width,
+            height,
+        };
+        self.raw()
+            .tasks()
+            .resize_pty(with_namespace!(request, self.namespace()))
+            .await
+            .with_context(|| format!("failed to resize pty for exec {exec_id:?}"))?;
+        Ok(())
+    }
+
+    /// Wait for an exec to exit, returning its exit code.
+    pub async fn wait_exec(&self, container_id: &str, exec_id: &str) -> Result<u32> {
+        let request = WaitRequest {
+            container_id: container_id.to_string(),
+            exec_id: exec_id.to_string(),
+        };
+        let response = self
+            .raw()
+            .tasks()
+            .wait(with_namespace!(request, self.namespace()))
+            .await
+            .with_context(|| format!("failed waiting for exec {exec_id:?}"))?;
+        Ok(response.into_inner().exit_status)
+    }
+
+    /// Signal that no more stdin will be written.
+    pub async fn close_exec_stdin(&self, container_id: &str, exec_id: &str) -> Result<()> {
+        let request = CloseIoRequest {
+            container_id: container_id.to_string(),
+            exec_id: exec_id.to_string(),
+            stdin: true,
+        };
+        let _ = self
+            .raw()
+            .tasks()
+            .close_io(with_namespace!(request, self.namespace()))
+            .await;
+        Ok(())
+    }
+
+    /// Delete an exec's process record.
+    ///
+    /// Execs are not reaped automatically; leaving them accumulates process
+    /// records on the task (NFR-03).
+    pub async fn delete_exec(&self, container_id: &str, exec_id: &str) -> Result<()> {
+        let request = DeleteProcessRequest {
+            container_id: container_id.to_string(),
+            exec_id: exec_id.to_string(),
+        };
+        match self
+            .raw()
+            .tasks()
+            .delete_process(with_namespace!(request, self.namespace()))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == Code::NotFound => Ok(()),
+            Err(status) => Err(anyhow::Error::from(status))
+                .with_context(|| format!("failed to delete exec {exec_id:?}")),
+        }
+    }
 }

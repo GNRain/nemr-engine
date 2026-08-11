@@ -93,6 +93,10 @@ pub async fn create(
         ],
         working_dir: Some(config::CONTAINER_WORKDIR.to_string()),
         extra_env: vec![],
+        args: Some(config::SUPERVISOR_ARGS.iter().map(|s| s.to_string()).collect()),
+        // Bare project name: the scope is `nemr-<name>.scope`, and passing the
+        // container id (already `nemr-` prefixed) would double it.
+        cgroup_name: Some(name.to_string()),
         labels,
     };
 
@@ -142,4 +146,197 @@ mod tests {
     fn container_id_is_prefixed() {
         assert_eq!(config::container_id("demo"), "nemr-demo");
     }
+}
+
+/// Resolve a project name to its container, failing clearly if absent.
+async fn resolve(client: &ContainerdClient, name: &str) -> Result<String> {
+    crate::engine::volume::validate_name(name)
+        .with_context(|| format!("invalid project name {name:?}"))?;
+
+    let container_id = config::container_id(name);
+    if !client.container_exists(&container_id).await? {
+        bail!(
+            "no project named {name:?}.\n\
+             Create it first: nemr create {name} --size 2GB"
+        );
+    }
+    Ok(container_id)
+}
+
+/// Start a project's container (Milestone 5).
+///
+/// PID 1 is the supervisor from PROC-01; no interactive session is created
+/// here. `attach` is what gives a shell.
+pub async fn start(client: &ContainerdClient, name: &str) -> Result<u32> {
+    let container_id = resolve(client, name).await?;
+
+    // AC-5.3: starting an already-running project is a clear error, not a
+    // second task or a silent no-op.
+    match client.task_state(&container_id).await? {
+        state if state.is_running() => bail!(
+            "project {name:?} is already running.\n\
+             Attach to it with: nemr attach {name}"
+        ),
+        crate::containerd::containers::TaskState::Stopped => {
+            // A task that exited but was never reaped would block a new one.
+            client.stop_task(&container_id).await?;
+        }
+        _ => {}
+    }
+
+    let pid = client.start_task(&container_id).await?;
+    Ok(pid)
+}
+
+/// Stop a project's container (Milestone 5).
+pub async fn stop(client: &ContainerdClient, name: &str) -> Result<()> {
+    let container_id = resolve(client, name).await?;
+
+    // AC-5.3: stopping an already-stopped project must fail clearly rather
+    // than report success for work it did not do.
+    if client.task_state(&container_id).await?
+        == crate::containerd::containers::TaskState::None
+    {
+        bail!(
+            "project {name:?} is not running.\n\
+             Start it with: nemr start {name}"
+        );
+    }
+
+    client.stop_task(&container_id).await
+}
+
+/// Whether a project is currently running.
+pub async fn is_running(client: &ContainerdClient, name: &str) -> Result<bool> {
+    let container_id = config::container_id(name);
+    Ok(client.task_state(&container_id).await?.is_running())
+}
+
+/// Attach an interactive session to a running project (Milestone 5).
+///
+/// Per PROC-02 this is a **task exec with its own TTY**, not a connection to
+/// PID 1's terminal. Exiting the shell ends only this exec; the project keeps
+/// running, and concurrent attaches get independent terminals.
+pub async fn attach(client: &ContainerdClient, name: &str) -> Result<u32> {
+    use crate::containerd::containers::ExecIo;
+    use crate::engine::tty;
+
+    let container_id = resolve(client, name).await?;
+
+    // AC-5.3: attaching to a project that was never started must fail clearly,
+    // not hang waiting for a task that does not exist.
+    if !client.task_state(&container_id).await?.is_running() {
+        bail!(
+            "project {name:?} is not running.\n\
+             Start it first: nemr start {name}"
+        );
+    }
+
+    // A unique exec id per attach, so concurrent sessions do not collide.
+    let exec_id = format!(
+        "attach-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+
+    let io_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .context("XDG_RUNTIME_DIR is not set; cannot place attach FIFOs")?
+        .join("nemr")
+        .join(&exec_id);
+    std::fs::create_dir_all(&io_dir)
+        .with_context(|| format!("failed to create {}", io_dir.display()))?;
+
+    let io = ExecIo {
+        stdin: io_dir.join("stdin"),
+        stdout: io_dir.join("stdout"),
+        terminal: true,
+    };
+    tty::make_fifo(&io.stdin)?;
+    tty::make_fifo(&io.stdout)?;
+
+    let process = serde_json::json!({
+        "terminal": true,
+        "user": { "uid": 0, "gid": 0 },
+        "args": ["/bin/bash", "-l"],
+        "env": [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME=/root",
+            "TERM=".to_string() + &std::env::var("TERM").unwrap_or_else(|_| "xterm".into()),
+            format!("USE_BUILTIN_RIPGREP=0"),
+        ],
+        "cwd": config::CONTAINER_WORKDIR,
+        "capabilities": {
+            "bounding":  ["CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FSETID","CAP_FOWNER","CAP_MKNOD",
+                          "CAP_NET_RAW","CAP_SETGID","CAP_SETUID","CAP_SETFCAP","CAP_SETPCAP",
+                          "CAP_NET_BIND_SERVICE","CAP_SYS_CHROOT","CAP_KILL","CAP_AUDIT_WRITE"],
+            "effective": ["CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FSETID","CAP_FOWNER","CAP_MKNOD",
+                          "CAP_NET_RAW","CAP_SETGID","CAP_SETUID","CAP_SETFCAP","CAP_SETPCAP",
+                          "CAP_NET_BIND_SERVICE","CAP_SYS_CHROOT","CAP_KILL","CAP_AUDIT_WRITE"],
+            "permitted": ["CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FSETID","CAP_FOWNER","CAP_MKNOD",
+                          "CAP_NET_RAW","CAP_SETGID","CAP_SETUID","CAP_SETFCAP","CAP_SETPCAP",
+                          "CAP_NET_BIND_SERVICE","CAP_SYS_CHROOT","CAP_KILL","CAP_AUDIT_WRITE"]
+        },
+        "noNewPrivileges": true
+    });
+
+    client
+        .exec_process(&container_id, &exec_id, process, &io)
+        .await?;
+
+    // Open both FIFOs before starting, so no output is lost in the gap between
+    // the process starting and us being ready to read.
+    let stdin_fifo = tty::open_fifo(&io.stdin)?;
+    let stdout_fifo = tty::open_fifo(&io.stdout)?;
+
+    // Raw mode is enabled only once the exec is about to run, and the guard
+    // restores the terminal on every exit path below.
+    let _raw = tty::RawMode::enable()?;
+
+    client.start_exec(&container_id, &exec_id).await?;
+
+    if let Some((width, height)) = tty::window_size() {
+        let _ = client.resize_pty(&container_id, &exec_id, width, height).await;
+    }
+
+    // Blocking IO on dedicated threads. The gRPC side stays async on the
+    // runtime; mixing is simpler here than making FIFO reads async, and these
+    // threads exit when their pipe closes.
+    let to_container = std::thread::spawn(move || {
+        tty::pump(std::io::stdin(), stdin_fifo);
+    });
+    let from_container = std::thread::spawn(move || {
+        tty::pump(stdout_fifo, std::io::stdout());
+    });
+
+    // Forward window resizes for as long as the session lasts.
+    let resize_client = container_id.clone();
+    let resize_exec = exec_id.clone();
+    let mut winch = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+        .context("failed to install SIGWINCH handler")?;
+
+    let exit_code = loop {
+        tokio::select! {
+            status = client.wait_exec(&container_id, &exec_id) => break status?,
+            _ = winch.recv() => {
+                if let Some((width, height)) = tty::window_size() {
+                    let _ = client.resize_pty(&resize_client, &resize_exec, width, height).await;
+                }
+            }
+        }
+    };
+
+    let _ = client.close_exec_stdin(&container_id, &exec_id).await;
+    let _ = client.delete_exec(&container_id, &exec_id).await;
+
+    // The output pump ends when the shim closes its end of the FIFO. The stdin
+    // pump is blocked reading the user's terminal and will not notice the
+    // session ended, so it is left to die with the process rather than joined.
+    drop(from_container.join());
+    drop(to_container);
+    let _ = std::fs::remove_dir_all(&io_dir);
+
+    Ok(exit_code)
 }

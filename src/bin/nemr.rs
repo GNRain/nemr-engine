@@ -33,6 +33,15 @@ enum Command {
         #[arg(long, default_value = "2GB", value_parser = parse_size)]
         size: VolumeSize,
     },
+
+    /// Start a project's container.
+    Start { name: String },
+
+    /// Stop a project's container.
+    Stop { name: String },
+
+    /// Open an interactive shell inside a running project.
+    Attach { name: String },
 }
 
 /// Parse `--size`, reusing the engine's own preset parsing so the CLI cannot
@@ -60,6 +69,29 @@ async fn main() -> Result<()> {
             println!("  container: {}", project.container_id);
             println!("  volume:    {} ({})", project.volume_path, project.size);
             println!("  status:    stopped (ready to start)");
+        }
+
+        Command::Start { name } => {
+            let client = ContainerdClient::connect().await?;
+            let pid = project::start(&client, &name).await?;
+            println!("started project {name:?} (supervisor pid {pid})");
+            println!("  attach with: nemr attach {name}");
+        }
+
+        Command::Stop { name } => {
+            let client = ContainerdClient::connect().await?;
+            project::stop(&client, &name).await?;
+            println!("stopped project {name:?}");
+        }
+
+        Command::Attach { name } => {
+            let client = ContainerdClient::connect().await?;
+            let code = project::attach(&client, &name).await?;
+            // The session's exit code becomes ours, so scripts can branch on
+            // what happened inside the container.
+            if code != 0 {
+                std::process::exit(code as i32);
+            }
         }
     }
 
