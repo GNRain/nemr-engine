@@ -42,3 +42,13 @@ pub const CONTAINER_WORKDIR: &str = "/workspace";
 ///
 /// The base image runs as root, so `HOME` is `/root`.
 pub const CONTAINER_CREDENTIALS: &str = "/root/.claude/.credentials.json";
+
+/// Prefix used in the systemd cgroup scope name, `user.slice:<prefix>:<id>`.
+pub const CGROUP_PREFIX: &str = "nemr";
+
+/// PID 1 inside a project container (Section 3.8, PROC-01/PROC-03).
+///
+/// A supervisor, not a shell. Written explicitly into the runtime spec so the
+/// process model cannot drift with the base image's `CMD`. Interactive shells
+/// are separate execs (PROC-02).
+pub const SUPERVISOR_ARGS: [&str; 2] = ["sleep", "infinity"];

@@ -4,7 +4,7 @@ Backend engine that provisions isolated, resource-bounded, pre-configured
 Claude Code execution environments on a single Linux host, with no dependency
 on Docker at any layer.
 
-Authoritative specification: [`SPEC.md`](SPEC.md) (NEMR-SPEC-001 v1.16),
+Authoritative specification: [`SPEC.md`](SPEC.md) (NEMR-SPEC-001 v1.19),
 tracked in this repository per Section 4A.5. Where this README and the
 specification disagree, the specification governs.
 
@@ -16,7 +16,7 @@ specification disagree, the specification governs.
 | M2 — Base image build | Complete — AC-2.1, AC-2.2, AC-2.3 met |
 | M3 — Volume creation with quota | Complete — AC-3.1 … AC-3.5 met |
 | M4 — Project lifecycle: create | Complete — AC-4.1, AC-4.2 met |
-| M5 — Start / attach / stop | Not started |
+| M5 — Start / attach / stop | Complete — AC-5.1, AC-5.2, AC-5.3 met |
 | M6 — List / delete | Not started |
 | M7 — End-to-end validation | Not started |
 
@@ -450,6 +450,69 @@ namespace. `nemr create` runs from the host namespace with no `nsenter` and no
 
 This does not extend to Milestone 5 — starting a task runs runc, which does
 mount, and carries its own cgroup constraint.
+
+## Project lifecycle (Milestone 5)
+
+```bash
+nemr start myproject      # start the container
+nemr attach myproject     # interactive shell inside it
+nemr stop myproject       # stop it; the volume and container record survive
+```
+
+### Process model (Section 3.8)
+
+PID 1 is a **supervisor** (`sleep infinity`), not a shell. `attach` is a task
+exec with its own TTY, one per call. This decouples two things that would
+otherwise be tangled: the project stays alive independently of any session, and
+concurrent attaches get separate terminals instead of fighting over one PTY.
+
+The supervisor command is written explicitly into the runtime spec, never
+inherited from the base image, so a change to `image/Dockerfile` cannot
+silently alter the process model.
+
+Two consequences worth knowing:
+
+- **`stop` escalates to SIGKILL.** Per `pid_namespaces(7)` the kernel delivers a
+  signal to a namespace's PID 1 only if that process installed a handler —
+  SIGKILL and SIGSTOP from an ancestor namespace excepted. `sleep infinity`
+  installs none, so SIGTERM against it is silently discarded and waiting for
+  exit blocks forever. `stop` sends SIGTERM, waits 5s, then SIGKILL.
+- **Exiting an attach does not stop the project.** That is PROC-02 working;
+  use `nemr stop`.
+
+### Attach internals
+
+`src/engine/tty.rs` handles the terminal side. Three details it exists for:
+
+- **Raw mode**, as an RAII guard. Without it Ctrl-C kills `nemr` rather than the
+  process inside. `Drop` restores the original `termios` on every path, since a
+  terminal left raw looks broken to the user and needs a blind `reset`.
+- **`O_RDWR` FIFO opens.** A FIFO opened read-only blocks until a writer
+  appears, write-only until a reader does; with both ends opened by different
+  processes at unpredictable times, either ordering can deadlock. `O_RDWR` never
+  blocks on Linux.
+- **SIGWINCH forwarding**, or the process keeps believing the terminal is
+  whatever size it was at start.
+
+### Networking (Section 3.9)
+
+Containers share rootlesskit's network namespace — equivalent to
+`nerdctl run --net=host` under rootless. A container given its *own* network
+namespace receives an empty one (loopback only, no egress), which surfaced as
+Claude Code failing with `ENOTIMP` against `api.anthropic.com`.
+
+There is therefore **no per-project network isolation in Phase 1**, and two
+projects binding the same port will collide (risk R-07). Storage isolation is
+unaffected. The Phase 2 path is rootless CNI.
+
+## Installing the CLI
+
+```bash
+cargo install --path . --bin nemr --root ~/.local --force
+```
+
+Installs a release binary to `~/.local/bin/nemr`. It is a snapshot, not a
+symlink into `target/`, so rerun it after changing engine code.
 
 ## Current blockers
 
