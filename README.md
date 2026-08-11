@@ -4,7 +4,7 @@ Backend engine that provisions isolated, resource-bounded, pre-configured
 Claude Code execution environments on a single Linux host, with no dependency
 on Docker at any layer.
 
-Authoritative specification: [`SPEC.md`](SPEC.md) (NEMR-SPEC-001 v1.19),
+Authoritative specification: [`SPEC.md`](SPEC.md) (NEMR-SPEC-001 v1.20),
 tracked in this repository per Section 4A.5. Where this README and the
 specification disagree, the specification governs.
 
@@ -541,6 +541,34 @@ snapshot, unmount and detach, then remove the backing file. Releasing the volume
 first would pull the mount from under a container still referencing it; removing
 the backing file before detaching would strand the loop device permanently,
 which is the bug Milestone 3 hit.
+
+### Surviving a host reboot (VOL-06)
+
+Container records live in containerd's database and survive a reboot. Mounts and
+loop devices do not. `start` therefore checks `/proc/self/mountinfo` and
+remounts the volume if it is missing:
+
+```
+$ nemr start myproject
+[nemr:volume] volume for "myproject" is not mounted at …/mounts/myproject; remounting (VOL-06)
+[nemr:volume] ELEVATED: sudo -n /usr/local/libexec/nemr-volume mount myproject 2GB
+started project "myproject"
+```
+
+Without this, `start` succeeded against an unmounted volume and the container
+got an empty `/workspace` backed by the **host root filesystem** — no data, and
+no quota (98G where 2GB was promised). Nothing errored, so a user could work an
+entire session believing they were writing to their project. That is a silent
+VOL-05 violation, which is why `start` remounts rather than merely warning.
+
+Remount is chosen over refuse-and-repair-by-hand deliberately: the backing file
+is intact and the helper already knows how to mount it, so requiring manual
+intervention would defeat the portability the product exists for. Failure to
+remount *is* fatal — proceeding is the thing being guarded against.
+
+Regression tests simulate the post-reboot state (unmount + detach via the same
+helper) rather than requiring an actual reboot, and assert the *same* filesystem
+returns by checking a marker file written beforehand.
 
 ## Installing the CLI
 
