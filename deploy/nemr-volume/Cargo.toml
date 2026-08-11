@@ -1,8 +1,8 @@
 [package]
-name = "aihub-volume"
+name = "nemr-volume"
 version = "0.1.0"
 edition = "2021"
-description = "Root-owned privileged helper for AI Hub volume provisioning (PRIV-03)"
+description = "Root-owned privileged helper for Nemr volume provisioning (PRIV-03)"
 
 # Standalone workspace on purpose. This crate is installed root-owned at a
 # fixed path and runs under sudo; it is a different privilege domain from the

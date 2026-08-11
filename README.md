@@ -1,10 +1,10 @@
-# AI Hub — Engine (Phase 1)
+# Nemr — Engine (Phase 1)
 
 Backend engine that provisions isolated, resource-bounded, pre-configured
 Claude Code execution environments on a single Linux host, with no dependency
 on Docker at any layer.
 
-Authoritative specification: [`SPEC.md`](SPEC.md) (AIHUB-SPEC-001 v1.15),
+Authoritative specification: [`SPEC.md`](SPEC.md) (NEMR-SPEC-001 v1.16),
 tracked in this repository per Section 4A.5. Where this README and the
 specification disagree, the specification governs.
 
@@ -43,7 +43,7 @@ srw-rw---- 1 nemr nemr /run/user/1000/containerd/containerd.sock
 ```
 
 Loop-device attach and mount are the sole exception (PRIV-02), bounded by a
-NOPASSWD grant to one fixed root-owned helper at `deploy/aihub-volume/`, with no
+NOPASSWD grant to one fixed root-owned helper at `deploy/nemr-volume/`, with no
 argument wildcards (PRIV-03). Sparse allocation and `mkfs.ext4` were measured to
 need no privilege and are excluded from that surface. See "Volumes and the
 privileged helper" below.
@@ -149,7 +149,7 @@ systemctl is-enabled containerd                          # disabled
 ls -l "$XDG_RUNTIME_DIR/containerd/containerd.sock"      # owned by you, not root
 
 # 1. Build
-cd ai-hub-engine
+cd nemr-engine
 cargo build
 
 # 2. AC-1.1 — raw connectivity baseline exits 0 (no sudo, per PRIV-01).
@@ -222,8 +222,8 @@ Node 22 matches the LTS line and the host's own Node (v22.23.2).
 
 | Artifact | Size |
 |---|---|
-| OCI archive (`/tmp/aihub-base.tar`) | 201 MB |
-| **Image in containerd** (`docker.io/aihub/base:0.1.0`) | **200.5 MiB** |
+| OCI archive (`/tmp/nemr-base.tar`) | 201 MB |
+| **Image in containerd** (`docker.io/nemr/base:0.1.0`) | **200.5 MiB** |
 
 Recorded per AC-2.2. This is larger than an Alpine-based equivalent would be
 (~80–130 MiB); the trade is glibc compatibility against size, per E-01 above.
@@ -239,10 +239,10 @@ buildctl build \
   --frontend dockerfile.v0 \
   --local context=image \
   --local dockerfile=image \
-  --output type=oci,dest=/tmp/aihub-base.tar,name=docker.io/aihub/base:0.1.0
+  --output type=oci,dest=/tmp/nemr-base.tar,name=docker.io/nemr/base:0.1.0
 
 export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
-ctr images import /tmp/aihub-base.tar
+ctr images import /tmp/nemr-base.tar
 ctr images list
 ```
 
@@ -260,8 +260,8 @@ nsenter -U --preserve-credentials -m -n -t "$CHILD_PID" \
     env CONTAINERD_ADDRESS=/run/containerd/containerd.sock \
         DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus" \
         XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-    ctr run --rm --runc-systemd-cgroup --cgroup "user.slice:aihub:m2verify" \
-        docker.io/aihub/base:0.1.0 m2-verify \
+    ctr run --rm --runc-systemd-cgroup --cgroup "user.slice:nemr:m2verify" \
+        docker.io/nemr/base:0.1.0 m2-verify \
         /bin/bash -lc 'claude --version'
 ```
 
@@ -306,7 +306,7 @@ involved, and it stays off the privileged surface entirely.
 The intuitive rule enumerates commands with path wildcards:
 
 ```
-nemr ALL=(root) NOPASSWD: /usr/bin/mount /dev/loop* /home/nemr/.local/share/aihub/mounts/*
+nemr ALL=(root) NOPASSWD: /usr/bin/mount /dev/loop* /home/nemr/.local/share/nemr/mounts/*
 ```
 
 That does not constrain paths. Per `sudoers(5)`, a slash **is** matched by
@@ -318,10 +318,10 @@ A path constraint therefore cannot be expressed in sudoers at all. It has to
 live in code the granted user cannot modify:
 
 ```
-nemr ALL=(root) NOPASSWD: /usr/local/libexec/aihub-volume
+nemr ALL=(root) NOPASSWD: /usr/local/libexec/nemr-volume
 ```
 
-One fixed path, no wildcards. `deploy/aihub-volume/` takes a volume **name**
+One fixed path, no wildcards. `deploy/nemr-volume/` takes a volume **name**
 and a **size preset** — never a path, device, or UID — and derives and
 validates everything internally. Zero dependencies (std only): a privileged
 binary's supply chain is part of its attack surface.
@@ -352,12 +352,12 @@ exposing it would permit re-owning arbitrary paths.
 ### Installing the helper
 
 ```bash
-cd deploy/aihub-volume && cargo build --release && cd ../..
+cd deploy/nemr-volume && cargo build --release && cd ../..
 sudo install -o root -g root -m 0755 \
-    deploy/aihub-volume/target/release/aihub-volume /usr/local/libexec/aihub-volume
-visudo -c -f deploy/sudoers.d/aihub-volume        # validate BEFORE installing
+    deploy/nemr-volume/target/release/nemr-volume /usr/local/libexec/nemr-volume
+visudo -c -f deploy/sudoers.d/nemr-volume        # validate BEFORE installing
 sudo install -o root -g root -m 0440 \
-    deploy/sudoers.d/aihub-volume /etc/sudoers.d/aihub-volume
+    deploy/sudoers.d/nemr-volume /etc/sudoers.d/nemr-volume
 ```
 
 A malformed file in `/etc/sudoers.d/` can lock every user out of sudo, hence
@@ -372,7 +372,7 @@ are `#[ignore]`d and need the helper installed:
 ```bash
 cargo test --lib                                              # 7 hermetic
 cargo test --lib -- --ignored --nocapture --test-threads=1    # 4 integration
-(cd deploy/aihub-volume && cargo test)                        # 6 helper
+(cd deploy/nemr-volume && cargo test)                        # 6 helper
 ```
 
 `--test-threads=1` is required: these attach loop devices and assert on global
@@ -382,8 +382,8 @@ Verify independently afterwards — the tests assert, but the host is the
 authority:
 
 ```bash
-losetup -a | grep -i "aihub\|deleted"      # expect no output
-grep aihub /proc/self/mountinfo            # expect no output
+losetup -a | grep -i "nemr\|deleted"      # expect no output
+grep nemr /proc/self/mountinfo            # expect no output
 ```
 
 That second check is not decorative. An early version of AC-3.4 passed while
@@ -396,12 +396,12 @@ stranded.
 
 ## Projects (Milestone 4)
 
-`aihub create <name> --size <500MB|2GB|10GB>` provisions a project: a
+`nemr create <name> --size <500MB|2GB|10GB>` provisions a project: a
 quota-bounded volume (Milestone 3) plus a container from the base image
 (Milestone 2), in a stopped, ready-to-start state.
 
 ```bash
-aihub create myproject --size 2GB
+nemr create myproject --size 2GB
 ```
 
 ### Discoverability
@@ -410,19 +410,19 @@ State lives in containerd, not in a side database the engine would have to keep
 in sync. The container record carries labels:
 
 ```
-aihub.project = myproject
-aihub.size    = 2GB
-aihub.volume  = /home/nemr/.local/share/aihub/mounts/myproject
+nemr.project = myproject
+nemr.size    = 2GB
+nemr.volume  = /home/nemr/.local/share/nemr/mounts/myproject
 ```
 
-so `ctr containers info aihub-<name>` is the source of truth, and Milestone 6's
+so `ctr containers info nemr-<name>` is the source of truth, and Milestone 6's
 `list` reads it back rather than tracking projects separately.
 
 ### Mounts
 
 | Host | Container | Mode |
 |---|---|---|
-| `~/.local/share/aihub/mounts/<name>` | `/workspace` | rw |
+| `~/.local/share/nemr/mounts/<name>` | `/workspace` | rw |
 | `~/.claude/.credentials.json` | `/root/.claude/.credentials.json` | **ro** |
 
 Only the credentials *file* is mounted, never the whole `~/.claude` directory
@@ -445,7 +445,7 @@ container now depends on it.
 mounts the image snapshot client-side to read the image config. The engine does
 not: it reads that config from the content store over gRPC and has containerd
 prepare the snapshot server-side, so nothing is mounted in the engine's own
-namespace. `aihub create` runs from the host namespace with no `nsenter` and no
+namespace. `nemr create` runs from the host namespace with no `nsenter` and no
 `sudo`.
 
 This does not extend to Milestone 5 — starting a task runs runc, which does
@@ -458,7 +458,7 @@ the host is provisioned and rootless containerd is verified reachable.
 
 ## Deviation log
 
-Recorded deviations from AIHUB-SPEC-001 live in **[`SPEC.md`](SPEC.md),
+Recorded deviations from NEMR-SPEC-001 live in **[`SPEC.md`](SPEC.md),
 Section 11** — the single source of truth, per Section 8 and 4A.5. They are
 deliberately not reproduced here; a second copy would drift.
 

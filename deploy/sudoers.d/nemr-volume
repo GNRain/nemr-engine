@@ -1,6 +1,6 @@
-# AI Hub — privileged volume provisioning (AIHUB-SPEC-001, PRIV-02/PRIV-03).
+# Nemr — privileged volume provisioning (NEMR-SPEC-001, PRIV-02/PRIV-03).
 #
-# Install to /etc/sudoers.d/aihub-volume, owned root:root, mode 0440.
+# Install to /etc/sudoers.d/nemr-volume, owned root:root, mode 0440.
 # Validate with `visudo -c -f` BEFORE installing — a malformed sudoers file can
 # lock every user out of sudo.
 #
@@ -10,7 +10,7 @@
 #
 # The obvious formulation would enumerate the underlying commands, e.g.
 #
-#     nemr ALL=(root) NOPASSWD: /usr/sbin/losetup --find --show /home/nemr/.local/share/aihub/volumes/*.img
+#     nemr ALL=(root) NOPASSWD: /usr/sbin/losetup --find --show /home/nemr/.local/share/nemr/volumes/*.img
 #
 # That does not do what it appears to do. Per sudoers(5):
 #
@@ -39,15 +39,18 @@
 # (subcommand from a fixed set, name matched against ^[a-z0-9][a-z0-9-]{0,31}$,
 # size from a fixed list of three presets).
 #
-# Replace `nemr` with the account that runs the engine.
+# The leading `nemr` below is the Unix ACCOUNT this grant applies to — replace
+# it with whichever account runs the engine. It coincides with the project name
+# on the reference host, where the user happens to also be called `nemr`; the
+# two are unrelated.
 
-nemr ALL=(root) NOPASSWD: /usr/local/libexec/aihub-volume
+nemr ALL=(root) NOPASSWD: /usr/local/libexec/nemr-volume
 
 # Notes:
 #
-# - /usr/local/libexec/aihub-volume must be owned root:root, mode 0755. If the
+# - /usr/local/libexec/nemr-volume must be owned root:root, mode 0755. If the
 #   invoking user can write to the helper, this grant becomes unrestricted
-#   root. Verify with: stat -c '%U:%G %a' /usr/local/libexec/aihub-volume
+#   root. Verify with: stat -c '%U:%G %a' /usr/local/libexec/nemr-volume
 #
 # - The helper refuses to run unless SUDO_UID/SUDO_GID are set, so it does
 #   nothing useful if executed directly as root.

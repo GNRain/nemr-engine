@@ -1,6 +1,6 @@
-# Host Prerequisites — AI Hub Phase 1
+# Host Prerequisites — Nemr Phase 1
 
-Per Section 3.3 of AIHUB-SPEC-001, these components are **provisioned
+Per Section 3.3 of NEMR-SPEC-001, these components are **provisioned
 manually**. The engine does not install its own dependencies in Phase 1.
 
 This document is written to be followed on a clean Ubuntu host by a person
@@ -195,7 +195,7 @@ Create `~/.config/systemd/user/containerd-rootless.service`:
 
 ```ini
 [Unit]
-Description=containerd (rootless) — AI Hub Phase 1, PRIV-01
+Description=containerd (rootless) — Nemr Phase 1, PRIV-01
 Documentation=https://github.com/containerd/nerdctl/blob/main/docs/rootless.md
 Documentation=file:///usr/share/doc/containerd/rootless.md
 

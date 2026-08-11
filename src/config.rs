@@ -11,7 +11,7 @@
 pub const NAMESPACE: &str = "default";
 
 /// Base image produced by Milestone 2.
-pub const BASE_IMAGE: &str = "docker.io/aihub/base:0.1.0";
+pub const BASE_IMAGE: &str = "docker.io/nemr/base:0.1.0";
 
 /// Snapshotter used for container rootfs.
 ///
@@ -26,9 +26,9 @@ pub const RUNTIME: &str = "io.containerd.runc.v2";
 /// Prefix for engine-created container IDs.
 ///
 /// Namespacing engine containers means `ctr containers list` shows at a glance
-/// which records belong to AI Hub, and a project named `demo` cannot collide
+/// which records belong to Nemr, and a project named `demo` cannot collide
 /// with an unrelated container of the same name.
-pub const CONTAINER_PREFIX: &str = "aihub-";
+pub const CONTAINER_PREFIX: &str = "nemr-";
 
 /// Container ID for a project.
 pub fn container_id(project: &str) -> String {

@@ -18,9 +18,9 @@ use crate::engine::volume::{HelperOps, Volume, VolumePaths, VolumeSize};
 ///
 /// Prefixed so engine metadata is distinguishable from anything else that
 /// might label a container in this namespace.
-pub const LABEL_PROJECT: &str = "aihub.project";
-pub const LABEL_VOLUME: &str = "aihub.volume";
-pub const LABEL_SIZE: &str = "aihub.size";
+pub const LABEL_PROJECT: &str = "nemr.project";
+pub const LABEL_VOLUME: &str = "nemr.volume";
+pub const LABEL_SIZE: &str = "nemr.size";
 
 /// Create a project: a quota-bounded volume plus a ready-to-start container.
 ///
@@ -134,12 +134,12 @@ mod tests {
     #[test]
     fn label_keys_are_namespaced() {
         for key in [LABEL_PROJECT, LABEL_VOLUME, LABEL_SIZE] {
-            assert!(key.starts_with("aihub."), "{key} should be namespaced");
+            assert!(key.starts_with("nemr."), "{key} should be namespaced");
         }
     }
 
     #[test]
     fn container_id_is_prefixed() {
-        assert_eq!(config::container_id("demo"), "aihub-demo");
+        assert_eq!(config::container_id("demo"), "nemr-demo");
     }
 }
