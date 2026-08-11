@@ -37,6 +37,13 @@ pub struct ContainerSummary {
     pub image: String,
     /// Runtime handling the container, e.g. `io.containerd.runc.v2`.
     pub runtime: String,
+    /// Labels stored on the record.
+    ///
+    /// Included because containerd is where engine metadata lives (see
+    /// [`ContainerSpec::labels`]); a caller listing containers needs them to
+    /// reconstruct project state without a second round trip or a side
+    /// database.
+    pub labels: HashMap<String, String>,
 }
 
 impl ContainerdClient {
@@ -67,6 +74,7 @@ impl ContainerdClient {
                 id: container.id,
                 image: container.image,
                 runtime: container.runtime.map(|r| r.name).unwrap_or_default(),
+                labels: container.labels,
             })
             .collect();
 
