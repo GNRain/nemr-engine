@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | AIHUB-SPEC-001 |
-| Version | 1.8 |
+| Version | 1.10 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -22,6 +22,8 @@
 | 1.4 | Revision | Added Section 3.7 (Privilege Model), recording the E-03 decision: rootless containerd for all container operations (PRIV-01), with a narrowly scoped sudoers exception for Milestone 3 volume provisioning only (PRIV-02–05). Updated Milestone 1 scope, Milestone 3 scope and acceptance criteria (AC-3.5 added), the corresponding `/goal` invocation in 4A.3, and added risk R-06. | Product Owner |
 | 1.5 | Revision | Carried forward a Milestone 1 finding into Milestone 4's scope: gRPC-only containerd operations connect directly to the rootless socket, but `create_container()` requires the client to perform mounts and must run inside rootlesskit's namespaces — an earlier assumption that a manual `nsenter` would be needed was incorrect and is superseded by this note. Recorded so Milestone 4 does not need to rediscover this. | Product Owner, per Claude Code M1 completion report |
 | 1.6 | Revision | Added Section 4A.5 (Spec Ownership): this document is now tracked in-repo as `SPEC.md`, committed as part of the Milestone 1 baseline. Claude Code updates milestone Notes and the Deviation Log directly for findings; Section 9 escalations and Sections 1–3 changes remain Product Owner decisions only. Product Owner review moves to commit-diff review of SPEC.md alongside code. Added `SPEC.md` to the Section 3.4 repository structure. | Product Owner |
+| 1.10 | Revision | Added a Milestone 5 "Note carried forward" from Milestone 2: under PRIV-01, runc's default cgroup path is unwritable and task start requires the systemd cgroup driver with an explicit scope under the delegated user slice, plus session-bus environment variables. Validated with `ctr` at M2. Flags the wrapper API shape for this as a possible E-04 at M5. Recorded under the 4A.5 delegation. | Claude Code |
+| 1.9 | Revision | Section 3.3: added cgroup v2 controller delegation to the host prerequisites list. Discovered at Milestone 2 — systemd delegates only `memory` and `pids` to a user session by default, and rootless container start fails on `cpu.weight` without `cpu`/`cpuset`/`io`. Procedure documented in PREREQUISITES.md Step 2a. Sections 1–3 are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction. | Claude Code, per Product Owner instruction |
 | 1.8 | Revision | Section 8: the `README.md` deliverable now requires a pointer to Section 11 rather than a reproduction of its contents, removing the duplicated deviation log. `SPEC.md` Section 11 is the single source of truth per 4A.5. Note that Section 1.1 still independently requires deviations to be "recorded in the project README with rationale" — a residual inconsistency left unedited, as Sections 1–3 are Product Owner territory. | Claude Code, per Product Owner instruction |
 | 1.7 | Correction | Corrected the Milestone 4 "Note carried forward" added in 1.5, which stated that a manual `nsenter` was the incorrect approach. That inverts the actual M1 finding: the incorrect earlier assumption was that `nsenter` would not be needed *at all*; manual `nsenter` against rootlesskit's `child_pid` is what was demonstrated working for mount-performing client operations. Note now records the validated command and the observed failure mode, and flags the engine-shape question as a possible E-04 at M4. Added a Milestone 1 note on the `containerd_client::tonic` re-export requirement. Recorded under the 4A.5 delegation. | Claude Code |
 
@@ -155,6 +157,11 @@ stage:
 - `runc`
 - Linux kernel with cgroups v2 and overlay filesystem support (standard on
   Ubuntu 22.04+)
+- Cgroup v2 controller delegation for the user session (memory, pids are
+  delegated by default; cpu, cpuset, io must be explicitly delegated via
+  a /etc/systemd/system/user@.service.d/delegate.conf drop-in — see
+  PREREQUISITES.md Step 2a for the exact procedure and why a reboot, not
+  just a service restart, is required)
 - Rust stable toolchain via `rustup`
 
 Exact installation steps (package names, systemd unit management, and a
@@ -367,6 +374,29 @@ API, it is an E-04 escalation.
 ### Milestone 5 — Project Lifecycle: Start / Attach / Stop
 
 **Scope:** `aihub start <name>`, `aihub attach <name>`, `aihub stop <name>`.
+
+**Note carried forward from Milestone 2 (rootless cgroup driver):** starting a
+task is where runc applies cgroup configuration, and under PRIV-01 the default
+path does not work. containerd running inside rootlesskit still sees the host
+`/sys/fs/cgroup`, so runc's default cgroup path is unwritable and start fails
+with `mkdir /sys/fs/cgroup/default: permission denied`. The task must be placed
+in a scope under the delegated user slice via the systemd cgroup driver. With
+`ctr` this was validated in M2 as:
+
+```bash
+ctr run --runc-systemd-cgroup --cgroup "user.slice:aihub:<name>" ...
+```
+
+`--runc-systemd-cgroup` requires `--cgroup` to be set explicitly. The driver
+talks to the user's systemd over the session bus, so `DBUS_SESSION_BUS_ADDRESS`
+and `XDG_RUNTIME_DIR` must be present in the environment — `nsenter` does not
+carry them in. This also depends on the cgroup v2 controller delegation now
+listed in Section 3.3; without it the scope is created but start fails on
+`cpu.weight: no such file or directory`.
+
+The engine equivalent is setting the task's cgroup path through the wrapper
+rather than shelling out to `ctr`. If the right wrapper API shape for this is
+not obvious, that is an E-04 escalation.
 
 **Acceptance Criteria:**
 - AC-5.1: `create` → `start` → `attach` results in an interactive shell in
