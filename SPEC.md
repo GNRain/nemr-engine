@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | NEMR-SPEC-001 |
-| Version | 1.19 |
+| Version | 1.20 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -35,6 +35,7 @@
 | 1.17 | Revision | Added Section 3.8 (Container Process Model, PROC-01..04): PID 1 is a long-lived supervisor (`sleep infinity`), `attach` performs a task exec with a fresh TTY per call, and the supervisor command is written explicitly into the runtime spec rather than inherited from the base image. Chosen so container liveness and stop/start state do not depend on shell state, and concurrent attaches do not collide on a shared PTY. Supersedes an implicit assumption in Milestone 4's original create() work; a note in Milestone 4 records the retroactive correction, and non-conforming containers are to be recreated rather than migrated. Sections 1–3 are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction. | Claude Code, per Product Owner instruction |
 | 1.18 | Revision | Added Section 3.9 (Container Network Model, NET-01/NET-02): project containers share rootlesskit's network namespace, equivalent to `nerdctl run --net=host` under rootless; per-project network isolation is explicitly out of scope for Phase 1, with rootless CNI via `rootlesskit --detach-netns` (requires rootlesskit >= 2.0) recorded as the Phase 2 path. Found at Milestone 5: a container given its own network namespace receives an empty one — loopback only, no egress — and Claude Code failed with `ENOTIMP` against api.anthropic.com. Added risk R-07 for port collisions between projects under a shared namespace. Sections 1–3 are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction. | Claude Code, per Product Owner instruction |
 | 1.19 | Revision | Section 3.4's repository diagram brought back in step with the actual repository, which had drifted: it was missing `src/lib.rs`, both `mod.rs` files, the two Milestone 1 baseline binaries, the whole `deploy/` tree from Milestone 3, and `src/engine/tty.rs` from Milestone 5. All of these were already recorded as deviations in Section 11; the diagram simply had not been updated alongside them. Added a note that the diagram states current reality rather than an aspiration. Section 11 gained entries for `tty.rs` and `deploy/`. Structural fact rather than a new decision, edited directly on Product Owner instruction. | Claude Code, per Product Owner instruction |
+| 1.20 | Revision | Added VOL-06 to Section 3.6: `start` must verify the project's volume is mounted and remount it if not, rather than proceeding. Found at Milestone 6 after a host reboot — container records persist in containerd's database while mounts and loop devices do not, so `start` succeeded against an unmounted volume and gave the container an empty `/workspace` backed by the host root filesystem with no quota. A silent VOL-05 violation: a user could work an entire session believing they were writing to their project, with no error at any point. Auto-remount rather than refuse-and-require-manual-repair, since requiring manual intervention defeats the portability this product exists for. Sections 1–3 are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction. | Claude Code, per Product Owner instruction |
 
 ---
 
@@ -240,6 +241,7 @@ record.
 | VOL-03 | All mount, loop-device, and format operations shall be logged with sufficient detail to be independently auditable without reading source code. |
 | VOL-04 | Volume creation, mounting, unmounting, and deletion logic shall use RAII patterns (Rust `Drop` implementations) to guarantee resource cleanup on error paths, not solely on the success path. |
 | VOL-05 | When a volume reaches capacity, dependent container operations shall fail with a clear, human-readable error. Silent data loss is a critical defect. Auto-expansion is explicitly out of scope (Section 1.4, item 5). |
+| VOL-06 | `start` shall verify via `/proc/self/mountinfo` that a project's volume is mounted before proceeding; if unmounted, `start` shall remount it using the same privileged helper as `create`, failing clearly only if the remount itself fails. Falling through to an unrelated filesystem is the specific critical defect this closes. |
 
 ### 3.7 Privilege Model (Normative)
 

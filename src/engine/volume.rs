@@ -943,3 +943,168 @@ mod integration_tests {
         destroy(&paths, name);
     }
 }
+
+/// Integration tests for VOL-06 — surviving the loss of a mount.
+///
+/// `#[ignore]` like the other volume integration tests: they need the
+/// privileged helper installed and they mutate host state. Run with
+/// `cargo test --lib -- --ignored --nocapture --test-threads=1`.
+#[cfg(test)]
+mod remount_tests {
+    use super::*;
+    use std::process::Command;
+
+    /// Put the host into the state a reboot leaves behind: backing file intact,
+    /// mount gone, loop device detached.
+    ///
+    /// A real reboot is not needed to reproduce the defect — what matters is
+    /// the resulting state, and this produces exactly it via the same helper
+    /// the engine uses. Testing it this way also makes it a regression test
+    /// rather than a one-off demonstration.
+    fn simulate_reboot(name: &str) {
+        HelperOps::new()
+            .unmount_and_detach(name)
+            .expect("helper should release the volume");
+    }
+
+    /// VOL-06: an unmounted volume is detected and remounted, not fallen
+    /// through to the host filesystem.
+    #[test]
+    #[ignore]
+    fn vol_06_start_remounts_a_volume_lost_to_reboot() {
+        let paths = VolumePaths::from_env().unwrap();
+        let name = "vol06-remount";
+        let _ = HelperOps::new().unmount_and_detach(name);
+        let _ = fs::remove_file(paths.image_file(name));
+
+        let volume =
+            Volume::create(name, VolumeSize::Small, paths.clone(), HelperOps::new()).unwrap();
+        let mount_point = volume.mount_point();
+
+        // Write a marker so we can prove the *same* filesystem comes back, not
+        // merely that something is mounted.
+        let marker = mount_point.join("vol06-marker.txt");
+        fs::write(&marker, b"written before the simulated reboot").unwrap();
+        let _ = volume.persist();
+
+        assert!(is_mounted(&mount_point), "precondition: volume is mounted");
+
+        simulate_reboot(name);
+
+        // The defect this closes: statvfs still succeeds here, reporting the
+        // filesystem *underneath* the mount point.
+        assert!(!is_mounted(&mount_point), "simulated reboot should leave it unmounted");
+        assert!(!marker.exists(), "data is invisible while unmounted");
+        assert!(
+            paths.image_file(name).exists(),
+            "backing file must survive — this is what makes remount possible"
+        );
+
+        // Prove the failure mode is real before proving the fix: an unmounted
+        // mount point resolves to the host filesystem, which is much larger
+        // than the 500MB the project asked for.
+        let host = usage_unchecked(&mount_point).expect("statvfs succeeds even unmounted");
+        assert!(
+            host.total > VolumeSize::Small.bytes() * 4,
+            "unmounted path should resolve to the much larger host filesystem, \
+             got {} bytes — the whole point of VOL-06",
+            host.total
+        );
+
+        crate::engine::project::ensure_volume_mounted(name)
+            .expect("VOL-06: start must remount rather than proceed");
+
+        assert!(is_mounted(&mount_point), "volume should be mounted again");
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "written before the simulated reboot",
+            "the SAME filesystem must come back, with its data intact"
+        );
+
+        let after = usage(&mount_point).expect("mounted volume reports usage");
+        assert!(
+            after.total <= VolumeSize::Small.bytes(),
+            "quota must be back in force: {} bytes",
+            after.total
+        );
+
+        let _ = HelperOps::new().unmount_and_detach(name);
+        let _ = fs::remove_file(paths.image_file(name));
+        let _ = fs::remove_dir(&mount_point);
+    }
+
+    /// A volume already mounted is left alone — remount must be idempotent, or
+    /// every `start` would churn the loop device.
+    #[test]
+    #[ignore]
+    fn vol_06_is_idempotent_when_already_mounted() {
+        let paths = VolumePaths::from_env().unwrap();
+        let name = "vol06-idem";
+        let _ = HelperOps::new().unmount_and_detach(name);
+        let _ = fs::remove_file(paths.image_file(name));
+
+        let volume =
+            Volume::create(name, VolumeSize::Small, paths.clone(), HelperOps::new()).unwrap();
+        let mount_point = volume.mount_point();
+        let _ = volume.persist();
+
+        let device_before = loop_device_for(&paths.image_file(name));
+        crate::engine::project::ensure_volume_mounted(name).unwrap();
+        crate::engine::project::ensure_volume_mounted(name).unwrap();
+        let device_after = loop_device_for(&paths.image_file(name));
+
+        assert!(is_mounted(&mount_point));
+        assert_eq!(
+            device_before, device_after,
+            "repeated calls must not attach a second loop device"
+        );
+
+        let _ = HelperOps::new().unmount_and_detach(name);
+        let _ = fs::remove_file(paths.image_file(name));
+        let _ = fs::remove_dir(&mount_point);
+    }
+
+    /// A project whose backing file is gone cannot be repaired by remounting,
+    /// and must fail clearly rather than silently starting on the host
+    /// filesystem.
+    #[test]
+    #[ignore]
+    fn vol_06_missing_backing_file_fails_clearly() {
+        let paths = VolumePaths::from_env().unwrap();
+        let name = "vol06-nofile";
+        let _ = HelperOps::new().unmount_and_detach(name);
+        let _ = fs::remove_file(paths.image_file(name));
+        let _ = fs::create_dir_all(paths.mount_point(name));
+
+        let error = crate::engine::project::ensure_volume_mounted(name)
+            .expect_err("missing backing file must be an error, not a silent pass")
+            .to_string();
+
+        assert!(error.contains("no backing file"), "should say what is wrong: {error}");
+        assert!(error.contains("nemr delete"), "should say what to do: {error}");
+
+        let _ = fs::remove_dir(paths.mount_point(name));
+    }
+
+    /// statvfs without the mount check — used to demonstrate the failure mode
+    /// the fix closes.
+    fn usage_unchecked(mount_point: &Path) -> Option<Usage> {
+        let path = std::ffi::CString::new(mount_point.as_os_str().as_encoded_bytes()).ok()?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+            return None;
+        }
+        let block = stat.f_frsize as u64;
+        Some(Usage {
+            used: (stat.f_blocks as u64).saturating_sub(stat.f_bfree as u64) * block,
+            available: stat.f_bavail as u64 * block,
+            total: stat.f_blocks as u64 * block,
+        })
+    }
+
+    fn loop_device_for(image: &Path) -> Option<String> {
+        let out = Command::new("losetup").args(["-j", &image.to_string_lossy()]).output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines().next().and_then(|l| l.split(':').next()).map(str::to_string)
+    }
+}

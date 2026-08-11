@@ -170,6 +170,15 @@ async fn resolve(client: &ContainerdClient, name: &str) -> Result<String> {
 pub async fn start(client: &ContainerdClient, name: &str) -> Result<u32> {
     let container_id = resolve(client, name).await?;
 
+    // VOL-06. Container records live in containerd's database and survive a
+    // reboot; mounts and loop devices do not. Starting without checking gives
+    // the container an empty /workspace backed by whatever filesystem the mount
+    // point directory happens to sit on — the host root filesystem, with no
+    // quota. Nothing errors, so a user can work an entire session believing
+    // they are writing to their project. That is a silent VOL-05 violation, and
+    // this check is what closes it.
+    ensure_volume_mounted(name)?;
+
     // AC-5.3: starting an already-running project is a clear error, not a
     // second task or a silent no-op.
     match client.task_state(&container_id).await? {
@@ -204,6 +213,70 @@ pub async fn stop(client: &ContainerdClient, name: &str) -> Result<()> {
     }
 
     client.stop_task(&container_id).await
+}
+
+/// Ensure a project's volume is mounted, remounting it if not (VOL-06).
+///
+/// Remount rather than refuse: the backing file is intact and the privileged
+/// helper already knows how to attach and mount it, so requiring the user to
+/// repair this by hand would defeat the portability the product exists for.
+/// Failure to remount *is* fatal — proceeding is what this guards against.
+pub fn ensure_volume_mounted(name: &str) -> Result<()> {
+    let paths = VolumePaths::from_env()?;
+    let mount_point = paths.mount_point(name);
+
+    if crate::engine::volume::is_mounted(&mount_point) {
+        return Ok(());
+    }
+
+    let image = paths.image_file(name);
+    if !image.exists() {
+        bail!(
+            "project {name:?} has no backing file at {}.\n\
+             The volume is gone; the project cannot be started. Delete it with \
+             `nemr delete {name}` and create it again.",
+            image.display()
+        );
+    }
+
+    // The size preset is needed only for logging inside the helper; the volume
+    // already exists and is not resized here.
+    let size = read_recorded_size(&paths, name).unwrap_or(VolumeSize::DEFAULT);
+
+    audit_remount(name, &mount_point);
+    std::fs::create_dir_all(&mount_point)
+        .with_context(|| format!("failed to recreate mount point {}", mount_point.display()))?;
+
+    HelperOps::new()
+        .attach_and_mount(name, size)
+        .with_context(|| {
+            format!(
+                "failed to remount the volume for project {name:?}.\n\
+                 Refusing to start: the container would otherwise run against \
+                 {} on the host filesystem, with no quota and none of the \
+                 project's data.",
+                mount_point.display()
+            )
+        })?;
+
+    Ok(())
+}
+
+/// Best-effort recovery of the size a volume was created with.
+///
+/// Derived from the backing file's apparent size, which is exactly the preset
+/// requested at creation — the file is sparse, so this costs nothing to read
+/// and does not depend on containerd being reachable.
+fn read_recorded_size(paths: &VolumePaths, name: &str) -> Option<VolumeSize> {
+    let length = std::fs::metadata(paths.image_file(name)).ok()?.len();
+    VolumeSize::all().into_iter().find(|s| s.bytes() == length)
+}
+
+fn audit_remount(name: &str, mount_point: &std::path::Path) {
+    eprintln!(
+        "[nemr:volume] volume for {name:?} is not mounted at {}; remounting (VOL-06)",
+        mount_point.display()
+    );
 }
 
 /// Whether a project is currently running.
