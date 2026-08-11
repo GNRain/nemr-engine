@@ -1,0 +1,46 @@
+[package]
+name = "ai-hub-engine"
+version = "0.1.0"
+edition = "2021"
+description = "AI Hub Phase 1 — core container engine (containerd/runc, no Docker)"
+
+# Library crate: hosts src/containerd/ (wrapper layer, Section 3.2) and
+# src/engine/ (product logic). Binaries under src/bin/ consume it.
+[lib]
+name = "ai_hub_engine"
+path = "src/lib.rs"
+
+# CLI entrypoint — sole user interface for Phase 1 (Section 1.3, item 6).
+# Populated in Milestones 4-6.
+[[bin]]
+name = "aihub"
+path = "src/bin/aihub.rs"
+
+# Milestone 1, scope item 1: raw connectivity baseline. Talks to
+# containerd-client DIRECTLY, deliberately bypassing the wrapper, to
+# establish a pre-abstraction baseline for AC-1.2 to compare against.
+[[bin]]
+name = "raw_connectivity"
+path = "src/bin/raw_connectivity.rs"
+
+# Milestone 1, scope item 2: exercises the src/containerd/ wrapper and prints
+# output byte-identical to raw_connectivity, so AC-1.2 is demonstrable by diff.
+[[bin]]
+name = "wrapper_connectivity"
+path = "src/bin/wrapper_connectivity.rs"
+
+[dependencies]
+# Section 3.1: first-party Rust bindings from containerd/rust-extensions.
+# 0.9.0 is the current release; verified against crates.io 2026-08-10.
+# Its build script generates gRPC bindings from .proto sources and therefore
+# requires `protoc` on the host at compile time (see PREREQUISITES.md).
+containerd-client = "0.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+anyhow = "1"
+
+# Deliberately NOT a direct dependency: `tonic` types must come from
+# `containerd_client::tonic` (the crate re-exports it). Declaring our own tonic
+# lets cargo resolve a second, incompatible version into the graph — the
+# generated gRPC clients then reject our `Request` type with a confusing
+# "multiple different versions of crate `tonic`" error.
+# tonic = "..."   <- do not add
