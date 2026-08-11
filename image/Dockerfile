@@ -1,4 +1,4 @@
-# AI Hub base image — Phase 1, Milestone 2.
+# Nemr base image — Phase 1, Milestone 2.
 #
 # Built with a daemonless OCI builder (BuildKit via buildctl, Section 3.1).
 # No Docker daemon is involved at any point; see README for the build command.

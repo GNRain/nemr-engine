@@ -1,4 +1,4 @@
-//! `aihub` — the CLI, and the sole user interface for Phase 1 (Section 1.3).
+//! `nemr` — the CLI, and the sole user interface for Phase 1 (Section 1.3).
 //!
 //! Subcommands arrive per milestone: `create` at Milestone 4, start/attach/stop
 //! at Milestone 5, list/delete at Milestone 6.
@@ -6,15 +6,15 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use ai_hub_engine::containerd::client::ContainerdClient;
-use ai_hub_engine::engine::project;
-use ai_hub_engine::engine::volume::VolumeSize;
+use nemr_engine::containerd::client::ContainerdClient;
+use nemr_engine::engine::project;
+use nemr_engine::engine::volume::VolumeSize;
 
 #[derive(Parser)]
 #[command(
-    name = "aihub",
+    name = "nemr",
     about = "Isolated, quota-bounded Claude Code environments",
-    long_about = "AI Hub engine — provisions isolated, resource-bounded Claude Code \
+    long_about = "Nemr engine — provisions isolated, resource-bounded Claude Code \
                   environments backed by rootless containerd. No Docker involved."
 )]
 struct Cli {
@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
         Command::Create { name, size } => {
             let client = ContainerdClient::connect().await?;
             eprintln!(
-                "[aihub] containerd: {} (namespace {})",
+                "[nemr] containerd: {} (namespace {})",
                 client.socket_path().display(),
                 client.namespace()
             );

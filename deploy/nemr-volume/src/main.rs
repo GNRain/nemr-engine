@@ -1,4 +1,4 @@
-//! `aihub-volume` — the privileged half of AI Hub volume provisioning.
+//! `nemr-volume` — the privileged half of Nemr volume provisioning.
 //!
 //! Installed root-owned at a fixed path and invoked through a NOPASSWD sudo
 //! rule scoped to exactly that path, with no argument wildcards (PRIV-03).
@@ -24,8 +24,8 @@
 //! # Usage
 //!
 //! ```text
-//! aihub-volume mount   <name> <500MB|2GB|10GB>
-//! aihub-volume unmount <name>
+//! nemr-volume mount   <name> <500MB|2GB|10GB>
+//! nemr-volume unmount <name>
 //! ```
 
 use std::fs;
@@ -45,7 +45,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("aihub-volume: {error}");
+            eprintln!("nemr-volume: {error}");
             ExitCode::FAILURE
         }
     }
@@ -71,7 +71,7 @@ fn run() -> Result<(), String> {
             "unknown subcommand {other:?}; expected 'mount' or 'unmount'"
         )),
         None => Err(
-            "usage: aihub-volume mount <name> <500MB|2GB|10GB> | aihub-volume unmount <name>"
+            "usage: nemr-volume mount <name> <500MB|2GB|10GB> | nemr-volume unmount <name>"
                 .to_string(),
         ),
     }
@@ -135,7 +135,7 @@ impl Invoker {
     /// are caller-controlled and would let the caller point privileged
     /// operations anywhere on the filesystem.
     fn managed_root(&self) -> PathBuf {
-        self.home.join(".local").join("share").join("aihub")
+        self.home.join(".local").join("share").join("nemr")
     }
 
     fn image_file(&self, name: &str) -> PathBuf {
@@ -487,11 +487,11 @@ mod tests {
         };
         assert_eq!(
             invoker.image_file("demo"),
-            PathBuf::from("/home/someone/.local/share/aihub/volumes/demo.img")
+            PathBuf::from("/home/someone/.local/share/nemr/volumes/demo.img")
         );
         assert_eq!(
             invoker.mount_point("demo"),
-            PathBuf::from("/home/someone/.local/share/aihub/mounts/demo")
+            PathBuf::from("/home/someone/.local/share/nemr/mounts/demo")
         );
     }
 

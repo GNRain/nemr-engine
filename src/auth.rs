@@ -79,7 +79,7 @@ pub fn check_permissions(path: &Path) -> Result<()> {
 
     if mode & 0o077 != 0 {
         eprintln!(
-            "[aihub:auth] warning: {} is mode {mode:04o}; credentials are readable beyond \
+            "[nemr:auth] warning: {} is mode {mode:04o}; credentials are readable beyond \
              the owner. Consider `chmod 600 {}`.",
             path.display(),
             path.display()
@@ -103,7 +103,7 @@ mod tests {
     fn missing_credentials_error_is_actionable() {
         // Point HOME at a directory with no credentials and check the message
         // tells the user what to do, not merely that something is absent.
-        let temp = std::env::temp_dir().join("aihub-auth-test-empty");
+        let temp = std::env::temp_dir().join("nemr-auth-test-empty");
         std::fs::create_dir_all(&temp).unwrap();
 
         let previous = std::env::var_os("HOME");

@@ -1,8 +1,8 @@
 [package]
-name = "ai-hub-engine"
+name = "nemr-engine"
 version = "0.1.0"
 edition = "2021"
-description = "AI Hub Phase 1 — core container engine (containerd/runc, no Docker)"
+description = "Nemr Phase 1 — core container engine (containerd/runc, no Docker)"
 # deploy/ holds a separate, standalone crate (the privileged helper) with its own
 # workspace. Excluded so the engine package does not try to absorb it.
 exclude = ["deploy"]
@@ -10,14 +10,14 @@ exclude = ["deploy"]
 # Library crate: hosts src/containerd/ (wrapper layer, Section 3.2) and
 # src/engine/ (product logic). Binaries under src/bin/ consume it.
 [lib]
-name = "ai_hub_engine"
+name = "nemr_engine"
 path = "src/lib.rs"
 
 # CLI entrypoint — sole user interface for Phase 1 (Section 1.3, item 6).
 # Populated in Milestones 4-6.
 [[bin]]
-name = "aihub"
-path = "src/bin/aihub.rs"
+name = "nemr"
+path = "src/bin/nemr.rs"
 
 # Milestone 1, scope item 1: raw connectivity baseline. Talks to
 # containerd-client DIRECTLY, deliberately bypassing the wrapper, to

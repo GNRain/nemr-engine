@@ -146,7 +146,7 @@ pub struct VolumePaths {
 }
 
 impl VolumePaths {
-    /// `~/.local/share/aihub`.
+    /// `~/.local/share/nemr`.
     ///
     /// Deliberately does **not** honour `XDG_DATA_HOME`, despite that being the
     /// conventional choice. The privileged helper derives this same path from
@@ -161,7 +161,7 @@ impl VolumePaths {
         let home = std::env::var_os("HOME")
             .context("HOME is not set; cannot locate volume storage")?;
         Ok(Self {
-            root: PathBuf::from(home).join(".local").join("share").join("aihub"),
+            root: PathBuf::from(home).join(".local").join("share").join("nemr"),
         })
     }
 
@@ -224,7 +224,7 @@ pub struct HelperOps {
 }
 
 impl HelperOps {
-    pub const DEFAULT_HELPER: &'static str = "/usr/local/libexec/aihub-volume";
+    pub const DEFAULT_HELPER: &'static str = "/usr/local/libexec/nemr-volume";
 
     pub fn new() -> Self {
         Self {
@@ -292,7 +292,7 @@ impl PrivilegedOps for HelperOps {
 /// confused with a command's own stdout. Prefixed so an operator can
 /// reconstruct what happened without reading Rust source.
 fn audit(message: &str) {
-    eprintln!("[aihub:volume] {message}");
+    eprintln!("[nemr:volume] {message}");
 }
 
 /// A provisioned volume.
@@ -577,15 +577,15 @@ mod tests {
     #[test]
     fn paths_are_derived_under_the_managed_root() {
         let paths = VolumePaths {
-            root: PathBuf::from("/tmp/aihub-test"),
+            root: PathBuf::from("/tmp/nemr-test"),
         };
         assert_eq!(
             paths.image_file("demo"),
-            PathBuf::from("/tmp/aihub-test/volumes/demo.img")
+            PathBuf::from("/tmp/nemr-test/volumes/demo.img")
         );
         assert_eq!(
             paths.mount_point("demo"),
-            PathBuf::from("/tmp/aihub-test/mounts/demo")
+            PathBuf::from("/tmp/nemr-test/mounts/demo")
         );
     }
 }

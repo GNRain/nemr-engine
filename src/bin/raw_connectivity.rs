@@ -6,7 +6,7 @@
 //! AC-1.2 compares the wrapper against.
 //!
 //! This is the one binary permitted to use `containerd_client` directly. It
-//! must not import `ai_hub_engine::containerd` — if it did, it would no longer
+//! must not import `nemr_engine::containerd` — if it did, it would no longer
 //! be an independent baseline and AC-1.2 would be comparing the wrapper with
 //! itself.
 //!

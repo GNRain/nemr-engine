@@ -1,10 +1,10 @@
-# AI Hub — Engineering Specification
+# Nemr — Engineering Specification
 ## Phase 1: Core Container Engine
 
 | Field | Value |
 |---|---|
-| Document ID | AIHUB-SPEC-001 |
-| Version | 1.15 |
+| Document ID | NEMR-SPEC-001 |
+| Version | 1.16 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -30,7 +30,8 @@
 | 1.12 | Revision | Propagated the 1.11 helper-binary design into the three places still describing the superseded enumerated-command approach: AC-3.5, Milestone 3's Scope, and 4A.3's Milestone 3 `/goal` text. All references to "command forms" and enumerated command whitelisting removed, since PRIV-03 no longer describes that. Milestone 3's `/goal` file scope widened from `deploy/sudoers.d/` to `deploy/` to cover the helper crate. Sections 1–3 and Acceptance Criteria are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction. | Claude Code, per Product Owner instruction |
 | 1.13 | Correction | PRIV-06's chown target was wrong. It specified an offset within the `/etc/subuid` range; the measured namespace mapping is `inside 0 -> host 1000 (count 1)` and `inside 1 -> host 100000 (count 65536)`, so the subuid range maps to container UID 1 and above, not 0. A volume chowned there would be owned by a non-root container user, which is wrong for a base image that runs as root. Corrected to the host UID that container UID 0 maps to — the invoking user's own host UID, taken from `SUDO_UID`/`SUDO_GID`. The error originated in Claude Code's own escalation wording at version 1.11 and was caught when implementing the helper. Sections 1–3 are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction. | Claude Code, per Product Owner instruction |
 | 1.14 | Correction | AUTH-02 was mis-scoped, not merely broad: it required mounting the whole `~/.claude` *directory*, which on a real host also contains `projects/`, `history.jsonl`, caches and plugin state. Mounting all of it would expose every project's history to every container — defeating the isolation this product exists to provide — and would break Claude Code regardless, since AUTH-02 mandates a read-only mount and Claude Code writes session state under `~/.claude`. Narrowed to the credentials file alone, with other `~/.claude` content explicitly container-local. Recorded as a correction to the requirement rather than an implementation deviation, per Product Owner instruction. The filename is `.credentials.json` with a leading dot, verified on the reference host; the instruction's wording omitted it and was corrected in both the host and container paths. | Claude Code, per Product Owner instruction |
-| 1.15 | Correction | Corrected the Milestone 4 "Note carried forward" now that `create_container()` has actually been run. The engine does **not** need to enter rootlesskit's namespaces: `aihub create` succeeded from the host mount namespace with no `nsenter` and no `sudo`. The constraint is specific to `ctr`, which mounts the image snapshot client-side to read the image config; the engine reads that config from the content store over gRPC and has containerd prepare the snapshot server-side, so nothing is mounted in the engine's own namespace. The `ctr`-specific guidance is retained because Milestones 2 and 6 invoke `ctr` directly. Milestone 5 is explicitly not settled by this — starting a task runs runc, which does mount. Recorded under the 4A.5 delegation, on evidence rather than assumption. | Claude Code |
+| 1.15 | Correction | Corrected the Milestone 4 "Note carried forward" now that `create_container()` has actually been run. The engine does **not** need to enter rootlesskit's namespaces: `nemr create` succeeded from the host mount namespace with no `nsenter` and no `sudo`. The constraint is specific to `ctr`, which mounts the image snapshot client-side to read the image config; the engine reads that config from the content store over gRPC and has containerd prepare the snapshot server-side, so nothing is mounted in the engine's own namespace. The `ctr`-specific guidance is retained because Milestones 2 and 6 invoke `ctr` directly. Milestone 5 is explicitly not settled by this — starting a task runs runc, which does mount. Recorded under the 4A.5 delegation, on evidence rather than assumption. | Claude Code |
+| 1.16 | Revision | Project renamed from "AI Hub" to "Nemr" throughout, on Product Owner instruction. Document ID NEMR-SPEC-001 (was AIHUB-SPEC-001); crate `nemr-engine`; CLI binary `nemr`; container ID prefix `nemr-`; container labels `nemr.project`/`nemr.size`/`nemr.volume`; managed storage `~/.local/share/nemr/`; privileged helper `/usr/local/libexec/nemr-volume` and its sudoers rule. Revision history before this entry refers to the same document under its former name. Requires a root reinstall of the helper at its new path and recreation of any existing project, since container IDs, labels and volume paths all carry the name. | Claude Code, per Product Owner instruction |
 
 ---
 
@@ -39,7 +40,7 @@
 ### 1.1 Purpose
 
 This document specifies the requirements, architecture, and acceptance
-criteria for Phase 1 of AI Hub: a backend engine capable of provisioning
+criteria for Phase 1 of Nemr: a backend engine capable of provisioning
 isolated, resource-bounded, pre-configured Claude Code execution
 environments on a single Linux host, without dependency on Docker or
 Docker Desktop.
@@ -51,7 +52,7 @@ project README with rationale (see Section 11).
 
 ### 1.2 Product Context (informative — not in scope for Phase 1)
 
-AI Hub is a desktop application addressing the portability and isolation
+Nemr is a desktop application addressing the portability and isolation
 problem in Claude Code usage: a Claude Code session's context and history
 are currently bound to the host machine on which they were created, with no
 supported mechanism for transferring that state to another machine.
@@ -108,7 +109,7 @@ approved by the Product Owner.
 | Term | Definition |
 |---|---|
 | **Project** | The user-facing unit of isolation: one named, size-bounded storage volume paired with one containerized Claude Code environment |
-| **Engine** | The Rust binary/library produced by this phase; the sole component with authority to create, mutate, or destroy containerd resources on behalf of AI Hub |
+| **Engine** | The Rust binary/library produced by this phase; the sole component with authority to create, mutate, or destroy containerd resources on behalf of Nemr |
 | **Base image** | The OCI image built once (Milestone 2) and instantiated per project; contains the OS userland, Node.js, and Claude Code |
 | **Wrapper layer** | The `src/containerd/` module providing an internal, higher-level API over the low-level `containerd-client` crate (see Section 4.1) |
 | **Volume** | A fixed-size, loopback-mounted ext4 filesystem bind-mounted into a project's container as its working directory |
@@ -178,11 +179,11 @@ this document alone.
 ### 3.4 Repository Structure (Normative)
 
 ```
-ai-hub-engine/
+nemr-engine/
 ├── SPEC.md                    # This document — tracked in-repo per 4A.5
 ├── src/
 │   ├── bin/
-│   │   └── aihub.rs           # CLI entrypoint; sole interface for Phase 1
+│   │   └── nemr.rs           # CLI entrypoint; sole interface for Phase 1
 │   ├── containerd/            # Wrapper layer over containerd-client (3.2)
 │   │   ├── client.rs          # Connection management, shared client handle
 │   │   ├── images.rs          # Image pull/import operations
@@ -315,7 +316,7 @@ otherwise go.
 **This is the sole milestone permitted to use elevated privilege, per the
 PRIV-02/PRIV-03 exception in Section 3.7.** Both halves of that exception
 shall be authored as part of this milestone's deliverables, not assumed to
-pre-exist on the host: the root-owned helper binary (`deploy/aihub-volume/`),
+pre-exist on the host: the root-owned helper binary (`deploy/nemr-volume/`),
 which performs all path and device construction and all input validation
 internally, and the sudoers rule (`deploy/sudoers.d/`) granting NOPASSWD
 access to exactly that one fixed path with no argument wildcards.
@@ -331,7 +332,7 @@ access to exactly that one fixed path with no argument wildcards.
   confirms RAII cleanup leaves no orphaned resources (validates VOL-04).
 - AC-3.5: The sudoers rule at `deploy/sudoers.d/` is shown granting
   NOPASSWD access to exactly one fixed, non-user-writable helper binary
-  path (`deploy/aihub-volume/`), with no argument wildcards — all
+  path (`deploy/nemr-volume/`), with no argument wildcards — all
   path/device construction and validation happening inside the helper per
   PRIV-03 — and every elevated operation is shown logged per PRIV-04.
 
@@ -357,7 +358,7 @@ ctr: failed to mount ... fstype: overlay ... err: operation not permitted
 ```
 
 **Resolved at Milestone 4: the engine's `create_container()` does *not*
-need this.** `aihub create` was run from the host mount namespace, with no
+need this.** `nemr create` was run from the host mount namespace, with no
 `nsenter` and no `sudo`, and produced a container and volume pair
 discoverable via `ctr`. The constraint below is specific to `ctr`, not to
 containerd's API.
@@ -392,7 +393,7 @@ evaluating at M4. If that evaluation would materially shape the wrapper
 API, it is an E-04 escalation.
 
 **Acceptance Criteria:**
-- AC-4.1: `aihub create <name> --size 2GB` produces a container and volume
+- AC-4.1: `nemr create <name> --size 2GB` produces a container and volume
   pair discoverable via containerd's own listing APIs, in a stopped-but-
   ready state.
 - AC-4.2: Repeating the command with a duplicate name fails with a clear
@@ -400,7 +401,7 @@ API, it is an E-04 escalation.
 
 ### Milestone 5 — Project Lifecycle: Start / Attach / Stop
 
-**Scope:** `aihub start <name>`, `aihub attach <name>`, `aihub stop <name>`.
+**Scope:** `nemr start <name>`, `nemr attach <name>`, `nemr stop <name>`.
 
 **Note carried forward from Milestone 2 (rootless cgroup driver):** starting a
 task is where runc applies cgroup configuration, and under PRIV-01 the default
@@ -411,7 +412,7 @@ in a scope under the delegated user slice via the systemd cgroup driver. With
 `ctr` this was validated in M2 as:
 
 ```bash
-ctr run --runc-systemd-cgroup --cgroup "user.slice:aihub:<name>" ...
+ctr run --runc-systemd-cgroup --cgroup "user.slice:nemr:<name>" ...
 ```
 
 `--runc-systemd-cgroup` requires `--cgroup` to be set explicitly. The driver
@@ -436,7 +437,7 @@ not obvious, that is an E-04 escalation.
 
 ### Milestone 6 — Project Lifecycle: List / Delete
 
-**Scope:** `aihub list`, `aihub delete <name>`.
+**Scope:** `nemr list`, `nemr delete <name>`.
 
 **Acceptance Criteria:**
 - AC-6.1: `list` output (status, storage used vs. quota) matches actual
@@ -542,7 +543,7 @@ mount → write past capacity → confirm enforced failure → delete is shown
 passing. AC-3.4: a fault-injection test confirming RAII cleanup (VOL-04)
 leaves no orphaned resources is shown passing. AC-3.5: the sudoers rule at
 deploy/sudoers.d/ is shown granting NOPASSWD access to exactly one fixed,
-non-user-writable helper binary path (deploy/aihub-volume/), with no
+non-user-writable helper binary path (deploy/nemr-volume/), with no
 argument wildcards, and all path/device construction and validation is
 shown happening inside the helper per PRIV-03; elevated operations are
 shown logged per PRIV-04. Stay within src/engine/volume.rs, its tests, and
@@ -551,7 +552,7 @@ deploy/ only. Stop after 30 turns if not met.
 
 **Milestone 4:**
 ```
-/goal AC-4.1: `aihub create <name> --size 2GB` is shown producing a
+/goal AC-4.1: `nemr create <name> --size 2GB` is shown producing a
 container and volume pair discoverable via containerd's own listing APIs,
 in a stopped-but-ready state. AC-4.2: repeating the command with a
 duplicate name is shown failing with a clear error rather than silently
@@ -574,8 +575,8 @@ not met.
 
 **Milestone 6:**
 ```
-/goal AC-6.1: `aihub list` output is shown matching actual containerd
-state, cross-checked directly against ctr output. AC-6.2: `aihub delete`
+/goal AC-6.1: `nemr list` output is shown matching actual containerd
+state, cross-checked directly against ctr output. AC-6.2: `nemr delete`
 is shown requiring explicit confirmation and, once executed, leaving zero
 orphaned containers, volumes, or loop devices, verified by host
 inspection. Stay within the list/delete CLI paths only. Stop after 20
@@ -697,7 +698,7 @@ engine, not run continuously outside active development sessions.
 - [ ] `src/engine/image.rs`
 - [ ] `src/engine/project.rs` + tests
 - [ ] `src/auth.rs`
-- [ ] `src/bin/aihub.rs` (`create`, `start`, `attach`, `stop`, `list`, `delete`)
+- [ ] `src/bin/nemr.rs` (`create`, `start`, `attach`, `stop`, `list`, `delete`)
 - [ ] `scripts/e2e_smoke_test.sh`
 - [ ] `README.md`, including: architecture decisions and rationale (base
       image choice, build tool choice), measured image size, wrapper-layer
@@ -742,7 +743,7 @@ execute `scripts/e2e_smoke_test.sh` from a clean checkout with only Section
 3.3 prerequisites installed, and observe it: create an isolated,
 quota-bounded, pre-configured Claude Code environment; execute a Claude Code
 command within it; stop it; list it accurately; and delete it with no
-residual host state — entirely through the `aihub` CLI, with zero Docker
+residual host state — entirely through the `nemr` CLI, with zero Docker
 involvement at any layer.
 
 ---
@@ -757,7 +758,7 @@ Product Owner sign-off status.)*
 |---|---|---|---|---|
 | 2026-08-10 | 3.4 | Added `src/lib.rs` | Section 3.4's tree defines no crate root, but `src/bin/*.rs` cannot import `src/containerd/` without a library target. Declares modules only; no logic. | Pending |
 | 2026-08-10 | 3.4 | Added `src/containerd/mod.rs`, `src/engine/mod.rs` | Rust requires a `mod.rs` for a directory to form a module. Declares submodules only. | Pending |
-| 2026-08-10 | 3.4 | Added `src/bin/raw_connectivity.rs` | Section 3.4's tree lists only `aihub.rs` under `src/bin/`, but Milestone 1 scope item 1 requires a raw baseline program. Kept separate from the CLI so `aihub` never links the raw `containerd-client` path. | Pending |
+| 2026-08-10 | 3.4 | Added `src/bin/raw_connectivity.rs` | Section 3.4's tree lists only `nemr.rs` under `src/bin/`, but Milestone 1 scope item 1 requires a raw baseline program. Kept separate from the CLI so `nemr` never links the raw `containerd-client` path. | Pending |
 | 2026-08-11 | 3.4 | Added `src/bin/wrapper_connectivity.rs` | AC-1.2 requires showing wrapper output identical to the baseline's, which needs a runnable harness using only the wrapper. Adding a flag to `raw_connectivity` instead would have made the "raw" binary link the wrapper, destroying its independence as a baseline. | Pending |
 | 2026-08-11 | 3.3 | `PREREQUISITES.md` documents rootless tooling (`uidmap`, `rootlesskit`, `slirp4netns`) not enumerated in Section 3.3 | Section 3.7 (PRIV-01) requires rootless containerd, which needs this tooling; Section 3.3's list predates 3.7 and was not updated alongside it. Documented rather than silently assumed, since 3.3 designates `PREREQUISITES.md` as the clean-host provisioning source. Section 3.3 itself left unedited — Sections 1–3 are Product Owner territory per 4A.5. | Pending |
 

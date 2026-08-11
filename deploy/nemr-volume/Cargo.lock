@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "aihub-volume"
+name = "nemr-volume"
 version = "0.1.0"
