@@ -4,7 +4,7 @@ Backend engine that provisions isolated, resource-bounded, pre-configured
 Claude Code execution environments on a single Linux host, with no dependency
 on Docker at any layer.
 
-Authoritative specification: [`SPEC.md`](SPEC.md) (AIHUB-SPEC-001 v1.10),
+Authoritative specification: [`SPEC.md`](SPEC.md) (AIHUB-SPEC-001 v1.13),
 tracked in this repository per Section 4A.5. Where this README and the
 specification disagree, the specification governs.
 
@@ -14,7 +14,7 @@ specification disagree, the specification governs.
 |---|---|
 | M1 — Containerd connectivity + wrapper foundation | Complete — AC-1.1, AC-1.2, AC-1.3 met |
 | M2 — Base image build | Complete — AC-2.1, AC-2.2, AC-2.3 met |
-| M3 — Volume creation with quota | Not started |
+| M3 — Volume creation with quota | Complete — AC-3.1 … AC-3.5 met |
 | M4 — Project lifecycle: create | Not started |
 | M5 — Start / attach / stop | Not started |
 | M6 — List / delete | Not started |
@@ -284,6 +284,114 @@ failure rather than assumed:
 `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` are passed through because the
 systemd cgroup driver talks to the user's systemd over the session bus, and
 `nsenter` does not carry them in.
+
+## Volumes and the privileged helper (Milestone 3)
+
+A volume is a sparse file, formatted ext4, attached to a loop device and
+mounted (VOL-02). Measured split of what actually needs privilege:
+
+| Step | Privileged? |
+|---|---|
+| Sparse allocation | no |
+| `mkfs.ext4` | no |
+| `losetup` attach/detach | **yes** |
+| `mount` / `umount` | **yes** |
+
+Formatting being unprivileged is worth noting: it is the most destructive verb
+involved, and it stays off the privileged surface entirely.
+
+### Why a helper binary rather than a sudoers command list
+
+The intuitive rule enumerates commands with path wildcards:
+
+```
+nemr ALL=(root) NOPASSWD: /usr/bin/mount /dev/loop* /home/nemr/.local/share/aihub/mounts/*
+```
+
+That does not constrain paths. Per `sudoers(5)`, a slash **is** matched by
+wildcards in command *arguments* (unlike in the command's own path), so
+`mounts/*` also matches `mounts/../../../../etc` — mounting over `/etc` as
+root. The rule looks narrow and is effectively passwordless root.
+
+A path constraint therefore cannot be expressed in sudoers at all. It has to
+live in code the granted user cannot modify:
+
+```
+nemr ALL=(root) NOPASSWD: /usr/local/libexec/aihub-volume
+```
+
+One fixed path, no wildcards. `deploy/aihub-volume/` takes a volume **name**
+and a **size preset** — never a path, device, or UID — and derives and
+validates everything internally. Zero dependencies (std only): a privileged
+binary's supply chain is part of its attack surface.
+
+Its defences: refuses to run without `SUDO_UID`/`SUDO_GID`; refuses to act for
+root; names matched against `^[a-z0-9][a-z0-9-]{0,31}$`; sizes from a
+three-item list; extra arguments rejected; symlinked backing files refused;
+paths re-checked after canonicalisation; backing file must belong to the
+invoker.
+
+### Ownership (PRIV-06)
+
+Mount and `chown` are one atomic operation. A freshly formatted ext4 has a
+root-owned root inode, and host UID 0 is unmapped inside the rootless user
+namespace, so it appears as `nobody` and the container cannot write to its own
+volume. The measured mapping is:
+
+```
+inside 0 → host 1000 (count 1)
+inside 1 → host 100000 (count 65536)
+```
+
+So the volume is chowned to the invoker's own UID — which appears as UID 0
+inside the container. **Not** the `/etc/subuid` range, which maps to container
+UID 1 and above. `chown` is deliberately not a separately invocable verb;
+exposing it would permit re-owning arbitrary paths.
+
+### Installing the helper
+
+```bash
+cd deploy/aihub-volume && cargo build --release && cd ../..
+sudo install -o root -g root -m 0755 \
+    deploy/aihub-volume/target/release/aihub-volume /usr/local/libexec/aihub-volume
+visudo -c -f deploy/sudoers.d/aihub-volume        # validate BEFORE installing
+sudo install -o root -g root -m 0440 \
+    deploy/sudoers.d/aihub-volume /etc/sudoers.d/aihub-volume
+```
+
+A malformed file in `/etc/sudoers.d/` can lock every user out of sudo, hence
+the `visudo -c` step. Verify afterwards that the helper is `root:root 755` — if
+the invoking user can write it, the grant becomes unrestricted root.
+
+### Running the volume tests
+
+Unit tests are hermetic. The integration tests mount real filesystems, so they
+are `#[ignore]`d and need the helper installed:
+
+```bash
+cargo test --lib                                              # 7 hermetic
+cargo test --lib -- --ignored --nocapture --test-threads=1    # 4 integration
+(cd deploy/aihub-volume && cargo test)                        # 6 helper
+```
+
+`--test-threads=1` is required: these attach loop devices and assert on global
+host state.
+
+Verify independently afterwards — the tests assert, but the host is the
+authority:
+
+```bash
+losetup -a | grep -i "aihub\|deleted"      # expect no output
+grep aihub /proc/self/mountinfo            # expect no output
+```
+
+That second check is not decorative. An early version of AC-3.4 passed while
+leaking a loop device, because the test probed by path and a device whose
+backing file has been unlinked no longer matches its path — `losetup -a`
+reports it as `(deleted)`. The residue check now scans the whole table, and
+`Volume::create` releases privileged resources *before* unlinking the backing
+file, since unlinking first makes the device unfindable and permanently
+stranded.
 
 ## Current blockers
 

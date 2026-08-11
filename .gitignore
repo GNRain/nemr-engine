@@ -1,2 +1,4 @@
-/target
+# Unanchored so it matches every crate's build directory, not just the root's.
+# deploy/aihub-volume/ is a separate crate with its own target/.
+target/
 **/*.rs.bk
