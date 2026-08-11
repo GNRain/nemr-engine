@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | AIHUB-SPEC-001 |
-| Version | 1.7 |
+| Version | 1.8 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -22,6 +22,7 @@
 | 1.4 | Revision | Added Section 3.7 (Privilege Model), recording the E-03 decision: rootless containerd for all container operations (PRIV-01), with a narrowly scoped sudoers exception for Milestone 3 volume provisioning only (PRIV-02–05). Updated Milestone 1 scope, Milestone 3 scope and acceptance criteria (AC-3.5 added), the corresponding `/goal` invocation in 4A.3, and added risk R-06. | Product Owner |
 | 1.5 | Revision | Carried forward a Milestone 1 finding into Milestone 4's scope: gRPC-only containerd operations connect directly to the rootless socket, but `create_container()` requires the client to perform mounts and must run inside rootlesskit's namespaces — an earlier assumption that a manual `nsenter` would be needed was incorrect and is superseded by this note. Recorded so Milestone 4 does not need to rediscover this. | Product Owner, per Claude Code M1 completion report |
 | 1.6 | Revision | Added Section 4A.5 (Spec Ownership): this document is now tracked in-repo as `SPEC.md`, committed as part of the Milestone 1 baseline. Claude Code updates milestone Notes and the Deviation Log directly for findings; Section 9 escalations and Sections 1–3 changes remain Product Owner decisions only. Product Owner review moves to commit-diff review of SPEC.md alongside code. Added `SPEC.md` to the Section 3.4 repository structure. | Product Owner |
+| 1.8 | Revision | Section 8: the `README.md` deliverable now requires a pointer to Section 11 rather than a reproduction of its contents, removing the duplicated deviation log. `SPEC.md` Section 11 is the single source of truth per 4A.5. Note that Section 1.1 still independently requires deviations to be "recorded in the project README with rationale" — a residual inconsistency left unedited, as Sections 1–3 are Product Owner territory. | Claude Code, per Product Owner instruction |
 | 1.7 | Correction | Corrected the Milestone 4 "Note carried forward" added in 1.5, which stated that a manual `nsenter` was the incorrect approach. That inverts the actual M1 finding: the incorrect earlier assumption was that `nsenter` would not be needed *at all*; manual `nsenter` against rootlesskit's `child_pid` is what was demonstrated working for mount-performing client operations. Note now records the validated command and the observed failure mode, and flags the engine-shape question as a possible E-04 at M4. Added a Milestone 1 note on the `containerd_client::tonic` re-export requirement. Recorded under the 4A.5 delegation. | Claude Code |
 
 ---
@@ -641,8 +642,9 @@ engine, not run continuously outside active development sessions.
 - [ ] `scripts/e2e_smoke_test.sh`
 - [ ] `README.md`, including: architecture decisions and rationale (base
       image choice, build tool choice), measured image size, wrapper-layer
-      design notes, any recorded deviations from this specification (Section
-      11)
+      design notes, and a pointer to Section 11 of `SPEC.md` for recorded
+      deviations — the README shall reference that log, not reproduce its
+      content, since `SPEC.md` is the single source of truth per 4A.5
 
 ---
 
@@ -700,7 +702,5 @@ Product Owner sign-off status.)*
 | 2026-08-11 | 3.4 | Added `src/bin/wrapper_connectivity.rs` | AC-1.2 requires showing wrapper output identical to the baseline's, which needs a runnable harness using only the wrapper. Adding a flag to `raw_connectivity` instead would have made the "raw" binary link the wrapper, destroying its independence as a baseline. | Pending |
 | 2026-08-11 | 3.3 | `PREREQUISITES.md` documents rootless tooling (`uidmap`, `rootlesskit`, `slirp4netns`) not enumerated in Section 3.3 | Section 3.7 (PRIV-01) requires rootless containerd, which needs this tooling; Section 3.3's list predates 3.7 and was not updated alongside it. Documented rather than silently assumed, since 3.3 designates `PREREQUISITES.md` as the clean-host provisioning source. Section 3.3 itself left unedited — Sections 1–3 are Product Owner territory per 4A.5. | Pending |
 
-**Note on duplication:** `README.md` carries a mirror of this table, because
-Section 1.1 requires deviations to be recorded in the README. This table is
-canonical. Consolidating the two would require editing Section 1.1, which is
-Product Owner territory under 4A.5.
+This table is the single source of truth for deviations (Section 8, 4A.5).
+`README.md` points here rather than reproducing it.

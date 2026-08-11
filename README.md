@@ -196,20 +196,14 @@ the host is provisioned and rootless containerd is verified reachable.
 
 ## Deviation log
 
-Deviations from AIHUB-SPEC-001, per Section 11. Structural additions required
-by the Rust module system are recorded here for transparency; none changes the
-layering the specification mandates.
+Recorded deviations from AIHUB-SPEC-001 live in **[`SPEC.md`](SPEC.md),
+Section 11** — the single source of truth, per Section 8 and 4A.5. They are
+deliberately not reproduced here; a second copy would drift.
 
-This table mirrors [`SPEC.md`](SPEC.md) Section 11, which is canonical. It is
-duplicated here because Section 1.1 requires deviations to be recorded in the
-README.
-
-| Date | Section | Deviation | Rationale | Approved |
-|---|---|---|---|---|
-| 2026-08-10 | 3.4 | Added `src/lib.rs` | Section 3.4's tree has no crate root, but `src/bin/*.rs` cannot import `src/containerd/` without a library target. Declares modules only. | Pending |
-| 2026-08-10 | 3.4 | Added `src/containerd/mod.rs`, `src/engine/mod.rs` | Rust requires a `mod.rs` for a directory to form a module. Declares submodules only. | Pending |
-| 2026-08-10 | 3.4 | Added `src/bin/raw_connectivity.rs` | Section 3.4's tree lists only `aihub.rs` under `src/bin/`, but Milestone 1 scope item 1 requires a separate raw baseline program, kept distinct from the CLI so the CLI never links the raw crate path. | Pending |
-| 2026-08-11 | 3.4 | Added `src/bin/wrapper_connectivity.rs` | AC-1.2 requires showing wrapper output identical to the baseline's, which needs a runnable harness that uses only the wrapper. Adding a flag to `raw_connectivity` instead would have made the "raw" binary link the wrapper and destroyed its independence as a baseline. | Pending |
+At the M1 baseline they are all structural additions required by the Rust
+module system (`src/lib.rs`, the two `mod.rs` files, the two `src/bin/`
+programs) plus one documentation-coverage note. None changes the layering the
+specification mandates.
 
 ## Pending decisions
 
