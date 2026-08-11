@@ -1,0 +1,19 @@
+[package]
+name = "aihub-volume"
+version = "0.1.0"
+edition = "2021"
+description = "Root-owned privileged helper for AI Hub volume provisioning (PRIV-03)"
+
+# Standalone workspace on purpose. This crate is installed root-owned at a
+# fixed path and runs under sudo; it is a different privilege domain from the
+# engine and must not inherit the engine's dependency graph. An empty
+# [workspace] table stops cargo from treating it as a member of the parent.
+[workspace]
+
+# No dependencies, deliberately. Everything this helper needs is in std. A
+# privileged binary's supply chain is part of its attack surface, and zero
+# third-party code is the strongest statement available.
+[dependencies]
+
+[profile.release]
+strip = true

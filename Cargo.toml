@@ -3,6 +3,9 @@ name = "ai-hub-engine"
 version = "0.1.0"
 edition = "2021"
 description = "AI Hub Phase 1 — core container engine (containerd/runc, no Docker)"
+# deploy/ holds a separate, standalone crate (the privileged helper) with its own
+# workspace. Excluded so the engine package does not try to absorb it.
+exclude = ["deploy"]
 
 # Library crate: hosts src/containerd/ (wrapper layer, Section 3.2) and
 # src/engine/ (product logic). Binaries under src/bin/ consume it.

@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | AIHUB-SPEC-001 |
-| Version | 1.10 |
+| Version | 1.13 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -22,6 +22,9 @@
 | 1.4 | Revision | Added Section 3.7 (Privilege Model), recording the E-03 decision: rootless containerd for all container operations (PRIV-01), with a narrowly scoped sudoers exception for Milestone 3 volume provisioning only (PRIV-02–05). Updated Milestone 1 scope, Milestone 3 scope and acceptance criteria (AC-3.5 added), the corresponding `/goal` invocation in 4A.3, and added risk R-06. | Product Owner |
 | 1.5 | Revision | Carried forward a Milestone 1 finding into Milestone 4's scope: gRPC-only containerd operations connect directly to the rootless socket, but `create_container()` requires the client to perform mounts and must run inside rootlesskit's namespaces — an earlier assumption that a manual `nsenter` would be needed was incorrect and is superseded by this note. Recorded so Milestone 4 does not need to rediscover this. | Product Owner, per Claude Code M1 completion report |
 | 1.6 | Revision | Added Section 4A.5 (Spec Ownership): this document is now tracked in-repo as `SPEC.md`, committed as part of the Milestone 1 baseline. Claude Code updates milestone Notes and the Deviation Log directly for findings; Section 9 escalations and Sections 1–3 changes remain Product Owner decisions only. Product Owner review moves to commit-diff review of SPEC.md alongside code. Added `SPEC.md` to the Section 3.4 repository structure. | Product Owner |
+| 1.13 | Correction | PRIV-06's chown target was wrong. It specified an offset within the `/etc/subuid` range; the measured namespace mapping is `inside 0 -> host 1000 (count 1)` and `inside 1 -> host 100000 (count 65536)`, so the subuid range maps to container UID 1 and above, not 0. A volume chowned there would be owned by a non-root container user, which is wrong for a base image that runs as root. Corrected to the host UID that container UID 0 maps to — the invoking user's own host UID, taken from `SUDO_UID`/`SUDO_GID`. The error originated in Claude Code's own escalation wording at version 1.11 and was caught when implementing the helper. Sections 1–3 are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction. | Claude Code, per Product Owner instruction |
+| 1.12 | Revision | Propagated the 1.11 helper-binary design into the three places still describing the superseded enumerated-command approach: AC-3.5, Milestone 3's Scope, and 4A.3's Milestone 3 `/goal` text. All references to "command forms" and enumerated command whitelisting removed, since PRIV-03 no longer describes that. Milestone 3's `/goal` file scope widened from `deploy/sudoers.d/` to `deploy/` to cover the helper crate. Sections 1–3 and Acceptance Criteria are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction. | Claude Code, per Product Owner instruction |
+| 1.11 | Revision | Rewrote PRIV-03 around a single root-owned helper binary with a wildcard-free NOPASSWD grant, after `sudoers(5)` was found to match `/` inside argument wildcards — making the originally specified path constraint unenforceable and the rule effectively equivalent to passwordless root. Corrected PRIV-02: sparse-file allocation and `mkfs.ext4` are not privileged (measured at M3), removing the most destructive verb from the privileged surface. Added PRIV-06 requiring the helper to perform mount and the subuid `chown` as one atomic operation, resolving the previously open rootless volume-ownership question without exposing `chown` as its own grant. Sections 1–3 are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction following an E-03/PRIV-05 escalation. | Claude Code, per Product Owner instruction |
 | 1.10 | Revision | Added a Milestone 5 "Note carried forward" from Milestone 2: under PRIV-01, runc's default cgroup path is unwritable and task start requires the systemd cgroup driver with an explicit scope under the delegated user slice, plus session-bus environment variables. Validated with `ctr` at M2. Flags the wrapper API shape for this as a possible E-04 at M5. Recorded under the 4A.5 delegation. | Claude Code |
 | 1.9 | Revision | Section 3.3: added cgroup v2 controller delegation to the host prerequisites list. Discovered at Milestone 2 — systemd delegates only `memory` and `pids` to a user session by default, and rootless container start fails on `cpu.weight` without `cpu`/`cpuset`/`io`. Procedure documented in PREREQUISITES.md Step 2a. Sections 1–3 are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction. | Claude Code, per Product Owner instruction |
 | 1.8 | Revision | Section 8: the `README.md` deliverable now requires a pointer to Section 11 rather than a reproduction of its contents, removing the duplicated deviation log. `SPEC.md` Section 11 is the single source of truth per 4A.5. Note that Section 1.1 still independently requires deviations to be "recorded in the project README with rationale" — a residual inconsistency left unedited, as Sections 1–3 are Product Owner territory. | Claude Code, per Product Owner instruction |
@@ -232,10 +235,11 @@ narrowly as the underlying Linux primitives allow.
 | Requirement ID | Requirement |
 |---|---|
 | PRIV-01 | The engine's containerd interactions (all operations in Milestones 1, 4, 5, and 6) shall run against a **rootless containerd** instance. Containers execute within an unprivileged user namespace; container UID 0 maps to an unprivileged host UID. No user is added to a root-equivalent group (e.g., a socket-access group with root-equivalent capability) as part of Phase 1. |
-| PRIV-02 | Volume provisioning (Milestone 3: `losetup`, `mkfs.ext4`, `mount`/`umount`) is a genuinely privileged operation on Linux and has no rootless equivalent within this phase's chosen quota mechanism (Section 3.6). This is the sole permitted exception to PRIV-01. |
-| PRIV-03 | The exception in PRIV-02 shall be implemented as a narrowly scoped sudoers rule limited to the exact command forms volume provisioning requires (specific `losetup`, `mkfs.ext4`, `mount`, `umount` invocations constrained to paths under the engine's managed volume directory), not blanket root access and not unrestricted `sudo`. The rule shall be committed to the repository (e.g., under `deploy/sudoers.d/`) so it is reviewable, not configured ad hoc on the host. |
+| PRIV-02 | Loop-device attachment (`losetup`) and mounting/unmounting (`mount`/`umount`) of a project volume are genuinely privileged operations on Linux and have no rootless equivalent within this phase's chosen quota mechanism (Section 3.6). This is the sole permitted exception to PRIV-01. **Sparse-file allocation and `mkfs.ext4` are *not* privileged** — both succeed as the unprivileged user against a user-owned file, measured at Milestone 3. This corrects the original assumption in version 1.4, which listed `mkfs.ext4` among the privileged operations; it is a correction to a mistaken premise, not a relaxation of the requirement. Excluding formatting from the privileged surface is a strict security improvement, since `mkfs.ext4` is the most destructive verb in the original list. |
+| PRIV-03 | The exception in PRIV-02 shall be implemented as a **single root-owned helper binary at a fixed, non-user-writable path**, with a NOPASSWD `sudo` grant scoped to exactly that path and **no argument wildcards**. All path and device construction, and all input validation, shall happen *inside* the helper: the caller supplies a volume name and a size, never a raw filesystem path, loop device, or mount target. The helper shall reject any name not matching a strict pattern before performing any privileged action. The sudoers rule and the helper's source shall both be committed to the repository (under `deploy/`) so they are reviewable, not configured ad hoc on the host. **Rationale:** a rule expressed as argument wildcards cannot express a path constraint at all. Per `sudoers(5)`, a slash *is* matched by wildcards in command-line arguments (unlike in the command's own path), so a pattern such as `.../volumes/*` also matches `.../volumes/../../../etc`. A rule of that shape would appear narrow while granting `mount` over arbitrary host paths — that is, root. Validation must therefore live in code the granted user cannot modify, which is what the helper provides. |
 | PRIV-04 | Every operation performed under the PRIV-03 exception shall be logged per NFR-04, specifically identifying that it ran under elevated privilege and why. |
-| PRIV-05 | This privilege split (rootless for container operations, narrowly scoped elevation for volume provisioning only) applies for the duration of Phase 1 in full — it is not re-litigated per milestone. Any milestone that appears to need elevated privilege outside the PRIV-03 scope shall be escalated per Section 9, not resolved by widening the sudoers rule unilaterally. |
+| PRIV-05 | This privilege split (rootless for container operations, narrowly scoped elevation for volume provisioning only) applies for the duration of Phase 1 in full — it is not re-litigated per milestone. Any milestone that appears to need elevated privilege outside the PRIV-03 scope shall be escalated per Section 9, not resolved by widening the sudoers rule or the helper's capabilities unilaterally. |
+| PRIV-06 | The helper shall perform the mount and the subsequent ownership change as **one atomic privileged operation**, not as separate grants. A volume mounted by root is owned by host root, which maps to `nobody` inside the rootless container's user namespace (PRIV-01), leaving the container user unable to write to its own project volume. On mounting, the helper shall therefore `chown` the mounted volume to **the host UID that the rootless container's UID 0 maps to** — which, under this project's mapping, is the invoking user's own host UID — **not** an offset within the `/etc/subuid` range. The `/etc/subuid` range maps to container UID 1 and above; using it would leave the volume owned by a non-root container user, which is wrong for a base image that runs as root. This ownership change is an internal step of the helper's mount operation and shall not be exposed as a separately invocable privileged verb: exposing `chown` as its own grant would permit re-owning arbitrary paths, reintroducing the escalation PRIV-03 exists to prevent. The helper shall derive the target UID/GID itself, from `SUDO_UID`/`SUDO_GID`, and shall not accept them as caller-supplied arguments. |
 
 **Rationale:** a broad root-equivalent group (the alternative considered
 under E-03) would have been simpler to implement but leaves the engine's
@@ -307,9 +311,12 @@ otherwise go.
 
 **Scope:** `src/engine/volume.rs`, implementing VOL-01 through VOL-05.
 **This is the sole milestone permitted to use elevated privilege, per the
-PRIV-02/PRIV-03 exception in Section 3.7.** The sudoers rule scoping that
-exception (`deploy/sudoers.d/`) shall be authored as part of this
-milestone's deliverables, not assumed to pre-exist on the host.
+PRIV-02/PRIV-03 exception in Section 3.7.** Both halves of that exception
+shall be authored as part of this milestone's deliverables, not assumed to
+pre-exist on the host: the root-owned helper binary (`deploy/aihub-volume/`),
+which performs all path and device construction and all input validation
+internally, and the sudoers rule (`deploy/sudoers.d/`) granting NOPASSWD
+access to exactly that one fixed path with no argument wildcards.
 
 **Acceptance Criteria:**
 - AC-3.1: Volume creation at a specified size is confirmed correctly capped
@@ -320,10 +327,11 @@ milestone's deliverables, not assumed to pre-exist on the host.
   → confirm enforced failure → delete, and passes.
 - AC-3.4: A fault-injection test (e.g., simulated failure mid-mount)
   confirms RAII cleanup leaves no orphaned resources (validates VOL-04).
-- AC-3.5: The sudoers rule at `deploy/sudoers.d/` is shown restricted to
-  the exact command forms and path constraints required by PRIV-03 — not
-  unrestricted `sudo` — and every elevated operation is shown logged per
-  PRIV-04.
+- AC-3.5: The sudoers rule at `deploy/sudoers.d/` is shown granting
+  NOPASSWD access to exactly one fixed, non-user-writable helper binary
+  path (`deploy/aihub-volume/`), with no argument wildcards — all
+  path/device construction and validation happening inside the helper per
+  PRIV-03 — and every elevated operation is shown logged per PRIV-04.
 
 ### Milestone 4 — Project Lifecycle: Create
 
@@ -514,10 +522,12 @@ commands and their output. AC-3.3: an automated test covering create →
 mount → write past capacity → confirm enforced failure → delete is shown
 passing. AC-3.4: a fault-injection test confirming RAII cleanup (VOL-04)
 leaves no orphaned resources is shown passing. AC-3.5: the sudoers rule at
-deploy/sudoers.d/ is shown restricted to the exact command forms and path
-constraints required by PRIV-03, and elevated operations are shown logged
-per PRIV-04. Stay within src/engine/volume.rs, its tests, and
-deploy/sudoers.d/ only. Stop after 30 turns if not met.
+deploy/sudoers.d/ is shown granting NOPASSWD access to exactly one fixed,
+non-user-writable helper binary path (deploy/aihub-volume/), with no
+argument wildcards, and all path/device construction and validation is
+shown happening inside the helper per PRIV-03; elevated operations are
+shown logged per PRIV-04. Stay within src/engine/volume.rs, its tests, and
+deploy/ only. Stop after 30 turns if not met.
 ```
 
 **Milestone 4:**
