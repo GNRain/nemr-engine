@@ -17,7 +17,7 @@ specification disagree, the specification governs.
 | M3 — Volume creation with quota | Complete — AC-3.1 … AC-3.5 met |
 | M4 — Project lifecycle: create | Complete — AC-4.1, AC-4.2 met |
 | M5 — Start / attach / stop | Complete — AC-5.1, AC-5.2, AC-5.3 met |
-| M6 — List / delete | Not started |
+| M6 — List / delete | Complete — AC-6.1, AC-6.2 met |
 | M7 — End-to-end validation | Not started |
 
 The host is fully provisioned per `PREREQUISITES.md`, including cgroup v2
@@ -504,6 +504,43 @@ Claude Code failing with `ENOTIMP` against `api.anthropic.com`.
 There is therefore **no per-project network isolation in Phase 1**, and two
 projects binding the same port will collide (risk R-07). Storage isolation is
 unaffected. The Phase 2 path is rootless CNI.
+
+## Listing and deleting (Milestone 6)
+
+```bash
+nemr list                 # all projects: status, usage vs quota, volume path
+nemr delete <name>        # prompts for the project name to confirm
+nemr delete <name> --yes  # non-interactive, for scripts
+```
+
+`list` reads state from containerd — the `nemr.*` labels written at create time
+are the source of truth, so there is no engine-side database to fall out of step
+with reality. Only containers carrying a `nemr.project` label are reported;
+unrelated containers in the namespace are not.
+
+### Usage figures follow `df`'s definitions
+
+Two `statvfs` subtleties, both of which produced plausible-but-wrong numbers
+before being caught by cross-checking against `df`:
+
+- **Used is `total - f_bfree`, not `total - f_bavail`.** The difference is
+  ext4's root reserve (5% by default), which `df` counts as neither used nor
+  available. Using `f_bavail` reported 190MiB/10% where `df` said 73M/4%.
+- **Percentage is `used / (used + available)`**, which is what `df` does, not
+  `used / total`.
+
+`usage()` also checks `/proc/self/mountinfo` before trusting `statvfs`, because
+`statvfs` succeeds on a directory that is not a mount point and silently reports
+the filesystem underneath it. An unmounted volume once showed as "30.6GiB used
+of 2GB" — that was the host root disk.
+
+### Deletion order
+
+The reverse of creation: stop the task, remove the container record and
+snapshot, unmount and detach, then remove the backing file. Releasing the volume
+first would pull the mount from under a container still referencing it; removing
+the backing file before detaching would strand the loop device permanently,
+which is the bug Milestone 3 hit.
 
 ## Installing the CLI
 

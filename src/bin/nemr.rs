@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use nemr_engine::containerd::client::ContainerdClient;
 use nemr_engine::engine::project;
-use nemr_engine::engine::volume::VolumeSize;
+use nemr_engine::engine::volume::{self, VolumeSize};
 
 #[derive(Parser)]
 #[command(
@@ -42,6 +42,17 @@ enum Command {
 
     /// Open an interactive shell inside a running project.
     Attach { name: String },
+
+    /// List all projects with status and storage usage.
+    List,
+
+    /// Delete a project and release all its resources.
+    Delete {
+        name: String,
+        /// Skip the confirmation prompt. Required for non-interactive use.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 /// Parse `--size`, reusing the engine's own preset parsing so the CLI cannot
@@ -82,6 +93,67 @@ async fn main() -> Result<()> {
             let client = ContainerdClient::connect().await?;
             project::stop(&client, &name).await?;
             println!("stopped project {name:?}");
+        }
+
+        Command::List => {
+            let client = ContainerdClient::connect().await?;
+            let projects = project::list(&client).await?;
+
+            if projects.is_empty() {
+                println!("no projects. Create one with: nemr create <name> --size 2GB");
+                return Ok(());
+            }
+
+            println!("{:<18} {:<9} {:<18} {:<8} {}", "NAME", "STATUS", "USED", "QUOTA", "VOLUME");
+            for p in &projects {
+                let status = if p.running { "running" } else { "stopped" };
+                let used = match p.usage {
+                    Some(u) => format!("{} ({:.0}%)", volume::human_bytes(u.used), u.percent()),
+                    None => "unmounted".to_string(),
+                };
+                println!(
+                    "{:<18} {:<9} {:<18} {:<8} {}",
+                    p.name, status, used, p.quota, p.volume_path
+                );
+            }
+        }
+
+        Command::Delete { name, yes } => {
+            let client = ContainerdClient::connect().await?;
+
+            // AC-6.2: deletion is destructive and irreversible — the volume and
+            // everything written to it goes. Confirm unless explicitly waived.
+            if !yes {
+                let projects = project::list(&client).await?;
+                let target = projects.iter().find(|p| p.name == name);
+                match target {
+                    Some(p) => {
+                        let used = p
+                            .usage
+                            .map(|u| volume::human_bytes(u.used))
+                            .unwrap_or_else(|| "unknown".into());
+                        eprintln!("About to delete project {name:?}:");
+                        eprintln!("  container: {}", p.container_id);
+                        eprintln!("  volume:    {} ({} used of {})", p.volume_path, used, p.quota);
+                        eprintln!("  status:    {}", if p.running { "running (will be stopped)" } else { "stopped" });
+                        eprintln!();
+                        eprintln!("This permanently destroys the volume and everything in it.");
+                    }
+                    None => eprintln!("About to delete project {name:?} (details unavailable)."),
+                }
+                eprint!("Type the project name to confirm: ");
+                std::io::Write::flush(&mut std::io::stderr())?;
+
+                let mut answer = String::new();
+                std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut answer)?;
+                if answer.trim() != name {
+                    eprintln!("Cancelled: input did not match {name:?}. Nothing was deleted.");
+                    std::process::exit(1);
+                }
+            }
+
+            project::delete(&client, &name).await?;
+            println!("deleted project {name:?}");
         }
 
         Command::Attach { name } => {

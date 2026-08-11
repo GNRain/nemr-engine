@@ -286,6 +286,108 @@ impl PrivilegedOps for HelperOps {
     }
 }
 
+/// Bytes used and total capacity of a mounted volume.
+///
+/// Reported from the filesystem itself rather than from the requested preset:
+/// AC-6.1 compares `list` against actual state, and ext4 metadata means the
+/// usable total is always somewhat below the size that was asked for. Quoting
+/// the preset here would be quoting an intention, not a measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    pub used: u64,
+    pub available: u64,
+    pub total: u64,
+}
+
+impl Usage {
+    /// Percentage full, using `df`'s definition.
+    ///
+    /// `df` computes `used / (used + available)`, **not** `used / total`. The
+    /// difference is ext4's root-reserved blocks, which are neither used nor
+    /// available to an ordinary caller. Dividing by `total` reports a smaller
+    /// percentage than `df` for the same filesystem, and AC-6.1 cross-checks
+    /// this output against `df`.
+    pub fn percent(&self) -> f64 {
+        let denominator = self.used + self.available;
+        if denominator == 0 {
+            0.0
+        } else {
+            (self.used as f64 / denominator as f64) * 100.0
+        }
+    }
+}
+
+/// Whether `path` is currently a mount point.
+///
+/// Checked against the kernel's mount table rather than inferred. This matters
+/// because `statvfs` succeeds on a directory that is *not* a mount point and
+/// reports the filesystem that directory sits on — so an unmounted volume
+/// silently yields the host root filesystem's numbers. That produced a `list`
+/// row reading "30.6GiB used of 2GB", which is the host disk, not the volume.
+pub fn is_mounted(mount_point: &Path) -> bool {
+    let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let target = mount_point.to_string_lossy().to_string();
+    table
+        .lines()
+        .any(|line| line.split(' ').nth(4).is_some_and(|m| m == target))
+}
+
+/// Query a mounted volume's usage.
+///
+/// Returns `None` when the volume is not mounted — after a host reboot, say,
+/// which destroys mounts and loop devices while the container record survives —
+/// so `list` reports "unmounted" instead of the host filesystem's figures.
+pub fn usage(mount_point: &Path) -> Option<Usage> {
+    if !is_mounted(mount_point) {
+        return None;
+    }
+
+    let path = std::ffi::CString::new(mount_point.as_os_str().as_encoded_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+
+    // SAFETY: `path` is a valid NUL-terminated string and `stat` is a valid,
+    // correctly-sized statvfs for the duration of the call.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+
+    let block = stat.f_frsize as u64;
+    let total = stat.f_blocks as u64 * block;
+
+    // Three quantities, and conflating them is easy:
+    //   f_blocks — total blocks in the filesystem
+    //   f_bfree  — blocks free, including ext4's root reserve
+    //   f_bavail — blocks free to an unprivileged caller, excluding that reserve
+    //
+    // `df` reports Used as total - f_bfree and Avail as f_bavail, so the root
+    // reserve counts as neither. Computing used as total - f_bavail instead
+    // silently folds the reserve (5% of the filesystem by default) into "used",
+    // which is what this originally did: it reported 190MiB/10% where `df`
+    // inside the container said 73M/4% for the same volume.
+    let used = total.saturating_sub(stat.f_bfree as u64 * block);
+    let available = stat.f_bavail as u64 * block;
+
+    Some(Usage { used, available, total })
+}
+
+/// Format a byte count for human reading.
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}{}", UNITS[unit])
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
 /// Audit log line (VOL-03, NFR-04).
 ///
 /// Written to stderr so it is visible without a log file and cannot be

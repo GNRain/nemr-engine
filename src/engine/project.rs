@@ -12,7 +12,7 @@ use crate::auth;
 use crate::config;
 use crate::containerd::client::ContainerdClient;
 use crate::containerd::containers::{BindMount, ContainerSpec};
-use crate::engine::volume::{HelperOps, Volume, VolumePaths, VolumeSize};
+use crate::engine::volume::{HelperOps, PrivilegedOps, Volume, VolumePaths, VolumeSize};
 
 /// Label keys written onto the container record.
 ///
@@ -339,4 +339,106 @@ pub async fn attach(client: &ContainerdClient, name: &str) -> Result<u32> {
     let _ = std::fs::remove_dir_all(&io_dir);
 
     Ok(exit_code)
+}
+
+/// A project as reported by `list`.
+#[derive(Debug, Clone)]
+pub struct ProjectStatus {
+    pub name: String,
+    pub container_id: String,
+    /// Quota recorded at creation time (the preset that was asked for).
+    pub quota: String,
+    pub running: bool,
+    pub volume_path: String,
+    /// Measured usage, absent when the volume is not currently mounted.
+    pub usage: Option<crate::engine::volume::Usage>,
+}
+
+/// List all projects (Milestone 6).
+///
+/// State comes from containerd: the container records and their labels are the
+/// source of truth, and usage is measured from the mounted filesystem. There is
+/// no engine-side database to fall out of step with reality — which is what
+/// AC-6.1 is really testing when it cross-checks against `ctr`.
+pub async fn list(client: &ContainerdClient) -> Result<Vec<ProjectStatus>> {
+    let containers = client.list_containers().await?;
+    let mut projects = Vec::new();
+
+    for container in containers {
+        // Only containers this engine created are projects. Others in the
+        // namespace are none of our business, and reporting them would make
+        // `list` disagree with reality in the other direction.
+        let Some(name) = container.labels.get(LABEL_PROJECT) else {
+            continue;
+        };
+
+        let running = client.task_state(&container.id).await?.is_running();
+        let volume_path = container
+            .labels
+            .get(LABEL_VOLUME)
+            .cloned()
+            .unwrap_or_default();
+        let usage = if volume_path.is_empty() {
+            None
+        } else {
+            crate::engine::volume::usage(std::path::Path::new(&volume_path))
+        };
+
+        projects.push(ProjectStatus {
+            name: name.clone(),
+            container_id: container.id.clone(),
+            quota: container
+                .labels
+                .get(LABEL_SIZE)
+                .cloned()
+                .unwrap_or_else(|| "unknown".into()),
+            running,
+            volume_path,
+            usage,
+        });
+    }
+
+    projects.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(projects)
+}
+
+/// Delete a project and everything it owns (Milestone 6).
+///
+/// Order matters, and it is the reverse of creation: stop the task, remove the
+/// container record and its snapshot, then release the volume, then remove the
+/// backing file. Releasing the volume before the container is gone would pull
+/// the mount out from under a container that still references it; removing the
+/// backing file before the loop device is detached would strand that device
+/// permanently, which is the failure Milestone 3 already ran into.
+///
+/// Confirmation is the caller's responsibility (AC-6.2) — this function does
+/// the deleting, the CLI does the asking, so a scripted caller is not fighting
+/// a prompt.
+pub async fn delete(client: &ContainerdClient, name: &str) -> Result<()> {
+    let container_id = resolve(client, name).await?;
+    let paths = VolumePaths::from_env()?;
+
+    // 1. Stop the task if one is running. Safe if it is not.
+    if client.task_state(&container_id).await?.is_running() {
+        client.stop_task(&container_id).await?;
+    }
+
+    // 2. Container record and rootfs snapshot.
+    client.delete_container(&container_id).await?;
+
+    // 3. Unmount and detach the loop device, via the privileged helper.
+    HelperOps::new()
+        .unmount_and_detach(name)
+        .with_context(|| format!("failed to release the volume for project {name:?}"))?;
+
+    // 4. Backing file and mount point, now that nothing refers to them.
+    let image = paths.image_file(name);
+    if image.exists() {
+        std::fs::remove_file(&image)
+            .with_context(|| format!("failed to remove {}", image.display()))?;
+    }
+    let mount_point = paths.mount_point(name);
+    let _ = std::fs::remove_dir(&mount_point);
+
+    Ok(())
 }
