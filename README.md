@@ -4,7 +4,7 @@ Backend engine that provisions isolated, resource-bounded, pre-configured
 Claude Code execution environments on a single Linux host, with no dependency
 on Docker at any layer.
 
-Authoritative specification: [`SPEC.md`](SPEC.md) (AIHUB-SPEC-001 v1.7),
+Authoritative specification: [`SPEC.md`](SPEC.md) (AIHUB-SPEC-001 v1.10),
 tracked in this repository per Section 4A.5. Where this README and the
 specification disagree, the specification governs.
 
@@ -13,15 +13,15 @@ specification disagree, the specification governs.
 | Milestone | State |
 |---|---|
 | M1 — Containerd connectivity + wrapper foundation | Complete — AC-1.1, AC-1.2, AC-1.3 met |
-| M2 — Base image build | Not started |
+| M2 — Base image build | Complete — AC-2.1, AC-2.2, AC-2.3 met |
 | M3 — Volume creation with quota | Not started |
 | M4 — Project lifecycle: create | Not started |
 | M5 — Start / attach / stop | Not started |
 | M6 — List / delete | Not started |
 | M7 — End-to-end validation | Not started |
 
-The host is fully provisioned per `PREREQUISITES.md`. No blockers outstanding
-for Milestone 1.
+The host is fully provisioned per `PREREQUISITES.md`, including cgroup v2
+controller delegation (Step 2a). No blockers outstanding.
 
 ## Architecture
 
@@ -188,6 +188,102 @@ user and mount namespaces, or they fail with `operation not permitted` on the
 overlay mount. The engine will have to account for this when it gains
 `create_container()` at Milestone 4. Recorded here so it is not rediscovered
 as a surprise then.
+
+## Base image (Milestone 2)
+
+### Build tool: BuildKit via `buildctl`
+
+The "standalone `buildctl`" option from Section 3.1. Not packaged for Ubuntu
+22.04, so installed from upstream release v0.32.2 into `~/.local/bin` and run
+as a **rootless** systemd user unit (`buildkitd-rootless.service`), mirroring
+the containerd setup — no `sudo`, consistent with PRIV-01.
+
+Chosen over `buildah`, which is in the Ubuntu archive and would have been one
+`apt install`: `buildah` is outside Section 3.1's candidate list and keeps its
+own image store, so images would need an extra push into containerd regardless.
+`buildctl` operated correctly on first attempt, so no E-02 escalation.
+
+BuildKit uses its own OCI worker and exports an OCI archive, which is then
+imported into containerd. Keeping the two decoupled means buildkitd's lifetime
+is not tied to containerd's rootlesskit child PID.
+
+### Base image: Debian-slim (`node:22-slim`)
+
+E-01 anticipates escalation *if Alpine exhibits musl libc problems* with
+Node.js or Claude Code — Alpine is the option carrying that risk. Debian-slim
+is glibc and avoids the failure mode E-01 exists to catch, so it is the initial
+selection and no escalation was required. Alpine remains a size optimisation
+worth revisiting once the engine works end to end.
+
+Node 22 matches the LTS line and the host's own Node (v22.23.2).
+
+### Measured size (AC-2.2)
+
+| Artifact | Size |
+|---|---|
+| OCI archive (`/tmp/aihub-base.tar`) | 201 MB |
+| **Image in containerd** (`docker.io/aihub/base:0.1.0`) | **200.5 MiB** |
+
+Recorded per AC-2.2. This is larger than an Alpine-based equivalent would be
+(~80–130 MiB); the trade is glibc compatibility against size, per E-01 above.
+Worth revisiting for Phase 2 planning alongside NFR-02, per R-04.
+
+### Build and import
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+export BUILDKIT_HOST=unix:///run/user/1000/buildkit/buildkitd.sock
+
+buildctl build \
+  --frontend dockerfile.v0 \
+  --local context=image \
+  --local dockerfile=image \
+  --output type=oci,dest=/tmp/aihub-base.tar,name=docker.io/aihub/base:0.1.0
+
+export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
+ctr images import /tmp/aihub-base.tar
+ctr images list
+```
+
+No Docker daemon is involved at any point (AC-2.1); `docker`/`dockerd` are not
+installed on the host and `docker.service` is inactive.
+
+### Verifying the image (AC-2.3)
+
+`ctr run` mounts client-side, so it must run inside rootlesskit's namespaces —
+see the Milestone 1 note above and PREREQUISITES.md.
+
+```bash
+CHILD_PID=$(cat "$XDG_RUNTIME_DIR/containerd-rootless/child_pid")
+nsenter -U --preserve-credentials -m -n -t "$CHILD_PID" \
+    env CONTAINERD_ADDRESS=/run/containerd/containerd.sock \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus" \
+        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+    ctr run --rm --runc-systemd-cgroup --cgroup "user.slice:aihub:m2verify" \
+        docker.io/aihub/base:0.1.0 m2-verify \
+        /bin/bash -lc 'claude --version'
+```
+
+Three requirements are doing real work in that command, each learned from a
+failure rather than assumed:
+
+1. **`nsenter`** — `ctr run` mounts client-side, so it must be inside
+   rootlesskit's namespaces (Milestone 1 note above). Without it:
+   `failed to mount ... fstype: overlay ... operation not permitted`.
+2. **`--runc-systemd-cgroup --cgroup user.slice:...`** — rootless containerd
+   inside rootlesskit still sees the host `/sys/fs/cgroup`, so runc's default
+   path is unwritable. Without these:
+   `mkdir /sys/fs/cgroup/default: permission denied`. The systemd cgroup driver
+   places the container in a scope under the delegated user slice instead.
+   `--runc-systemd-cgroup` requires `--cgroup` to be set explicitly.
+3. **cgroup v2 controller delegation** (PREREQUISITES.md Step 2a). Without it,
+   the scope is created but start fails on
+   `.../cpu.weight: no such file or directory`, because only `memory` and
+   `pids` are delegated by default.
+
+`DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` are passed through because the
+systemd cgroup driver talks to the user's systemd over the session bus, and
+`nsenter` does not carry them in.
 
 ## Current blockers
 

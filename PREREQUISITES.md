@@ -139,7 +139,53 @@ ls: cannot access '/run/containerd/containerd.sock': No such file or directory
 
 ## Step 2 — Set up rootless containerd
 
-Enable lingering so the service runs without an active login session:
+### 2a. Delegate cgroup v2 controllers (required to run containers)
+
+By default systemd delegates only `memory` and `pids` to a user session. runc
+needs `cpu` (and `cpuset`/`io` for resource bounding) or container start fails:
+
+```
+runc create failed: unable to start container process: error during container
+init: error setting cgroup config for procHooks process: openat2
+/sys/fs/cgroup/.../cpu.weight: no such file or directory
+```
+
+Check what is currently delegated:
+
+```bash
+cat /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cgroup.controllers
+# Insufficient: "memory pids"      Wanted: "cpuset cpu io memory pids"
+```
+
+Fix with a root-owned drop-in — this is host provisioning, in the same category
+as installing packages, and is **not** the engine escalating its own privileges
+(PRIV-01 is unaffected: the daemon and containers still run as your user):
+
+```bash
+sudo mkdir -p /etc/systemd/system/user@.service.d
+printf '[Service]\nDelegate=cpu cpuset io memory pids\n' \
+    | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+sudo systemctl daemon-reload
+```
+
+**Then reboot**, or log fully out and back in. The delegation applies when
+`user@1000.service` restarts; `daemon-reload` alone does not re-apply it to an
+already-running session. Restarting that unit directly would tear down every
+user service, including rootless containerd, so a reboot is cleaner.
+
+Verify afterwards:
+
+```bash
+cat /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cgroup.controllers
+# expect cpu and cpuset to now be present
+```
+
+This is required for Milestone 2's AC-2.3 onward, and is load-bearing for the
+product's resource-bounded projects generally — not a workaround for one test.
+
+### 2b. Enable lingering
+
+So the service runs without an active login session:
 
 ```bash
 loginctl enable-linger "$(id -un)"
