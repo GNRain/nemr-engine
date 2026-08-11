@@ -407,6 +407,28 @@ impl<P: PrivilegedOps> Volume<P> {
     pub fn is_mounted(&self) -> bool {
         self.mounted
     }
+
+    /// Give up ownership of the mount, leaving it in place.
+    ///
+    /// The guard exists so a *failed* provisioning run releases everything
+    /// (VOL-04). A successful one is the opposite case: the volume must outlive
+    /// the guard, because a project's container is about to depend on it. This
+    /// marks the mount as no longer owned, so `Drop` becomes a no-op, and
+    /// returns the mount point.
+    ///
+    /// Call only once the volume is genuinely committed to. Anything that can
+    /// still fail should happen before this, so the failure path still cleans
+    /// up.
+    pub fn persist(mut self) -> PathBuf {
+        let mount_point = self.paths.mount_point(&self.name);
+        self.mounted = false;
+        audit(&format!(
+            "volume {:?} persisted at {}; no longer released on drop",
+            self.name,
+            mount_point.display()
+        ));
+        mount_point
+    }
 }
 
 impl<P: PrivilegedOps> Drop for Volume<P> {

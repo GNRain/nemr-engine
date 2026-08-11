@@ -106,6 +106,15 @@ impl ContainerdClient {
         &self.namespace
     }
 
+    /// Snapshotter used for container rootfs.
+    ///
+    /// Confirmed `ok` rootless on the reference host at Milestone 1. A host
+    /// where overlayfs is unavailable in a user namespace would need `native`,
+    /// which is why this is reachable rather than inlined at call sites.
+    pub fn snapshotter(&self) -> &str {
+        crate::config::SNAPSHOTTER
+    }
+
     /// Access to the underlying low-level client.
     ///
     /// Crate-visible on purpose: this is the seam Section 3.2 draws. Sibling
