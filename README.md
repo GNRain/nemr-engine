@@ -4,7 +4,7 @@ Backend engine that provisions isolated, resource-bounded, pre-configured
 Claude Code execution environments on a single Linux host, with no dependency
 on Docker at any layer.
 
-Authoritative specification: [`SPEC.md`](SPEC.md) (AIHUB-SPEC-001 v1.13),
+Authoritative specification: [`SPEC.md`](SPEC.md) (AIHUB-SPEC-001 v1.15),
 tracked in this repository per Section 4A.5. Where this README and the
 specification disagree, the specification governs.
 
@@ -15,7 +15,7 @@ specification disagree, the specification governs.
 | M1 — Containerd connectivity + wrapper foundation | Complete — AC-1.1, AC-1.2, AC-1.3 met |
 | M2 — Base image build | Complete — AC-2.1, AC-2.2, AC-2.3 met |
 | M3 — Volume creation with quota | Complete — AC-3.1 … AC-3.5 met |
-| M4 — Project lifecycle: create | Not started |
+| M4 — Project lifecycle: create | Complete — AC-4.1, AC-4.2 met |
 | M5 — Start / attach / stop | Not started |
 | M6 — List / delete | Not started |
 | M7 — End-to-end validation | Not started |
@@ -42,10 +42,11 @@ $ ls -l $XDG_RUNTIME_DIR/containerd/containerd.sock
 srw-rw---- 1 nemr nemr /run/user/1000/containerd/containerd.sock
 ```
 
-Volume provisioning (Milestone 3: `losetup`, `mkfs.ext4`, `mount`) is the sole
-exception, and is bounded by a narrowly scoped sudoers rule committed to
-`deploy/sudoers.d/` (PRIV-02–03). That rule is a Milestone 3 deliverable and
-does not exist yet.
+Loop-device attach and mount are the sole exception (PRIV-02), bounded by a
+NOPASSWD grant to one fixed root-owned helper at `deploy/aihub-volume/`, with no
+argument wildcards (PRIV-03). Sparse allocation and `mkfs.ext4` were measured to
+need no privilege and are excluded from that surface. See "Volumes and the
+privileged helper" below.
 
 The root-owned system service is **disabled** on this host, so the rootless
 instance is the only containerd running:
@@ -392,6 +393,63 @@ reports it as `(deleted)`. The residue check now scans the whole table, and
 `Volume::create` releases privileged resources *before* unlinking the backing
 file, since unlinking first makes the device unfindable and permanently
 stranded.
+
+## Projects (Milestone 4)
+
+`aihub create <name> --size <500MB|2GB|10GB>` provisions a project: a
+quota-bounded volume (Milestone 3) plus a container from the base image
+(Milestone 2), in a stopped, ready-to-start state.
+
+```bash
+aihub create myproject --size 2GB
+```
+
+### Discoverability
+
+State lives in containerd, not in a side database the engine would have to keep
+in sync. The container record carries labels:
+
+```
+aihub.project = myproject
+aihub.size    = 2GB
+aihub.volume  = /home/nemr/.local/share/aihub/mounts/myproject
+```
+
+so `ctr containers info aihub-<name>` is the source of truth, and Milestone 6's
+`list` reads it back rather than tracking projects separately.
+
+### Mounts
+
+| Host | Container | Mode |
+|---|---|---|
+| `~/.local/share/aihub/mounts/<name>` | `/workspace` | rw |
+| `~/.claude/.credentials.json` | `/root/.claude/.credentials.json` | **ro** |
+
+Only the credentials *file* is mounted, never the whole `~/.claude` directory
+(AUTH-02). Mounting the directory would expose every project's history to every
+container and would break Claude Code anyway, since the mount is read-only and
+Claude Code writes session state there.
+
+### Ordering, and why it is what it is
+
+Creation validates the name, rejects a duplicate, then resolves credentials —
+all before allocating storage, since there is no point provisioning a volume for
+a container that could not authenticate. If container creation fails, the volume
+guard's `Drop` releases the mount and loop device and the backing file is
+removed. Only once the container exists does the volume `persist()`, because the
+container now depends on it.
+
+### The engine does not need nsenter
+
+`ctr container create` must run inside rootlesskit's namespaces because **`ctr`**
+mounts the image snapshot client-side to read the image config. The engine does
+not: it reads that config from the content store over gRPC and has containerd
+prepare the snapshot server-side, so nothing is mounted in the engine's own
+namespace. `aihub create` runs from the host namespace with no `nsenter` and no
+`sudo`.
+
+This does not extend to Milestone 5 — starting a task runs runc, which does
+mount, and carries its own cgroup constraint.
 
 ## Current blockers
 
