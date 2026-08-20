@@ -82,6 +82,25 @@ struct LoopConfig {
 /// is not marked autoclear: it persists until [`detach`] or until its mount is
 /// released, matching the previous `losetup` behaviour.
 pub fn attach(backing_fd: &OwnedFd) -> Result<u32, String> {
+    // LOOP_CONFIGURE landed in Linux 5.8. The spec's target is Ubuntu 22.04+
+    // (kernel 5.15+), comfortably above that, so a bare `losetup`-free path is
+    // safe there — but fail with an actionable message on an older kernel rather
+    // than an opaque EINVAL from the ioctl. A LOOP_SET_FD + LOOP_SET_STATUS64
+    // fallback is deliberately NOT shipped: it is code that could only run on a
+    // sub-5.8 kernel, which is below the supported floor and which this host
+    // cannot exercise, and shipping an unverifiable privileged path is the exact
+    // trap we just climbed out of. If a real sub-5.8 target appears, add it then
+    // with a host to test it on.
+    if let Some((major, minor)) = running_kernel_version() {
+        if (major, minor) < (5, 8) {
+            return Err(format!(
+                "this kernel is {major}.{minor}; loop provisioning needs LOOP_CONFIGURE, \
+                 which requires Linux 5.8 or newer (see PREREQUISITES.md). The supported \
+                 platform is Ubuntu 22.04+ (kernel 5.15+)."
+            ));
+        }
+    }
+
     let control = File::open("/dev/loop-control")
         .map_err(|e| format!("cannot open /dev/loop-control: {e}"))?;
 
@@ -222,27 +241,73 @@ pub fn device_path(number: u32) -> String {
     format!("/dev/loop{number}")
 }
 
+/// The running kernel's `(major, minor)` from `/proc/sys/kernel/osrelease`,
+/// e.g. `6.8.0-136-generic` -> `(6, 8)`. `None` if it cannot be read or parsed.
+fn running_kernel_version() -> Option<(u32, u32)> {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok()?;
+    parse_kernel_version(&release)
+}
+
+/// Parse a `major.minor...` kernel release string into `(major, minor)`.
+fn parse_kernel_version(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.trim().split(['.', '-', '+']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The ioctl structs are a binary ABI contract with the kernel. A wrong
-    /// field type or a missing field would be undetectable at runtime except as
-    /// corruption, so pin the sizes against the kernel's own definitions:
-    /// `loop_info64` is 232 bytes and `loop_config` is 304 bytes on 64-bit
-    /// Linux. This runs without root and fails the build the instant the layout
-    /// drifts.
+    /// field type, a missing field, or a reordering would be undetectable at
+    /// runtime except as corruption, so pin the layout against the kernel's own
+    /// `<linux/loop.h>` definitions.
+    ///
+    /// The sizes (232 / 304) are **not** x86-64-specific: every field is a
+    /// fixed-width integer or a `[u8; N]`, so the layout is identical on every
+    /// LP64 target, aarch64 (Apple Silicon) included. Only a 32-bit (ILP32)
+    /// target would differ, and none is on the roadmap. Size alone cannot catch
+    /// a reordering of two same-width fields, so the offsets of the two fields
+    /// this code actually reads — `lo_device` and `lo_inode`, the identity pair
+    /// used to match a loop device to its backing file — are pinned explicitly.
     #[test]
     fn ioctl_struct_layout_matches_the_kernel() {
+        use std::mem::{offset_of, size_of};
+
         assert_eq!(
-            std::mem::size_of::<LoopInfo64>(),
+            size_of::<LoopInfo64>(),
             232,
             "loop_info64 layout does not match <linux/loop.h>"
         );
         assert_eq!(
-            std::mem::size_of::<LoopConfig>(),
+            size_of::<LoopConfig>(),
             304,
             "loop_config layout does not match <linux/loop.h>"
         );
+
+        // The identity pair `find_by_backing` compares must sit where the kernel
+        // writes them, or a device would be matched to the wrong backing file.
+        assert_eq!(offset_of!(LoopInfo64, lo_device), 0, "lo_device must be field 0");
+        assert_eq!(offset_of!(LoopInfo64, lo_inode), 8, "lo_inode must be field 1");
+
+        // The backing descriptor must be the very first field of loop_config, or
+        // LOOP_CONFIGURE binds the wrong fd.
+        assert_eq!(offset_of!(LoopConfig, fd), 0, "loop_config.fd must be field 0");
+        assert_eq!(offset_of!(LoopConfig, info), 8, "loop_config.info follows fd+block_size");
+    }
+
+    #[test]
+    fn kernel_version_parsing() {
+        assert_eq!(parse_kernel_version("6.8.0-136-generic"), Some((6, 8)));
+        assert_eq!(parse_kernel_version("5.15.0-generic\n"), Some((5, 15)));
+        assert_eq!(parse_kernel_version("5.4.0"), Some((5, 4)));
+        assert_eq!(parse_kernel_version("6.8"), Some((6, 8)));
+        assert_eq!(parse_kernel_version("garbage"), None);
+        // The gate: 5.7 is too old, 5.8 is the floor.
+        assert!((5, 7) < (5, 8));
+        assert!((5, 15) >= (5, 8));
+        assert!((6, 8) >= (5, 8));
     }
 }

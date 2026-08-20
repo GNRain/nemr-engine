@@ -301,8 +301,11 @@ assert_eq "systemd scope gone" "0" \
     "$(systemctl --user list-units --type=scope --all 2>/dev/null | grep -c "nemr-${PROJECT}" || true)"
 
 # The orphan class that once passed a green test: a loop device whose backing
-# file was deleted is still attached but no longer matches its path.
-assert_eq "no loop device with a deleted backing file" "0" "$(losetup -a 2>/dev/null | grep -ci deleted || true)"
+# file was deleted is still attached but no longer matches its path. Scope this
+# to THIS project's backing file — a bare `grep -ci deleted` is host-global and
+# fails on any unrelated `(deleted)` loop left by something else on the machine.
+assert_eq "no loop device backed by this project's (deleted) file" "0" \
+    "$(losetup -a 2>/dev/null | grep -F "${VOLUME_DIR}/${PROJECT}.img" | grep -ci deleted || true)"
 
 assert "project gone from list" \
     bash -c "! $NEMR list 2>/dev/null | grep -q '^${PROJECT} '"
