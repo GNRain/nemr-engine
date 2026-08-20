@@ -727,6 +727,30 @@ mod tests {
     /// unmounted — which sends `start` down the remount path and stacks a second
     /// loop device and ext4 mount over the same bytes (#2). This is the unit
     /// proof; it needs no `/proc`.
+    /// VOL-05 (#30): `Usage::percent` uses df's definition — used/(used+available),
+    /// NOT used/total — so the ext4 root reserve counts as neither. Pinned here
+    /// because the smoke test's df cross-check is the only other guard, and a
+    /// host-free unit test catches an arithmetic regression instantly.
+    #[test]
+    fn usage_percent_matches_df_definition() {
+        // 100 used, 300 available, 500 total (100 reserved, neither used nor avail).
+        let u = Usage { used: 100, available: 300, total: 500 };
+        // df: 100 / (100 + 300) = 25%, NOT 100/500 = 20%.
+        assert!((u.percent() - 25.0).abs() < 1e-9, "percent should be 25.0, got {}", u.percent());
+    }
+
+    #[test]
+    fn usage_percent_is_zero_on_empty_filesystem() {
+        let u = Usage { used: 0, available: 0, total: 0 };
+        assert_eq!(u.percent(), 0.0, "an empty/degenerate fs must not divide by zero");
+    }
+
+    #[test]
+    fn usage_percent_full_is_100() {
+        let u = Usage { used: 400, available: 0, total: 500 };
+        assert!((u.percent() - 100.0).abs() < 1e-9, "no space available reads as 100%");
+    }
+
     #[test]
     fn is_mounted_decodes_octal_escaped_mount_points() {
         // A real mountinfo line for a mount point containing a space, exactly as
