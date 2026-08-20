@@ -270,23 +270,22 @@ pub fn make_fifo(path: &Path) -> Result<()> {
 /// unpredictable times, doing either invites a deadlock. `O_RDWR` on a FIFO
 /// never blocks on Linux, which is the standard way around this.
 pub fn open_fifo(path: &Path) -> Result<File> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
-        .with_context(|| format!("failed to open FIFO {}", path.display()))
-        .and_then(|file| {
-            // Clear O_NONBLOCK: it was only needed to guarantee the open itself
-            // did not block. The proxy threads want ordinary blocking reads.
-            let fd = file.as_raw_fd();
-            // SAFETY: `fd` is valid and owned by `file`.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags != -1 {
-                unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
-            }
-            Ok(file)
-        })
+        .with_context(|| format!("failed to open FIFO {}", path.display()))?;
+
+    // Clear O_NONBLOCK: it was only needed to guarantee the open itself did not
+    // block. The proxy threads want ordinary blocking reads.
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is valid and owned by `file`.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags != -1 {
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+    }
+    Ok(file)
 }
 
 /// Copy bytes from `from` to `to` until EOF, flushing as it goes.
