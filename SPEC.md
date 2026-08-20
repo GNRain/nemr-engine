@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | NEMR-SPEC-001 |
-| Version | 1.23 |
+| Version | 1.24 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -39,6 +39,7 @@
 | 1.21 | Revision | Recorded the Milestone 7 finding that `attach` allocates a pty only when its own stdin is a terminal, and that this drifts from PROC-02 as written. Added the note under Milestone 5, a Section 11 deviation row, and escalation item E-07. PROC-02 itself left unedited — Section 3.8 is Product Owner territory per 4A.5. | Claude Code |
 | 1.22 | Revision | Recorded the PRIV-03/PRIV-06 privileged-helper hardening: the mount point was checked with `is_dir()` (follows symlinks) and then mounted by name, a demonstrated local root escalation (mount an attacker ext4 over `/etc`); the backing file and chown were likewise re-resolved by name after validation (TOCTOU). Rewrote the helper to resolve every managed path to a file descriptor refusing symlinked components and to drive losetup/mount/fchown through `/proc/self/fd`, plus a backing-file flock against concurrent double-mount and inode-identity loop lookup. Added a `version` handshake (protocol 2). Requirement text in Section 3.7 unchanged — it already mandated symlink refusal and validation inside the helper; this is an implementation correction, recorded in Section 11 and escalated for visibility as E-08. | Claude Code |
 | 1.23 | Revision | Recorded that the privileged helper attaches loop devices via the `LOOP_CONFIGURE` ioctl (Linux 5.8+), a consequence of moving loop/mount off `losetup`/`mount` subprocesses. The helper checks the running kernel and fails with an actionable error below 5.8; no pre-5.8 `LOOP_SET_FD` fallback is shipped (below the Ubuntu 22.04+ floor, untestable on the reference host). Documented in PREREQUISITES.md Step 0. Section 3.3 (a Section 1-3 requirement) left unedited; recorded here per 4A.5. | Claude Code |
+| 1.24 | Revision | Added E-08 (privileged-helper escalation, already fixed) to the Section 9 escalation list for completeness — it was referenced from Section 11 and the revision history but not enumerated in Section 9. Recorded the shared `E-` escalation namespace between SPEC.md and docs/DECISIONS.md so the two do not collide (DECISIONS.md continues from E-09). | Claude Code |
 
 ---
 
@@ -848,6 +849,24 @@ resolved unilaterally, if encountered during implementation:
   representable". Consequence of not deciding: the code and the spec disagree
   on a normative requirement, and the smoke test depends on the code's
   behaviour, not the spec's.
+- E-08: The privileged helper's mount path contained a local root escalation —
+  the mount point was checked with a symlink-following `is_dir()` and then
+  mounted by name, letting a caller mount an attacker-controlled ext4 over
+  `/etc` (with backing-file and chown TOCTOU variants). Section 3.7 already
+  required symlink refusal and in-helper validation, so the fix is an
+  *implementation* correction, not a requirement change, and does not itself
+  need a Product Owner ruling — it is raised here only for visibility of a
+  security-critical change. Fixed (fd-based resolution, in-process syscalls);
+  see Section 11 (2026-08-20). No decision required unless the Product Owner
+  wants the threat model in Section 3.7 expanded to name the TOCTOU class
+  explicitly.
+
+**Escalation ID namespace.** These `E-0x` IDs are the canonical escalation
+ledger. `docs/DECISIONS.md` records Product Owner rulings and continues the same
+`E-` series (so the next new escalation raised there is `E-09`, not a fresh
+`E-01`), alongside its own `D-0x` series for decisions raised outside the
+escalation path. The two files share one `E-` namespace to keep a cross-reference
+unambiguous.
 
 ---
 
