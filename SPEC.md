@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | NEMR-SPEC-001 |
-| Version | 1.25 |
+| Version | 1.26 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -41,6 +41,7 @@
 | 1.23 | Revision | Recorded that the privileged helper attaches loop devices via the `LOOP_CONFIGURE` ioctl (Linux 5.8+), a consequence of moving loop/mount off `losetup`/`mount` subprocesses. The helper checks the running kernel and fails with an actionable error below 5.8; no pre-5.8 `LOOP_SET_FD` fallback is shipped (below the Ubuntu 22.04+ floor, untestable on the reference host). Documented in PREREQUISITES.md Step 0. Section 3.3 (a Section 1-3 requirement) left unedited; recorded here per 4A.5. | Claude Code |
 | 1.24 | Revision | Added E-08 (privileged-helper escalation, already fixed) to the Section 9 escalation list for completeness — it was referenced from Section 11 and the revision history but not enumerated in Section 9. Recorded the shared `E-` escalation namespace between SPEC.md and docs/DECISIONS.md so the two do not collide (DECISIONS.md continues from E-09). | Claude Code |
 | 1.25 | Revision | Recorded the single-source-of-truth precedence rule for reconciliation (A6) and the recoverable `delete` ordering. Added `nemr reconcile`. Precedence rule captured in Section 11 pending Product Owner promotion to a Section 3 subsection (a new Section 3.x is Section 1-3 territory under 4A.5). | Claude Code |
+| 1.26 | Revision | Added the former Section 7 product gates to the Section 9 escalation ledger under the shared `E-` namespace: E-09 engine consumption model (RESOLVED — long-running user daemon, gRPC over a Unix domain socket, with implementation constraints), E-10 non-Linux hosts (open), E-11 open-core seam (open). Applied on Product Owner instruction; `docs/DECISIONS.md` remains the Product Owner-maintained ruling record. | Claude Code, per Product Owner instruction |
 
 ---
 
@@ -861,13 +862,42 @@ resolved unilaterally, if encountered during implementation:
   see Section 11 (2026-08-20). No decision required unless the Product Owner
   wants the threat model in Section 3.7 expanded to name the TOCTOU class
   explicitly.
+- E-09: **Engine consumption model — RESOLVED 2026-08-20.** A **long-running
+  user daemon, gRPC over a Unix domain socket.** Two already-resolved product
+  decisions require something running while the GUI is closed: the session lease
+  (`docs/DECISIONS.md` D-03) must keep heartbeating with the lid shut, and
+  snapshot-on-quiesce (D-04) must watch the transcript whenever a session is
+  live. A linked library would force both into a process the user closes, or
+  bolt on a background helper later — a daemon arrived at by accident with an
+  undesigned IPC surface. The daemon also makes single-writer *structural*: CLI
+  and GUI both exist and must not independently mutate containerd/mount state,
+  the divergence class WP A spent nine commits eliminating. Implementation
+  constraints (binding on all downstream work): **(1)** Unix domain socket, not
+  TCP — filesystem permissions are the authentication, and the E-10 remote
+  fallback swaps only the transport; **(2)** a version handshake from day one,
+  same pattern as the helper's protocol version, refusing a client/daemon
+  mismatch cleanly; **(3)** the daemon is a *client* of the containerd wrapper
+  crate, which stays usable standalone — not a replacement for it; **(4)** the
+  CLI talks to the daemon and keeps no second, direct path into containerd. Not
+  implemented yet: the ruling exists so WP B stops paying for library/daemon
+  optionality and WP C's design can assume it.
+- E-10: **Non-Linux hosts — OPEN.** Loopback ext4 plus rootless namespaces is
+  Linux-only; the product vision is a cross-platform GUI, and D-01 (local
+  compute) makes this a direct contradiction rather than a deferred concern.
+  Options to cost: bundled VM, WSL2 + a macOS story, or a remote-engine fallback
+  that partially reverses D-01. Ruling pending in `docs/DECISIONS.md`.
+- E-11: **Open-core seam — OPEN.** What stays in `nemr-engine` versus the
+  commercial portability/sync layer. Wants deciding while WP B is still moving
+  module boundaries, since retrofitting a seam is a multi-year tax. Ruling
+  pending in `docs/DECISIONS.md`.
 
 **Escalation ID namespace.** These `E-0x` IDs are the canonical escalation
-ledger. `docs/DECISIONS.md` records Product Owner rulings and continues the same
-`E-` series (so the next new escalation raised there is `E-09`, not a fresh
-`E-01`), alongside its own `D-0x` series for decisions raised outside the
-escalation path. The two files share one `E-` namespace to keep a cross-reference
-unambiguous.
+ledger, now including the former Section 7 product gates as E-09 (resolved),
+E-10 and E-11. `docs/DECISIONS.md` is the Product Owner's record of rulings and
+uses the same `E-` series plus its own `D-0x` series for decisions raised
+outside the escalation path. The two files share one `E-` namespace so a
+cross-reference is unambiguous; the Product Owner maintains `docs/DECISIONS.md`,
+and this section is kept in step with it.
 
 ---
 
