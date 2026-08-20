@@ -365,10 +365,10 @@ fn cmd_mount(invoker: &Invoker, name: &str, size: &str) -> Result<(), String> {
 /// Unmount and detach. Idempotent: the engine's `Drop` calls this on error
 /// paths where the mount may never have been established (VOL-04).
 ///
-/// Runs under the same `/run/nemr` flock as [`cmd_mount`], and finds the loop
-/// device by the backing file's inode identity rather than its path, so it
-/// still detaches a device whose backing file was unlinked or whose path
-/// contains whitespace.
+/// Takes the same backing-file lock as [`cmd_mount`] (when the file still
+/// exists), and finds the loop device by the backing file's (device, inode)
+/// identity rather than its path, so it still detaches a device whose backing
+/// file was unlinked or whose path contains whitespace.
 fn cmd_unmount(invoker: &Invoker, name: &str) -> Result<(), String> {
     validate_name(name)?;
 
