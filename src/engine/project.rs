@@ -127,21 +127,38 @@ pub async fn create(
         .with_context(|| format!("failed to provision volume for project {name:?}"))?;
     let mount_point = volume.mount_point();
 
+    // M8: create the on-volume directories that hold the relocated session state,
+    // before the container binds them in. They are created on the mounted volume
+    // (chowned to the invoker, so they map to root inside the container) so that
+    // Claude Code's conversation history is written to the layer that travels.
+    // See `session_state_mounts` and docs/state-locality.md.
+    for subdir in [config::VOLUME_STATE_PROJECTS, config::VOLUME_STATE_SESSIONS] {
+        let dir = mount_point.join(subdir);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create session-state dir {}", dir.display()))?;
+    }
+
     let mut labels = HashMap::new();
     labels.insert(LABEL_PROJECT.to_string(), name.to_string());
     labels.insert(LABEL_VOLUME.to_string(), mount_point.to_string_lossy().to_string());
     labels.insert(LABEL_SIZE.to_string(), size.to_string());
 
+    let mut mounts = vec![
+        // The project volume becomes the container's working directory.
+        BindMount::read_write(&mount_point, config::CONTAINER_WORKDIR),
+        // AUTH-02: credentials read-only, and only the credentials file — no
+        // other host-side ~/.claude content. This stays a host bind mount and is
+        // NOT relocated onto the volume (D-02): the credential must never travel.
+        BindMount::read_only(&credentials, config::CONTAINER_CREDENTIALS),
+    ];
+    // M8: bind the session-critical subtrees from the volume over their rootfs
+    // locations, so history and session state live on the portable layer.
+    mounts.extend(session_state_mounts(&mount_point));
+
     let spec = ContainerSpec {
         id: container_id.clone(),
         image: config::BASE_IMAGE.to_string(),
-        mounts: vec![
-            // The project volume becomes the container's working directory.
-            BindMount::read_write(&mount_point, config::CONTAINER_WORKDIR),
-            // AUTH-02: credentials read-only, and only the credentials file —
-            // no other host-side ~/.claude content.
-            BindMount::read_only(&credentials, config::CONTAINER_CREDENTIALS),
-        ],
+        mounts,
         working_dir: Some(config::CONTAINER_WORKDIR.to_string()),
         extra_env: vec![],
         args: Some(config::SUPERVISOR_ARGS.iter().map(|s| s.to_string()).collect()),
@@ -171,6 +188,27 @@ pub async fn create(
         volume_path: mount_point.to_string_lossy().to_string(),
         size,
     })
+}
+
+/// Bind mounts that relocate Claude Code's session-critical state onto the
+/// portable volume (M8).
+///
+/// Each maps a directory on the volume over the rootfs location Claude Code
+/// writes to, so the conversation history and session state land on the layer
+/// that travels with a bundle. Credentials (`CONTAINER_CREDENTIALS`) and the
+/// identity-bearing `/root/.claude.json` are deliberately absent — they stay on
+/// the rootfs so they cannot travel (D-02). See `docs/state-locality.md`.
+fn session_state_mounts(mount_point: &std::path::Path) -> Vec<BindMount> {
+    vec![
+        BindMount::read_write(
+            mount_point.join(config::VOLUME_STATE_PROJECTS),
+            config::CONTAINER_CLAUDE_PROJECTS,
+        ),
+        BindMount::read_write(
+            mount_point.join(config::VOLUME_STATE_SESSIONS),
+            config::CONTAINER_CLAUDE_SESSIONS,
+        ),
+    ]
 }
 
 /// What `create` produced, for the CLI to report.
@@ -378,6 +416,126 @@ fn audit_remount(name: &str, mount_point: &std::path::Path) {
 pub async fn is_running(client: &ContainerdClient, name: &str) -> Result<bool> {
     let container_id = config::container_id(name);
     Ok(client.task_state(&container_id).await?.is_running())
+}
+
+/// Run one command in a running project and capture its stdout and exit code.
+///
+/// A non-interactive counterpart to [`attach`]: no TTY, no stdin, output
+/// collected rather than streamed. Used by health checks and by the regression
+/// suite to read the container's own view of a path (e.g. to prove that
+/// relocated session state is visible where Claude Code writes it), without
+/// depending on the streaming attach machinery.
+pub async fn exec_capture(
+    client: &ContainerdClient,
+    name: &str,
+    argv: &[&str],
+) -> Result<(u32, String)> {
+    use crate::containerd::containers::ExecIo;
+    use crate::engine::tty;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let container_id = resolve(client, name).await?;
+    if !client.task_state(&container_id).await?.is_running() {
+        bail!("project {name:?} is not running; start it first");
+    }
+
+    let exec_id = format!(
+        "capture-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let io_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .context("XDG_RUNTIME_DIR is not set; cannot place exec FIFOs")?
+        .join("nemr")
+        .join(&exec_id);
+    std::fs::create_dir_all(&io_dir)
+        .with_context(|| format!("failed to create {}", io_dir.display()))?;
+
+    let io = ExecIo {
+        stdin: io_dir.join("stdin"),
+        stdout: io_dir.join("stdout"),
+        stderr: Some(io_dir.join("stderr")),
+        terminal: false,
+    };
+    tty::make_fifo(&io.stdin)?;
+    tty::make_fifo(&io.stdout)?;
+    if let Some(stderr) = &io.stderr {
+        tty::make_fifo(stderr)?;
+    }
+
+    let process = serde_json::json!({
+        "terminal": false,
+        "user": { "uid": 0, "gid": 0 },
+        "args": argv,
+        "env": [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME=/root",
+        ],
+        "cwd": "/",
+        "noNewPrivileges": true
+    });
+
+    client.exec_process(&container_id, &exec_id, process, &io).await?;
+
+    let stdin_fifo = tty::open_fifo(&io.stdin)?;
+    let stdout_fifo = tty::open_fifo(&io.stdout)?;
+    let stderr_fifo = io.stderr.as_ref().map(|p| tty::open_fifo(p)).transpose()?;
+
+    client.start_exec(&container_id, &exec_id).await?;
+
+    // No stdin: close our write end so the process sees EOF immediately.
+    drop(stdin_fifo);
+    let _ = client.close_exec_stdin(&container_id, &exec_id).await;
+
+    // Collect stdout on a thread until the exec exits (the FIFO is O_RDWR, so it
+    // never reports EOF on its own — same reason attach uses a stop flag).
+    let collected = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let out_writer = SharedWriter(collected.clone());
+    let out_stop = stop.clone();
+    let out_thread =
+        std::thread::spawn(move || tty::pump_until_stopped(stdout_fifo, out_writer, out_stop, None));
+    let err_thread = stderr_fifo.map(|fifo| {
+        let stop = stop.clone();
+        std::thread::spawn(move || tty::pump_until_stopped(fifo, std::io::sink(), stop, None))
+    });
+
+    let exit = client.wait_exec(&container_id, &exec_id).await?;
+    let _ = client.delete_exec(&container_id, &exec_id).await;
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = out_thread.join();
+    if let Some(handle) = err_thread {
+        let _ = handle.join();
+    }
+    let _ = std::fs::remove_dir_all(&io_dir);
+
+    let stdout = collected
+        .lock()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+
+    // A tiny local Write adapter, so pump_until_stopped can collect into a Vec.
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut guard) = self.0.lock() {
+                guard.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    Ok((exit, stdout))
 }
 
 /// Attach an interactive session to a running project (Milestone 5).

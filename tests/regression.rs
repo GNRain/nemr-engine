@@ -302,3 +302,97 @@ fn vol_06_missing_backing_file_fails_loudly() {
 
     common::purge(&name);
 }
+
+/// M8 — session-critical state is relocated onto the portable volume.
+///
+/// WP-C1 measured that Claude Code writes its conversation history under
+/// `/root/.claude/projects` on the ephemeral rootfs, which does not travel with
+/// a volume export (docs/state-locality.md). M8 bind-mounts that subtree from
+/// the volume. This test proves the relocation end to end, in the faithful
+/// direction — a write *inside the container* to Claude Code's history path must
+/// land on the volume, survive a stop and an actual unmount, and come back
+/// readable after remount.
+///
+/// It does not use the real API (that is the smoke test's job and would be
+/// flaky here); it proves the storage relocation deterministically. "Genuinely
+/// gone when unmounted" is asserted directly, which is also the proof the state
+/// is not cached on the rootfs — if it were, unmounting the volume would not
+/// remove it.
+#[test]
+fn m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "m8", VolumeSize::Small).await;
+        project::start(&client, &project.name).await.expect("start");
+
+        let token = format!("history-token-{}", std::process::id());
+        let container_path = "/root/.claude/projects/proof.jsonl";
+        let host_path = VolumePaths::from_env()
+            .unwrap()
+            .mount_point(&project.name)
+            .join(nemr_engine::config::VOLUME_STATE_PROJECTS)
+            .join("proof.jsonl");
+
+        // 1. Write to Claude Code's history path FROM INSIDE the container.
+        let (code, _) = project::exec_capture(
+            &client,
+            &project.name,
+            &["/bin/sh", "-c", &format!("printf '%s' '{token}' > {container_path}")],
+        )
+        .await
+        .expect("write inside container");
+        assert_eq!(code, 0, "the in-container write must succeed");
+
+        // 2. It must have landed on the VOLUME, visible from the host.
+        assert!(
+            host_path.exists(),
+            "a write to {container_path} must land on the volume at {} — the relocation bind \
+             mount is missing or wrong",
+            host_path.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&host_path).unwrap(),
+            token,
+            "the volume must hold exactly what the container wrote"
+        );
+
+        // 3. Stop, then actually unmount the volume.
+        project::stop(&client, &project.name).await.expect("stop");
+        HelperOps::new()
+            .unmount_and_detach(&project.name)
+            .expect("unmount the volume");
+
+        // 4. Genuinely gone — not cached on the host, not on the rootfs (if it
+        //    were on the rootfs, unmounting the volume would not remove it).
+        assert!(
+            !host_path.exists(),
+            "with the volume unmounted the session state must be gone from {}; if it survives, \
+             it was not really on the volume",
+            host_path.display()
+        );
+
+        // 5. Remount (start) and read it back inside the container — sourced
+        //    from the volume, intact.
+        project::start(&client, &project.name).await.expect("restart");
+        let (code, out) = project::exec_capture(
+            &client,
+            &project.name,
+            &["/bin/cat", container_path],
+        )
+        .await
+        .expect("read back inside container");
+        assert_eq!(code, 0, "the history file must be readable again after remount");
+        assert_eq!(
+            out.trim(),
+            token,
+            "the session state must come back from the volume, byte-identical"
+        );
+
+        project::stop(&client, &project.name).await.ok();
+    });
+}
