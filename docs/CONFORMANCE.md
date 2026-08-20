@@ -54,15 +54,22 @@ unless `sha256(installed) == sha256(built)` (finding F-11 / TEST-01).
 | ID | Requirement | Implementation | Test | Status |
 |---|---|---|---|---|
 | AUTH-01 | Credentials not baked into the image | `image/Dockerfile` (no creds) | smoke step 4 | ✅ |
-| AUTH-02 | Host `~/.claude/.credentials.json` bind-mounted read-only | `auth.rs`, `project.rs::create` (`BindMount::read_only`) | smoke step 4 (readable + read-only) | 🔶 (narrowed from whole `~/.claude` to the file, SPEC 1.14) — but **F-12**: a file bind-mount pins an inode, so an atomic-replace credential rotation on the host is invisible in-container. Open, tracked for WP-C. |
+| AUTH-02 | Host `~/.claude/.credentials.json` bind-mounted read-only | `auth.rs`, `project.rs::create` (`BindMount::read_only`) | smoke step 4 (readable + read-only) | 🔶 (narrowed from whole `~/.claude` to the file, SPEC 1.14) — WP-C1 confirmed it is the **only** secret and stays a host bind-mount off both portable layers (D-02). **F-12** open: a file bind-mount pins an inode, so an atomic-replace credential rotation on the host is invisible in-container. |
 | AUTH-03 | Missing credentials → clear, actionable failure | `auth.rs::resolve_credentials` | `missing_credentials_error_is_actionable` | ✅ |
+
+### State locality & relocation (WP-C, new — pending Section 3 promotion)
+
+| ID | Requirement | Implementation | Test | Status |
+|---|---|---|---|---|
+| STATE-01 (C1) | Determine empirically where session state lives | `docs/state-locality.md` (measured both layers) | experiment (evidence in doc) | ✅ history on rootfs, project files on volume; credential is a host bind-mount |
+| M8 (C2) | Relocate session-critical state onto the portable volume | `project.rs::session_state_mounts`, `create`; `config.rs` state paths | `m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted` + real-API `--continue` recall | ✅ surgical (history subtrees only; credential + `.claude.json` identity stay off the volume, D-02) |
 
 ### Process model (PROC, Section 3.8)
 
 | ID | Requirement | Implementation | Test | Status |
 |---|---|---|---|---|
 | PROC-01 | PID 1 is a long-lived supervisor | `config.rs::SUPERVISOR_ARGS` | `proc_06_*` | ✅ |
-| PROC-02 | `attach` is a task exec with a fresh TTY per call | `project.rs::attach` | smoke step 3–5 | 🔶 **E-07**: a pty is allocated only when stdin is a terminal (a scripted attach must be pipe-backed to terminate). Drift from PROC-02 as written; awaiting Section 3.8 amendment. Terminal-restore logic (`ModeTracker`) still untested — **F-40**. |
+| PROC-02 | `attach` is a task exec with a fresh TTY per call | `project.rs::attach`, `ModeTracker` (`tty.rs`) | smoke step 3–5; `mode_tracker_tests` (11) | 🔶 **E-07**: a pty is allocated only when stdin is a terminal (a scripted attach must be pipe-backed to terminate). Drift from PROC-02 as written; awaiting Section 3.8 amendment. `ModeTracker` now unit-tested (F-40 closed; found+fixed an ESC-restart parser gap). |
 | PROC-03 | Supervisor written explicitly into the runtime spec | `project.rs::create` (`args`) | — | ✅ |
 | PROC-04 | `stop` terminates the task incl. live execs | `containers.rs::stop_task` (SIGKILL-all) | — | 🟡 (exec-kill path untested — F-35) |
 | PROC-06 *(new)* | Supervisor must trap SIGTERM; `stop` terminates gracefully, not by timeout→SIGKILL | `config.rs::SUPERVISOR_ARGS`, `StopOutcome` | `proc_06_stop_terminates_gracefully_without_escalating_to_sigkill`, `proc_06_supervisor_installs_a_sigterm_handler` | ✅ |
@@ -115,17 +122,18 @@ disposition tracked here.
 | F-11 (TEST-01) | — | — | Helper passed 13 tests while unable to provision (rejection-only coverage) | hash gate + success-path test |
 | F-19 | med | NFR-03 | No engine↔helper version handshake | `version` subcommand (protocol 2) |
 | F-30-loop | med | NFR-03 | Loop lookup by path string breaks on `(deleted)`/whitespace | inode-identity via `LOOP_GET_STATUS64` |
+| F-30 | med | VOL-05 | statvfs `f_bfree`/`f_bavail` + `Usage::percent` untested | 3 `usage_percent_*` unit tests (df definition) |
+| F-40 | med | PROC-02 | `ModeTracker` untested; ESC-restart parser gap | 11 `mode_tracker_tests` + ESC-restart fix |
+| F-09/F-16 | high | VOL-06/AC-3 | AC-3.x + VOL-06 tests `#[ignore]`d in volume.rs | migrated to the non-skippable suite; zero ignored tests remain |
 
-**Open — this branch (WP-A remaining)**
+**Open — this branch / next (WP-A remnant + WP-C follow-up)**
 
 | ID | Sev | Requirement | Finding | Plan |
 |---|---|---|---|---|
-| F-30 | med | VOL-05 | statvfs `f_bfree`/`f_bavail` + `Usage::percent` have no unit test | add unit test asserting df-parity within tolerance |
-| F-40 | med | PROC-02 | `ModeTracker` + pipe-vs-pty decision untested | pure unit tests (no host) |
-| F-09/F-16 | high | VOL-06/AC-3 | AC-3.x + VOL-06 tests `#[ignore]`d in volume.rs | migrate to non-skippable `tests/regression.rs` |
 | F-18 | med | NFR-03 | SIGKILLed attach leaks its containerd exec record | reap stale execs in `reconcile_orphans` |
 | F-28 | med | VOL-06 | `ensure_volume_mounted` accepts *any* fs at the mount point (identity not checked) | verify the mount is backed by the project's loop device |
 | F-35 | med | PROC-04 | exec-kill on stop untested | add regression test |
+| F-12 | high | AUTH-02 | Credential file bind-mount pins an inode → host rotation invisible in-container | WP-C follow-up (mount a dir, or re-resolve) |
 
 **Open — deferred to WP-B/C/D (tracked, not lost)**
 
@@ -133,7 +141,6 @@ disposition tracked here.
 |---|---|---|---|---|
 | F-24 | med | NFR-01 | No CI: Docker-freeness/lint/licensing unenforced | WP-B |
 | F-45 | low | NFR-02 | create/start latency measured nowhere | WP-B benchmark harness |
-| F-12 | high | AUTH-02 | Credential file bind-mount pins an inode → host rotation invisible in-container | WP-C (state locality) |
 | F-22/F-34 | med | VOL-05 | `list` trusts labels blind; destroyed volume shown as merely "unmounted" | WP-A/B follow-up |
 | F-25 | med | NFR-01 | `BASE_IMAGE` in a squattable Docker Hub namespace | pin by digest (WP-B reproducible build) |
 | F-37 | med | — | `image.rs` is a stub — base-image build orchestration never implemented | WP-B |

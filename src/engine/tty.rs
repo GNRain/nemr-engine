@@ -135,12 +135,17 @@ impl ModeTracker {
     /// because the parse state persists between calls.
     pub fn observe(&mut self, bytes: &[u8]) {
         for &byte in bytes {
+            // ESC restarts an escape sequence from any state (ECMA-48). Without
+            // this, an ESC arriving mid-CSI — a truncated or malformed sequence,
+            // which a killed full-screen program can easily emit — would be
+            // swallowed as an ordinary parameter byte and the following real
+            // sequence missed, so a mode left on would never be restored.
+            if byte == 0x1b {
+                self.state = ScanState::Escape;
+                continue;
+            }
             match self.state {
-                ScanState::Ground => {
-                    if byte == 0x1b {
-                        self.state = ScanState::Escape;
-                    }
-                }
+                ScanState::Ground => {}
                 ScanState::Escape => {
                     if byte == b'[' {
                         self.state = ScanState::Csi;
@@ -377,5 +382,97 @@ pub fn pump_until_stopped<W: Write>(
             // Idle and asked to stop: everything buffered has been drained.
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod mode_tracker_tests {
+    use super::ModeTracker;
+
+    fn restore_after(chunks: &[&[u8]]) -> String {
+        let mut t = ModeTracker::default();
+        for c in chunks {
+            t.observe(c);
+        }
+        t.restore_sequence()
+    }
+
+    /// A clean session — no private modes left on — restores nothing. This is
+    /// the whole point of tracking rather than blindly resetting: a well-behaved
+    /// program should cost zero restore bytes.
+    #[test]
+    fn clean_session_restores_nothing() {
+        assert_eq!(restore_after(&[b"hello world\n\x1b[0mnormal text"]), "");
+    }
+
+    /// A program that entered the alternate screen and never left it (killed
+    /// mid-run) must have it turned off, or the user's terminal is stuck on a
+    /// dead frame.
+    #[test]
+    fn alt_screen_left_on_is_restored() {
+        let r = restore_after(&[b"\x1b[?1049h drawing..."]);
+        assert!(r.contains("\x1b[?1049l"), "must leave the alternate screen: {r:?}");
+        assert!(r.ends_with("\x1b[0m"), "must reset attributes after: {r:?}");
+    }
+
+    /// Entered and left cleanly — nothing to undo. Emitting `\e[?1049l` here
+    /// would restore a stale cursor position; that was a real reported bug.
+    #[test]
+    fn alt_screen_entered_and_left_restores_nothing() {
+        assert_eq!(restore_after(&[b"\x1b[?1049h\x1b[?1049l"]), "");
+    }
+
+    /// Cursor polarity is inverted: `\e[?25l` hides, `\e[?25h` shows. A hidden
+    /// cursor left behind must be shown again.
+    #[test]
+    fn hidden_cursor_is_shown_again() {
+        let r = restore_after(&[b"\x1b[?25l"]);
+        assert!(r.contains("\x1b[?25h"), "must show the cursor: {r:?}");
+    }
+
+    #[test]
+    fn cursor_hidden_then_shown_restores_nothing() {
+        assert_eq!(restore_after(&[b"\x1b[?25l\x1b[?25h"]), "");
+    }
+
+    /// A sequence split across two reads must still be recognised — the parse
+    /// state persists between `observe` calls. This is the property that makes
+    /// it safe to feed arbitrary read() chunks.
+    #[test]
+    fn sequence_split_across_reads_is_recognised() {
+        let r = restore_after(&[b"\x1b[?10", b"49h rest"]);
+        assert!(r.contains("\x1b[?1049l"), "split sequence must be parsed: {r:?}");
+    }
+
+    /// Modes the tracker does not manage are left alone — guessing at a mode a
+    /// program manages itself risks more harm than the leak.
+    #[test]
+    fn untracked_mode_is_ignored() {
+        // 12 (cursor blink) is not in TRACKED.
+        assert_eq!(restore_after(&[b"\x1b[?12h"]), "");
+    }
+
+    #[test]
+    fn mouse_modes_left_on_are_disabled() {
+        let r = restore_after(&[b"\x1b[?1000h\x1b[?1006h"]);
+        assert!(r.contains("\x1b[?1000l") && r.contains("\x1b[?1006l"), "mouse off: {r:?}");
+    }
+
+    /// Alternate-screen restore must come first: leaving the buffer repositions
+    /// the cursor, so any other restore emitted before it would be undone.
+    #[test]
+    fn alt_screen_is_restored_before_mouse() {
+        let r = restore_after(&[b"\x1b[?1049h\x1b[?1000h"]);
+        let alt = r.find("\x1b[?1049l").expect("alt present");
+        let mouse = r.find("\x1b[?1000l").expect("mouse present");
+        assert!(alt < mouse, "alt-screen must restore before mouse: {r:?}");
+    }
+
+    /// Malformed CSI (no final byte, garbage params) must not panic and must not
+    /// wedge the parser against a following valid sequence.
+    #[test]
+    fn malformed_csi_does_not_panic_or_wedge() {
+        let r = restore_after(&[b"\x1b[?99999999999", b"\x1b[?1049h"]);
+        assert!(r.contains("\x1b[?1049l"), "recovers after garbage: {r:?}");
     }
 }

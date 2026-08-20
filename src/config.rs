@@ -43,6 +43,31 @@ pub const CONTAINER_WORKDIR: &str = "/workspace";
 /// The base image runs as root, so `HOME` is `/root`.
 pub const CONTAINER_CREDENTIALS: &str = "/root/.claude/.credentials.json";
 
+/// Session-critical Claude Code state, relocated onto the portable volume (M8).
+///
+/// WP-C1 measured that Claude Code writes its conversation history and session
+/// state under `/root/.claude/` on the **rootfs snapshot**, which does not
+/// travel with a volume export — so the whole premise of a portable session was
+/// unmet (see `docs/state-locality.md`). These two subtrees are bind-mounted
+/// from the volume so that history lives on the layer that travels.
+///
+/// The relocation is deliberately **surgical** rather than a blanket
+/// `CLAUDE_CONFIG_DIR` override: `/root/.claude.json` carries machine and
+/// account identity (`machineID`, `oauthAccount`) and `/root/.claude/.credentials.json`
+/// is the credential, and a whole-directory move would drag both onto the
+/// exportable volume, violating D-02. Only the history subtrees move; secrets
+/// and identity stay on the rootfs by construction.
+pub const CONTAINER_CLAUDE_PROJECTS: &str = "/root/.claude/projects";
+pub const CONTAINER_CLAUDE_SESSIONS: &str = "/root/.claude/sessions";
+
+/// Directory on the volume that holds the relocated session state. A dotted
+/// name so it does not clutter the user's `/workspace` listing, and a single
+/// parent so the bundle's exclusion/inclusion policy (D-06) can reason about
+/// `.nemr-state/**` as one unit.
+pub const VOLUME_STATE_DIR: &str = ".nemr-state";
+pub const VOLUME_STATE_PROJECTS: &str = ".nemr-state/projects";
+pub const VOLUME_STATE_SESSIONS: &str = ".nemr-state/sessions";
+
 /// Prefix used in the systemd cgroup scope name, `user.slice:<prefix>:<id>`.
 pub const CGROUP_PREFIX: &str = "nemr";
 

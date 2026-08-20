@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | NEMR-SPEC-001 |
-| Version | 1.25 |
+| Version | 1.28 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -41,6 +41,9 @@
 | 1.23 | Revision | Recorded that the privileged helper attaches loop devices via the `LOOP_CONFIGURE` ioctl (Linux 5.8+), a consequence of moving loop/mount off `losetup`/`mount` subprocesses. The helper checks the running kernel and fails with an actionable error below 5.8; no pre-5.8 `LOOP_SET_FD` fallback is shipped (below the Ubuntu 22.04+ floor, untestable on the reference host). Documented in PREREQUISITES.md Step 0. Section 3.3 (a Section 1-3 requirement) left unedited; recorded here per 4A.5. | Claude Code |
 | 1.24 | Revision | Added E-08 (privileged-helper escalation, already fixed) to the Section 9 escalation list for completeness — it was referenced from Section 11 and the revision history but not enumerated in Section 9. Recorded the shared `E-` escalation namespace between SPEC.md and docs/DECISIONS.md so the two do not collide (DECISIONS.md continues from E-09). | Claude Code |
 | 1.25 | Revision | Recorded the single-source-of-truth precedence rule for reconciliation (A6) and the recoverable `delete` ordering. Added `nemr reconcile`. Precedence rule captured in Section 11 pending Product Owner promotion to a Section 3 subsection (a new Section 3.x is Section 1-3 territory under 4A.5). | Claude Code |
+| 1.26 | Revision | Added the former Section 7 product gates to the Section 9 escalation ledger under the shared `E-` namespace: E-09 engine consumption model (RESOLVED — long-running user daemon, gRPC over a Unix domain socket, with implementation constraints), E-10 non-Linux hosts (open), E-11 open-core seam (open). Applied on Product Owner instruction; `docs/DECISIONS.md` remains the Product Owner-maintained ruling record. | Claude Code, per Product Owner instruction |
+| 1.27 | Revision | Recorded the WP-C1 state-locality findings (docs/state-locality.md): a real 3-turn session writes conversation history to /root/.claude/projects on the **rootfs snapshot**, not the portable volume; only the project file lands on the volume. Credentials are a host bind-mount (never on either portable layer); /root/.claude.json holds machine/account identity (machineID, oauthAccount). Findings captured in Section 11 pending Product Owner promotion to a Section 3 subsection (4A.5). | Claude Code |
+| 1.28 | Revision | Recorded M8 (WP-C2): session-critical Claude Code state relocated onto the portable volume by surgically bind-mounting `/root/.claude/projects` and `/root/.claude/sessions` from `<volume>/.nemr-state/`, keeping credentials and `/root/.claude.json` identity on the rootfs (D-02). Acceptance proven both with real Claude Code (--continue recalls after unmount/remount) and by a deterministic regression test. Section 11 deviation added pending Section 3 promotion. | Claude Code |
 
 ---
 
@@ -861,13 +864,42 @@ resolved unilaterally, if encountered during implementation:
   see Section 11 (2026-08-20). No decision required unless the Product Owner
   wants the threat model in Section 3.7 expanded to name the TOCTOU class
   explicitly.
+- E-09: **Engine consumption model — RESOLVED 2026-08-20.** A **long-running
+  user daemon, gRPC over a Unix domain socket.** Two already-resolved product
+  decisions require something running while the GUI is closed: the session lease
+  (`docs/DECISIONS.md` D-03) must keep heartbeating with the lid shut, and
+  snapshot-on-quiesce (D-04) must watch the transcript whenever a session is
+  live. A linked library would force both into a process the user closes, or
+  bolt on a background helper later — a daemon arrived at by accident with an
+  undesigned IPC surface. The daemon also makes single-writer *structural*: CLI
+  and GUI both exist and must not independently mutate containerd/mount state,
+  the divergence class WP A spent nine commits eliminating. Implementation
+  constraints (binding on all downstream work): **(1)** Unix domain socket, not
+  TCP — filesystem permissions are the authentication, and the E-10 remote
+  fallback swaps only the transport; **(2)** a version handshake from day one,
+  same pattern as the helper's protocol version, refusing a client/daemon
+  mismatch cleanly; **(3)** the daemon is a *client* of the containerd wrapper
+  crate, which stays usable standalone — not a replacement for it; **(4)** the
+  CLI talks to the daemon and keeps no second, direct path into containerd. Not
+  implemented yet: the ruling exists so WP B stops paying for library/daemon
+  optionality and WP C's design can assume it.
+- E-10: **Non-Linux hosts — OPEN.** Loopback ext4 plus rootless namespaces is
+  Linux-only; the product vision is a cross-platform GUI, and D-01 (local
+  compute) makes this a direct contradiction rather than a deferred concern.
+  Options to cost: bundled VM, WSL2 + a macOS story, or a remote-engine fallback
+  that partially reverses D-01. Ruling pending in `docs/DECISIONS.md`.
+- E-11: **Open-core seam — OPEN.** What stays in `nemr-engine` versus the
+  commercial portability/sync layer. Wants deciding while WP B is still moving
+  module boundaries, since retrofitting a seam is a multi-year tax. Ruling
+  pending in `docs/DECISIONS.md`.
 
 **Escalation ID namespace.** These `E-0x` IDs are the canonical escalation
-ledger. `docs/DECISIONS.md` records Product Owner rulings and continues the same
-`E-` series (so the next new escalation raised there is `E-09`, not a fresh
-`E-01`), alongside its own `D-0x` series for decisions raised outside the
-escalation path. The two files share one `E-` namespace to keep a cross-reference
-unambiguous.
+ledger, now including the former Section 7 product gates as E-09 (resolved),
+E-10 and E-11. `docs/DECISIONS.md` is the Product Owner's record of rulings and
+uses the same `E-` series plus its own `D-0x` series for decisions raised
+outside the escalation path. The two files share one `E-` namespace so a
+cross-reference is unambiguous; the Product Owner maintains `docs/DECISIONS.md`,
+and this section is kept in step with it.
 
 ---
 
@@ -902,6 +934,8 @@ Product Owner sign-off status.)*
 | 2026-08-20 | 3.7 | Privileged helper hardened against a demonstrated local root escalation | `cmd_mount` checked the mount point with `is_dir()` (which follows symlinks) and passed the path by name to `mount(8)`; a caller who owns `~/.local/share/nemr/mounts` replaced `<name>` with a symlink to `/etc` and the helper mounted an attacker-authored ext4 over `/etc`. The backing-file `losetup` and the post-mount `chown` were re-resolved by name after their checks (TOCTOU), and there was no lock against a concurrent double-mount. All paths are now resolved once to an `O_NOFOLLOW` descriptor and operated on via `/proc/self/fd`; the flow is serialised on the backing file. Section 3.7 already required "symlinks are refused" and all validation "inside the helper", so this is an implementation correction, not a requirement change — but it is security-critical, so it is flagged as E-08 for Product Owner visibility. | **Escalated (E-08)** |
 | 2026-08-20 | 3.3 | Helper requires Linux 5.8+ (LOOP_CONFIGURE) | Loop attach moved from a `losetup` subprocess to the `LOOP_CONFIGURE` ioctl (5.8+) as part of the E-08 hardening. The helper detects an older kernel and errors clearly; PREREQUISITES.md Step 0 now checks `uname -r`. Ubuntu 22.04+/24.04 satisfy it. No fallback to pre-5.8 `LOOP_SET_FD` — below the supported floor and untestable here. Section 3.3 is Section 1-3 territory (4A.5), so recorded here rather than edited into 3.3. | Recorded |
 | 2026-08-20 | 3 (new) | Single-source-of-truth precedence rule for state reconciliation (A6) | **Rule:** containerd's container records are the sole source of truth for which projects exist (there is no side database). Any mount, loop device, or snapshot with no owning container record is an orphan and is reclaimed by `nemr reconcile` / `reconcile_orphans`. The one exception is a backing *file*, which may hold user data: its mount and loop device are released, but the file is reported and kept, never auto-deleted. `delete` is ordered so the container record — the anchor `list`/`resolve` use — is removed last, after the volume is released and the backing file removed, so a failure mid-delete leaves the project listable and the delete retryable; reconciliation is the backstop for a crash after the record is gone. This wants promotion to a normative Section 3.10, which is Product Owner territory (4A.5); recorded here meanwhile. | Recorded, awaiting promotion |
+| 2026-08-20 | 3 (new) | State-locality findings (WP-C1) — session state is on the rootfs, not the volume | Measured empirically (docs/state-locality.md): conversation history (`/root/.claude/projects/<hash>/*.jsonl`), session state (`sessions/`) and config+identity (`/root/.claude.json`, holding machineID/oauthAccount) all land on the ephemeral rootfs snapshot; only project files (`/workspace/**`) land on the portable volume. The credential (`/root/.claude/.credentials.json`) is a read-only host bind-mount, on neither portable layer (D-02-compliant by construction). Resumption verified by history continuity across stop/start. **Consequence:** an export of the volume today carries no history — M8 must relocate `projects/` and `sessions/` onto the volume, surgically, keeping credentials and `.claude.json` identity off it. Wants promotion to a normative Section 3 subsection (PO territory, 4A.5). | Recorded, awaiting promotion |
+| 2026-08-20 | 3 (new) / M8 | Session-state relocation onto the portable volume (WP-C2) | `create` now creates `<volume>/.nemr-state/{projects,sessions}` and bind-mounts them over `/root/.claude/{projects,sessions}`, so conversation history lands on the layer that travels. Deliberately surgical: `/root/.claude.json` (machineID/oauthAccount) and `/root/.claude/.credentials.json` (the credential) stay on the rootfs, never on the volume (D-02). Verified end-to-end with real Claude Code — after stop + volume unmount + remount, `--continue` recalled the session; the transcript is on the volume backing image and absent from the rootfs snapshot upperdir — and by a non-#[ignore]d regression test (`m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted`). Wants promotion to a Section 3 subsection (PO territory, 4A.5). | Recorded, awaiting promotion |
 
 This table is the single source of truth for deviations (Section 8, 4A.5).
 `README.md` points here rather than reproducing it.
