@@ -17,10 +17,12 @@
 //! apparently-broken shell that needs a blind `reset`.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -72,6 +74,163 @@ impl Drop for RawMode {
             libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
         }
     }
+}
+
+/// Tracks which private terminal modes the container's programs have turned on.
+///
+/// # Why tracking, rather than resetting everything
+///
+/// A full-screen program interrupted mid-run never emits its own restores, and
+/// the modes it set — alternate screen, hidden cursor, mouse reporting — live
+/// in the *local* terminal emulator, so they outlive the container. Something
+/// has to undo them.
+///
+/// The obvious approach, emitting every disable sequence unconditionally on
+/// exit, is actively harmful. `\e[?1049l` does not merely leave the alternate
+/// screen: it **restores the cursor position saved when the buffer was
+/// switched**. Sent when the program never switched, it moves the cursor to a
+/// stale or default position. That was the cause of a report of `logout`
+/// followed by a screenful of blank lines and a cursor stranded far below it.
+///
+/// So the output stream is watched, and only modes observed to be *still on*
+/// when the session ends are turned off.
+#[derive(Default)]
+pub struct ModeTracker {
+    state: ScanState,
+    params: Vec<u16>,
+    digits: String,
+    private: bool,
+    /// Modes set with `\e[?Nh` and not yet cleared.
+    enabled: std::collections::BTreeSet<u16>,
+    /// The cursor is hidden. Tracked separately because its polarity is
+    /// inverted: `\e[?25h` *shows* the cursor.
+    cursor_hidden: bool,
+}
+
+#[derive(Default, Clone, Copy, PartialEq)]
+enum ScanState {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
+}
+
+impl ModeTracker {
+    /// Private modes worth undoing. Others are left alone: guessing at modes a
+    /// program manages itself risks doing more harm than the leak.
+    const TRACKED: [u16; 8] = [
+        47,   // alternate screen (legacy)
+        1000, // mouse click reporting
+        1002, // mouse drag reporting
+        1003, // all-motion mouse reporting
+        1006, // SGR mouse encoding
+        1047, // alternate screen, no cursor save
+        1049, // alternate screen with cursor save/restore
+        2004, // bracketed paste
+    ];
+
+    /// Feed output bytes on their way to the terminal.
+    ///
+    /// Incremental: a sequence split across two reads is still recognised,
+    /// because the parse state persists between calls.
+    pub fn observe(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            match self.state {
+                ScanState::Ground => {
+                    if byte == 0x1b {
+                        self.state = ScanState::Escape;
+                    }
+                }
+                ScanState::Escape => {
+                    if byte == b'[' {
+                        self.state = ScanState::Csi;
+                        self.params.clear();
+                        self.digits.clear();
+                        self.private = false;
+                    } else {
+                        self.state = ScanState::Ground;
+                    }
+                }
+                ScanState::Csi => match byte {
+                    b'?' => self.private = true,
+                    b'0'..=b'9' => self.digits.push(byte as char),
+                    b';' => self.take_param(),
+                    b'h' | b'l' => {
+                        self.take_param();
+                        if self.private {
+                            let set = byte == b'h';
+                            for mode in std::mem::take(&mut self.params) {
+                                self.record(mode, set);
+                            }
+                        }
+                        self.state = ScanState::Ground;
+                    }
+                    _ => self.state = ScanState::Ground,
+                },
+            }
+        }
+    }
+
+    fn take_param(&mut self) {
+        if let Ok(value) = self.digits.parse::<u16>() {
+            self.params.push(value);
+        }
+        self.digits.clear();
+    }
+
+    fn record(&mut self, mode: u16, set: bool) {
+        if mode == 25 {
+            self.cursor_hidden = !set;
+            return;
+        }
+        if !Self::TRACKED.contains(&mode) {
+            return;
+        }
+        if set {
+            self.enabled.insert(mode);
+        } else {
+            self.enabled.remove(&mode);
+        }
+    }
+
+    /// Sequences that undo what is still set, or empty if nothing is.
+    pub fn restore_sequence(&self) -> String {
+        let mut restore = String::new();
+
+        // Alternate-screen modes first: leaving the buffer repositions the
+        // cursor, so anything else would be undone by it.
+        for mode in [1049u16, 1047, 47] {
+            if self.enabled.contains(&mode) {
+                restore.push_str(&format!("\x1b[?{mode}l"));
+            }
+        }
+        for mode in [1000u16, 1002, 1003, 1006, 2004] {
+            if self.enabled.contains(&mode) {
+                restore.push_str(&format!("\x1b[?{mode}l"));
+            }
+        }
+        if self.cursor_hidden {
+            restore.push_str("\x1b[?25h");
+        }
+        if !restore.is_empty() {
+            // Only reset attributes if something else needed undoing; a clean
+            // session should emit nothing at all.
+            restore.push_str("\x1b[0m");
+        }
+        restore
+    }
+}
+
+/// Whether this process's stdin is a terminal.
+///
+/// Decides whether an attach session allocates a pty. A pty is what makes an
+/// interactive shell behave, but it also changes how end-of-input works: a pty
+/// has no EOF, so a scripted `echo cmd | nemr attach` can never tell the shell
+/// its input has finished. Without a terminal, stdin is an ordinary pipe and
+/// closing it produces a real EOF, which shells handle correctly.
+pub fn stdin_is_terminal() -> bool {
+    // SAFETY: stdin's descriptor is valid for the duration of the call.
+    unsafe { libc::isatty(std::io::stdin().as_raw_fd()) == 1 }
 }
 
 /// Current terminal size as `(width, height)`, if stdin is a terminal.
@@ -144,6 +303,80 @@ pub fn pump<R: Read, W: Write>(mut from: R, mut to: W) {
                     break;
                 }
             }
+        }
+    }
+}
+
+/// Copy from a FIFO to `to`, stopping once `stop` is set and no data remains.
+///
+/// # Why this cannot simply read until EOF
+///
+/// [`open_fifo`] opens `O_RDWR` to avoid the blocking-open deadlock, which
+/// means **this process holds a write end of the FIFO itself**. A FIFO reports
+/// EOF only when every write end is closed, so a plain read loop never sees
+/// EOF here even after the container's process exits and the shim closes its
+/// side — it blocks forever on a pipe nobody will ever write to again.
+///
+/// That is not theoretical: it deadlocked `attach` on exit. The exec had
+/// finished and `wait_exec` had returned, but joining the output pump blocked
+/// indefinitely, leaving the CLI hung.
+///
+/// So the loop polls with a timeout and checks `stop` when idle. Once the
+/// caller sets `stop`, any buffered output is drained first — a poll timeout
+/// with the flag set is what ends it, so no trailing bytes are lost.
+pub fn pump_until_stopped<W: Write>(
+    from: File,
+    mut to: W,
+    stop: Arc<AtomicBool>,
+    tracker: Option<Arc<std::sync::Mutex<ModeTracker>>>,
+) {
+    const POLL_TIMEOUT_MS: libc::c_int = 100;
+
+    let mut from = from;
+    let fd = from.as_raw_fd();
+
+    // SAFETY: `fd` is valid and owned by `from` for the whole function.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags != -1 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+
+    let mut buffer = [0u8; 8192];
+    loop {
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+
+        // SAFETY: `poll_fd` is a valid, correctly-sized pollfd.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, POLL_TIMEOUT_MS) };
+
+        if ready > 0 && (poll_fd.revents & libc::POLLIN) != 0 {
+            match from.read(&mut buffer) {
+                Ok(0) => {
+                    // A genuine EOF, which happens if every writer including
+                    // ours has closed. Nothing more is coming.
+                    break;
+                }
+                Ok(n) => {
+                    if let Some(tracker) = &tracker {
+                        if let Ok(mut tracker) = tracker.lock() {
+                            tracker.observe(&buffer[..n]);
+                        }
+                    }
+                    if to.write_all(&buffer[..n]).is_err() || to.flush().is_err() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => break,
+            }
+        } else if stop.load(Ordering::Relaxed) {
+            // Idle and asked to stop: everything buffered has been drained.
+            break;
         }
     }
 }

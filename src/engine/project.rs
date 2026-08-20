@@ -14,6 +14,57 @@ use crate::containerd::client::ContainerdClient;
 use crate::containerd::containers::{BindMount, ContainerSpec};
 use crate::engine::volume::{HelperOps, PrivilegedOps, Volume, VolumePaths, VolumeSize};
 
+/// Runs in the container's shell before every prompt, so a prompt never lands
+/// on top of the previous command's output.
+///
+/// # The problem
+///
+/// A full-screen program interrupted with Ctrl+C — Claude Code being the case
+/// that matters here — exits with the cursor wherever it happened to be
+/// rendering, and often with the cursor hidden and colours still set. Bash then
+/// draws its next prompt at that position, so the prompt and everything typed
+/// afterwards overwrites the program's output. Recovering means running
+/// `clear`, which is a poor thing to ask of every user after every session.
+///
+/// # The fix
+///
+/// Three parts, all emitted before each prompt:
+///
+/// 1. Show the cursor and reset attributes, undoing what the interrupted
+///    program left set.
+/// 2. Move to a fresh line, but *only* when the previous output ended
+///    mid-line. Printing exactly `$COLUMNS` spaces from column `c` lands the
+///    cursor at column `c` of the next line when `c > 0`, and — thanks to
+///    deferred wrap — leaves it on the current line when `c == 0`. The
+///    following `\r` returns to column 0. So a command that ended cleanly gets
+///    no blank line, and one that ended mid-line gets exactly one. This is the
+///    partial-line trick zsh uses for `PROMPT_SP`, with spaces instead of
+///    zsh's inverse `%` marker so nothing visible is left behind.
+/// 3. Erase from the cursor to the end of the screen (`\e[J`).
+///
+/// Step 3 is what handles the interrupted-TUI case, and step 2 alone does not.
+/// An Ink-based program like Claude Code re-renders by moving the cursor *up*
+/// over its own frame; interrupted mid-frame, it leaves the cursor above output
+/// that is still on screen, at column 0. Bash then draws its prompt there, and
+/// the prompt — plus everything typed after it — overwrites the stale frame
+/// line by line. Measured against a terminal emulator, the prompt landed on top
+/// of "claude output line 7" and `logout` on top of line 8.
+///
+/// Erasing below the cursor is safe at prompt time because a well-behaved
+/// command leaves the cursor after its last line, where there is nothing to
+/// erase. Anything still below is a frame nobody is managing any more, and it
+/// is going to be overwritten regardless — erased is strictly better than
+/// garbled. Scrollback above the cursor is untouched, so the session's history
+/// remains readable.
+///
+/// Set through the exec's environment rather than the image, because it is a
+/// property of an interactive attach session rather than of the image itself —
+/// and bash reads `PROMPT_COMMAND` from the environment.
+const PROMPT_TIDY: &str = concat!(
+    "PROMPT_COMMAND=",
+    r#"printf '\e[?25h\e[0m%*s\r\e[J' "${COLUMNS:-80}" ''"#,
+);
+
 /// Label keys written onto the container record.
 ///
 /// Prefixed so engine metadata is distinguishable from anything else that
@@ -215,6 +266,45 @@ pub async fn stop(client: &ContainerdClient, name: &str) -> Result<()> {
     client.stop_task(&container_id).await
 }
 
+/// Remove FIFO directories left behind by attach processes that are gone.
+///
+/// A clean exit removes its own directory. One killed outright cannot, so these
+/// accumulate in `$XDG_RUNTIME_DIR` (NFR-03). Each directory carries the PID
+/// that created it, so a live session's directory is never touched — deleting
+/// one belonging to a long-running attach would break it, which rules out
+/// simpler age-based sweeping.
+///
+/// Best-effort throughout: this is tidying, and must never obstruct an attach.
+fn sweep_stale_attach_dirs() {
+    let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return;
+    };
+    let base = std::path::PathBuf::from(runtime_dir).join("nemr");
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+
+        // attach-<pid>-<nanos>
+        let Some(pid) = name
+            .strip_prefix("attach-")
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+
+        // /proc/<pid> existing is the liveness test; absent means the creator
+        // is gone and the directory is safe to remove.
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Ensure a project's volume is mounted, remounting it if not (VOL-06).
 ///
 /// Remount rather than refuse: the backing file is intact and the privileged
@@ -305,14 +395,19 @@ pub async fn attach(client: &ContainerdClient, name: &str) -> Result<u32> {
         );
     }
 
-    // A unique exec id per attach, so concurrent sessions do not collide.
+    // A unique exec id per attach, so concurrent sessions do not collide. The
+    // PID is included so a directory left behind by a killed process can be
+    // identified and swept later — see `sweep_stale_attach_dirs`.
     let exec_id = format!(
-        "attach-{}",
+        "attach-{}-{}",
+        std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
+
+    sweep_stale_attach_dirs();
 
     let io_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
@@ -322,23 +417,39 @@ pub async fn attach(client: &ContainerdClient, name: &str) -> Result<u32> {
     std::fs::create_dir_all(&io_dir)
         .with_context(|| format!("failed to create {}", io_dir.display()))?;
 
+    // A pty only when stdin really is a terminal. This is what `docker exec -t`
+    // does, and it matters for more than cosmetics: a pty has no EOF, so a
+    // scripted `echo cmd | nemr attach` could never tell the shell its input had
+    // finished. Neither writing EOT nor containerd's CloseIO ends a pty-backed
+    // session — both were tried, and both hung indefinitely. Without a terminal
+    // stdin is an ordinary pipe, closing it is a real EOF, and the shell exits
+    // on its own with its own status.
+    let use_terminal = tty::stdin_is_terminal();
+
     let io = ExecIo {
         stdin: io_dir.join("stdin"),
         stdout: io_dir.join("stdout"),
-        terminal: true,
+        // A pty merges stderr into the same stream; only a pipe-backed session
+        // needs a separate one.
+        stderr: (!use_terminal).then(|| io_dir.join("stderr")),
+        terminal: use_terminal,
     };
     tty::make_fifo(&io.stdin)?;
     tty::make_fifo(&io.stdout)?;
+    if let Some(stderr) = &io.stderr {
+        tty::make_fifo(stderr)?;
+    }
 
     let process = serde_json::json!({
-        "terminal": true,
+        "terminal": use_terminal,
         "user": { "uid": 0, "gid": 0 },
         "args": ["/bin/bash", "-l"],
         "env": [
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HOME=/root",
             "TERM=".to_string() + &std::env::var("TERM").unwrap_or_else(|_| "xterm".into()),
-            format!("USE_BUILTIN_RIPGREP=0"),
+            "USE_BUILTIN_RIPGREP=0".to_string(),
+            PROMPT_TIDY.to_string(),
         ],
         "cwd": config::CONTAINER_WORKDIR,
         "capabilities": {
@@ -363,6 +474,7 @@ pub async fn attach(client: &ContainerdClient, name: &str) -> Result<u32> {
     // the process starting and us being ready to read.
     let stdin_fifo = tty::open_fifo(&io.stdin)?;
     let stdout_fifo = tty::open_fifo(&io.stdout)?;
+    let stderr_fifo = io.stderr.as_ref().map(|p| tty::open_fifo(p)).transpose()?;
 
     // Raw mode is enabled only once the exec is about to run, and the guard
     // restores the terminal on every exit path below.
@@ -374,14 +486,68 @@ pub async fn attach(client: &ContainerdClient, name: &str) -> Result<u32> {
         let _ = client.resize_pty(&container_id, &exec_id, width, height).await;
     }
 
-    // Blocking IO on dedicated threads. The gRPC side stays async on the
-    // runtime; mixing is simpler here than making FIFO reads async, and these
-    // threads exit when their pipe closes.
-    let to_container = std::thread::spawn(move || {
+    // Blocking IO off the async runtime. The gRPC side stays async; mixing is
+    // simpler here than making FIFO reads async.
+    //
+    // The stdin pump is a tracked task rather than a detached thread because
+    // its *completion* is load-bearing: when local input is exhausted the exec
+    // must be told, or a shell reading piped input never sees EOF and never
+    // exits. See the select loop below.
+    // A second handle on the stdin FIFO, kept so EOT can be written after the
+    // pump has consumed local input and given up ownership of its copy.
+    // Kept so end-of-input can be signalled after the pump has finished with
+    // its own copy. Held in an Option because, for a pipe-backed session,
+    // *dropping* it is the signal: the shim only sees EOF on the FIFO once
+    // every write end is closed, and ours would otherwise hold it open forever.
+    let mut eof_handle = Some(
+        stdin_fifo
+            .try_clone()
+            .context("failed to duplicate the stdin FIFO handle")?,
+    );
+
+    // A plain thread, deliberately not `spawn_blocking`.
+    //
+    // Interactively this pump blocks in `read()` on the user's terminal, which
+    // never reaches EOF, so it can never finish. Tokio cannot cancel a blocking
+    // task once it has started, and dropping the runtime *waits* for the
+    // blocking pool to drain — so the process could not exit after the shell
+    // did. The symptom was `exit` printing "logout" and then hanging forever,
+    // leaving the terminal unusable.
+    //
+    // A detached OS thread dies with the process instead. Completion is
+    // reported over a channel, since `select!` still needs to know when local
+    // input has run out.
+    let (stdin_done_tx, stdin_done) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
         tty::pump(std::io::stdin(), stdin_fifo);
+        if std::env::var_os("NEMR_DEBUG_ATTACH").is_some() {
+            eprintln!("[debug] stdin pump finished");
+        }
+        // Failure means the receiver is gone because the session already
+        // ended, which is not an error.
+        let _ = stdin_done_tx.send(());
     });
+    tokio::pin!(stdin_done);
+    // The output pump needs an explicit stop signal rather than relying on EOF;
+    // see `pump_until_stopped` for why a FIFO opened O_RDWR never reports one.
+    let output_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pump_stop = output_stop.clone();
+
+    // Only an interactive session can leave the local terminal in a bad state,
+    // so only that one is worth watching.
+    let modes = use_terminal
+        .then(|| std::sync::Arc::new(std::sync::Mutex::new(tty::ModeTracker::default())));
+    let pump_modes = modes.clone();
+
     let from_container = std::thread::spawn(move || {
-        tty::pump(stdout_fifo, std::io::stdout());
+        tty::pump_until_stopped(stdout_fifo, std::io::stdout(), pump_stop, pump_modes);
+    });
+
+    let errors_from_container = stderr_fifo.map(|fifo| {
+        let stop = output_stop.clone();
+        std::thread::spawn(move || {
+            tty::pump_until_stopped(fifo, std::io::stderr(), stop, None);
+        })
     });
 
     // Forward window resizes for as long as the session lasts.
@@ -390,25 +556,106 @@ pub async fn attach(client: &ContainerdClient, name: &str) -> Result<u32> {
     let mut winch = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
         .context("failed to install SIGWINCH handler")?;
 
+    // Fallback timer, armed only if signalling EOF the polite way does not get
+    // the process to exit. Created up front so `select!` always has something
+    // to poll; it does nothing until armed.
+    let fallback = tokio::time::sleep(std::time::Duration::from_secs(0));
+    tokio::pin!(fallback);
+    let mut fallback_armed = false;
+    let mut eof_signalled = false;
+
     let exit_code = loop {
         tokio::select! {
             status = client.wait_exec(&container_id, &exec_id) => break status?,
+
             _ = winch.recv() => {
                 if let Some((width, height)) = tty::window_size() {
                     let _ = client.resize_pty(&resize_client, &resize_exec, width, height).await;
                 }
             }
+
+            // Local input ran out — a pipe or heredoc rather than a terminal.
+            // Signal it now, while still waiting: doing it *after* `wait_exec`
+            // returns deadlocks, since the shell will not exit until it sees
+            // EOF and we would not send EOF until it exits. Interactively this
+            // never shows, because a terminal's stdin never reaches EOF.
+            _ = &mut stdin_done, if !eof_signalled => {
+                eof_signalled = true;
+                if std::env::var_os("NEMR_DEBUG_ATTACH").is_some() {
+                    eprintln!("[debug] local stdin exhausted; sending EOT");
+                }
+
+                if use_terminal {
+                    // On a pty, EOF is EOT (0x04) written into the terminal
+                    // rather than a closed descriptor. Best-effort: whether it
+                    // ends the session depends on the program, hence the
+                    // fallback below.
+                    if let Some(fifo) = eof_handle.as_ref() {
+                        use std::io::Write;
+                        let mut fifo = fifo;
+                        let _ = fifo.write_all(&[0x04]);
+                        let _ = fifo.flush();
+                    }
+
+                    fallback.as_mut().reset(
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                    );
+                    fallback_armed = true;
+                } else {
+                    // A pipe. Dropping our handle is what produces the EOF: the
+                    // shim's copier is reading this FIFO, and a FIFO only
+                    // reports EOF once *every* write end is closed — including
+                    // the one this process holds. CloseIO alone did not end the
+                    // session, because our handle kept the pipe alive.
+                    drop(eof_handle.take());
+                    let _ = client.close_exec_stdin(&container_id, &exec_id).await;
+                }
+            }
+
+            // The process ignored EOT — not a shell, or one not reading stdin.
+            // Force the issue rather than waiting forever; the exit status is
+            // then SIGHUP-flavoured, but a wrong code beats a hang.
+            _ = &mut fallback, if fallback_armed => {
+                fallback_armed = false;
+                if std::env::var_os("NEMR_DEBUG_ATTACH").is_some() {
+                    eprintln!("[debug] EOT ignored; forcing stdin closed");
+                }
+                let _ = client.close_exec_stdin(&container_id, &exec_id).await;
+            }
         }
     };
 
-    let _ = client.close_exec_stdin(&container_id, &exec_id).await;
+    if !eof_signalled {
+        let _ = client.close_exec_stdin(&container_id, &exec_id).await;
+    }
     let _ = client.delete_exec(&container_id, &exec_id).await;
 
-    // The output pump ends when the shim closes its end of the FIFO. The stdin
-    // pump is blocked reading the user's terminal and will not notice the
-    // session ended, so it is left to die with the process rather than joined.
-    drop(from_container.join());
-    drop(to_container);
+    // Tell the output pump to drain and stop. It cannot detect this itself: we
+    // hold a write end of the FIFO, so it would never see EOF and joining it
+    // would hang — which is exactly what `attach` used to do on exit.
+    output_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = from_container.join();
+    if let Some(handle) = errors_from_container {
+        let _ = handle.join();
+    }
+
+    // Undo display modes the container's programs left on — and only those.
+    // Emitted before the termios guard drops, so the terminal is put back in
+    // one pass.
+    if let Some(modes) = &modes {
+        if let Ok(modes) = modes.lock() {
+            let restore = modes.restore_sequence();
+            if !restore.is_empty() {
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(restore.as_bytes());
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+
+    // The stdin pump thread may still be blocked reading the user's terminal.
+    // It is deliberately left alone: it holds nothing the process needs
+    // released, and it is torn down when the process exits.
     let _ = std::fs::remove_dir_all(&io_dir);
 
     Ok(exit_code)

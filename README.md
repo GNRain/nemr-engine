@@ -595,6 +595,30 @@ module system (`src/lib.rs`, the two `mod.rs` files, the two `src/bin/`
 programs) plus one documentation-coverage note. None changes the layering the
 specification mandates.
 
+## End-to-end regression test (Milestone 7, AC-7.2)
+
+`scripts/e2e_smoke_test.sh` is the **standing regression test for all future
+engine changes**. Run it before merging anything that touches the engine, the
+privileged helper, or the base image:
+
+```bash
+export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
+./scripts/e2e_smoke_test.sh                  # full run, including the API round-trip
+NEMR_SKIP_API=1 ./scripts/e2e_smoke_test.sh  # skip the API round-trip
+```
+
+It drives the complete lifecycle non-interactively — create, start, attach with
+a scripted Claude Code invocation, stop, restart, list, delete — plus reboot
+survival (VOL-06) and a host-cleanliness sweep. Exit codes: `0` all assertions
+passed, `1` an assertion failed, `2` prerequisites missing (see
+[PREREQUISITES.md](PREREQUISITES.md)).
+
+It deliberately asserts on **host** state — loop devices, `/proc/self/mountinfo`
+entries, backing files, systemd scopes — rather than only on what the engine
+reports. The engine agreeing with itself is not evidence: VOL-05 and VOL-06 were
+both cases where every engine-reported check was green while the data was going
+to the wrong filesystem.
+
 ## Pending decisions
 
 Recorded here when made, per Section 11:
