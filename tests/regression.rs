@@ -396,3 +396,122 @@ fn m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted() {
         project::stop(&client, &project.name).await.ok();
     });
 }
+
+/// VOL-05 / AC-3.3 — writing past the quota fails with a clear ENOSPC, never a
+/// silent short write. Migrated from a `#[ignore]`d volume.rs test into the
+/// non-skippable suite.
+#[test]
+fn vol_write_past_quota_fails_with_enospc() {
+    use std::io::Write;
+    if !require_host(HostRequirements::VOLUME) {
+        return;
+    }
+    let name = common::unique_name("enospc");
+    common::purge(&name);
+    let paths = VolumePaths::from_env().unwrap();
+    let volume = Volume::create(&name, VolumeSize::Small, paths, HelperOps::new())
+        .unwrap_or_else(|e| panic!("provision: {e:#}"));
+
+    let target = volume.mount_point().join("filler.bin");
+    let mut file = std::fs::File::create(&target).expect("volume writable");
+    let chunk = vec![0u8; 4 * 1024 * 1024];
+    let mut written: u64 = 0;
+    let error = loop {
+        match file.write_all(&chunk).and_then(|()| file.flush()) {
+            Ok(()) => {
+                written += chunk.len() as u64;
+                assert!(
+                    written < VolumeSize::Small.bytes() * 2,
+                    "wrote {written} bytes into a {}-byte volume without hitting a limit — the \
+                     quota is not enforced",
+                    VolumeSize::Small.bytes()
+                );
+            }
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(
+        error.raw_os_error(),
+        Some(28),
+        "expected ENOSPC (28) at the quota, got {error:?}"
+    );
+    assert!(written < VolumeSize::Small.bytes(), "must not exceed the volume size");
+    drop(volume);
+    common::purge(&name);
+}
+
+/// VOL-04 / AC-3.4 — a fault after a successful mount must leave no orphaned
+/// loop device or mount (RAII cleanup). Migrated from `#[ignore]`.
+#[test]
+fn vol_fault_injection_leaves_no_orphans() {
+    use nemr_engine::engine::volume::VolumeSize as VS;
+    if !require_host(HostRequirements::VOLUME) {
+        return;
+    }
+
+    // Wraps the real helper but fails *after* the mount succeeds — host state is
+    // genuinely live at that point, so cleanup is load-bearing, not cosmetic.
+    struct FailAfterMount {
+        inner: HelperOps,
+    }
+    impl PrivilegedOps for FailAfterMount {
+        fn attach_and_mount(&self, name: &str, size: VS) -> anyhow::Result<()> {
+            self.inner.attach_and_mount(name, size)?;
+            anyhow::bail!("injected fault: failure after mount succeeded")
+        }
+        fn unmount_and_detach(&self, name: &str) -> anyhow::Result<()> {
+            self.inner.unmount_and_detach(name)
+        }
+    }
+
+    let name = common::unique_name("faultinj");
+    common::purge(&name);
+    let paths = VolumePaths::from_env().unwrap();
+
+    let result = Volume::create(&name, VS::Small, paths.clone(), FailAfterMount { inner: HelperOps::new() });
+    assert!(result.is_err(), "the injected fault must fail creation");
+
+    // No residue: the mount genuinely happened, then failed — Drop must release it.
+    assert!(!is_mounted(&paths.mount_point(&name)), "no orphaned mount after the fault");
+    let loop_attached = std::process::Command::new("losetup")
+        .arg("-a")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("{name}.img")))
+        .unwrap_or(false);
+    assert!(!loop_attached, "no orphaned loop device after the fault");
+    common::purge(&name);
+}
+
+/// VOL-06 — remount is idempotent: two `ensure_volume_mounted` calls must not
+/// stack a second loop device. Migrated from `#[ignore]`.
+#[test]
+fn vol_remount_is_idempotent() {
+    if !require_host(HostRequirements::VOLUME) {
+        return;
+    }
+    let name = common::unique_name("idem");
+    common::purge(&name);
+    let paths = VolumePaths::from_env().unwrap();
+    let volume = Volume::create(&name, VolumeSize::Small, paths.clone(), HelperOps::new())
+        .unwrap_or_else(|e| panic!("provision: {e:#}"));
+    let mount_point = volume.mount_point();
+    let _ = volume.persist();
+
+    let device_of = || {
+        std::process::Command::new("losetup")
+            .args(["-j", &paths.image_file(&name).to_string_lossy()])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+            .unwrap_or(0)
+    };
+    let before = device_of();
+    project::ensure_volume_mounted(&name).unwrap();
+    project::ensure_volume_mounted(&name).unwrap();
+    let after = device_of();
+
+    assert!(is_mounted(&mount_point), "still mounted");
+    assert_eq!(before, after, "repeated remount must not attach a second loop device");
+    assert_eq!(after, 1, "exactly one loop device backs the image");
+    common::purge(&name);
+}
