@@ -142,12 +142,77 @@ pub fn openat_dir(parent: &OwnedFd, name: &CString) -> Result<OwnedFd, String> {
     })
 }
 
-/// The `/proc/self/fd/<n>` name for a descriptor.
+/// The `/proc/self/fd/<n>` name for a descriptor, resolved **in this process**.
 ///
-/// A syscall handed this path resolves it to the descriptor's pinned inode, so
-/// it is immune to a concurrent rename or symlink swap of the original path.
+/// A syscall made by the helper itself and handed this path resolves it to the
+/// descriptor's pinned inode, so it is immune to a concurrent rename or symlink
+/// swap of the original path. This only holds in-process: `/proc/self` resolves
+/// against the calling process's pid, so handing this path to a *child* process
+/// names an entry in the child's fd table, not the helper's — which is exactly
+/// why the mount and loop operations are done via direct syscalls here rather
+/// than by spawning `mount`/`losetup`.
 pub fn proc_fd_path(fd: &impl AsRawFd) -> String {
     format!("/proc/self/fd/{}", fd.as_raw_fd())
+}
+
+/// The `/proc/self/fd/<parent>/<name>` path for a child of a pinned directory.
+///
+/// Names a directory entry relative to a descriptor whose ancestors cannot be
+/// re-resolved, without holding a descriptor open *into* the child — which
+/// matters for `umount`, where an open descriptor into the mount would make the
+/// unmount fail `EBUSY`. Safe because the parent is pinned and, while the child
+/// is a mount point, it cannot be renamed out from under us (renaming a mount
+/// point is itself `EBUSY`).
+pub fn proc_child_path(parent: &impl AsRawFd, name: &CString) -> String {
+    format!(
+        "/proc/self/fd/{}/{}",
+        parent.as_raw_fd(),
+        name.to_string_lossy()
+    )
+}
+
+/// `mount(2)`, called in-process so a `/proc/self/fd` target resolves against
+/// this process. `source` is a `/dev/loopN` device path (root-owned, not
+/// caller-controlled); `target` is a `/proc/self/fd/...` path pinned to a
+/// validated descriptor.
+pub fn mount_ext4(source: &str, target: &str) -> Result<(), String> {
+    let source = CString::new(source).map_err(|_| "source has an interior NUL".to_string())?;
+    let target = CString::new(target).map_err(|_| "target has an interior NUL".to_string())?;
+    let fstype = c"ext4";
+    // SAFETY: all pointers are valid NUL-terminated strings for the call; data
+    // is NULL, meaning ext4 defaults.
+    let rc = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "mount({} -> {}) failed: {}",
+            source.to_string_lossy(),
+            target.to_string_lossy(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// `umount2(2)`, called in-process.
+pub fn umount(target: &str) -> Result<(), String> {
+    let c_target = CString::new(target).map_err(|_| "target has an interior NUL".to_string())?;
+    // SAFETY: c_target is a valid NUL-terminated string for the call.
+    let rc = unsafe { libc::umount2(c_target.as_ptr(), 0) };
+    if rc != 0 {
+        return Err(format!(
+            "umount({target}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 /// `fstat` a descriptor.

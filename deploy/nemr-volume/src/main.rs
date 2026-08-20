@@ -32,16 +32,12 @@
 //! nemr-volume unmount <name>
 //! ```
 
+mod loopdev;
 mod safe;
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, ExitCode};
-
-/// Absolute paths. Never resolved via `PATH`, which the caller could influence.
-const LOSETUP: &str = "/usr/sbin/losetup";
-const MOUNT: &str = "/usr/bin/mount";
-const UMOUNT: &str = "/usr/bin/umount";
+use std::process::ExitCode;
 
 const MAX_NAME_LEN: usize = 32;
 const VALID_SIZES: [&str; 3] = ["500MB", "2GB", "10GB"];
@@ -252,60 +248,6 @@ fn audit(message: &str) {
     eprintln!("[elevated] {message}");
 }
 
-/// Run a command with a fixed environment, returning trimmed stdout.
-fn run_command(program: &str, args: &[&str]) -> Result<String, String> {
-    audit(&format!("{program} {}", args.join(" ")));
-
-    let output = Command::new(program)
-        .args(args)
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .output()
-        .map_err(|e| format!("failed to execute {program}: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "{program} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Loop device currently backing the file at descriptor `image_fd`, if any.
-///
-/// Matches on the backing file's **device and inode numbers**, read from
-/// `losetup`'s own `BACK-FILE-INO`/`BACK-FILE-DEV` output, rather than on the
-/// path string. The path is unreliable twice over: a backing file that has been
-/// unlinked is reported as `/path (deleted)` (which broke `-j <path>`), and any
-/// path containing whitespace is split wrongly by whitespace tokenisation. The
-/// inode identity is what actually ties a loop device to the file we hold open,
-/// and it cannot be spoofed by a rename.
-fn loop_device_for_fd(image_fd: &impl std::os::fd::AsRawFd) -> Result<Option<String>, String> {
-    let st = safe::fstat(image_fd)?;
-    let table = run_command(
-        LOSETUP,
-        &["-l", "-O", "NAME,BACK-FILE-INO,BACK-FILE-DEV", "--raw", "-n"],
-    )?;
-
-    for line in table.lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(device), Some(ino), Some(dev)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let (Ok(ino), Ok(dev)) = (ino.parse::<u64>(), dev.parse::<u64>()) else {
-            continue;
-        };
-        if ino == st.st_ino && dev == st.st_dev {
-            return Ok(Some(device.to_string()));
-        }
-    }
-    Ok(None)
-}
-
 /// Attach the backing file to a loop device, mount it, and hand ownership to
 /// the invoking user — as one operation (PRIV-06).
 ///
@@ -373,23 +315,21 @@ fn cmd_mount(invoker: &Invoker, name: &str, size: &str) -> Result<(), String> {
         mount_path.display()
     ));
 
-    // Attach the loop device to the pinned backing-file descriptor. --nooverlap
-    // refuses a second device for the same file as defence in depth alongside
-    // the flock. The device is derived by losetup, never supplied by the caller.
-    let image_fd_path = safe::proc_fd_path(&image_fd);
-    let device = run_command(
-        LOSETUP,
-        &["--find", "--show", "--nooverlap", &image_fd_path],
-    )?;
+    // Attach the loop device to the pinned backing-file descriptor, in-process
+    // via ioctl — no subprocess, so no second path resolution and no fd table
+    // to lose across an exec.
+    let loop_number = loopdev::attach(&image_fd)?;
+    let device = loopdev::device_path(loop_number);
     audit(&format!("attached {} to {device}", image_path.display()));
 
-    // Mount onto the pinned mount-point descriptor. Even if the caller swaps
-    // the mount-point name for a symlink now, the target resolves through the
-    // descriptor to the inode we validated.
-    let mount_fd_path = safe::proc_fd_path(&mount_dir_fd);
-    if let Err(error) = run_command(MOUNT, &[&device, &mount_fd_path]) {
+    // Mount onto the pinned mount-point descriptor, in-process. `/proc/self/fd`
+    // resolves against the helper here, so even if the caller swaps the
+    // mount-point name for a symlink now, the target still resolves to the inode
+    // we validated. The loop device path is root-owned, not caller-controlled.
+    let mount_target = safe::proc_fd_path(&mount_dir_fd);
+    if let Err(error) = safe::mount_ext4(&device, &mount_target) {
         audit(&format!("mount failed, detaching {device}"));
-        let _ = run_command(LOSETUP, &["-d", &device]);
+        let _ = loopdev::detach(loop_number);
         return Err(error);
     }
     audit(&format!("mounted {device} at {}", mount_path.display()));
@@ -405,8 +345,8 @@ fn cmd_mount(invoker: &Invoker, name: &str, size: &str) -> Result<(), String> {
         .and_then(|mounted_root_fd| safe::fchown(&mounted_root_fd, invoker.uid, invoker.gid));
     if let Err(error) = chown_result {
         audit("chown failed, unwinding mount and loop device");
-        let _ = run_command(UMOUNT, &[&mount_fd_path]);
-        let _ = run_command(LOSETUP, &["-d", &device]);
+        let _ = safe::umount(&safe::proc_child_path(&parent_fd, &child));
+        let _ = loopdev::detach(loop_number);
         return Err(format!(
             "mounted but failed to chown to {}:{}: {error}. Mount and loop device were released.",
             invoker.uid, invoker.gid
@@ -441,16 +381,16 @@ fn cmd_unmount(invoker: &Invoker, name: &str) -> Result<(), String> {
     let lock_fd = safe::open_beneath(&image_path, libc::O_RDONLY).ok();
     let _lock = lock_fd.as_ref().map(safe::FileLock::acquire).transpose()?;
 
-    // Unmount via the pinned descriptor so we cannot be tricked into unmounting
-    // a path the caller has since redirected. Tolerate the mount point or its
-    // parent being gone — this runs on cleanup paths.
+    // Unmount via the pinned parent descriptor so we cannot be tricked into
+    // unmounting a path the caller has since redirected — and without holding a
+    // descriptor *into* the mount, which would make umount fail EBUSY. The
+    // parent's ancestors are pinned; the mount-point name cannot be renamed
+    // while it is a mount point. Tolerate the parent being gone (cleanup paths).
     if safe::is_mounted(&mount_path) {
-        match safe::open_parent_and_name(&mount_path)
-            .and_then(|(parent, child)| safe::openat_dir(&parent, &child))
-        {
-            Ok(mount_dir_fd) => {
-                let mount_fd_path = safe::proc_fd_path(&mount_dir_fd);
-                run_command(UMOUNT, &[&mount_fd_path])?;
+        match safe::open_parent_and_name(&mount_path) {
+            Ok((parent_fd, child)) => {
+                let target = safe::proc_child_path(&parent_fd, &child);
+                safe::umount(&target)?;
                 audit(&format!("unmounted {}", mount_path.display()));
             }
             Err(error) => {
@@ -471,15 +411,17 @@ fn cmd_unmount(invoker: &Invoker, name: &str) -> Result<(), String> {
         ));
     }
 
-    // Detach the loop device by the backing file's inode identity. The file may
-    // already be gone (a delete unlinks it), so tolerate that and fall back to
-    // no-op — a detached-and-deleted device auto-clears once its mount is gone.
-    // Reuse the descriptor already opened for the lock.
+    // Detach the loop device, found by the backing file's (device, inode)
+    // identity via ioctl — robust to an unlinked backing file and to whitespace
+    // in the path, both of which broke the old string-parse of `losetup --list`.
+    // The file may already be gone (delete unlinks it); then there is nothing to
+    // look up, and a detached-and-deleted device auto-clears once its mount is
+    // released. Reuse the descriptor already opened for the lock.
     match lock_fd.as_ref() {
-        Some(image_fd) => match loop_device_for_fd(image_fd)? {
-            Some(device) => {
-                run_command(LOSETUP, &["-d", &device])?;
-                audit(&format!("detached {device}"));
+        Some(image_fd) => match loopdev::find_by_backing(image_fd)? {
+            Some(number) => {
+                loopdev::detach(number)?;
+                audit(&format!("detached /dev/loop{number}"));
             }
             None => audit(&format!(
                 "no loop device attached to {}; nothing to detach",
