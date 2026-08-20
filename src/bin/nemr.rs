@@ -54,6 +54,9 @@ enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+
+    /// Reclaim orphaned mounts, loop devices and snapshots left by a crash.
+    Reconcile,
 }
 
 /// Parse `--size`, reusing the engine's own preset parsing so the CLI cannot
@@ -165,6 +168,27 @@ async fn main() -> Result<()> {
 
             project::delete(&client, &name).await?;
             println!("deleted project {name:?}");
+        }
+
+        Command::Reconcile => {
+            let client = ContainerdClient::connect().await?;
+            let report = project::reconcile_orphans(&client).await?;
+            if report.is_empty() {
+                println!("nothing to reconcile: no orphaned mounts, loop devices or snapshots");
+            } else {
+                for name in &report.released {
+                    println!("released orphan volume {name:?} (mount + loop device)");
+                }
+                for key in &report.snapshots_removed {
+                    println!("removed orphan snapshot {key:?}");
+                }
+                for name in &report.orphan_backing_files {
+                    println!(
+                        "orphan backing file for {name:?}: mount/loop released, but the file was \
+                         KEPT — it may hold data. Remove it deliberately if you are sure."
+                    );
+                }
+            }
         }
 
         Command::Attach { name } => {

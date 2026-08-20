@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use containerd_client::services::v1::snapshots::{
-    MountsRequest, PrepareSnapshotRequest, RemoveSnapshotRequest,
+    ListSnapshotsRequest, MountsRequest, PrepareSnapshotRequest, RemoveSnapshotRequest,
 };
 use containerd_client::services::v1::{
     container::Runtime, Container, CreateContainerRequest, CreateTaskRequest,
@@ -181,6 +181,38 @@ impl ContainerdClient {
                 )
             })?;
         Ok(())
+    }
+
+    /// All snapshot keys in this snapshotter, for reconciliation.
+    ///
+    /// `Snapshots.List` is a server-streaming RPC, so the response is drained
+    /// message by message. Used by the orphan sweep to find snapshots that
+    /// outlived their container record (a crash between snapshot prepare and
+    /// container create, or between task delete and container delete).
+    pub async fn list_snapshot_keys(&self) -> Result<Vec<String>> {
+        let request = ListSnapshotsRequest {
+            snapshotter: self.snapshotter().to_string(),
+            filters: vec![],
+        };
+
+        let mut stream = self
+            .raw()
+            .snapshots()
+            .list(with_namespace!(request, self.namespace()))
+            .await
+            .context("containerd Snapshots.List failed")?
+            .into_inner();
+
+        let mut keys = Vec::new();
+        while let Some(response) = stream
+            .message()
+            .await
+            .context("error draining the snapshot list stream")?
+        {
+            // `Info.name` is the snapshot key in containerd's snapshots proto.
+            keys.extend(response.info.into_iter().map(|info| info.name));
+        }
+        Ok(keys)
     }
 
     /// Remove a snapshot. Tolerates absence so cleanup paths can call it

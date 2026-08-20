@@ -666,6 +666,112 @@ pub async fn attach(client: &ContainerdClient, name: &str) -> Result<u32> {
     Ok(exit_code)
 }
 
+/// What a reconciliation sweep found and did.
+#[derive(Debug, Default)]
+pub struct ReconcileReport {
+    /// Orphan mounts/loop devices released (mounted, or a backing file present,
+    /// with no owning container record).
+    pub released: Vec<String>,
+    /// Orphan snapshots removed (a snapshot key with no matching container).
+    pub snapshots_removed: Vec<String>,
+    /// Backing files with no owning container record. **Reported, not deleted** —
+    /// they may hold user data. Their mount and loop device are released, but the
+    /// file is left for the operator to remove deliberately.
+    pub orphan_backing_files: Vec<String>,
+}
+
+impl ReconcileReport {
+    pub fn is_empty(&self) -> bool {
+        self.released.is_empty()
+            && self.snapshots_removed.is_empty()
+            && self.orphan_backing_files.is_empty()
+    }
+}
+
+/// Reclaim host resources whose owning container record is gone (#3/#10/#15/#23).
+///
+/// # Precedence rule (normative — recorded in SPEC.md Section 11, pending
+/// promotion to a Section 3 subsection by the Product Owner)
+///
+/// **containerd's container records are the single source of truth for which
+/// projects exist.** There is no side database. Any host resource — a mount, a
+/// loop device, a snapshot — that is not owned by a current container record is
+/// an orphan and is reclaimed. The one exception is a backing *file*, which may
+/// hold user data: its mount and loop device are released, but the file itself
+/// is only reported, never deleted, because destroying data is not something a
+/// reconciliation sweep should do unprompted.
+///
+/// This is the backstop for the one window `delete`'s idempotent ordering cannot
+/// cover: a crash after the container record is removed but before the volume is
+/// released. Without it, that leaves a mounted, loop-attached volume nothing
+/// references and nothing can find. Run it explicitly with `nemr reconcile`, or
+/// periodically per `.claude/loop.md`.
+pub async fn reconcile_orphans(client: &ContainerdClient) -> Result<ReconcileReport> {
+    use std::collections::HashSet;
+
+    let paths = VolumePaths::from_env()?;
+    let containers = client.list_containers().await?;
+
+    // The source of truth: names and ids of projects that actually exist.
+    let known_names: HashSet<String> = containers
+        .iter()
+        .filter_map(|c| c.labels.get(LABEL_PROJECT).cloned())
+        .collect();
+    let known_ids: HashSet<&str> = containers.iter().map(|c| c.id.as_str()).collect();
+
+    let mut report = ReconcileReport::default();
+    let helper = HelperOps::new();
+
+    // 1. Orphan mounts: a mount point under the managed dir whose name is not a
+    //    known project. Release it (unmount + detach).
+    if let Ok(entries) = std::fs::read_dir(paths.mount_dir()) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if known_names.contains(&name) || crate::engine::volume::validate_name(&name).is_err() {
+                continue;
+            }
+            if crate::engine::volume::is_mounted(&paths.mount_point(&name)) {
+                match helper.unmount_and_detach(&name) {
+                    Ok(()) => report.released.push(name),
+                    Err(error) => {
+                        eprintln!("[nemr:reconcile] could not release orphan mount {name:?}: {error:#}")
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Orphan backing files: an image with no container record. Release any
+    //    stray mount/loop, but keep the file (it may hold data) and report it.
+    if let Ok(entries) = std::fs::read_dir(paths.image_dir()) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let Some(name) = file_name.strip_suffix(".img") else {
+                continue;
+            };
+            if known_names.contains(name) || crate::engine::volume::validate_name(name).is_err() {
+                continue;
+            }
+            let _ = helper.unmount_and_detach(name);
+            report.orphan_backing_files.push(name.to_string());
+        }
+    }
+
+    // 3. Orphan snapshots: an engine-created snapshot key with no container.
+    for key in client.list_snapshot_keys().await? {
+        if key.starts_with(config::CONTAINER_PREFIX) && !known_ids.contains(key.as_str()) {
+            match client.remove_snapshot(&key).await {
+                Ok(()) => report.snapshots_removed.push(key),
+                Err(error) => {
+                    eprintln!("[nemr:reconcile] could not remove orphan snapshot {key:?}: {error:#}")
+                }
+            }
+        }
+    }
+
+    Ok(report)
+}
+
 /// A project as reported by `list`.
 #[derive(Debug, Clone)]
 pub struct ProjectStatus {
@@ -729,12 +835,24 @@ pub async fn list(client: &ContainerdClient) -> Result<Vec<ProjectStatus>> {
 
 /// Delete a project and everything it owns (Milestone 6).
 ///
-/// Order matters, and it is the reverse of creation: stop the task, remove the
-/// container record and its snapshot, then release the volume, then remove the
-/// backing file. Releasing the volume before the container is gone would pull
-/// the mount out from under a container that still references it; removing the
-/// backing file before the loop device is detached would strand that device
-/// permanently, which is the failure Milestone 3 already ran into.
+/// # Ordering: the container record is the anchor, removed last (#3/#10/#20)
+///
+/// The container record is what `list` and `resolve` use to find a project —
+/// there is no side database. So it is removed **last**, only once everything it
+/// owns is already gone. The earlier order removed it second, before releasing
+/// the volume, which meant a helper failure at the release step stranded a
+/// mounted, loop-attached volume that `list` could no longer see, `delete` could
+/// no longer resolve to retry, and `create` of the same name rejected with a
+/// confusing "volume exists but no container" message. Releasing first is safe
+/// because the task is already stopped, so nothing is using the mount; the
+/// record referencing the volume path is only metadata.
+///
+/// Every step is idempotent, so a `delete` interrupted partway is completed by
+/// simply running it again: `stop_task` tolerates a missing task, the helper's
+/// unmount tolerates an already-released or already-gone volume, and the file
+/// removals tolerate absence. The startup reconciliation sweep
+/// ([`reconcile_orphans`]) is the backstop for the one window this cannot cover
+/// itself — a crash after the record is gone but before the volume is released.
 ///
 /// Confirmation is the caller's responsibility (AC-6.2) — this function does
 /// the deleting, the CLI does the asking, so a scripted caller is not fighting
@@ -743,20 +861,16 @@ pub async fn delete(client: &ContainerdClient, name: &str) -> Result<()> {
     let container_id = resolve(client, name).await?;
     let paths = VolumePaths::from_env()?;
 
-    // 1. Stop the task if one is running. Safe if it is not.
-    if client.task_state(&container_id).await?.is_running() {
-        client.stop_task(&container_id).await?;
-    }
+    // 1. Stop the task. Idempotent: stop_task returns NoTask if none is running.
+    client.stop_task(&container_id).await?;
 
-    // 2. Container record and rootfs snapshot.
-    client.delete_container(&container_id).await?;
-
-    // 3. Unmount and detach the loop device, via the privileged helper.
+    // 2. Release the volume (unmount + detach) BEFORE the record, so a failure
+    //    here leaves the project still listable and this delete retryable.
     HelperOps::new()
         .unmount_and_detach(name)
         .with_context(|| format!("failed to release the volume for project {name:?}"))?;
 
-    // 4. Backing file and mount point, now that nothing refers to them.
+    // 3. Backing file and mount point, now that the loop device is detached.
     let image = paths.image_file(name);
     if image.exists() {
         std::fs::remove_file(&image)
@@ -764,6 +878,10 @@ pub async fn delete(client: &ContainerdClient, name: &str) -> Result<()> {
     }
     let mount_point = paths.mount_point(name);
     let _ = std::fs::remove_dir(&mount_point);
+
+    // 4. The container record and its snapshot, LAST. Until this returns, the
+    //    project is still discoverable and every prior step is safe to repeat.
+    client.delete_container(&container_id).await?;
 
     Ok(())
 }
