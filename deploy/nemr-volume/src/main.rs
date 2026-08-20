@@ -16,10 +16,14 @@
 //! - **No caller-controlled environment variable influences path
 //!   construction.** In particular `XDG_DATA_HOME` and `HOME` are ignored;
 //!   the invoking user's home directory comes from `/etc/passwd`.
-//! - **Symlinks are refused.** The backing file must be a regular file, so a
-//!   symlink cannot redirect `losetup` at a device the user should not reach.
-//! - **Paths are re-checked after canonicalisation**, so no resolved path can
-//!   escape the managed directory.
+//! - **Every managed path is resolved to a file descriptor, refusing any
+//!   symlinked component**, and the privileged syscalls act on the descriptor
+//!   (`/proc/self/fd/<n>`), never on a name that could be re-resolved. This
+//!   closes the check-to-use races that let a caller redirect a privileged
+//!   `mount`/`losetup`/`chown` off the managed directory. See `safe.rs`.
+//! - **The whole mount sequence is serialised** under an advisory lock on the
+//!   backing file, so two concurrent callers cannot each attach a separate loop
+//!   device to the same image.
 //!
 //! # Usage
 //!
@@ -28,18 +32,29 @@
 //! nemr-volume unmount <name>
 //! ```
 
-use std::fs;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+mod loopdev;
+mod safe;
 
-/// Absolute paths. Never resolved via `PATH`, which the caller could influence.
-const LOSETUP: &str = "/usr/sbin/losetup";
-const MOUNT: &str = "/usr/bin/mount";
-const UMOUNT: &str = "/usr/bin/umount";
+use std::fs;
+use std::path::PathBuf;
+use std::process::ExitCode;
 
 const MAX_NAME_LEN: usize = 32;
 const VALID_SIZES: [&str; 3] = ["500MB", "2GB", "10GB"];
+
+/// Interface version between the engine and this helper.
+///
+/// The engine checks this before invoking a privileged operation and refuses to
+/// run against a helper whose protocol it does not understand, so a source
+/// change that was never installed (`scripts/setup_test_host.sh`) is caught
+/// rather than silently ignored. Bump it whenever the argument grammar or the
+/// helper's guarantees change.
+///
+/// - 1: initial mount/unmount grammar (implicit; helpers without a `version`
+///   subcommand predate the fd-based hardening).
+/// - 2: symlink-safe fd-based mount/chown, backing-file flock, inode-identity
+///   loop lookup.
+const PROTOCOL_VERSION: u32 = 2;
 
 fn main() -> ExitCode {
     match run() {
@@ -53,6 +68,15 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // `version` is answered before identifying the invoker: the engine calls it
+    // as a preflight handshake and it touches nothing privileged, so it must
+    // work even when run directly. Print a stable, parseable line.
+    if args.first().map(String::as_str) == Some("version") {
+        println!("nemr-volume protocol {PROTOCOL_VERSION}");
+        return Ok(());
+    }
+
     let invoker = Invoker::from_sudo_env()?;
 
     match args.first().map(String::as_str) {
@@ -68,10 +92,11 @@ fn run() -> Result<(), String> {
             cmd_unmount(&invoker, name)
         }
         Some(other) => Err(format!(
-            "unknown subcommand {other:?}; expected 'mount' or 'unmount'"
+            "unknown subcommand {other:?}; expected 'mount', 'unmount' or 'version'"
         )),
         None => Err(
-            "usage: nemr-volume mount <name> <500MB|2GB|10GB> | nemr-volume unmount <name>"
+            "usage: nemr-volume mount <name> <500MB|2GB|10GB> | nemr-volume unmount <name> \
+             | nemr-volume version"
                 .to_string(),
         ),
     }
@@ -223,186 +248,115 @@ fn audit(message: &str) {
     eprintln!("[elevated] {message}");
 }
 
-/// Confirm `path` is a regular file inside `managed_root`, and return its
-/// canonical form.
-///
-/// `symlink_metadata` does not follow links, so a symlink is rejected outright
-/// rather than followed to a device node. Canonicalising and re-checking the
-/// prefix afterwards catches anything the name validation did not.
-fn resolve_regular_file(path: &Path, managed_root: &Path) -> Result<PathBuf, String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
-
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "{} is a symlink; refusing to operate on it",
-            path.display()
-        ));
-    }
-    if !metadata.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
-    }
-
-    let canonical = path
-        .canonicalize()
-        .map_err(|e| format!("cannot canonicalise {}: {e}", path.display()))?;
-
-    // Defence in depth: the name is already validated, so this should be
-    // unreachable. It costs nothing and would catch a mistake elsewhere.
-    if !canonical.starts_with(managed_root) {
-        return Err(format!(
-            "{} resolves outside the managed directory {}",
-            canonical.display(),
-            managed_root.display()
-        ));
-    }
-    Ok(canonical)
-}
-
-/// Run a command with a fixed environment, returning trimmed stdout.
-fn run_command(program: &str, args: &[&str]) -> Result<String, String> {
-    audit(&format!("{program} {}", args.join(" ")));
-
-    let output = Command::new(program)
-        .args(args)
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .output()
-        .map_err(|e| format!("failed to execute {program}: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "{program} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Loop device currently backing `image`, if any.
-///
-/// Scans the full loop table instead of using `losetup -j <path>`. If the
-/// backing file has been unlinked, `-j` matches nothing while the device stays
-/// attached — the kernel reports it as `/path/to/file.img (deleted)`. Matching
-/// on that prefix lets us still detach it, so an interrupted provisioning run
-/// cannot strand a loop device permanently (NFR-03).
-///
-/// The path is derived internally from a validated name, never supplied by the
-/// caller, so this cannot be steered at an unrelated device.
-fn loop_device_for(image: &Path) -> Result<Option<String>, String> {
-    let table = run_command(LOSETUP, &["-l", "-O", "NAME,BACK-FILE", "-n"])?;
-    let wanted = image.to_string_lossy().to_string();
-
-    for line in table.lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(device), Some(back_file)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        // A deleted backing file is reported as "/path/to/file.img (deleted)",
-        // so the marker lands in its own whitespace-separated token and the
-        // path compares equal either way.
-        if back_file == wanted {
-            return Ok(Some(device.to_string()));
-        }
-    }
-    Ok(None)
-}
-
-fn is_mounted(mount_point: &Path) -> bool {
-    // Read the kernel's mount table directly rather than shelling out, so this
-    // works identically on error paths where a command might fail.
-    fs::read_to_string("/proc/self/mountinfo")
-        .map(|table| {
-            let target = mount_point.to_string_lossy().to_string();
-            table
-                .lines()
-                .any(|line| line.split(' ').nth(4).is_some_and(|m| m == target))
-        })
-        .unwrap_or(false)
-}
-
 /// Attach the backing file to a loop device, mount it, and hand ownership to
 /// the invoking user — as one operation (PRIV-06).
+///
+/// # Security
+///
+/// Every path this touches lives inside the invoking user's home directory,
+/// which the (untrusted) caller owns. So nothing is re-opened by name after
+/// validation: the backing file and the mount point are each resolved once, to
+/// a file descriptor, refusing any symlinked component ([`safe::open_beneath`]),
+/// and `losetup`/`mount`/`fchown` all act on `/proc/self/fd/<n>`, which the
+/// kernel resolves to the pinned inode. A concurrent symlink swap therefore has
+/// nothing to redirect. The whole sequence runs under a `/run/nemr` flock so two
+/// concurrent callers cannot each attach a separate loop device to the same
+/// backing file. See src/safe.rs for the full rationale.
 fn cmd_mount(invoker: &Invoker, name: &str, size: &str) -> Result<(), String> {
     validate_name(name)?;
     validate_size(size)?;
 
-    let managed_root = invoker.managed_root();
-    let image = invoker.image_file(name);
-    let mount_point = invoker.mount_point(name);
+    let image_path = invoker.image_file(name);
+    let mount_path = invoker.mount_point(name);
 
-    let image = resolve_regular_file(&image, &managed_root)?;
+    // Resolve the backing file to a pinned descriptor, refusing a symlink
+    // anywhere in the path. O_RDWR because the loop device must be writable for
+    // an ext4 read-write mount.
+    let image_fd = safe::open_beneath(&image_path, libc::O_RDWR)?;
 
-    // The backing file must belong to the invoker. Without this, a user could
-    // ask us to attach another user's file.
-    let owner = fs::metadata(&image)
-        .map_err(|e| format!("cannot stat {}: {e}", image.display()))?
-        .uid();
-    if owner != invoker.uid {
+    // Serialise the whole check-then-mount against a concurrent start of the
+    // same project (double-attach / double-mount corruption). The lock is on
+    // the backing file itself, so it needs no privileged lock directory.
+    let _lock = safe::FileLock::acquire(&image_fd)?;
+
+    let image_stat = safe::fstat(&image_fd)?;
+    if image_stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(format!("{} is not a regular file", image_path.display()));
+    }
+    if image_stat.st_uid != invoker.uid {
         return Err(format!(
-            "{} is owned by uid {owner}, not the invoking user {}",
-            image.display(),
+            "{} is owned by uid {}, not the invoking user {}",
+            image_path.display(),
+            image_stat.st_uid,
             invoker.uid
         ));
     }
 
-    if !mount_point.is_dir() {
+    // Resolve the mount point's parent to a pinned descriptor, again refusing
+    // symlinks. The child is opened relative to it, so the mount target cannot
+    // be redirected out of the managed directory (this is the /etc-shadowing
+    // escalation's fix).
+    let (parent_fd, child) = safe::open_parent_and_name(&mount_path)?;
+    let mount_dir_fd = safe::openat_dir(&parent_fd, &child)?;
+    let mount_dir_stat = safe::fstat(&mount_dir_fd)?;
+    if mount_dir_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
         return Err(format!(
-            "mount point {} does not exist; the engine creates it before calling",
-            mount_point.display()
+            "mount point {} is not a directory; the engine creates it before calling",
+            mount_path.display()
         ));
     }
-    if is_mounted(&mount_point) {
-        return Err(format!("{} is already mounted", mount_point.display()));
+    if safe::is_mounted(&mount_path) {
+        return Err(format!("{} is already mounted", mount_path.display()));
     }
 
     audit(&format!(
         "provisioning volume {name:?} ({size}) for uid {} at {}",
         invoker.uid,
-        mount_point.display()
+        mount_path.display()
     ));
 
-    let device = run_command(
-        LOSETUP,
-        &["--find", "--show", &image.to_string_lossy()],
-    )?;
-    audit(&format!("attached {} to {device}", image.display()));
+    // Attach the loop device to the pinned backing-file descriptor, in-process
+    // via ioctl — no subprocess, so no second path resolution and no fd table
+    // to lose across an exec.
+    let loop_number = loopdev::attach(&image_fd)?;
+    let device = loopdev::device_path(loop_number);
+    audit(&format!("attached {} to {device}", image_path.display()));
 
-    let mount_target = mount_point.to_string_lossy().to_string();
-    if let Err(error) = run_command(MOUNT, &[&device, &mount_target]) {
-        // Do not leak the loop device if mounting fails (NFR-03).
+    // Mount onto the pinned mount-point descriptor, in-process. `/proc/self/fd`
+    // resolves against the helper here, so even if the caller swaps the
+    // mount-point name for a symlink now, the target still resolves to the inode
+    // we validated. The loop device path is root-owned, not caller-controlled.
+    let mount_target = safe::proc_fd_path(&mount_dir_fd);
+    if let Err(error) = safe::mount_ext4(&device, &mount_target) {
         audit(&format!("mount failed, detaching {device}"));
-        let _ = run_command(LOSETUP, &["-d", &device]);
+        let _ = loopdev::detach(loop_number);
         return Err(error);
     }
-    audit(&format!("mounted {device} at {mount_target}"));
+    audit(&format!("mounted {device} at {}", mount_path.display()));
 
     // PRIV-06. A freshly formatted ext4 has a root-owned root inode; inside the
     // rootless container's user namespace host uid 0 is unmapped and appears as
     // nobody, so the container could not write to its own volume. Handing the
-    // mount to the invoking user's uid makes it appear as uid 0 — root — inside
-    // the container, because the namespace maps host uid <invoker> to 0.
-    //
-    // The uid is taken from SUDO_UID, never from an argument: accepting a
-    // caller-supplied uid would turn this into a general-purpose chown.
-    if let Err(error) = std::os::unix::fs::chown(&mount_point, Some(invoker.uid), Some(invoker.gid))
-    {
-        // A mounted-but-unchowned volume is useless to the container and would
-        // be an orphaned mount plus loop device if we simply returned here
-        // (NFR-03). Unwind both before reporting.
-        audit(&format!("chown failed, unwinding mount and loop device"));
-        let _ = run_command(UMOUNT, &[&mount_target]);
-        let _ = run_command(LOSETUP, &["-d", &device]);
+    // mount to the invoking user's uid makes it appear as uid 0 inside the
+    // container. Re-open the mount point through the pinned parent descriptor so
+    // the fchown lands on the *mounted* root (openat crosses into the mount) and
+    // cannot be redirected — chown-by-path here was itself an escalation.
+    let chown_result = safe::openat_dir(&parent_fd, &child)
+        .and_then(|mounted_root_fd| safe::fchown(&mounted_root_fd, invoker.uid, invoker.gid));
+    if let Err(error) = chown_result {
+        audit("chown failed, unwinding mount and loop device");
+        let _ = safe::umount(&safe::proc_child_path(&parent_fd, &child));
+        let _ = loopdev::detach(loop_number);
         return Err(format!(
-            "mounted at {mount_target} but failed to chown to {}:{}: {error}. \
-             Mount and loop device were released.",
+            "mounted but failed to chown to {}:{}: {error}. Mount and loop device were released.",
             invoker.uid, invoker.gid
         ));
     }
     audit(&format!(
-        "chowned {mount_target} to {}:{} (maps to root inside the container)",
-        invoker.uid, invoker.gid
+        "chowned {} to {}:{} (maps to root inside the container)",
+        mount_path.display(),
+        invoker.uid,
+        invoker.gid
     ));
 
     Ok(())
@@ -410,30 +364,73 @@ fn cmd_mount(invoker: &Invoker, name: &str, size: &str) -> Result<(), String> {
 
 /// Unmount and detach. Idempotent: the engine's `Drop` calls this on error
 /// paths where the mount may never have been established (VOL-04).
+///
+/// Takes the same backing-file lock as [`cmd_mount`] (when the file still
+/// exists), and finds the loop device by the backing file's (device, inode)
+/// identity rather than its path, so it still detaches a device whose backing
+/// file was unlinked or whose path contains whitespace.
 fn cmd_unmount(invoker: &Invoker, name: &str) -> Result<(), String> {
     validate_name(name)?;
 
-    let mount_point = invoker.mount_point(name);
-    let image = invoker.image_file(name);
-    let mount_target = mount_point.to_string_lossy().to_string();
+    let mount_path = invoker.mount_point(name);
+    let image_path = invoker.image_file(name);
 
-    if is_mounted(&mount_point) {
-        run_command(UMOUNT, &[&mount_target])?;
-        audit(&format!("unmounted {mount_target}"));
+    // Take the same backing-file lock as mount when the file still exists, so an
+    // unmount cannot race a concurrent mount of the same project. On the delete
+    // path the file may already be gone; then there is nothing to race.
+    let lock_fd = safe::open_beneath(&image_path, libc::O_RDONLY).ok();
+    let _lock = lock_fd.as_ref().map(safe::FileLock::acquire).transpose()?;
+
+    // Unmount via the pinned parent descriptor so we cannot be tricked into
+    // unmounting a path the caller has since redirected — and without holding a
+    // descriptor *into* the mount, which would make umount fail EBUSY. The
+    // parent's ancestors are pinned; the mount-point name cannot be renamed
+    // while it is a mount point. Tolerate the parent being gone (cleanup paths).
+    if safe::is_mounted(&mount_path) {
+        match safe::open_parent_and_name(&mount_path) {
+            Ok((parent_fd, child)) => {
+                let target = safe::proc_child_path(&parent_fd, &child);
+                safe::umount(&target)?;
+                audit(&format!("unmounted {}", mount_path.display()));
+            }
+            Err(error) => {
+                // The mount table says it is mounted but the path no longer
+                // resolves cleanly. Report rather than umounting a name we
+                // cannot vouch for.
+                return Err(format!(
+                    "{} is mounted but its path no longer resolves safely ({error}); \
+                     refusing to unmount a path that may have been redirected",
+                    mount_path.display()
+                ));
+            }
+        }
     } else {
-        audit(&format!("{mount_target} was not mounted; nothing to unmount"));
+        audit(&format!(
+            "{} was not mounted; nothing to unmount",
+            mount_path.display()
+        ));
     }
 
-    // Detach by looking the device up from the image, rather than trusting a
-    // caller-supplied device name.
-    match loop_device_for(&image)? {
-        Some(device) => {
-            run_command(LOSETUP, &["-d", &device])?;
-            audit(&format!("detached {device}"));
-        }
+    // Detach the loop device, found by the backing file's (device, inode)
+    // identity via ioctl — robust to an unlinked backing file and to whitespace
+    // in the path, both of which broke the old string-parse of `losetup --list`.
+    // The file may already be gone (delete unlinks it); then there is nothing to
+    // look up, and a detached-and-deleted device auto-clears once its mount is
+    // released. Reuse the descriptor already opened for the lock.
+    match lock_fd.as_ref() {
+        Some(image_fd) => match loopdev::find_by_backing(image_fd)? {
+            Some(number) => {
+                loopdev::detach(number)?;
+                audit(&format!("detached /dev/loop{number}"));
+            }
+            None => audit(&format!(
+                "no loop device attached to {}; nothing to detach",
+                image_path.display()
+            )),
+        },
         None => audit(&format!(
-            "no loop device attached to {}; nothing to detach",
-            image.display()
+            "backing file {} is gone; nothing to detach by inode",
+            image_path.display()
         )),
     }
 

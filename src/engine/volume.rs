@@ -24,6 +24,7 @@
 
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -324,14 +325,55 @@ impl Usage {
 /// reports the filesystem that directory sits on — so an unmounted volume
 /// silently yields the host root filesystem's numbers. That produced a `list`
 /// row reading "30.6GiB used of 2GB", which is the host disk, not the volume.
+///
+/// The mount-point field is **octal-unescaped** before comparison. The kernel
+/// writes mountinfo field 5 with `\040` for space, `\011` for tab, `\012` for
+/// newline and `\134` for backslash, so a raw comparison of a path containing
+/// any of those reports a mounted volume as *unmounted*. Under a `$HOME` with a
+/// space that is not cosmetic: `start` would take the remount path against an
+/// already-mounted volume and stack a second loop device and ext4 mount over
+/// the same backing bytes — the exact silent-corruption shape VOL-06 exists to
+/// prevent. Same defect, same fix, as the privileged helper's parser.
 pub fn is_mounted(mount_point: &Path) -> bool {
     let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return false;
     };
-    let target = mount_point.to_string_lossy().to_string();
-    table
-        .lines()
-        .any(|line| line.split(' ').nth(4).is_some_and(|m| m == target))
+    mountinfo_has_target(&table, mount_point)
+}
+
+/// Whether `table` (mountinfo contents) lists `mount_point` as a mount target.
+///
+/// Split out so the octal-unescaping logic is unit-testable without a live
+/// `/proc/self/mountinfo`.
+fn mountinfo_has_target(table: &str, mount_point: &Path) -> bool {
+    let wanted = mount_point.as_os_str().as_bytes();
+    table.lines().any(|line| {
+        // Field 5 (1-indexed) is the mount point; optional fields follow it
+        // until a " - " separator, so counting from the left is correct.
+        line.split(' ')
+            .nth(4)
+            .is_some_and(|field| unescape_octal(field) == wanted)
+    })
+}
+
+/// Decode mountinfo/`/proc/mounts` octal escapes (`\NNN`) into raw bytes.
+fn unescape_octal(field: &str) -> Vec<u8> {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let octal = &bytes[i + 1..i + 4];
+            if octal.iter().all(|b| (b'0'..=b'7').contains(b)) {
+                out.push((octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0'));
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Query a mounted volume's usage.
@@ -549,9 +591,13 @@ impl<P: PrivilegedOps> Drop for Volume<P> {
                 audit(&format!("released volume {:?}", self.name));
             }
             Err(error) => audit(&format!(
-                "WARNING: failed to release volume {:?}: {error:#}. \
-                 Check `losetup -a` and `mount` for orphaned resources.",
-                self.name
+                "WARNING: the release helper for volume {:?} returned an error: {error:#}\n\
+                 This is the *cleanup path* failing, which is not the same as a confirmed \
+                 leak — the mount may never have been established (this runs on create's \
+                 error path too). It does mean the release could not be confirmed. Verify \
+                 with `losetup -a` and `grep {} /proc/self/mountinfo`; a startup \
+                 reconciliation sweep will also reclaim it if it did leak.",
+                self.name, self.name
             )),
         }
     }
@@ -674,6 +720,42 @@ mod tests {
         assert!(validate_name("").is_err());
         assert!(validate_name(&"a".repeat(MAX_NAME_LEN + 1)).is_err());
         assert!(validate_name(&"a".repeat(MAX_NAME_LEN)).is_ok());
+    }
+
+    /// The mountinfo parser must decode the kernel's octal escapes, or a volume
+    /// mounted under a path containing a space/tab/newline/backslash reads as
+    /// unmounted — which sends `start` down the remount path and stacks a second
+    /// loop device and ext4 mount over the same bytes (#2). This is the unit
+    /// proof; it needs no `/proc`.
+    #[test]
+    fn is_mounted_decodes_octal_escaped_mount_points() {
+        // A real mountinfo line for a mount point containing a space, exactly as
+        // the kernel escapes it (\040), with two optional fields before " - ".
+        let table = "301 29 7:19 / /home/john\\040doe/.local/share/nemr/mounts/p \
+                     rw,relatime shared:277 master:2 - ext4 /dev/loop7 rw\n";
+
+        assert!(
+            mountinfo_has_target(table, Path::new("/home/john doe/.local/share/nemr/mounts/p")),
+            "a mount point with a space must be recognised despite the \\040 escape"
+        );
+        assert!(
+            !mountinfo_has_target(table, Path::new("/home/john doe/.local/share/nemr/mounts/other")),
+            "a different path must not match"
+        );
+        // The naive (broken) comparison would have matched the escaped form:
+        assert!(
+            !mountinfo_has_target(table, Path::new("/home/john\\040doe/.local/share/nemr/mounts/p")),
+            "the escaped literal must NOT match — that was the bug"
+        );
+    }
+
+    #[test]
+    fn unescape_octal_covers_the_kernel_escapes() {
+        assert_eq!(unescape_octal("plain"), b"plain");
+        assert_eq!(unescape_octal(r"a\040b"), b"a b");
+        assert_eq!(unescape_octal(r"a\011b"), b"a\tb");
+        assert_eq!(unescape_octal(r"a\012b"), b"a\nb");
+        assert_eq!(unescape_octal(r"a\134b"), b"a\\b");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | NEMR-SPEC-001 |
-| Version | 1.21 |
+| Version | 1.25 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -37,6 +37,10 @@
 | 1.19 | Revision | Section 3.4's repository diagram brought back in step with the actual repository, which had drifted: it was missing `src/lib.rs`, both `mod.rs` files, the two Milestone 1 baseline binaries, the whole `deploy/` tree from Milestone 3, and `src/engine/tty.rs` from Milestone 5. All of these were already recorded as deviations in Section 11; the diagram simply had not been updated alongside them. Added a note that the diagram states current reality rather than an aspiration. Section 11 gained entries for `tty.rs` and `deploy/`. Structural fact rather than a new decision, edited directly on Product Owner instruction. | Claude Code, per Product Owner instruction |
 | 1.20 | Revision | Added VOL-06 to Section 3.6: `start` must verify the project's volume is mounted and remount it if not, rather than proceeding. Found at Milestone 6 after a host reboot — container records persist in containerd's database while mounts and loop devices do not, so `start` succeeded against an unmounted volume and gave the container an empty `/workspace` backed by the host root filesystem with no quota. A silent VOL-05 violation: a user could work an entire session believing they were writing to their project, with no error at any point. Auto-remount rather than refuse-and-require-manual-repair, since requiring manual intervention defeats the portability this product exists for. Sections 1–3 are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction. | Claude Code, per Product Owner instruction |
 | 1.21 | Revision | Recorded the Milestone 7 finding that `attach` allocates a pty only when its own stdin is a terminal, and that this drifts from PROC-02 as written. Added the note under Milestone 5, a Section 11 deviation row, and escalation item E-07. PROC-02 itself left unedited — Section 3.8 is Product Owner territory per 4A.5. | Claude Code |
+| 1.22 | Revision | Recorded the PRIV-03/PRIV-06 privileged-helper hardening: the mount point was checked with `is_dir()` (follows symlinks) and then mounted by name, a demonstrated local root escalation (mount an attacker ext4 over `/etc`); the backing file and chown were likewise re-resolved by name after validation (TOCTOU). Rewrote the helper to resolve every managed path to a file descriptor refusing symlinked components and to drive losetup/mount/fchown through `/proc/self/fd`, plus a backing-file flock against concurrent double-mount and inode-identity loop lookup. Added a `version` handshake (protocol 2). Requirement text in Section 3.7 unchanged — it already mandated symlink refusal and validation inside the helper; this is an implementation correction, recorded in Section 11 and escalated for visibility as E-08. | Claude Code |
+| 1.23 | Revision | Recorded that the privileged helper attaches loop devices via the `LOOP_CONFIGURE` ioctl (Linux 5.8+), a consequence of moving loop/mount off `losetup`/`mount` subprocesses. The helper checks the running kernel and fails with an actionable error below 5.8; no pre-5.8 `LOOP_SET_FD` fallback is shipped (below the Ubuntu 22.04+ floor, untestable on the reference host). Documented in PREREQUISITES.md Step 0. Section 3.3 (a Section 1-3 requirement) left unedited; recorded here per 4A.5. | Claude Code |
+| 1.24 | Revision | Added E-08 (privileged-helper escalation, already fixed) to the Section 9 escalation list for completeness — it was referenced from Section 11 and the revision history but not enumerated in Section 9. Recorded the shared `E-` escalation namespace between SPEC.md and docs/DECISIONS.md so the two do not collide (DECISIONS.md continues from E-09). | Claude Code |
+| 1.25 | Revision | Recorded the single-source-of-truth precedence rule for reconciliation (A6) and the recoverable `delete` ordering. Added `nemr reconcile`. Precedence rule captured in Section 11 pending Product Owner promotion to a Section 3 subsection (a new Section 3.x is Section 1-3 territory under 4A.5). | Claude Code |
 
 ---
 
@@ -846,6 +850,24 @@ resolved unilaterally, if encountered during implementation:
   representable". Consequence of not deciding: the code and the spec disagree
   on a normative requirement, and the smoke test depends on the code's
   behaviour, not the spec's.
+- E-08: The privileged helper's mount path contained a local root escalation —
+  the mount point was checked with a symlink-following `is_dir()` and then
+  mounted by name, letting a caller mount an attacker-controlled ext4 over
+  `/etc` (with backing-file and chown TOCTOU variants). Section 3.7 already
+  required symlink refusal and in-helper validation, so the fix is an
+  *implementation* correction, not a requirement change, and does not itself
+  need a Product Owner ruling — it is raised here only for visibility of a
+  security-critical change. Fixed (fd-based resolution, in-process syscalls);
+  see Section 11 (2026-08-20). No decision required unless the Product Owner
+  wants the threat model in Section 3.7 expanded to name the TOCTOU class
+  explicitly.
+
+**Escalation ID namespace.** These `E-0x` IDs are the canonical escalation
+ledger. `docs/DECISIONS.md` records Product Owner rulings and continues the same
+`E-` series (so the next new escalation raised there is `E-09`, not a fresh
+`E-01`), alongside its own `D-0x` series for decisions raised outside the
+escalation path. The two files share one `E-` namespace to keep a cross-reference
+unambiguous.
 
 ---
 
@@ -877,6 +899,9 @@ Product Owner sign-off status.)*
 | 2026-08-11 | 3.4 | Added `deploy/` (helper crate + sudoers rule) | The PRIV-03 privileged helper is a separate privilege domain and a standalone crate; Section 3.4's original tree predates Section 3.7. Now reflected in the diagram. | Pending |
 | 2026-08-11 | 3.3 | `PREREQUISITES.md` documents rootless tooling (`uidmap`, `rootlesskit`, `slirp4netns`) not enumerated in Section 3.3 | Section 3.7 (PRIV-01) requires rootless containerd, which needs this tooling; Section 3.3's list predates 3.7 and was not updated alongside it. Documented rather than silently assumed, since 3.3 designates `PREREQUISITES.md` as the clean-host provisioning source. Section 3.3 itself left unedited — Sections 1–3 are Product Owner territory per 4A.5. | Pending |
 | 2026-08-20 | 3.8 | `attach` allocates a pty only when its own stdin is a terminal; PROC-02 requires one per call unconditionally | A pty has no EOF, so a scripted `echo cmd \| nemr attach` can never signal end-of-input and the session hangs forever. EOT and `CloseIO` were both tried against a pty and both hung. Milestone 7's smoke test is non-interactive and therefore depends on the pipe path existing. Recorded rather than resolved: PROC-02 is in Section 3.8, which is Product Owner territory per 4A.5. Escalated as E-07; full reasoning in the Milestone 7 note under Milestone 5. | **Escalated (E-07)** |
+| 2026-08-20 | 3.7 | Privileged helper hardened against a demonstrated local root escalation | `cmd_mount` checked the mount point with `is_dir()` (which follows symlinks) and passed the path by name to `mount(8)`; a caller who owns `~/.local/share/nemr/mounts` replaced `<name>` with a symlink to `/etc` and the helper mounted an attacker-authored ext4 over `/etc`. The backing-file `losetup` and the post-mount `chown` were re-resolved by name after their checks (TOCTOU), and there was no lock against a concurrent double-mount. All paths are now resolved once to an `O_NOFOLLOW` descriptor and operated on via `/proc/self/fd`; the flow is serialised on the backing file. Section 3.7 already required "symlinks are refused" and all validation "inside the helper", so this is an implementation correction, not a requirement change — but it is security-critical, so it is flagged as E-08 for Product Owner visibility. | **Escalated (E-08)** |
+| 2026-08-20 | 3.3 | Helper requires Linux 5.8+ (LOOP_CONFIGURE) | Loop attach moved from a `losetup` subprocess to the `LOOP_CONFIGURE` ioctl (5.8+) as part of the E-08 hardening. The helper detects an older kernel and errors clearly; PREREQUISITES.md Step 0 now checks `uname -r`. Ubuntu 22.04+/24.04 satisfy it. No fallback to pre-5.8 `LOOP_SET_FD` — below the supported floor and untestable here. Section 3.3 is Section 1-3 territory (4A.5), so recorded here rather than edited into 3.3. | Recorded |
+| 2026-08-20 | 3 (new) | Single-source-of-truth precedence rule for state reconciliation (A6) | **Rule:** containerd's container records are the sole source of truth for which projects exist (there is no side database). Any mount, loop device, or snapshot with no owning container record is an orphan and is reclaimed by `nemr reconcile` / `reconcile_orphans`. The one exception is a backing *file*, which may hold user data: its mount and loop device are released, but the file is reported and kept, never auto-deleted. `delete` is ordered so the container record — the anchor `list`/`resolve` use — is removed last, after the volume is released and the backing file removed, so a failure mid-delete leaves the project listable and the delete retryable; reconciliation is the backstop for a crash after the record is gone. This wants promotion to a normative Section 3.10, which is Product Owner territory (4A.5); recorded here meanwhile. | Recorded, awaiting promotion |
 
 This table is the single source of truth for deviations (Section 8, 4A.5).
 `README.md` points here rather than reproducing it.

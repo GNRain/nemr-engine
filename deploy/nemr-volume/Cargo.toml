@@ -10,10 +10,18 @@ description = "Root-owned privileged helper for Nemr volume provisioning (PRIV-0
 # [workspace] table stops cargo from treating it as a member of the parent.
 [workspace]
 
-# No dependencies, deliberately. Everything this helper needs is in std. A
-# privileged binary's supply chain is part of its attack surface, and zero
-# third-party code is the strongest statement available.
+# One dependency, deliberately: `libc`, the platform ABI crate maintained by
+# the Rust project itself. It is the single exception to the zero-dependency
+# stance, and it is not a real supply-chain concession — `libc` is the binding
+# to the C library every Rust program already links, not third-party logic.
+#
+# It is here because closing the TOCTOU that let a caller redirect a privileged
+# `mount`/`chown` off the managed directory (a demonstrated local root
+# escalation) requires `openat`/`O_NOFOLLOW`/`fchown`/`flock`, none of which
+# `std` exposes. Correctness against a root escalation outranks a dependency
+# count. See src/safe.rs.
 [dependencies]
+libc = "0.2"
 
 [profile.release]
 strip = true

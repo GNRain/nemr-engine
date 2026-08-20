@@ -7,6 +7,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use nemr_engine::containerd::client::ContainerdClient;
+use nemr_engine::containerd::containers::StopOutcome;
 use nemr_engine::engine::project;
 use nemr_engine::engine::volume::{self, VolumeSize};
 
@@ -53,6 +54,9 @@ enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+
+    /// Reclaim orphaned mounts, loop devices and snapshots left by a crash.
+    Reconcile,
 }
 
 /// Parse `--size`, reusing the engine's own preset parsing so the CLI cannot
@@ -91,8 +95,18 @@ async fn main() -> Result<()> {
 
         Command::Stop { name } => {
             let client = ContainerdClient::connect().await?;
-            project::stop(&client, &name).await?;
-            println!("stopped project {name:?}");
+            let outcome = project::stop(&client, &name).await?;
+            println!("stopped project {name:?} ({outcome})");
+
+            // A container that had to be killed got no chance to shut down
+            // cleanly. Not an error, but the user should not have to guess
+            // which of the two happened (PROC-06).
+            if outcome == StopOutcome::Killed {
+                eprintln!(
+                    "[nemr] warning: the container ignored SIGTERM and was killed after the \n\
+                     grace period. Its processes were given no opportunity to flush state."
+                );
+            }
         }
 
         Command::List => {
@@ -104,7 +118,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            println!("{:<18} {:<9} {:<18} {:<8} {}", "NAME", "STATUS", "USED", "QUOTA", "VOLUME");
+            println!("{:<18} {:<9} {:<18} {:<8} VOLUME", "NAME", "STATUS", "USED", "QUOTA");
             for p in &projects {
                 let status = if p.running { "running" } else { "stopped" };
                 let used = match p.usage {
@@ -154,6 +168,27 @@ async fn main() -> Result<()> {
 
             project::delete(&client, &name).await?;
             println!("deleted project {name:?}");
+        }
+
+        Command::Reconcile => {
+            let client = ContainerdClient::connect().await?;
+            let report = project::reconcile_orphans(&client).await?;
+            if report.is_empty() {
+                println!("nothing to reconcile: no orphaned mounts, loop devices or snapshots");
+            } else {
+                for name in &report.released {
+                    println!("released orphan volume {name:?} (mount + loop device)");
+                }
+                for key in &report.snapshots_removed {
+                    println!("removed orphan snapshot {key:?}");
+                }
+                for name in &report.orphan_backing_files {
+                    println!(
+                        "orphan backing file for {name:?}: mount/loop released, but the file was \
+                         KEPT — it may hold data. Remove it deliberately if you are sure."
+                    );
+                }
+            }
         }
 
         Command::Attach { name } => {

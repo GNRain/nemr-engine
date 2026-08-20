@@ -1,0 +1,304 @@
+//! Permanent regression tests for the defects Phase 1 shipped and then fixed.
+//!
+//! Each test here corresponds to a numbered requirement and a real incident.
+//! None of them is `#[ignore]`d, and none of them skips silently — see
+//! `tests/common/mod.rs` for why that distinction is the entire point.
+//!
+//! Run the whole suite:
+//!
+//! ```text
+//! cargo test --test regression -- --test-threads=1
+//! ```
+//!
+//! `--test-threads=1` is required: these attach loop devices, mount
+//! filesystems and start containers, all of which are global host state.
+
+mod common;
+
+use std::time::{Duration, Instant};
+
+use common::{installed_helper_matches_built, require_host, unit_only, HostRequirements, TestProject};
+use nemr_engine::containerd::client::ContainerdClient;
+use nemr_engine::containerd::containers::StopOutcome;
+use nemr_engine::engine::project;
+use nemr_engine::engine::volume::{self, is_mounted, HelperOps, PrivilegedOps, Volume, VolumePaths, VolumeSize};
+
+/// TEST-01 — the installed helper must be the one this suite is testing.
+///
+/// # The gap this closes
+///
+/// The PRIV-03 hardening shipped a helper that refused every attack in 13 unit
+/// tests and via direct-invocation testing — and could not provision a single
+/// volume, because the fd-based design was routed through `losetup`/`mount`
+/// subprocesses that share neither the helper's fd table nor its column
+/// vocabulary. Every test passed; the deployed artifact was non-functional.
+///
+/// That is the VOL-05 shape again — green while wrong — and the root cause was
+/// that the tests exercised the rejection paths and pure logic, never a real
+/// provision against the installed binary. This canary makes "green" require
+/// that the installed helper is byte-identical to the built source, so a source
+/// change that was not reinstalled (`sudo ./scripts/setup_test_host.sh`) fails
+/// the suite loudly instead of testing a binary nobody runs.
+#[test]
+fn test_01_installed_helper_matches_built_source() {
+    if unit_only() {
+        return;
+    }
+    if !std::path::Path::new(HelperOps::DEFAULT_HELPER).exists() {
+        panic!(
+            "no privileged helper is installed at {}. These regression tests exercise the \
+             installed helper, so it must be present.\n     fix: sudo ./scripts/setup_test_host.sh",
+            HelperOps::DEFAULT_HELPER
+        );
+    }
+    installed_helper_matches_built().unwrap_or_else(|reason| panic!("{reason}"));
+}
+
+/// PROC-06 — SIGTERM was silently discarded by `sleep infinity` as PID 1.
+///
+/// # The defect
+///
+/// PROC-01 originally specified `sleep infinity` as the container's supervisor.
+/// Per `pid_namespaces(7)`, the kernel delivers a signal sent from an ancestor
+/// namespace to a namespace's PID 1 **only if that process has installed a
+/// handler for it**; SIGKILL and SIGSTOP are the only exceptions. `sleep`
+/// installs no handlers at all — its `/proc/1/status` reports
+/// `SigCgt: 0000000000000000` — so `stop`'s SIGTERM was dropped by the kernel
+/// without reaching the process.
+///
+/// The visible effect was not an error. `nemr stop` still worked: it waited out
+/// the full five-second grace period, escalated to SIGKILL, and reported
+/// success. Measured on the reference host before the fix, every stop took
+/// **6.4 to 6.8 seconds** and every container died of SIGKILL. Nothing in the
+/// output said so.
+///
+/// # Why this asserts on the signal path
+///
+/// Asserting only that the task ends up stopped passes just as happily against
+/// the broken version — the SIGKILL fallback does stop it. So the assertion is
+/// on *how* it stopped: [`StopOutcome`] records whether the graceful path
+/// succeeded, and this test requires `Graceful`. The elapsed-time bound is a
+/// second, independent check on the same property.
+#[test]
+fn proc_06_stop_terminates_gracefully_without_escalating_to_sigkill() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "proc06", VolumeSize::Small).await;
+
+        nemr_engine::engine::project::start(&client, &project.name)
+            .await
+            .expect("start");
+
+        let started = Instant::now();
+        let outcome = nemr_engine::engine::project::stop(&client, &project.name)
+            .await
+            .expect("stop");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome,
+            StopOutcome::Graceful,
+            "stop escalated to SIGKILL after {elapsed:?}. PID 1 is ignoring SIGTERM, which \
+             means it installs no handler for it — check config::SUPERVISOR_ARGS. A container \
+             that can only be killed is a container that never gets to flush anything."
+        );
+
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "stop took {elapsed:?}. A graceful stop should be near-instant; anything \
+             approaching the five-second grace period means the signal is not being handled."
+        );
+
+        assert!(
+            !nemr_engine::engine::project::is_running(&client, &project.name)
+                .await
+                .expect("is_running"),
+            "the task must actually be gone after stop, not merely signalled"
+        );
+    });
+}
+
+/// PROC-06, static half — the supervisor must install a SIGTERM handler.
+///
+/// The integration test above is the real proof, but it needs a provisioned
+/// host. This one needs nothing, so it runs everywhere including a bare CI
+/// container, and it fails the moment someone reverts the supervisor to a
+/// command that cannot trap anything.
+///
+/// It deliberately checks for the *mechanism* (a shell with a TERM trap) rather
+/// than string-matching the exact command, so the command can be rewritten
+/// without a spurious failure — but it cannot be rewritten back to a bare
+/// `sleep`.
+#[test]
+fn proc_06_supervisor_installs_a_sigterm_handler() {
+    let args = nemr_engine::config::SUPERVISOR_ARGS;
+    let command = args.join(" ");
+
+    assert!(
+        command.contains("trap"),
+        "the supervisor must install a signal handler, or the kernel will discard SIGTERM \
+         sent to PID 1 (pid_namespaces(7)). Got: {command:?}"
+    );
+    assert!(
+        command.contains("TERM"),
+        "the supervisor's trap must cover TERM specifically, since that is what `stop` sends. \
+         Got: {command:?}"
+    );
+    assert!(
+        !command.starts_with("sleep "),
+        "`sleep` installs no signal handlers (SigCgt: 0000000000000000), so SIGTERM to PID 1 \
+         is dropped by the kernel and every `stop` degrades to a timeout plus SIGKILL. \
+         This is the PROC-06 defect. Got: {command:?}"
+    );
+}
+
+/// The provisioning success path, end to end through the *installed* helper.
+///
+/// This is the coverage whose absence let a non-functional helper pass CI. It
+/// asserts the helper actually attaches a loop device, mounts an ext4
+/// filesystem, and chowns it so the invoking user can write — i.e. every step
+/// the fd-based ioctl rewrite touches — rather than only that attacks are
+/// refused.
+#[test]
+fn vol_provision_mount_and_ownership_success_path() {
+    if !require_host(HostRequirements::VOLUME) {
+        return;
+    }
+
+    let name = common::unique_name("volok");
+    common::purge(&name);
+
+    let paths = VolumePaths::from_env().expect("HOME set");
+    let volume = Volume::create(&name, VolumeSize::Small, paths, HelperOps::new())
+        .unwrap_or_else(|e| panic!("provisioning must succeed against the installed helper: {e:#}"));
+    let mount_point = volume.mount_point();
+
+    // 1. The volume is genuinely mounted (loop attach + mount both worked).
+    assert!(
+        is_mounted(&mount_point),
+        "the volume must be mounted after create — if this fails against a fresh helper, the \
+         loop attach or mount step is broken"
+    );
+
+    // 2. The chown worked: the invoking user can write to the volume root. On a
+    //    freshly formatted ext4 the root inode is root-owned, so without the
+    //    PRIV-06 chown this write fails with EACCES — and the container (which
+    //    maps to this uid) could not use its own volume.
+    let marker = mount_point.join("provision-marker");
+    std::fs::write(&marker, b"written by the invoking user")
+        .unwrap_or_else(|e| panic!("the volume must be writable by the invoking user (PRIV-06 chown): {e}"));
+    assert_eq!(std::fs::read(&marker).unwrap(), b"written by the invoking user");
+
+    // 3. The quota is real: the filesystem's total does not exceed the request.
+    let usage = volume::usage(&mount_point).expect("a mounted volume reports usage");
+    assert!(
+        usage.total <= VolumeSize::Small.bytes(),
+        "quota must cap the filesystem at <= 500MB; got {} bytes",
+        usage.total
+    );
+
+    // 4. Release: drop unmounts and detaches, leaving nothing mounted.
+    drop(volume);
+    assert!(
+        !is_mounted(&mount_point),
+        "the volume must be unmounted after the guard drops (loop detach + umount both worked)"
+    );
+
+    common::purge(&name);
+}
+
+/// VOL-06 — a volume lost to a reboot is remounted on start, never silently
+/// fallen through to the host filesystem.
+///
+/// The reference defect: after a reboot the container record survives but the
+/// mount and loop device do not, and `start` used to proceed against whatever
+/// filesystem the mount-point directory happened to sit on — the host root, with
+/// no quota and none of the project's data — reporting success the whole way.
+///
+/// This reproduces the post-reboot state exactly (unmount + detach via the same
+/// helper a reboot's teardown is equivalent to) and asserts the volume is
+/// remounted with its data and quota intact. It is not `#[ignore]`d: the whole
+/// point is that the reference defect's guard runs on every pass.
+#[test]
+fn vol_06_start_remounts_a_volume_lost_to_reboot() {
+    if !require_host(HostRequirements::VOLUME) {
+        return;
+    }
+
+    let name = common::unique_name("vol06");
+    common::purge(&name);
+
+    let paths = VolumePaths::from_env().expect("HOME set");
+    let volume = Volume::create(&name, VolumeSize::Small, paths.clone(), HelperOps::new())
+        .unwrap_or_else(|e| panic!("setup: provisioning must succeed: {e:#}"));
+    let mount_point = volume.mount_point();
+
+    // A marker proves the *same* filesystem returns, not merely that something
+    // is mounted.
+    let marker = mount_point.join("vol06-marker");
+    std::fs::write(&marker, b"before the simulated reboot").expect("write marker");
+    let _ = volume.persist();
+
+    // Reproduce the post-reboot state: mount and loop gone, backing file intact.
+    HelperOps::new()
+        .unmount_and_detach(&name)
+        .expect("simulated reboot teardown");
+    assert!(!is_mounted(&mount_point), "precondition: unmounted after simulated reboot");
+    assert!(!marker.exists(), "data is invisible while unmounted");
+    assert!(
+        paths.image_file(&name).exists(),
+        "the backing file must survive a reboot — it is what makes remount possible"
+    );
+
+    // The fix: start detects the missing mount and remounts, rather than running
+    // against the host filesystem.
+    project::ensure_volume_mounted(&name)
+        .unwrap_or_else(|e| panic!("VOL-06: start must remount, not proceed unmounted: {e:#}"));
+
+    assert!(is_mounted(&mount_point), "VOL-06: the volume must be mounted again");
+    assert_eq!(
+        std::fs::read(&marker).expect("marker must be back"),
+        b"before the simulated reboot",
+        "VOL-06: the SAME filesystem must return, data intact"
+    );
+    let usage = volume::usage(&mount_point).expect("mounted volume reports usage");
+    assert!(
+        usage.total <= VolumeSize::Small.bytes(),
+        "VOL-06: quota must be back in force; got {} bytes",
+        usage.total
+    );
+
+    common::purge(&name);
+}
+
+/// VOL-06 — a project whose backing file is gone must fail loudly, never
+/// silently start against the host filesystem.
+#[test]
+fn vol_06_missing_backing_file_fails_loudly() {
+    if !require_host(HostRequirements::VOLUME) {
+        return;
+    }
+
+    let name = common::unique_name("vol06gone");
+    common::purge(&name);
+
+    let paths = VolumePaths::from_env().expect("HOME set");
+    // Create the mount-point directory but no backing file — the state a lost
+    // volume leaves behind.
+    std::fs::create_dir_all(paths.mount_point(&name)).expect("create mount point");
+
+    let error = project::ensure_volume_mounted(&name)
+        .expect_err("a missing backing file must be an error, not a silent pass")
+        .to_string();
+    assert!(
+        error.contains("no backing file"),
+        "the error must say what is wrong: {error}"
+    );
+
+    common::purge(&name);
+}

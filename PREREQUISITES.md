@@ -40,6 +40,7 @@ setup is complete, no runtime operation in Milestone 1 requires it.
 ## Step 0 — Verify kernel support (no install required)
 
 ```bash
+uname -r                                            # expect: 5.8 or newer
 stat -fc %T /sys/fs/cgroup                          # expect: cgroup2fs
 sysctl kernel.unprivileged_userns_clone             # expect: = 1
 sysctl kernel.apparmor_restrict_unprivileged_userns # expect: = 0
@@ -60,6 +61,12 @@ USERNS OK
 
 Notes on the checks that commonly fail:
 
+- **Kernel must be 5.8 or newer.** The privileged volume helper attaches loop
+  devices with the `LOOP_CONFIGURE` ioctl, which landed in Linux 5.8. On an
+  older kernel `nemr create` fails with a clear message naming this requirement.
+  Ubuntu 22.04 (kernel 5.15) and 24.04 (6.8) both satisfy it; the reference host
+  is 6.8. There is deliberately no fallback to the pre-5.8 `LOOP_SET_FD` path —
+  it is below the supported floor and untestable here.
 - **`apparmor_restrict_unprivileged_userns` must be 0.** Ubuntu 23.10+ ships
   this as `1`, which blocks unprivileged user namespaces and therefore blocks
   PRIV-01 outright. If it reads `1`, that is a genuine blocker to escalate
