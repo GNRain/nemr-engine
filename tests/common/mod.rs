@@ -16,7 +16,7 @@
 //! point: `#[ignore]` is how the VOL-06 regression suite came to exist without
 //! ever running.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -88,7 +88,7 @@ pub fn require_host(requirements: HostRequirements) -> bool {
         if !helper.exists() {
             missing.push(format!(
                 "privileged helper not installed at {}\n     \
-                 fix: ./scripts/setup_test_host.sh",
+                 fix: sudo ./scripts/setup_test_host.sh",
                 helper.display()
             ));
         } else if !sudo_grant_works() {
@@ -97,6 +97,14 @@ pub fn require_host(requirements: HostRequirements) -> bool {
                  fix: install deploy/sudoers.d/nemr-volume (see ./scripts/setup_test_host.sh)",
                 helper.display()
             ));
+        } else if let Err(reason) = installed_helper_matches_built() {
+            // TEST-01: a host-backed test must exercise the *installed* helper,
+            // not a locally-built one that was never deployed. If they differ,
+            // the deployed artifact is not what this suite is proving anything
+            // about — the exact gap that let a helper which could not provision
+            // a single volume pass 13 unit tests. Refuse to run rather than
+            // report a green result against a stale binary.
+            missing.push(reason);
         }
     }
 
@@ -137,6 +145,56 @@ fn sudo_grant_works() -> bool {
             text.contains("usage")
         })
         .unwrap_or(false)
+}
+
+/// Whether the installed helper is byte-identical to the crate's built release
+/// artifact.
+///
+/// This is the enforcement behind "the suite passes against the *installed*
+/// helper, verified by hash". A stale installed helper — source changed but
+/// `setup_test_host.sh` not re-run — makes every host-backed assertion a
+/// statement about a binary nobody is running.
+pub fn installed_helper_matches_built() -> Result<(), String> {
+    let installed = PathBuf::from(HelperOps::DEFAULT_HELPER);
+    let built = built_helper_path();
+
+    if !built.exists() {
+        return Err(format!(
+            "the helper's release binary is not built at {}\n     \
+             fix: (cd deploy/nemr-volume && cargo build --release) then sudo ./scripts/setup_test_host.sh",
+            built.display()
+        ));
+    }
+
+    let installed_hash = sha256_of(&installed)
+        .map_err(|e| format!("cannot hash the installed helper {}: {e}", installed.display()))?;
+    let built_hash = sha256_of(&built)
+        .map_err(|e| format!("cannot hash the built helper {}: {e}", built.display()))?;
+
+    if installed_hash != built_hash {
+        return Err(format!(
+            "the installed helper does not match the built source:\n     \
+             installed {} = {installed_hash}\n     \
+             built     {} = {built_hash}\n     \
+             fix: sudo ./scripts/setup_test_host.sh",
+            installed.display(),
+            built.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Path to the helper crate's release binary, relative to this crate's root.
+pub fn built_helper_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("deploy/nemr-volume/target/release/nemr-volume")
+}
+
+fn sha256_of(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)?;
+    let digest = Sha256::digest(&bytes);
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn base_image_present() -> bool {

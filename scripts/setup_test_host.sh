@@ -38,7 +38,7 @@ fi
 
 echo "==> Building the helper (release)"
 # Build as the invoking user so the target/ tree stays user-owned.
-sudo -u "$ACCOUNT" bash -c "cd '$HELPER_SRC_DIR' && cargo build --release"
+sudo -u "$ACCOUNT" bash -lc "cd '$HELPER_SRC_DIR' && cargo build --release"
 
 echo "==> Installing $HELPER_DEST (root:root, 0755)"
 install -o root -g root -m 0755 "$HELPER_SRC_DIR/target/release/nemr-volume" "$HELPER_DEST"

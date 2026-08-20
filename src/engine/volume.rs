@@ -549,9 +549,13 @@ impl<P: PrivilegedOps> Drop for Volume<P> {
                 audit(&format!("released volume {:?}", self.name));
             }
             Err(error) => audit(&format!(
-                "WARNING: failed to release volume {:?}: {error:#}. \
-                 Check `losetup -a` and `mount` for orphaned resources.",
-                self.name
+                "WARNING: the release helper for volume {:?} returned an error: {error:#}\n\
+                 This is the *cleanup path* failing, which is not the same as a confirmed \
+                 leak — the mount may never have been established (this runs on create's \
+                 error path too). It does mean the release could not be confirmed. Verify \
+                 with `losetup -a` and `grep {} /proc/self/mountinfo`; a startup \
+                 reconciliation sweep will also reclaim it if it did leak.",
+                self.name, self.name
             )),
         }
     }
