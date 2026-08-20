@@ -108,14 +108,12 @@ pub fn require_host(requirements: HostRequirements) -> bool {
         }
     }
 
-    if requirements.base_image {
-        if !base_image_present() {
-            missing.push(format!(
-                "base image {} not found in containerd\n     \
-                 fix: build and import it per README, \"Base image (Milestone 2)\"",
-                nemr_engine::config::BASE_IMAGE
-            ));
-        }
+    if requirements.base_image && !base_image_present() {
+        missing.push(format!(
+            "base image {} not found in containerd\n     \
+             fix: build and import it per README, \"Base image (Milestone 2)\"",
+            nemr_engine::config::BASE_IMAGE
+        ));
     }
 
     assert!(
@@ -253,18 +251,6 @@ impl TestProject {
             .unwrap_or_else(|error| panic!("failed to create test project {name:?}: {error:#}"));
 
         Self { name }
-    }
-
-    pub fn mount_point(&self) -> PathBuf {
-        VolumePaths::from_env()
-            .expect("HOME must be set")
-            .mount_point(&self.name)
-    }
-
-    pub fn image_file(&self) -> PathBuf {
-        VolumePaths::from_env()
-            .expect("HOME must be set")
-            .image_file(&self.name)
     }
 }
 

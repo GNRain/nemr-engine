@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            println!("{:<18} {:<9} {:<18} {:<8} {}", "NAME", "STATUS", "USED", "QUOTA", "VOLUME");
+            println!("{:<18} {:<9} {:<18} {:<8} VOLUME", "NAME", "STATUS", "USED", "QUOTA");
             for p in &projects {
                 let status = if p.running { "running" } else { "stopped" };
                 let used = match p.usage {
