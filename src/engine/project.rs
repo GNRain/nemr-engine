@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use crate::auth;
 use crate::config;
 use crate::containerd::client::ContainerdClient;
-use crate::containerd::containers::{BindMount, ContainerSpec};
+use crate::containerd::containers::{BindMount, ContainerSpec, StopOutcome};
 use crate::engine::volume::{HelperOps, PrivilegedOps, Volume, VolumePaths, VolumeSize};
 
 /// Runs in the container's shell before every prompt, so a prompt never lands
@@ -249,7 +249,12 @@ pub async fn start(client: &ContainerdClient, name: &str) -> Result<u32> {
 }
 
 /// Stop a project's container (Milestone 5).
-pub async fn stop(client: &ContainerdClient, name: &str) -> Result<()> {
+///
+/// Returns how the task actually stopped, so the caller can distinguish a
+/// clean shutdown from one that had to be killed (PROC-06). Reporting only
+/// success is what let a supervisor that ignored SIGTERM go unnoticed for the
+/// whole of Phase 1.
+pub async fn stop(client: &ContainerdClient, name: &str) -> Result<StopOutcome> {
     let container_id = resolve(client, name).await?;
 
     // AC-5.3: stopping an already-stopped project must fail clearly rather

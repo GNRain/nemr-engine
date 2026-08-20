@@ -435,6 +435,34 @@ impl TaskState {
     }
 }
 
+/// How a task actually came to a stop.
+///
+/// Exists because "the task is stopped" is not the same claim as "the task shut
+/// down cleanly", and conflating them hid PROC-06 for the whole of Phase 1: a
+/// supervisor that ignored SIGTERM was killed after a five-second timeout on
+/// every single stop, and `stop` reported success either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// The task handled SIGTERM and exited within the grace period.
+    Graceful,
+    /// The task ignored SIGTERM and had to be killed. Not an error, but it
+    /// means the container got no chance to flush or shut down cleanly, and it
+    /// is worth surfacing rather than swallowing.
+    Killed,
+    /// There was no task to stop.
+    NoTask,
+}
+
+impl std::fmt::Display for StopOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Graceful => "terminated gracefully",
+            Self::Killed => "ignored SIGTERM; killed after the grace period",
+            Self::NoTask => "no task was running",
+        })
+    }
+}
+
 impl ContainerdClient {
     /// Current task state for a container.
     ///
@@ -535,33 +563,41 @@ impl ContainerdClient {
     /// state of AC-4.1 (PROC-04). Leaving a stopped-but-undeleted task behind
     /// would make a later `start` fail with "already exists".
     ///
-    /// # Why this escalates to SIGKILL
+    /// # Why the outcome is reported rather than discarded
     ///
-    /// The task's PID 1 is a supervisor (PROC-01). Per `pid_namespaces(7)`, the
-    /// kernel delivers a signal to a namespace's PID 1 **only if that process
-    /// has installed a handler for it** — SIGKILL and SIGSTOP from an ancestor
-    /// namespace being the exceptions. `sleep infinity` installs no handlers
-    /// (`SigCgt` is all zeroes), so SIGTERM against it is silently discarded and
-    /// waiting for exit blocks forever.
+    /// Per `pid_namespaces(7)`, the kernel delivers a signal sent from an
+    /// ancestor namespace to a namespace's PID 1 **only if that process has
+    /// installed a handler for it** — SIGKILL and SIGSTOP being the exceptions.
+    /// A supervisor that traps nothing therefore never sees SIGTERM at all, and
+    /// `stop` silently degrades into "wait out the grace period, then SIGKILL".
     ///
-    /// SIGTERM is still sent first, and still worth sending: a future
-    /// supervisor that does trap it gets its chance to shut down cleanly. But
-    /// the wait is bounded, and SIGKILL follows, because with the current
-    /// supervisor the graceful path cannot succeed by construction.
-    pub async fn stop_task(&self, id: &str) -> Result<()> {
+    /// That degradation is invisible from the outside: the task does stop, and
+    /// the command does report success. It cost this project a defect (PROC-06)
+    /// that survived precisely because nothing distinguished the two paths. So
+    /// the path taken is returned rather than dropped, and callers surface it.
+    pub async fn stop_task(&self, id: &str) -> Result<StopOutcome> {
         const GRACE: Duration = Duration::from_secs(5);
         const KILL_TIMEOUT: Duration = Duration::from_secs(10);
 
+        // Nothing to stop. Reported distinctly so a caller can tell "already
+        // stopped" from "stopped by us", rather than inferring it.
+        if self.task_state(id).await? == TaskState::None {
+            return Ok(StopOutcome::NoTask);
+        }
+
         self.signal_task(id, 15).await?;
 
-        if timeout(GRACE, self.wait_task(id)).await.is_err() {
+        let outcome = if timeout(GRACE, self.wait_task(id)).await.is_err() {
             self.signal_task(id, 9).await?;
             timeout(KILL_TIMEOUT, self.wait_task(id))
                 .await
                 .with_context(|| {
                     format!("task for {id:?} did not exit within {KILL_TIMEOUT:?} of SIGKILL")
                 })??;
-        }
+            StopOutcome::Killed
+        } else {
+            StopOutcome::Graceful
+        };
 
         let delete = DeleteTaskRequest {
             container_id: id.to_string(),
@@ -572,8 +608,8 @@ impl ContainerdClient {
             .delete(with_namespace!(delete, self.namespace()))
             .await
         {
-            Ok(_) => Ok(()),
-            Err(status) if status.code() == Code::NotFound => Ok(()),
+            Ok(_) => Ok(outcome),
+            Err(status) if status.code() == Code::NotFound => Ok(outcome),
             Err(status) => Err(anyhow::Error::from(status))
                 .with_context(|| format!("failed to delete task for {id:?}")),
         }

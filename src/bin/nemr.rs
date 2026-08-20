@@ -7,6 +7,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use nemr_engine::containerd::client::ContainerdClient;
+use nemr_engine::containerd::containers::StopOutcome;
 use nemr_engine::engine::project;
 use nemr_engine::engine::volume::{self, VolumeSize};
 
@@ -91,8 +92,18 @@ async fn main() -> Result<()> {
 
         Command::Stop { name } => {
             let client = ContainerdClient::connect().await?;
-            project::stop(&client, &name).await?;
-            println!("stopped project {name:?}");
+            let outcome = project::stop(&client, &name).await?;
+            println!("stopped project {name:?} ({outcome})");
+
+            // A container that had to be killed got no chance to shut down
+            // cleanly. Not an error, but the user should not have to guess
+            // which of the two happened (PROC-06).
+            if outcome == StopOutcome::Killed {
+                eprintln!(
+                    "[nemr] warning: the container ignored SIGTERM and was killed after the \n\
+                     grace period. Its processes were given no opportunity to flush state."
+                );
+            }
         }
 
         Command::List => {
