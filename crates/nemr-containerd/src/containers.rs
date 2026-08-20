@@ -132,6 +132,13 @@ pub struct ContainerSpec {
     /// The scope is named `<prefix>-<name>.scope`, so passing an id that
     /// already carries the prefix yields a doubled name. `None` uses `id`.
     pub cgroup_name: Option<String>,
+    /// Prefix for the cgroup slice path, `user.slice:<prefix>:<name>`.
+    ///
+    /// Product-specific (the caller's, e.g. `"nemr"`), so it lives on the spec
+    /// rather than as a wrapper constant — the wrapper stays product-agnostic
+    /// and the same crate serves the CLI, the daemon and the connectivity
+    /// baselines without carrying anyone's branding.
+    pub cgroup_prefix: String,
     /// Labels stored on the container record.
     ///
     /// containerd persists these and returns them from its listing API, so
@@ -376,7 +383,7 @@ fn oci_spec(spec: &ContainerSpec, image_config: &ImageConfig) -> serde_json::Val
             // under the delegated user slice is what works.
             "cgroupsPath": format!(
                 "user.slice:{}:{}",
-                crate::config::CGROUP_PREFIX,
+                spec.cgroup_prefix,
                 spec.cgroup_name.as_deref().unwrap_or(&spec.id)
             ),
             "namespaces": [

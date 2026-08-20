@@ -1,55 +1,36 @@
+[workspace]
+# The wrapper layer (SPEC §3.2) is its own crate so the GUI and the resolved
+# E-09 daemon can consume it without pulling in the engine. deploy/nemr-volume
+# has its own [workspace] and stays a separate privilege domain.
+members = ["crates/nemr-containerd"]
+
 [package]
 name = "nemr-engine"
 version = "0.1.0"
 edition = "2021"
 description = "Nemr Phase 1 — core container engine (containerd/runc, no Docker)"
-# deploy/ holds a separate, standalone crate (the privileged helper) with its own
-# workspace. Excluded so the engine package does not try to absorb it.
 exclude = ["deploy"]
 
-# Library crate: hosts src/containerd/ (wrapper layer, Section 3.2) and
-# src/engine/ (product logic). Binaries under src/bin/ consume it.
+# Library crate: product logic in src/engine/, re-exporting the wrapper crate as
+# `containerd` so the layering rule (SPEC §3.2) reads unchanged at call sites.
 [lib]
 name = "nemr_engine"
 path = "src/lib.rs"
 
 # CLI entrypoint — sole user interface for Phase 1 (Section 1.3, item 6).
-# Populated in Milestones 4-6.
 [[bin]]
 name = "nemr"
 path = "src/bin/nemr.rs"
 
-# Milestone 1, scope item 1: raw connectivity baseline. Talks to
-# containerd-client DIRECTLY, deliberately bypassing the wrapper, to
-# establish a pre-abstraction baseline for AC-1.2 to compare against.
-[[bin]]
-name = "raw_connectivity"
-path = "src/bin/raw_connectivity.rs"
-
-# Milestone 1, scope item 2: exercises the src/containerd/ wrapper and prints
-# output byte-identical to raw_connectivity, so AC-1.2 is demonstrable by diff.
-[[bin]]
-name = "wrapper_connectivity"
-path = "src/bin/wrapper_connectivity.rs"
-
 [dependencies]
-# Section 3.1: first-party Rust bindings from containerd/rust-extensions.
-# 0.9.0 is the current release; verified against crates.io 2026-08-10.
-# Its build script generates gRPC bindings from .proto sources and therefore
-# requires `protoc` on the host at compile time (see PREREQUISITES.md).
-containerd-client = "0.9"
+# The engine depends on the wrapper crate, never on containerd-client directly
+# (SPEC §3.2). The connectivity baselines that DO use containerd-client directly
+# moved into the wrapper crate's own bins.
+nemr-containerd = { path = "crates/nemr-containerd" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
 anyhow = "1"
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 clap = { version = "4.6.6", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
-prost-types = "0.14"
 libc = "0.2.189"
-
-# Deliberately NOT a direct dependency: `tonic` types must come from
-# `containerd_client::tonic` (the crate re-exports it). Declaring our own tonic
-# lets cargo resolve a second, incompatible version into the graph — the
-# generated gRPC clients then reject our `Request` type with a confusing
-# "multiple different versions of crate `tonic`" error.
-# tonic = "..."   <- do not add

@@ -1,0 +1,37 @@
+[package]
+name = "nemr-containerd"
+version = "0.1.0"
+edition = "2021"
+description = "Higher-level wrapper over the low-level containerd-client crate (NEMR-SPEC-001 §3.2)"
+
+# The wrapper layer (SPEC §3.2). It is the single place that talks to
+# containerd-client; the engine and any future daemon depend on THIS crate, not
+# on containerd-client directly. Kept usable standalone (see src/bin/).
+[lib]
+name = "nemr_containerd"
+path = "src/lib.rs"
+
+# M1 connectivity artifacts live with the wrapper they exercise: the raw
+# baseline (containerd-client directly) and the wrapper equivalent (AC-1.2).
+[[bin]]
+name = "raw_connectivity"
+path = "src/bin/raw_connectivity.rs"
+
+[[bin]]
+name = "wrapper_connectivity"
+path = "src/bin/wrapper_connectivity.rs"
+
+[dependencies]
+# tonic types must come from containerd_client::tonic (the crate re-exports it);
+# a direct tonic dep resolves a second, incompatible version. See SPEC M1 note.
+containerd-client = "0.9"
+# The library itself needs only `time` (the stop-task timeout). `macros` and
+# `rt-multi-thread` are here for the two connectivity binaries below, which need
+# an #[tokio::main]; a consumer linking only the library still pays for them, but
+# splitting them behind a feature would complicate the standalone-usability
+# property this crate is meant to keep.
+tokio = { version = "1", features = ["time", "macros", "rt-multi-thread"] }
+anyhow = "1"
+serde_json = "1.0.151"
+prost-types = "0.14"
+sha2 = "0.11.0"

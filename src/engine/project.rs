@@ -165,6 +165,7 @@ pub async fn create(
         // Bare project name: the scope is `nemr-<name>.scope`, and passing the
         // container id (already `nemr-` prefixed) would double it.
         cgroup_name: Some(name.to_string()),
+        cgroup_prefix: config::CGROUP_PREFIX.to_string(),
         labels,
     };
 

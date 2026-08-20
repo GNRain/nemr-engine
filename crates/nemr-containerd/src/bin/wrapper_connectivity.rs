@@ -8,7 +8,7 @@
 //! `ContainerdClient`, call wrapper methods, never touch the raw crate.
 
 use anyhow::Result;
-use nemr_engine::containerd::client::ContainerdClient;
+use nemr_containerd::client::ContainerdClient;
 
 #[tokio::main]
 async fn main() -> Result<()> {
