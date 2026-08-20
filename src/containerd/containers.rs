@@ -628,6 +628,9 @@ pub struct ExecIo {
     pub stdin: PathBuf,
     /// FIFO the caller reads the process's output from.
     pub stdout: PathBuf,
+    /// FIFO for stderr. Only used without a terminal — a pty merges the two
+    /// streams, and containerd rejects a spec that sets both.
+    pub stderr: Option<PathBuf>,
     /// Allocate a pseudo-terminal for the process.
     pub terminal: bool,
 }
@@ -661,7 +664,11 @@ impl ContainerdClient {
             terminal: io.terminal,
             stdin: io.stdin.to_string_lossy().to_string(),
             stdout: io.stdout.to_string_lossy().to_string(),
-            stderr: String::new(),
+            stderr: io
+                .stderr
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
             spec: Some(Any {
                 type_url: "types.containerd.io/opencontainers/runtime-spec/1/Process".to_string(),
                 value: spec_bytes,

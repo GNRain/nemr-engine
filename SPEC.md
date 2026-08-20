@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | NEMR-SPEC-001 |
-| Version | 1.20 |
+| Version | 1.21 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -36,6 +36,7 @@
 | 1.18 | Revision | Added Section 3.9 (Container Network Model, NET-01/NET-02): project containers share rootlesskit's network namespace, equivalent to `nerdctl run --net=host` under rootless; per-project network isolation is explicitly out of scope for Phase 1, with rootless CNI via `rootlesskit --detach-netns` (requires rootlesskit >= 2.0) recorded as the Phase 2 path. Found at Milestone 5: a container given its own network namespace receives an empty one — loopback only, no egress — and Claude Code failed with `ENOTIMP` against api.anthropic.com. Added risk R-07 for port collisions between projects under a shared namespace. Sections 1–3 are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction. | Claude Code, per Product Owner instruction |
 | 1.19 | Revision | Section 3.4's repository diagram brought back in step with the actual repository, which had drifted: it was missing `src/lib.rs`, both `mod.rs` files, the two Milestone 1 baseline binaries, the whole `deploy/` tree from Milestone 3, and `src/engine/tty.rs` from Milestone 5. All of these were already recorded as deviations in Section 11; the diagram simply had not been updated alongside them. Added a note that the diagram states current reality rather than an aspiration. Section 11 gained entries for `tty.rs` and `deploy/`. Structural fact rather than a new decision, edited directly on Product Owner instruction. | Claude Code, per Product Owner instruction |
 | 1.20 | Revision | Added VOL-06 to Section 3.6: `start` must verify the project's volume is mounted and remount it if not, rather than proceeding. Found at Milestone 6 after a host reboot — container records persist in containerd's database while mounts and loop devices do not, so `start` succeeded against an unmounted volume and gave the container an empty `/workspace` backed by the host root filesystem with no quota. A silent VOL-05 violation: a user could work an entire session believing they were writing to their project, with no error at any point. Auto-remount rather than refuse-and-require-manual-repair, since requiring manual intervention defeats the portability this product exists for. Sections 1–3 are Product Owner territory under 4A.5; this edit was made on explicit Product Owner instruction. | Claude Code, per Product Owner instruction |
+| 1.21 | Revision | Recorded the Milestone 7 finding that `attach` allocates a pty only when its own stdin is a terminal, and that this drifts from PROC-02 as written. Added the note under Milestone 5, a Section 11 deviation row, and escalation item E-07. PROC-02 itself left unedited — Section 3.8 is Product Owner territory per 4A.5. | Claude Code |
 
 ---
 
@@ -505,6 +506,28 @@ The engine equivalent is setting the task's cgroup path through the wrapper
 rather than shelling out to `ctr`. If the right wrapper API shape for this is
 not obvious, that is an E-04 escalation.
 
+**Note carried forward from Milestone 7 (attach allocates a pty only when
+stdin is a terminal).** PROC-02 (Section 3.8) specifies "a task exec with a
+fresh TTY per call". Implementing that literally makes a *scripted* attach —
+`echo cmd | nemr attach <name>` — impossible to terminate, which is what
+Milestone 7's smoke test needs. A pty has no end-of-file: the shell never
+learns its input has finished, so it never exits. Writing EOT (0x04) into the
+pty and calling containerd's `CloseIO` were both tried, and both hung
+indefinitely.
+
+`attach` therefore allocates a pty only when its own stdin is a terminal
+(`isatty(0)`), matching what `docker exec -t` does. Without a terminal, stdin
+is an ordinary pipe, closing every write end is a real EOF, and the shell
+exits on its own with its own status. A separate stderr FIFO is passed only on
+the pipe path, since a pty merges the two streams and containerd rejects a
+spec that sets both.
+
+This is a **drift from PROC-02 as written**, not a correction to it: the
+requirement says every attach gets a TTY, and the implementation now gives one
+only to interactive attaches. Section 3.8 is Product Owner territory under
+4A.5, so PROC-02 is left unedited and the divergence is recorded here and in
+Section 11 pending a decision. Escalated as **E-07**.
+
 **Acceptance Criteria:**
 - AC-5.1: `create` → `start` → `attach` results in an interactive shell in
   which Claude Code runs correctly against the mounted project volume.
@@ -813,6 +836,16 @@ resolved unilaterally, if encountered during implementation:
   remains unmet and why, per the evaluator's most recent reason, rather
   than re-running the same `/goal` invocation unchanged or silently
   narrowing the condition to force a pass
+- E-07: PROC-02 (Section 3.8) requires a fresh TTY per `attach`. The
+  implementation allocates one only when `attach`'s own stdin is a terminal,
+  because a pty has no EOF and a scripted attach could otherwise never
+  terminate — see the Milestone 7 note under Milestone 5. Requires a Section
+  3.8 amendment to PROC-02, which is Product Owner territory under 4A.5.
+  Recommendation: amend PROC-02 to "a fresh TTY per *interactive* call;
+  a non-interactive attach is pipe-backed so that end-of-input is
+  representable". Consequence of not deciding: the code and the spec disagree
+  on a normative requirement, and the smoke test depends on the code's
+  behaviour, not the spec's.
 
 ---
 
@@ -843,6 +876,7 @@ Product Owner sign-off status.)*
 | 2026-08-11 | 3.4 | Added `src/engine/tty.rs` | Interactive attach (PROC-02) needs local terminal handling: raw mode as an RAII guard, FIFO creation and opening, and IO pumps. Kept out of `project.rs` because it is host-terminal mechanics rather than project logic, and out of `src/containerd/` because it is not a containerd concern. Section 3.4's diagram updated to match. | Pending |
 | 2026-08-11 | 3.4 | Added `deploy/` (helper crate + sudoers rule) | The PRIV-03 privileged helper is a separate privilege domain and a standalone crate; Section 3.4's original tree predates Section 3.7. Now reflected in the diagram. | Pending |
 | 2026-08-11 | 3.3 | `PREREQUISITES.md` documents rootless tooling (`uidmap`, `rootlesskit`, `slirp4netns`) not enumerated in Section 3.3 | Section 3.7 (PRIV-01) requires rootless containerd, which needs this tooling; Section 3.3's list predates 3.7 and was not updated alongside it. Documented rather than silently assumed, since 3.3 designates `PREREQUISITES.md` as the clean-host provisioning source. Section 3.3 itself left unedited — Sections 1–3 are Product Owner territory per 4A.5. | Pending |
+| 2026-08-20 | 3.8 | `attach` allocates a pty only when its own stdin is a terminal; PROC-02 requires one per call unconditionally | A pty has no EOF, so a scripted `echo cmd \| nemr attach` can never signal end-of-input and the session hangs forever. EOT and `CloseIO` were both tried against a pty and both hung. Milestone 7's smoke test is non-interactive and therefore depends on the pipe path existing. Recorded rather than resolved: PROC-02 is in Section 3.8, which is Product Owner territory per 4A.5. Escalated as E-07; full reasoning in the Milestone 7 note under Milestone 5. | **Escalated (E-07)** |
 
 This table is the single source of truth for deviations (Section 8, 4A.5).
 `README.md` points here rather than reproducing it.
