@@ -3,22 +3,15 @@
 Product-owner rulings on escalations and architectural questions. Section 1–3
 decisions and Section 9 escalations are Rain's to make; this file is the record.
 
-Claude Code appends new escalations to **Open** with options and a
-recommendation, and does not move them to **Resolved** — that edit is Rain's.
+**Maintenance rules.** Append-only — never delete an entry, never rewrite an
+existing entry's rationale. If a ruling changes, mark the old one `Superseded`
+with its rationale intact and write a new entry referencing it. Claude Code may
+add to **Open** but may not move anything to **Resolved**; that edit is Rain's.
+Every entry states its consequences — a decision without consequences is a
+preference. Update the Log table on every change.
 
 **Status values:** Open · Resolved · Superseded
-**ID prefixes:** `E-xx` escalations · `D-xx` decisions raised outside the escalation path
-
-> **Escalation numbering (reconciled 2026-08-21).** `E-` is one global namespace
-> shared with SPEC.md Section 9, which is the canonical ledger. SPEC owns
-> `E-01`…`E-08` (the original spec escalations, plus `E-07` the attach-pty drift
-> and `E-08` the helper-hardening visibility item). The three product gates
-> recorded in **Open** below as `E-01`/`E-02`/`E-03` are SPEC's **`E-09`**
-> (engine consumption — resolved), **`E-10`** (non-Linux hosts) and **`E-11`**
-> (open-core seam). They are pending renumber to those IDs in this file — flagged
-> for the Product Owner because it restructures existing entries, which the
-> maintenance rules reserve. `D-0x` is a separate series for decisions raised
-> outside the escalation path and does not collide.
+**ID prefixes:** `D-xx` product decisions · `E-xx` escalations (shared namespace with SPEC Section 9) · `F-xx` findings from the conformance ledger
 
 ---
 
@@ -27,7 +20,6 @@ recommendation, and does not move them to **Resolved** — that edit is Rain's.
 ### D-01 — Compute model: local compute, cloud storage
 
 **Status:** Resolved · 2026-08-20
-**Supersedes/blocks:** GUI planning, non-Linux host support
 
 **Question.** Does the container engine run on the user's machine, with the
 cloud used only for storage and coordination, or do we host the compute?
@@ -43,18 +35,17 @@ portability layer is the commercial product.
 
 **Consequences.**
 - The stack (loopback ext4, rootless containerd, runc) is Linux-only. Windows
-  and macOS require a bundled VM. **This is now the top product risk**, not a
-  footnote, and it blocks GUI planning. See `E-02`.
+  and macOS require a bundled VM. **Top product risk**, not a footnote. See E-10.
 - Every attach is a download from object storage, so egress cost scales with
-  active usage. See `D-05`.
-- The engine needs a stable consumption interface for the GUI. See `E-01`.
+  active usage. See D-05.
+- The engine needs a stable consumption interface for the GUI. See E-09.
 
 ---
 
 ### D-02 — Credentials: per-device, never synced
 
 **Status:** Resolved · 2026-08-20
-**Relates to:** M9 exclusion policy, import UX
+**Relates to:** M9 exclusion policy, import UX, F-12
 
 **Question.** Do credentials travel inside an exported bundle — encrypted,
 stripped and re-prompted, or something else?
@@ -70,12 +61,19 @@ Per-device keeps the secret's blast radius at one machine.
 
 **Consequences.**
 - **A session bundle is not self-sufficient.** Import on a fresh machine
-  requires a separate credential step. This is the first thing a new user
-  hits, so design it into the import flow's UX now rather than bolting it on.
-- M9's exclusion policy must treat credential paths as a hard exclusion, tested,
+  requires a separate credential step — the first thing a new user hits, so it
+  belongs in the import flow's UX rather than bolted on.
+- M9's exclusion policy treats credential paths as a hard exclusion, tested,
   not a configurable default.
-- WP C's state-locality findings must enumerate every path that holds a
-  credential or token, or this ruling can't be enforced.
+- Enforcement depends on every credential-bearing path being enumerated. WP C
+  did this: the credential is a read-only host bind-mount, off both portable
+  layers. `.claude.json` holds machine and account identity that must not travel.
+- Rotation must propagate to a running container, or per-device injection is
+  only true at create time. See F-12.
+
+**Verification.** WP C confirmed the credential sits outside both portable
+layers, and WP C2's implementation keeps it there deliberately — the
+whole-directory `CLAUDE_CONFIG_DIR` relocation was rejected on these grounds.
 
 ---
 
@@ -97,10 +95,10 @@ its lease without manual intervention.
 
 **Consequences.**
 - Requires a server component beyond object storage — the lease can't live in
-  the bucket. This is the minimum viable backend alongside identity and the
-  session index.
+  the bucket. Minimum viable backend: identity, session index, lease.
+- The heartbeat must outlive the GUI process. This was a deciding input to E-09.
 - Forced takeover needs a defined answer for the loser's unsynced state.
-  Specify it before shipping: reject the stale upload, or accept it into a
+  Specify before shipping: reject the stale upload, or accept it into a
   conflict bundle.
 
 ---
@@ -108,7 +106,7 @@ its lease without manual intervention.
 ### D-04 — Dirty-close recovery: snapshot on quiesce
 
 **Status:** Resolved · 2026-08-20
-**Supersedes:** the earlier proposal of a fixed 5-minute sync timer
+**Supersedes:** the fixed 5-minute sync timer proposed earlier the same day
 
 **Question.** The laptop lid closes mid-session. What has been persisted?
 
@@ -116,30 +114,31 @@ its lease without manual intervention.
 last write, snapshot and upload asynchronously. Retain a 5-minute timer as a
 floor for the case where writes never quiesce.
 
-**Rationale.** A fixed timer uploads mid-write (torn state), uploads when
-nothing has changed (wasted egress), and still loses up to five minutes in the
-worst case. Agent sessions are bursty — a quiesce trigger gives near-zero loss
-and fewer uploads than a fixed interval.
+**Superseded proposal, kept deliberately.** The original instinct was a fixed
+5-minute sync interval. Rejected because it uploads mid-write (torn state),
+uploads when nothing has changed (wasted egress), and still loses up to five
+minutes in the worst case. Agent sessions are bursty — a quiesce trigger gives
+near-zero loss and fewer uploads than a fixed interval. Recorded so the
+fixed-interval idea isn't re-proposed on its surface appeal.
 
 **Consequences.**
-- The snapshot must be crash-consistent. If the transcript is mid-append when
-  the snapshot fires, it's a torn upload — the quiesce window is what avoids
-  this, so the watcher's correctness is load-bearing.
-- Uploads must be resumable; a lid-close mid-upload is the common case, not the
-  edge case.
+- The snapshot must be crash-consistent; the quiesce window is what avoids a
+  torn upload, so the watcher's correctness is load-bearing.
+- Uploads must be resumable. Lid-close mid-upload is the common case.
+- The watcher must run whenever a session is live, GUI open or not. Second
+  deciding input to E-09.
 - "What did I lose?" needs a user-visible answer at next attach.
 
 ---
 
 ### D-06 — Bundle format: file-level, base image by digest
 
-**Status:** Resolved · 2026-08-20
+**Status:** Resolved · 2026-08-20 · dependency discharged 2026-08-21
 **Relates to:** M9, M11, M13
 
-**Question.** What does an exported session bundle actually contain, and in
-what form?
+**Question.** What does an exported session bundle contain, and in what form?
 
-**Ruling.** Four parts:
+**Ruling.**
 
 1. **File-level, not image-level.** Tar from inside the mounted volume rather
    than snapshotting the `.img`.
@@ -147,102 +146,125 @@ what form?
    on the destination.
 3. **Chunk plaintext → compress each chunk → encrypt each chunk.** In that
    order. zstd as the codec.
-4. **Manifest separates session-critical from reconstructible content**, so
+4. **The manifest separates session-critical from reconstructible content**, so
    import can materialize lazily.
 
 **Rationale.** Image-level bundles track the volume's high-water mark and never
 shrink, and ext4 metadata churn destroys delta efficiency. Compress-then-chunk
 kills dedup — one byte early in the stream shifts every downstream boundary —
 which is why restic and borg chunk first. Referencing the base image rather
-than carrying it is what keeps bundles in megabytes instead of gigabytes.
+than carrying it keeps bundles in megabytes instead of gigabytes.
 
 Exclusion policy, not codec choice, is the compression strategy: dropping
-`target/` and `node_modules/` saves ~95%, while zstd-vs-xz is worth ~20%.
+`target/` and `node_modules/` saves ~95%; zstd-vs-xz is worth ~20%.
 
 **Consequences.**
-- We own uid/gid mapping across the user namespace, plus xattrs, sparse files,
+- We own uid/gid mapping across the user namespace, plus xattrs, sparse files
   and hardlinks. Bounded work, but ours.
-- Base image reproducibility becomes load-bearing, which is why M11 lists base
-  image drift as a hardening concern.
+- Base image reproducibility is load-bearing — hence M11's drift hardening.
 - Cold attach on a new machine is a full download. Mitigated by cross-project
-  dedup for shared base images and by lazy materialization — both of which
+  dedup for shared base images and by lazy materialization, both of which
   depend on point 4 being in the manifest from the start.
 - **M9 must be built with the chunk boundary as a seam.** A single compressed
   stream makes M13 a format rewrite.
 
-**Dependency.** All of this assumes session history lives on the portable
-volume. If WP C finds it in the rootfs snapshot, this ruling describes a
-container with nothing in it, and M8's relocation work is what makes it
-coherent. Re-confirm after `docs/state-locality.md` lands.
+**Dependency — discharged 2026-08-21, and how matters.** This ruling assumed
+session history lived on the portable volume. **That premise was false.** WP C1
+found only the project file on the volume; the 24 KB transcript, session state
+and config were all on the ephemeral rootfs, and an export of the volume would
+have carried zero history. M8's surgical bind-mounting of
+`/root/.claude/{projects,sessions}` is what made the ruling true — the finding
+did not confirm it. D-06 is therefore contingent on relocation continuing to
+hold, not on an observed property of Claude Code. Any change to M8's mount
+strategy invalidates this entry until re-verified.
 
-**Dependency resolved (2026-08-21, per WP-C — Claude Code).** The premise was
-**false**. `docs/state-locality.md` measured session history on the ephemeral
-rootfs, not the portable volume; an export of the volume would have carried zero
-history. This ruling was therefore *not* confirmed by an observed property of
-Claude Code — it was made **true** by M8's relocation, which bind-mounts the
-history subtrees (`projects/`, `sessions/`) onto the volume. **D-06 is contingent
-on relocation continuing to hold**, not on where Claude Code writes by default.
-If relocation regresses, or Claude Code moves its history path, this ruling
-silently describes the wrong bytes again; the M8 regression test
-(`m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted`) is the guard.
+---
+
+### E-09 — Engine consumption model: daemon over UDS gRPC
+
+**Status:** Resolved · 2026-08-21
+**Recorded in:** SPEC Section 9
+
+**Question.** Long-running daemon with IPC/gRPC, or a library linked into the
+GUI process?
+
+**Ruling.** A long-running user daemon, gRPC over a Unix domain socket.
+
+**Rationale.** Two already-resolved decisions require something running when
+the GUI isn't. D-03's lease must keep heartbeating with the lid shut, or a user
+is locked out of their own session from another machine until TTL expiry.
+D-04's quiesce watcher must observe the transcript whenever a session is live,
+which under D-01 means whenever the container is up — GUI open or closed. A
+library forces both into a process users close, or bolts on a background helper
+later, which is a daemon arrived at by accident with an undesigned IPC surface.
+
+Secondary: CLI and GUI will both exist and must not disagree. Two processes
+independently mutating containerd state and mount records is the divergence
+class WP A spent nine commits eliminating. A daemon makes single-writer
+structural rather than conventional.
+
+**Consequences.**
+- **Unix domain socket, not TCP.** No port, no localhost binding; filesystem
+  permissions authenticate. If E-10's remote-engine fallback ever happens, the
+  transport swaps and the service definition doesn't.
+- Version handshake from day one, same pattern as the helper's protocol
+  version — refuse a client/daemon mismatch cleanly.
+- The daemon is a client of the `nemr-containerd` crate, not a replacement.
+  The crate stays usable standalone. WP B proved this.
+- The CLI talks to the daemon; it keeps no second direct path into containerd.
+- Accepted costs: service lifecycle management, client/daemon version skew, and
+  an IPC surface that becomes a compatibility obligation once third parties
+  touch it.
 
 ---
 
 ## Open
 
-### E-01 — Engine consumption model
+### E-10 — Non-Linux hosts
 
 **Status:** Open
-**Blocks:** GUI work, WP-B crate extraction
+**Escalated by:** D-01 · **Blocks:** GUI planning, the Windows/macOS product
 
-Long-running daemon with IPC/gRPC, or a library linked into the GUI process?
-Touches Sections 1–3.
+Loopback ext4 plus rootless namespaces is Linux-only. The product vision is a
+cross-platform GUI. With D-01 putting compute on the user's machine, this is a
+direct contradiction rather than a deferred concern.
 
-The WP-B containerd wrapper crate is currently being designed to keep both
-options open, which costs complexity until this is ruled on. Don't let that
-persist longer than WP B.
-
-> **Annotation (2026-08-21, Claude Code — not a status change).** This was ruled
-> on in chat as **`E-09`: a long-running user daemon, gRPC over a Unix domain
-> socket**, and recorded in SPEC.md Section 9 with the four implementation
-> constraints (UDS not TCP; version handshake from day one; the daemon is a
-> *client* of the wrapper crate, which stays usable standalone; the CLI talks to
-> the daemon and keeps no second path into containerd). WP-B's crate extraction
-> was carried out against that ruling, so the "keep both options open" cost noted
-> above is no longer being paid.
->
-> The entry is left in **Open** deliberately: moving it to Resolved, and
-> renumbering it to `E-09`, are Product Owner edits under this file's maintenance
-> rules. Flagged rather than performed.
+Options to cost out: bundled VM (the Docker Desktop route — note that's why
+Docker Desktop is a ~500MB install); WSL2 on Windows with something else on
+macOS; or a remote-engine fallback that partially reverses D-01.
 
 ---
 
-### E-02 — Non-Linux hosts
+### E-11 — Open-core seam
 
-**Status:** Open
-**Escalated by:** `D-01`
-**Blocks:** GUI planning, the Windows/macOS product
+**Status:** Open · **decide now**
+**Blocks:** WP D
 
-Loopback ext4 plus rootless namespaces is Linux-only. The product vision is a
-cross-platform GUI. Now that `D-01` puts compute on the user's machine, this is
-a direct contradiction rather than a deferred concern.
+What stays in `nemr-engine` versus the commercial portability/sync layer.
 
-Options to cost out: bundled VM (the Docker Desktop route — note that's why
-Docker Desktop is a ~500MB install), WSL2 on Windows with something else on
-macOS, or a remote-engine fallback that partially reverses `D-01`.
+The crate boundary is no longer hypothetical: WP B extracted
+`crates/nemr-containerd`, proved it standalone, and CI-verified it. This is the
+cheapest moment to draw the line — WP D builds on top of it, and retrofitting a
+seam through a codebase is a tax paid for years.
+
+**Working position, not yet a ruling.** `nemr-containerd` and the engine stay
+open. The sync layer, lease service, and cloud storage backends are commercial.
+The **bundle format stays open and documented** — a proprietary format
+undermines the open-core story and makes the engine useless without the paid
+layer, which is the opposite of the intent.
 
 ---
 
 ### D-05 — Storage backend
 
-**Status:** Open (technical direction set, commercial choice deferred)
+**Status:** Open — technical direction set, commercial choice deferred
 **Relates to:** M12
 
-**Direction.** Build Cloudflare R2 first behind the M12 S3-compatible trait,
+**Direction.** Build Cloudflare R2 first behind the M12 S3-compatible trait;
 keep Backblaze B2 viable behind the same interface. No vendor-specific behavior
 above the trait.
 
-**Numbers as of this writing — re-verify before committing commercially:**
+**Numbers as of 2026-08-20 — re-verify before committing commercially:**
 
 | | Egress | At rest |
 |---|---|---|
@@ -250,80 +272,57 @@ above the trait.
 | Cloudflare R2 | $0 | ~$0.015/GB-month |
 | Backblaze B2 | free up to 3× stored | ~$0.006/GB-month |
 
-Our workload is egress-heavy — every attach is a download. R2 wins on the line
-item that scales with usage. B2 is cheaper at rest, but its free egress is
+The workload is egress-heavy — every attach is a download — so R2 wins on the
+line item that scales with usage. B2 is cheaper at rest, but its free egress is
 capped as a multiple of stored bytes, and a sync product with small bundles and
 frequent pulls can exceed 3× without much effort.
 
-**Still to decide.** Which backend is the default at launch, and whether tiers
-are backed by different providers.
+**Still to decide.** Default backend at launch; whether tiers map to different
+providers.
 
 ---
 
-### E-03 — Open-core seam
+### D-07 — Error model: unify now or with the daemon
 
-**Status:** Open
-**Raise early, not late**
+**Status:** Open · Rain's position below, ruling pending
+**Raised by:** Claude Code, WP B
 
-What stays in `nemr-engine` versus the commercial portability/sync layer.
-Retrofitting a seam through a codebase is a tax paid for years, so this wants
-deciding while WP B is still moving module boundaries.
+Claude Code deferred error-model unification, recommending it land with the
+daemon on the grounds that gRPC status mapping can't be designed until the IPC
+surface exists.
 
----
-
-### F-12 — credential rotation must propagate into a running container
-
-**Status:** Open · feeds M9
-**Relates to:** `D-02`, AUTH-02
-**Raised by:** Claude Code (WP-C finding)
-
-The host credential is delivered as a read-only **bind mount of a single file**
-at `/root/.claude/.credentials.json`. WP-C1 confirmed it is the only secret and
-is on neither portable layer, so `D-02` holds — but a file bind-mount pins an
-**inode**. If Claude Code on the host rotates the credential by atomic replace
-(write-new-then-rename, the safe and common pattern), the container keeps reading
-the old inode. Verified as a finding, not yet fixed.
-
-**Why it is a decision, not only a fix.** `D-02` says credentials are per-device,
-injected at attach. That holds end to end only if rotation *propagates*; a stale
-token in a long-lived container fails silently against the API. The fix options
-trade off — bind-mount the parent directory instead of the file, re-resolve on
-each attach, or watch-and-remount — and they touch the attach path WP D depends
-on.
-
-**Consequences.** Forecloses nothing yet; obliges M9's credential handling to
-assume rotation is visible, which it currently is not. If left unfixed, a
-long-running session on a rotated host silently loses API access.
-
-**Recommendation (Claude Code):** bind-mount the credential's parent directory
-rather than the file, so a rotated inode is visible without a remount, and
-re-verify at attach. Decision yours before M9's exclusion policy hardens around
-the current single-file shape.
+**Rain's position.** The recommendation conflates two layers. The internal
+`thiserror` enum and the gRPC status mapping are independent: the mapping lives
+at the daemon boundary and can be added later without touching the enum.
+Deferring the whole thing means WP D writes error handling twice and then
+rewrites it. **Do the enum now; defer the status codes.**
 
 ---
 
-### D-07 — `.claude.json`: split portable config from machine identity
+### F-12 — Credential bind-mount pins an inode
 
-**Status:** Open · feeds M9 and `D-06`'s exclusion policy
-**Raised by:** Claude Code (WP-C finding)
+**Status:** Open · verified, tracked, not fixed
+**Feeds:** M9 · **Interacts with:** D-02
 
-`/root/.claude.json` mixes two kinds of content (measured in WP-C1): **portable
-configuration** — MCP server definitions and project-trust entries, which a user
-would want to travel with a session — and **machine/account identity**
-(`machineID`, `userID`, `oauthAccount` with email, organization and billing),
-which must *not* travel: it identifies the source device and account. It is
-currently kept wholly on the rootfs, off the volume, so nothing travels — safe,
-but MCP configuration is lost on import.
+The credential bind-mount pins an inode, so host-side rotation is invisible
+inside a running container. Per-device credentials injected at attach only hold
+if rotation propagates; otherwise D-02 is true at create time and drifts
+thereafter.
 
-**Consequences.** `D-06`'s manifest must decide this before M9's exclusion policy
-is written, or M9 will either drop MCP config (a usability regression on import)
-or carry the identity block (a `D-02`-adjacent leak). It forecloses a file-level
-include/exclude of `.claude.json`; the split has to be finer than the file.
+---
 
-**Recommendation (Claude Code):** treat `.claude.json` as a **field-level** split,
-not file-level — the bundle carries an allowlist of portable keys (`mcpServers`,
-project trust) and never the identity block. I can prototype the field filter
-behind `D-06`'s pluggable exclusion policy when M9 starts. Decision yours.
+### F-XX — `.claude.json` MCP-vs-identity split
+
+**Status:** Open · **needs ruling before M9's exclusion policy is written**
+**Feeds:** D-06 manifest, M9
+
+`.claude.json` mixes two kinds of content. MCP configuration should ideally
+travel with a bundle so a session resumes with its tools intact. Machine and
+account identity must not travel, per D-02.
+
+That's a manifest-level split rather than a whole-file include/exclude, and it
+has to be decided before M9's exclusion policy is written. Claude Code to
+supply a recommendation; assign a real F-number from the conformance ledger.
 
 ---
 
@@ -337,11 +336,11 @@ behind `D-06`'s pluggable exclusion policy when M9 starts. Decision yours.
 | 2026-08-20 | D-04 | Resolved — snapshot on quiesce; supersedes fixed 5-min timer |
 | 2026-08-20 | D-05 | Opened — R2 first behind the M12 trait; default deferred |
 | 2026-08-20 | D-06 | Resolved — file-level bundle, base image by digest |
-| 2026-08-20 | E-01 | Opened — engine consumption model |
-| 2026-08-20 | E-02 | Opened — non-Linux hosts, escalated by D-01 |
-| 2026-08-20 | E-03 | Opened — open-core seam |
-| 2026-08-21 | D-06 | Dependency resolved — premise was false; M8 relocation made the ruling true (Claude Code) |
-| 2026-08-21 | F-12 | Opened — credential rotation must propagate; feeds M9 (Claude Code) |
-| 2026-08-21 | D-07 | Opened — .claude.json field-level portable/identity split; feeds M9 (Claude Code) |
-| 2026-08-21 | — | Numbering note reconciled: E- shared with SPEC §9; E-01/02/03 here = SPEC E-09/10/11, renumber pending PO |
-| 2026-08-21 | E-01 | Annotated — ruled in chat as E-09 (daemon over UDS gRPC); Open→Resolved move left to PO (Claude Code) |
+| 2026-08-20 | — | Numbering reconciled: one global `E-` namespace shared with SPEC Section 9; provisional E-01/02/03 renumbered to E-09/10/11 |
+| 2026-08-21 | E-09 | Resolved — daemon, gRPC over Unix domain socket |
+| 2026-08-21 | D-06 | Dependency discharged — premise was false; M8 relocation made the ruling true |
+| 2026-08-21 | D-02 | Verification from WP C recorded; F-12 noted as a rotation gap |
+| 2026-08-21 | E-11 | Working position added; crate boundary now real and CI-verified |
+| 2026-08-21 | D-07 | Opened — error model; Rain's position recorded, ruling pending |
+| 2026-08-21 | F-12 | Opened — credential bind-mount inode pin |
+| 2026-08-21 | F-XX | Opened — `.claude.json` MCP-vs-identity split |

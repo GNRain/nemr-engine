@@ -57,6 +57,29 @@ enum Command {
 
     /// Reclaim orphaned mounts, loop devices and snapshots left by a crash.
     Reconcile,
+
+    /// Import a bundle into an existing, stopped project.
+    ///
+    /// Works standalone against a local file: no account, no network (E-11).
+    Import {
+        /// Destination project. Create it first with the quota you want.
+        name: String,
+        /// Bundle to read.
+        bundle: std::path::PathBuf,
+    },
+
+    /// Export a stopped project to a portable bundle.
+    ///
+    /// Works standalone against a local file: no account, no network (E-11).
+    Export {
+        name: String,
+        /// Bundle to write. Defaults to <name>.nemr in the current directory.
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
+        /// Include build artifacts and caches that are excluded by default.
+        #[arg(long)]
+        include_build_artifacts: bool,
+    },
 }
 
 /// Parse `--size`, reusing the engine's own preset parsing so the CLI cannot
@@ -193,6 +216,68 @@ async fn main() -> Result<()> {
                     );
                 }
             }
+        }
+
+        Command::Import { name, bundle } => {
+            let client = ContainerdClient::connect().await?;
+            let summary = project::import(&client, &name, &bundle).await?;
+            println!(
+                "imported {} into project {name:?} ({} members, {})",
+                bundle.display(),
+                summary.members,
+                volume::human_bytes(summary.bytes)
+            );
+            println!("\nThe bundle carried no credential, and never does (D-02).");
+            println!("Authenticate on this host, then: nemr start {name} && nemr attach {name}");
+        }
+
+        Command::Export {
+            name,
+            output,
+            include_build_artifacts,
+        } => {
+            let client = ContainerdClient::connect().await?;
+            let destination = output.unwrap_or_else(|| std::path::PathBuf::from(format!("{name}.nemr")));
+            let policy = nemr_engine::bundle::policy::Policy {
+                include_build_artifacts,
+            };
+
+            let summary = project::export(&client, &name, &destination, policy).await?;
+            let manifest = &summary.manifest;
+
+            println!("exported project {name:?} to {}", summary.path.display());
+            println!(
+                "  schema:    v{} (see docs/bundle-format.md)",
+                manifest.schema_version
+            );
+            println!(
+                "  contents:  {} members, {} uncompressed -> {} on disk",
+                manifest.members.len(),
+                volume::human_bytes(manifest.project.content_bytes),
+                volume::human_bytes(summary.bundle_bytes)
+            );
+            println!(
+                "  base image: {} ({})",
+                manifest.base_image.reference, manifest.base_image.digest
+            );
+            println!("  excluded:  {} entries", manifest.excluded.len());
+
+            // F-54: schema drift must be visible, not silent.
+            if !summary.unrecognised_fields.is_empty() {
+                eprintln!(
+                    "\n[nemr] warning: {} unrecognised field(s) in .claude.json did NOT travel:",
+                    summary.unrecognised_fields.len()
+                );
+                for field in &summary.unrecognised_fields {
+                    eprintln!("         {field}");
+                }
+                eprintln!("       If any of these should travel, add them to the portable allowlist.");
+            }
+
+            // The credential exclusion is a security property (D-02), so state
+            // it rather than leaving the user to infer it from a count.
+            println!("\nCredentials were not included and never are (D-02).");
+            println!("On the destination, authenticate on that host before attaching.");
         }
 
         Command::Attach { name } => {

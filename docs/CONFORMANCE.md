@@ -144,12 +144,14 @@ disposition tracked here.
 | F-24 | med | NFR-01 | No CI — Docker-freeness/lint/licensing unenforced | `.github/workflows/ci.yml` + `check_docker_free.sh` (negative-tested) + `deny.toml` |
 | F-37 | med | — | base-image build never scripted (README prose only) | `scripts/build_base_image.sh`, run and verified (200.5 MiB, same digest) |
 | F-53 | high | NFR-01/supply chain | **RUSTSEC-2026-0258** — `h2` unbounded empty DATA frames, reachable via `tonic` → `containerd-client` | found by the new `cargo deny` gate on its first run; `h2` 0.4.15 → 0.4.18 |
+| **F-54** | high | AUTH-02 / D-02 | `.claude.json` mixes portable config (MCP servers) with machine/account identity (`machineID`, `oauthAccount`) — a file-level include/exclude either leaks identity or drops MCP config | **Ruled 2026-08-21:** field-level **allowlist**; unrecognised fields stay and are logged. Implemented in M9's exclusion policy. |
 
 **Open — this branch / next (WP-A remnant + WP-C follow-up)**
 
 | ID | Sev | Requirement | Finding | Plan |
 |---|---|---|---|---|
 | F-18 | med | NFR-03 | SIGKILLed attach leaks its containerd exec record | reap stale execs in `reconcile_orphans` |
+| **F-55** | high | F-54 / M9 | **MCP configuration cannot travel.** F-54 rules that it must, but `.claude.json` lives on the **rootfs**, not the portable volume, so a volume-only export cannot reach it. `filter_claude_json` is correct and currently unreachable in a real export. | Needs an M8 bind-mount change (relocate a portable `.claude.json` onto the volume), which invalidates D-06 until re-verified. **Raised for the M9/M10 review.** |
 | F-28 | med | VOL-06 | `ensure_volume_mounted` accepts *any* fs at the mount point (identity not checked) | verify the mount is backed by the project's loop device |
 | F-35 | med | PROC-04 | exec-kill on stop untested | add regression test |
 | F-12 | high | AUTH-02 | Credential file bind-mount pins an inode → host rotation invisible in-container | WP-C follow-up (mount a dir, or re-resolve) |

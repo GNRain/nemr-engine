@@ -1075,3 +1075,141 @@ pub async fn delete(client: &ContainerdClient, name: &str) -> Result<()> {
 
     Ok(())
 }
+
+/// Export a project to a bundle (M9).
+///
+/// The project must be stopped, so the volume is not being written while it is
+/// read. Exporting a running project would capture a transcript mid-append —
+/// a torn read that produces a bundle which looks fine and restores a corrupt
+/// session, which is the failure shape this project keeps hitting.
+pub async fn export(
+    client: &ContainerdClient,
+    name: &str,
+    destination: &std::path::Path,
+    policy: crate::bundle::policy::Policy,
+) -> crate::error::Result<crate::bundle::export::ExportSummary> {
+    use crate::bundle::export::{export as write_bundle, ExportRequest};
+    use crate::bundle::manifest::BaseImageRef;
+    use crate::error::Error;
+
+    let container_id = config::container_id(name);
+    if !client
+        .container_exists(&container_id)
+        .await
+        .map_err(Error::Internal)?
+    {
+        return Err(Error::NoSuchProject {
+            name: name.to_string(),
+        });
+    }
+
+    if client
+        .task_state(&container_id)
+        .await
+        .map_err(Error::Internal)?
+        .is_running()
+    {
+        return Err(Error::WrongState {
+            name: name.to_string(),
+            state: "running; stop it first so the volume is not written while it is read",
+        });
+    }
+
+    // VOL-06: the volume must actually be mounted, or we would export whatever
+    // the mount point happens to sit on — the host filesystem.
+    ensure_volume_mounted(name).map_err(Error::Internal)?;
+
+    let paths = VolumePaths::from_env().map_err(Error::Internal)?;
+    let mount_point = paths.mount_point(name);
+
+    let quota = read_recorded_size(&paths, name)
+        .map(|size| size.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // The base image is referenced by digest, never carried (D-06).
+    let digest = client
+        .image_target_digest(config::BASE_IMAGE)
+        .await
+        .map_err(Error::Internal)?;
+
+    let request = ExportRequest {
+        project: name,
+        quota: &quota,
+        source_root: &mount_point,
+        base_image: BaseImageRef {
+            reference: config::BASE_IMAGE.to_string(),
+            digest,
+        },
+        policy,
+    };
+    write_bundle(&request, destination)
+}
+
+/// Import a bundle into a new project (M10).
+///
+/// The destination project must already exist and be stopped: creating it is a
+/// separate step so the user chooses the quota, and a quota too small for the
+/// bundle is refused up front rather than discovered mid-extraction.
+///
+/// Per D-02 the bundle carries no credential. The caller authenticates on the
+/// destination host before attaching; `import` states this rather than leaving
+/// it to be discovered at the first API call.
+pub async fn import(
+    client: &ContainerdClient,
+    name: &str,
+    bundle_path: &std::path::Path,
+) -> crate::error::Result<crate::bundle::import::ExtractSummary> {
+    use crate::bundle::import::{open as open_bundle, ImportChecks};
+    use crate::error::Error;
+
+    let container_id = config::container_id(name);
+    if !client
+        .container_exists(&container_id)
+        .await
+        .map_err(Error::Internal)?
+    {
+        return Err(Error::NoSuchProject {
+            name: name.to_string(),
+        });
+    }
+    if client
+        .task_state(&container_id)
+        .await
+        .map_err(Error::Internal)?
+        .is_running()
+    {
+        return Err(Error::WrongState {
+            name: name.to_string(),
+            state: "running; stop it before importing over its volume",
+        });
+    }
+
+    // Read and validate the bundle before touching the destination.
+    let bundle = open_bundle(bundle_path)?;
+
+    ensure_volume_mounted(name).map_err(Error::Internal)?;
+    let paths = VolumePaths::from_env().map_err(Error::Internal)?;
+    let mount_point = paths.mount_point(name);
+
+    // The destination's real usable capacity, measured rather than assumed from
+    // the preset — ext4 metadata means the usable total is below the request.
+    let usage = crate::engine::volume::usage(&mount_point).ok_or_else(|| {
+        Error::host(
+            "the destination volume",
+            format!("{} is not mounted", mount_point.display()),
+            "Start the project once so its volume is mounted, then retry.",
+        )
+    })?;
+    let quota = read_recorded_size(&paths, name)
+        .map(|size| size.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let local_digest = client.image_target_digest(config::BASE_IMAGE).await.ok();
+    bundle.check(&ImportChecks {
+        local_base_image_digest: local_digest.as_deref(),
+        destination_capacity: usage.available,
+        destination_quota: &quota,
+    })?;
+
+    bundle.extract(&mount_point)
+}
