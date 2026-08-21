@@ -67,6 +67,10 @@ fn parse_size(input: &str) -> Result<VolumeSize, String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install the subscriber before anything can log. NEMR_DEBUG=1 turns on the
+    // decision-point detail; NEMR_LOG takes a full env-filter.
+    nemr_engine::observability::init();
+
     let cli = Cli::parse();
 
     match cli.command {

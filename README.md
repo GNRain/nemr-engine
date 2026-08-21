@@ -619,6 +619,39 @@ reports. The engine agreeing with itself is not evidence: VOL-05 and VOL-06 were
 both cases where every engine-reported check was green while the data was going
 to the wrong filesystem.
 
+## Logging and debugging
+
+Default output is the audit trail NFR-04 requires — every mount, loop-device
+attach/detach and elevated invocation, in plain text on stderr:
+
+```bash
+nemr start myproject
+```
+
+Two levers turn up the detail:
+
+```bash
+NEMR_DEBUG=1 nemr start myproject          # decision points, spans, devices
+NEMR_LOG=nemr_containerd=trace nemr start myproject   # full env-filter syntax
+```
+
+Debug mode exists to satisfy a falsifiable requirement: **VOL-05 must be obvious
+on the first run.** VOL-05 was a container running against the host root
+filesystem instead of the project volume, with every message reporting success;
+it was found after a reboot by inspecting host state by hand. Debug mode logs the
+mount check, its result, and the device backing the working directory:
+
+```
+DEBUG ensure_volume_mounted{project=demo}: checked whether the project volume is mounted
+      mount_point=/home/u/.local/share/nemr/mounts/demo mounted=false backing_device=<none>
+ INFO ensure_volume_mounted{project=demo}: [nemr:volume] volume for "demo" is not mounted; remounting (VOL-06)
+DEBUG ensure_volume_mounted{project=demo}: remounted the project volume
+      mount_point=/home/u/.local/share/nemr/mounts/demo remounted=true backing_device=/dev/loop23
+```
+
+A working directory backed by the host root device rather than a loop device is
+visible in that output directly.
+
 ## Pending decisions
 
 Recorded here when made, per Section 11:

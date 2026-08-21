@@ -34,3 +34,9 @@ sha2 = "0.11.0"
 clap = { version = "4.6.6", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 libc = "0.2.189"
+# Structured lifecycle logging (B3). `tracing` rather than `log` because spans —
+# not just events — are what make a multi-step operation like create/start
+# legible in a log: every event inside a span carries the project name and the
+# step it happened in, without threading that through every call site.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

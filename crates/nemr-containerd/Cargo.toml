@@ -35,3 +35,6 @@ anyhow = "1"
 serde_json = "1.0.151"
 prost-types = "0.14"
 sha2 = "0.11.0"
+# Spans/events only — the library never installs a subscriber; the consumer
+# (CLI today, the E-09 daemon later) decides how logs are rendered.
+tracing = "0.1"

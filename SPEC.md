@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | NEMR-SPEC-001 |
-| Version | 1.29 |
+| Version | 1.30 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -45,6 +45,7 @@
 | 1.27 | Revision | Recorded the WP-C1 state-locality findings (docs/state-locality.md): a real 3-turn session writes conversation history to /root/.claude/projects on the **rootfs snapshot**, not the portable volume; only the project file lands on the volume. Credentials are a host bind-mount (never on either portable layer); /root/.claude.json holds machine/account identity (machineID, oauthAccount). Findings captured in Section 11 pending Product Owner promotion to a Section 3 subsection (4A.5). | Claude Code |
 | 1.28 | Revision | Recorded M8 (WP-C2): session-critical Claude Code state relocated onto the portable volume by surgically bind-mounting `/root/.claude/projects` and `/root/.claude/sessions` from `<volume>/.nemr-state/`, keeping credentials and `/root/.claude.json` identity on the rootfs (D-02). Acceptance proven both with real Claude Code (--continue recalls after unmount/remount) and by a deterministic regression test. Section 11 deviation added pending Section 3 promotion. | Claude Code |
 | 1.29 | Revision | WP-B: extracted the §3.2 wrapper layer from `src/containerd/` into a standalone `crates/nemr-containerd` crate, consumed by the engine and designed for the E-09 daemon while remaining usable standalone. Updated the §3.4 repository tree. containerd-level constants (runtime, snapshotter) moved to the wrapper crate; the product-specific cgroup prefix moved onto `ContainerSpec` so the wrapper carries no branding. The M1 connectivity baselines moved into the wrapper crate with the layer they exercise. | Claude Code |
+| 1.30 | Revision | WP-B: added `tracing` with span coverage across the lifecycle and a debug mode (`NEMR_DEBUG=1`, `NEMR_LOG=<filter>`). The VOL-03/NFR-04 audit trail now flows through `tracing` at `info` so it remains on by default. Acceptance is falsifiable and was demonstrated: in debug mode the VOL-05 decision point logs the mount check, its result, and the backing device, so a working directory backed by the host root device instead of a loop device is visible on the first run. Added CI gates (NFR-01 Docker-freeness with negative tests, clippy warnings-denied, cargo-deny licences/advisories, host-backed suite + smoke on a clean runner) and scripted the base-image build and CI host provisioning. | Claude Code |
 
 ---
 

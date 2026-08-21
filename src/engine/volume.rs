@@ -341,6 +341,42 @@ pub fn is_mounted(mount_point: &Path) -> bool {
     mountinfo_has_target(&table, mount_point)
 }
 
+/// The device backing `mount_point`, e.g. `/dev/loop19`, or `None` if it is not
+/// a mount point.
+///
+/// This is the fact that makes VOL-05 legible. "Is something mounted here" and
+/// "is the *project's volume* mounted here" are different questions; a working
+/// directory backed by the host root device rather than a loop device is the
+/// VOL-05 signature, and it is invisible unless the device is logged.
+pub fn backing_device(mount_point: &Path) -> Option<String> {
+    let table = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    mountinfo_device_for(&table, mount_point)
+}
+
+/// Source device for a mount target, parsed from a mountinfo table.
+///
+/// Split out for unit-testing without a live `/proc`. The source field sits
+/// after the ` - ` separator (`… - <fstype> <source> <superopts>`), which is why
+/// the optional-fields section has to be skipped rather than counted past.
+fn mountinfo_device_for(table: &str, mount_point: &Path) -> Option<String> {
+    let wanted = mount_point.as_os_str().as_bytes();
+    for line in table.lines() {
+        let Some(target) = line.split(' ').nth(4) else {
+            continue;
+        };
+        if unescape_octal(target) != wanted {
+            continue;
+        }
+        // Everything after " - " is: fstype, source, super options.
+        if let Some((_, after)) = line.split_once(" - ") {
+            if let Some(source) = after.split_whitespace().nth(1) {
+                return Some(String::from_utf8_lossy(&unescape_octal(source)).into_owned());
+            }
+        }
+    }
+    None
+}
+
 /// Whether `table` (mountinfo contents) lists `mount_point` as a mount target.
 ///
 /// Split out so the octal-unescaping logic is unit-testable without a live
@@ -436,7 +472,10 @@ pub fn human_bytes(bytes: u64) -> String {
 /// confused with a command's own stdout. Prefixed so an operator can
 /// reconstruct what happened without reading Rust source.
 fn audit(message: &str) {
-    eprintln!("[nemr:volume] {message}");
+    // VOL-03 / NFR-04: the audit trail. Emitted at `info` so it is on by
+    // default without any flag — an operator must be able to reconstruct what
+    // happened without knowing to enable anything.
+    tracing::info!("[nemr:volume] {message}");
 }
 
 /// A provisioned volume.
@@ -770,6 +809,26 @@ mod tests {
         assert!(
             !mountinfo_has_target(table, Path::new("/home/john\\040doe/.local/share/nemr/mounts/p")),
             "the escaped literal must NOT match — that was the bug"
+        );
+    }
+
+    /// The device parser backs the VOL-05 debug line. Field 5 is the target;
+    /// the source sits after the " - " separator, so the optional-fields
+    /// section has to be skipped rather than counted past — a fixed field index
+    /// would read the wrong token whenever the optional count changes.
+    #[test]
+    fn mountinfo_device_is_read_after_the_separator() {
+        let table = "301 29 7:19 / /home/u/.local/share/nemr/mounts/p rw,relatime \
+shared:277 master:2 - ext4 /dev/loop7 rw\n"
+            .replace(" \\\n", " ");
+        assert_eq!(
+            mountinfo_device_for(&table, Path::new("/home/u/.local/share/nemr/mounts/p")),
+            Some("/dev/loop7".to_string()),
+        );
+        // A path that is not a mount point has no device — the VOL-05 condition.
+        assert_eq!(
+            mountinfo_device_for(&table, Path::new("/home/u/.local/share/nemr/mounts/other")),
+            None,
         );
     }
 
