@@ -38,6 +38,10 @@ sha2 = "0.11.0"
 clap = { version = "4.6.6", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 libc = "0.2.189"
+# The engine's error taxonomy (E-12). thiserror only generates Display/Error
+# impls — no runtime, no dependencies of consequence — and it is what lets the
+# taxonomy carry structured fields instead of formatted strings.
+thiserror = "2"
 # Structured lifecycle logging (B3). `tracing` rather than `log` because spans —
 # not just events — are what make a multi-step operation like create/start
 # legible in a log: every event inside a span carries the project name and the
