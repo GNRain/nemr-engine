@@ -515,3 +515,138 @@ fn vol_remount_is_idempotent() {
     assert_eq!(after, 1, "exactly one loop device backs the image");
     common::purge(&name);
 }
+
+/// M10 — a bundle exported from one project imports into another with the
+/// session intact.
+///
+/// The acceptance is *continuity*, not file presence. This test proves the
+/// storage half deterministically: a transcript written on the source appears
+/// byte-identical at the path Claude Code reads on the destination, into a
+/// project that provably had no history of its own. The live-API half — that
+/// `claude --continue` actually recalls it — is exercised manually and by the
+/// smoke test, because an API round-trip inside a regression test would make
+/// the suite flaky and credential-dependent.
+///
+/// The control matters: the destination is asserted empty *before* the import,
+/// so a pass cannot come from the destination having had the content already.
+#[test]
+fn m10_bundle_round_trip_carries_the_session_to_another_project() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let source = TestProject::create(&client, "m10src", VolumeSize::Small).await;
+        let destination = TestProject::create(&client, "m10dst", VolumeSize::Small).await;
+
+        let paths = VolumePaths::from_env().unwrap();
+        let source_root = paths.mount_point(&source.name);
+        let destination_root = paths.mount_point(&destination.name);
+
+        // Write a transcript on the source, where Claude Code would put it.
+        let token = format!("bundle-token-{}", std::process::id());
+        let transcript = source_root
+            .join(nemr_engine::config::VOLUME_STATE_PROJECTS)
+            .join("-workspace/session.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).expect("mkdir");
+        std::fs::write(&transcript, &token).expect("write transcript");
+
+        // Control: the destination must have no transcript of its own, or a
+        // pass would prove nothing.
+        let restored = destination_root
+            .join(nemr_engine::config::VOLUME_STATE_PROJECTS)
+            .join("-workspace/session.jsonl");
+        assert!(
+            !restored.exists(),
+            "control: the destination must start without this transcript"
+        );
+
+        let bundle = std::env::temp_dir().join(format!("m10-{}.nemr", std::process::id()));
+        let _ = std::fs::remove_file(&bundle);
+
+        project::export(
+            &client,
+            &source.name,
+            &bundle,
+            nemr_engine::bundle::policy::Policy::default(),
+        )
+        .await
+        .expect("export");
+
+        // The bundle must actually contain the session, not merely exist.
+        let opened = nemr_engine::bundle::import::open(&bundle).expect("open bundle");
+        assert!(
+            opened
+                .manifest
+                .members
+                .iter()
+                .any(|m| m.path.ends_with("session.jsonl") && m.is_session_critical()),
+            "the transcript must be a session-critical member: {:?}",
+            opened.manifest.members.iter().map(|m| &m.path).collect::<Vec<_>>()
+        );
+
+        project::import(&client, &destination.name, &bundle)
+            .await
+            .expect("import");
+
+        assert_eq!(
+            std::fs::read_to_string(&restored).expect("the transcript must exist on the destination"),
+            token,
+            "the session must arrive byte-identical at the path Claude Code reads"
+        );
+
+        let _ = std::fs::remove_file(&bundle);
+    });
+}
+
+/// D-02, asserted against a real bundle rather than the policy unit.
+///
+/// The credential must not appear in a bundle exported from a real project. The
+/// policy test alone was once satisfied by a path that could not occur, so this
+/// one greps the actual bytes.
+#[test]
+fn m9_a_real_bundle_contains_no_credential() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "m9cred", VolumeSize::Small).await;
+
+        let bundle = std::env::temp_dir().join(format!("m9cred-{}.nemr", std::process::id()));
+        let _ = std::fs::remove_file(&bundle);
+        project::export(
+            &client,
+            &project.name,
+            &bundle,
+            nemr_engine::bundle::policy::Policy::default(),
+        )
+        .await
+        .expect("export");
+
+        let raw = std::fs::read(&bundle).expect("read bundle");
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            !text.contains(".credentials.json"),
+            "no bundle member may reference the credential file (D-02)"
+        );
+
+        // And the host's real credential contents must not appear either.
+        if let Ok(host_credential) = std::fs::read_to_string(
+            nemr_engine::auth::host_credentials_path().expect("credential path"),
+        ) {
+            for line in host_credential.lines().filter(|l| l.len() > 24) {
+                assert!(
+                    !text.contains(line.trim()),
+                    "a line of the host credential appeared in the bundle (D-02)"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(&bundle);
+    });
+}

@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | NEMR-SPEC-001 |
-| Version | 1.33 |
+| Version | 1.34 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -49,6 +49,7 @@
 | 1.31 | Revision | Recorded three Product Owner rulings: E-11 open-core seam RESOLVED (engine + wrapper + volume layer + helper + **bundle format spec** open source; sync, lease, storage backends, identity, GUI commercial; test = "can someone use the open half productively without ever paying?"); E-12/D-07 error model RESOLVED (thiserror taxonomy now, as WP D's first commit; gRPC status mapping deferred to the daemon); F-54 `.claude.json` split RESOLVED (field-level allowlist, unrecognised fields stay and are logged). Transcribed from the Product Owner's rulings, not resolved unilaterally. | Claude Code, per Product Owner ruling |
 | 1.32 | Revision | WP-D first commit per E-12: added the engine error taxonomy (`src/error.rs`). Variants exist where a caller branches or where a diagnostic needs structured fields; everything else arrives as `Internal` with the `anyhow` chain preserved. `ErrorKind` is the stable axis callers match on (InvalidRequest, Conflict, HostPrerequisite, CapacityExceeded, DataIntegrity, Incompatible, Transient, Internal), so adding a variant does not break callers. The WP-D failure modes named in the ruling each have a home before the code that raises them is written. gRPC status mapping deferred to the daemon boundary. | Claude Code |
 | 1.33 | Revision | M9: added `docs/bundle-format.md` (NEMR-BUNDLE-001 schema v1) as a versioned public interface per E-11. File-level, base image by digest, manifest first, fixed 4 MiB chunks each compressed independently so the chunk boundary is a real seam for M13 deduplication and v2 encryption. Manifest carries C1's session-critical/reconstructible classification to enable lazy materialisation. Exclusion policy: credentials unconditionally (D-02), `.claude.json` by field-level allowlist with unrecognised fields staying put and logged (F-54), build artifacts by default. | Claude Code |
+| 1.34 | Revision | M9/M10: implemented bundle export and import against NEMR-BUNDLE-001 v1, with `nemr export` and `nemr import` as standalone CLI surface (E-11). Import is decide-verify-extract: schema, base image digest and quota all refuse before a byte is written; chunk and member digests are verified before extraction; member paths are refused if they escape the destination. Acceptance demonstrated end to end with the live API — a session exported from one project and imported into a fresh one recalled its codeword via `claude --continue` without reading any file. Raised F-55 (MCP configuration cannot travel: `.claude.json` is on the rootfs, not the volume). | Claude Code |
 
 ---
 

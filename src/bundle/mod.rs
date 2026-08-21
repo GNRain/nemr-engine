@@ -6,6 +6,7 @@
 //! here may depend on the commercial sync layer.
 
 pub mod export;
+pub mod import;
 pub mod manifest;
 pub mod policy;
 

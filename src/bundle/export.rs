@@ -348,7 +348,7 @@ fn mode_of(metadata: &std::fs::Metadata) -> u32 {
     metadata.permissions().mode()
 }
 
-pub(crate) fn hex(bytes: &[u8]) -> String {
+pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

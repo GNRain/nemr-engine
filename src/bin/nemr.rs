@@ -58,6 +58,16 @@ enum Command {
     /// Reclaim orphaned mounts, loop devices and snapshots left by a crash.
     Reconcile,
 
+    /// Import a bundle into an existing, stopped project.
+    ///
+    /// Works standalone against a local file: no account, no network (E-11).
+    Import {
+        /// Destination project. Create it first with the quota you want.
+        name: String,
+        /// Bundle to read.
+        bundle: std::path::PathBuf,
+    },
+
     /// Export a stopped project to a portable bundle.
     ///
     /// Works standalone against a local file: no account, no network (E-11).
@@ -206,6 +216,19 @@ async fn main() -> Result<()> {
                     );
                 }
             }
+        }
+
+        Command::Import { name, bundle } => {
+            let client = ContainerdClient::connect().await?;
+            let summary = project::import(&client, &name, &bundle).await?;
+            println!(
+                "imported {} into project {name:?} ({} members, {})",
+                bundle.display(),
+                summary.members,
+                volume::human_bytes(summary.bytes)
+            );
+            println!("\nThe bundle carried no credential, and never does (D-02).");
+            println!("Authenticate on this host, then: nemr start {name} && nemr attach {name}");
         }
 
         Command::Export {
