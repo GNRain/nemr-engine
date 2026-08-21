@@ -202,6 +202,19 @@ The WP-B containerd wrapper crate is currently being designed to keep both
 options open, which costs complexity until this is ruled on. Don't let that
 persist longer than WP B.
 
+> **Annotation (2026-08-21, Claude Code — not a status change).** This was ruled
+> on in chat as **`E-09`: a long-running user daemon, gRPC over a Unix domain
+> socket**, and recorded in SPEC.md Section 9 with the four implementation
+> constraints (UDS not TCP; version handshake from day one; the daemon is a
+> *client* of the wrapper crate, which stays usable standalone; the CLI talks to
+> the daemon and keeps no second path into containerd). WP-B's crate extraction
+> was carried out against that ruling, so the "keep both options open" cost noted
+> above is no longer being paid.
+>
+> The entry is left in **Open** deliberately: moving it to Resolved, and
+> renumbering it to `E-09`, are Product Owner edits under this file's maintenance
+> rules. Flagged rather than performed.
+
 ---
 
 ### E-02 — Non-Linux hosts
@@ -331,3 +344,4 @@ behind `D-06`'s pluggable exclusion policy when M9 starts. Decision yours.
 | 2026-08-21 | F-12 | Opened — credential rotation must propagate; feeds M9 (Claude Code) |
 | 2026-08-21 | D-07 | Opened — .claude.json field-level portable/identity split; feeds M9 (Claude Code) |
 | 2026-08-21 | — | Numbering note reconciled: E- shared with SPEC §9; E-01/02/03 here = SPEC E-09/10/11, renumber pending PO |
+| 2026-08-21 | E-01 | Annotated — ruled in chat as E-09 (daemon over UDS gRPC); Open→Resolved move left to PO (Claude Code) |
