@@ -3,6 +3,10 @@ name = "nemr-volume"
 version = "0.1.0"
 edition = "2021"
 description = "Root-owned privileged helper for Nemr volume provisioning (PRIV-03)"
+# Not published to crates.io: this is a workspace-internal crate. Also what lets
+# cargo-deny skip the licence check for it (deny.toml `private`), rather than
+# asserting a licence the Product Owner has not chosen yet (E-11).
+publish = false
 
 # Standalone workspace on purpose. This crate is installed root-owned at a
 # fixed path and runs under sudo; it is a different privilege domain from the

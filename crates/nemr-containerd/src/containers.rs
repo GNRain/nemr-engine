@@ -25,7 +25,7 @@ use tokio::time::timeout;
 use super::client::ContainerdClient;
 use super::images::ImageConfig;
 
-/// One container, reduced to the fields the engine actually uses.
+/// One container, reduced to the fields a consumer actually uses.
 ///
 /// See the note on [`super::images::ImageSummary`] for why this is a
 /// projection rather than the generated protobuf type.
@@ -109,9 +109,9 @@ impl BindMount {
 
 /// What a container needs to be created.
 ///
-/// Deliberately general: nothing here is specific to a "project". The engine
-/// layer decides what to mount and where; this describes a container, so later
-/// milestones extend it rather than adding a parallel path (Section 3.2).
+/// Deliberately general: nothing here is specific to a "project". The caller
+/// decides what to mount and where; this describes a container, so consumers
+/// extend it rather than adding a parallel path (SPEC §3.2).
 #[derive(Debug, Clone)]
 pub struct ContainerSpec {
     pub id: String,
@@ -132,12 +132,18 @@ pub struct ContainerSpec {
     /// The scope is named `<prefix>-<name>.scope`, so passing an id that
     /// already carries the prefix yields a doubled name. `None` uses `id`.
     pub cgroup_name: Option<String>,
+    /// Prefix for the cgroup slice path, `user.slice:<prefix>:<name>`.
+    ///
+    /// Product-specific (the caller's, e.g. `"nemr"`), so it lives on the spec
+    /// rather than as a wrapper constant — the wrapper stays product-agnostic
+    /// and the same crate serves the CLI, the daemon and the connectivity
+    /// baselines without carrying anyone's branding.
+    pub cgroup_prefix: String,
     /// Labels stored on the container record.
     ///
     /// containerd persists these and returns them from its listing API, so
-    /// engine metadata (which project, which volume, what quota) is
-    /// discoverable through containerd itself rather than a side database the
-    /// engine would have to keep in sync.
+    /// caller metadata is discoverable through containerd itself rather than a
+    /// side database the caller would have to keep in sync.
     pub labels: HashMap<String, String>,
 }
 
@@ -160,7 +166,7 @@ impl ContainerdClient {
     ///
     /// `parent` is the image's rootfs chain ID. containerd performs the
     /// snapshot work server-side and returns the mounts the runtime will later
-    /// apply — the engine never mounts anything itself here.
+    /// apply — this crate never mounts anything itself here.
     pub async fn prepare_snapshot(&self, key: &str, parent: &str) -> Result<()> {
         let request = PrepareSnapshotRequest {
             snapshotter: self.snapshotter().to_string(),
@@ -376,7 +382,7 @@ fn oci_spec(spec: &ContainerSpec, image_config: &ImageConfig) -> serde_json::Val
             // under the delegated user slice is what works.
             "cgroupsPath": format!(
                 "user.slice:{}:{}",
-                crate::config::CGROUP_PREFIX,
+                spec.cgroup_prefix,
                 spec.cgroup_name.as_deref().unwrap_or(&spec.id)
             ),
             "namespaces": [

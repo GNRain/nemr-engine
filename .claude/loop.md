@@ -26,6 +26,30 @@ Invoked ad hoc during engine work with `/loop 30m` (fixed interval) or a bare
   failing while the engine reports success is the highest-priority class — it is
   the VOL-05 shape. Never downgrade it.
 
+## The negative-assertion rule (a green signal over nothing)
+
+The recurring defect that has caught this project four times is a green signal
+over a non-working or non-existent artifact: VOL-05 reported success writing to
+the wrong filesystem; the M7 branch was "done" with zero commits; the helper
+passed 13 unit tests while unable to provision a volume; and a WP-C `grep`
+"proved" history was not on the rootfs by searching `/var/lib/containerd`, the
+**system** path, which under rootless is empty for a reason unrelated to the
+claim.
+
+**Standing rule: any "X is absent" / "not found" / "no matches" assertion must
+first prove, in the same breath, that the search would have found a known-present
+control.** Before trusting a negative:
+
+- Prove the path is **readable and non-empty** — grep a control string you know
+  is there, or list the directory and assert it has the expected entries.
+- Under rootless, a path may be namespace-remapped; confirm you are searching the
+  real host location (`~/.local/share/containerd/…`), not the system one.
+- Never suppress errors (`2>/dev/null`) on the command whose *silence* you are
+  about to read as evidence — a permission-denied is not an absence.
+
+Absence-because-correct and absence-because-you-looked-in-the-wrong-place are
+indistinguishable without the control. This recurs on every negative assertion.
+
 ## Fix autonomously
 
 - A newly `#[ignore]`d or skipped test — de-skip it and make it run.

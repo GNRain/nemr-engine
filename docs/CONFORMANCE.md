@@ -19,6 +19,22 @@ which **refuses to skip** — a missing host facility fails the test with
 instructions rather than silently passing (this is why the old `#[ignore]`d
 VOL-06 suite never ran). The end-to-end script is `scripts/e2e_smoke_test.sh`.
 
+**What CI proves, and what it does not.** All five CI jobs are green on a clean
+Ubuntu runner, including the host-backed regression suite (10/10, hash-gated) and
+the E2E smoke test. Two limits are deliberate and must not be blurred by a green
+badge:
+
+- CI runs the smoke test with `NEMR_SKIP_API=1`. It never contacts the Anthropic
+  API. Only a local run exercises the round-trip.
+- CI provisions a **placeholder** credential. That proves AUTH-02's mount
+  mechanics — bind-mounted, read-only, at the path Claude Code expects — and
+  proves nothing about whether a real credential authenticates.
+
+So a CI pass is a strictly weaker claim than a local `verify_wp_a.sh` pass. The
+smoke test prints which mode it ran in; treat "green in CI" and "works" as
+different statements, because the gap between them is where this project's
+defects have lived.
+
 **Verification note.** Host-backed rows are proven against the *installed*
 privileged helper, which `tests/common/mod.rs` enforces by refusing to run
 unless `sha256(installed) == sha256(built)` (finding F-11 / TEST-01).
@@ -85,10 +101,10 @@ unless `sha256(installed) == sha256(built)` (finding F-11 / TEST-01).
 
 | ID | Requirement | Implementation | Test | Status |
 |---|---|---|---|---|
-| NFR-01 | No Docker at any layer, incl. transitively | verified: `cargo tree` clean, buildkit rootless, no docker CLI/socket/group | — | 🟡 (verified empirically this session; **CI gate owed** — F-24, WP-B) |
+| NFR-01 | No Docker at any layer, incl. transitively | `scripts/check_docker_free.sh` (CLI/socket, transitive deps, build path) + `deny.toml` bans | CI `docker-free` job; **negative-tested** three ways (socket path, CLI invocation, real `bollard` dep) | ✅ (F-24 closed — now enforced by the pipeline, not memory) |
 | NFR-02 | create/start in low single-digit seconds | — | — | 🟡 (measured nowhere — F-45, WP-B benchmark harness) |
 | NFR-03 | No orphaned loops/mounts/containerd resources after delete | recoverable `delete` ordering + `reconcile_orphans` | live reconcile test; smoke step 9 | ✅ (cluster F-03/F-10/F-15/F-20/F-23 fixed; exec-record leak on SIGKILLed attach still open — F-18) |
-| NFR-04 | Destructive ops logged auditably | `audit` in engine + helper | smoke output | ✅ |
+| NFR-04 | Destructive ops logged auditably | `audit` via `tracing` (info, on by default); `NEMR_DEBUG=1` adds decision points | smoke output; VOL-05 debug demo in README | ✅ |
 | NFR-05 | No silent privilege escalation; documented | helper via explicit sudo; `setup_test_host.sh` | — | ✅ |
 
 ### Acceptance criteria (AC)
@@ -125,6 +141,9 @@ disposition tracked here.
 | F-30 | med | VOL-05 | statvfs `f_bfree`/`f_bavail` + `Usage::percent` untested | 3 `usage_percent_*` unit tests (df definition) |
 | F-40 | med | PROC-02 | `ModeTracker` untested; ESC-restart parser gap | 11 `mode_tracker_tests` + ESC-restart fix |
 | F-09/F-16 | high | VOL-06/AC-3 | AC-3.x + VOL-06 tests `#[ignore]`d in volume.rs | migrated to the non-skippable suite; zero ignored tests remain |
+| F-24 | med | NFR-01 | No CI — Docker-freeness/lint/licensing unenforced | `.github/workflows/ci.yml` + `check_docker_free.sh` (negative-tested) + `deny.toml` |
+| F-37 | med | — | base-image build never scripted (README prose only) | `scripts/build_base_image.sh`, run and verified (200.5 MiB, same digest) |
+| F-53 | high | NFR-01/supply chain | **RUSTSEC-2026-0258** — `h2` unbounded empty DATA frames, reachable via `tonic` → `containerd-client` | found by the new `cargo deny` gate on its first run; `h2` 0.4.15 → 0.4.18 |
 
 **Open — this branch / next (WP-A remnant + WP-C follow-up)**
 
@@ -139,11 +158,9 @@ disposition tracked here.
 
 | ID | Sev | Requirement | Finding | Owner |
 |---|---|---|---|---|
-| F-24 | med | NFR-01 | No CI: Docker-freeness/lint/licensing unenforced | WP-B |
 | F-45 | low | NFR-02 | create/start latency measured nowhere | WP-B benchmark harness |
 | F-22/F-34 | med | VOL-05 | `list` trusts labels blind; destroyed volume shown as merely "unmounted" | WP-A/B follow-up |
 | F-25 | med | NFR-01 | `BASE_IMAGE` in a squattable Docker Hub namespace | pin by digest (WP-B reproducible build) |
-| F-37 | med | — | `image.rs` is a stub — base-image build orchestration never implemented | WP-B |
 | F-46 | low | PROC-02 | `std::process::exit` in attach/delete skips destructors | WP-B error-model unification |
 | F-49 | low | NFR-01 | `~/.docker` created by buildctl's vendored telemetry (not Docker) — audit tripwire | document |
 

@@ -1,6 +1,6 @@
 //! Connection management and the shared client handle.
 //!
-//! This is the only place in the engine that opens a containerd connection.
+//! This is the only place a containerd connection is opened.
 //! Everything above it (`src/engine/`) receives a [`ContainerdClient`] and
 //! never constructs a `containerd_client::Client` of its own — see Section 3.2.
 
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use containerd_client::Client;
 
-/// containerd namespace used by the engine.
+/// containerd namespace this client operates in.
 ///
 /// containerd partitions all resources by namespace; `ctr` defaults to
 /// `default`, so using the same name keeps engine state inspectable with the

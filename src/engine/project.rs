@@ -165,6 +165,7 @@ pub async fn create(
         // Bare project name: the scope is `nemr-<name>.scope`, and passing the
         // container id (already `nemr-` prefixed) would double it.
         cgroup_name: Some(name.to_string()),
+        cgroup_prefix: config::CGROUP_PREFIX.to_string(),
         labels,
     };
 
@@ -354,11 +355,25 @@ fn sweep_stale_attach_dirs() {
 /// helper already knows how to attach and mount it, so requiring the user to
 /// repair this by hand would defeat the portability the product exists for.
 /// Failure to remount *is* fatal — proceeding is what this guards against.
+#[tracing::instrument(name = "ensure_volume_mounted", skip_all, fields(project = %name))]
 pub fn ensure_volume_mounted(name: &str) -> Result<()> {
     let paths = VolumePaths::from_env()?;
     let mount_point = paths.mount_point(name);
 
-    if crate::engine::volume::is_mounted(&mount_point) {
+    // The VOL-05 decision point. Log what was checked and what the answer was —
+    // not just the action taken. VOL-05 was invisible in the log precisely
+    // because "proceeding" and "proceeding against the wrong filesystem" printed
+    // the same nothing.
+    let mounted = crate::engine::volume::is_mounted(&mount_point);
+    tracing::debug!(
+        mount_point = %mount_point.display(),
+        mounted,
+        backing_device = %crate::engine::volume::backing_device(&mount_point)
+            .unwrap_or_else(|| "<none>".into()),
+        "checked whether the project volume is mounted"
+    );
+
+    if mounted {
         return Ok(());
     }
 
@@ -392,6 +407,23 @@ pub fn ensure_volume_mounted(name: &str) -> Result<()> {
             )
         })?;
 
+    // Confirm the remount actually landed, and say which device backs it. This
+    // is the line that turns VOL-05 from "found after a reboot by hand" into
+    // "obvious on the first run": a working directory backed by the host root
+    // device instead of a loop device is visible right here.
+    let device = crate::engine::volume::backing_device(&mount_point);
+    tracing::debug!(
+        mount_point = %mount_point.display(),
+        remounted = crate::engine::volume::is_mounted(&mount_point),
+        backing_device = %device.clone().unwrap_or_else(|| "<none>".into()),
+        "remounted the project volume"
+    );
+    tracing::info!(
+        "remounted volume for {name:?} from {} ({})",
+        image.display(),
+        device.unwrap_or_else(|| "unknown device".into())
+    );
+
     Ok(())
 }
 
@@ -406,7 +438,7 @@ fn read_recorded_size(paths: &VolumePaths, name: &str) -> Option<VolumeSize> {
 }
 
 fn audit_remount(name: &str, mount_point: &std::path::Path) {
-    eprintln!(
+    tracing::info!(
         "[nemr:volume] volume for {name:?} is not mounted at {}; remounting (VOL-06)",
         mount_point.display()
     );

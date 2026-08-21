@@ -1,0 +1,70 @@
+# cargo-deny configuration — dependency licensing, advisories, and sources.
+#
+# This matters most for the open-core split (E-11): the engine is intended to be
+# open source with a commercial layer above it, and a copyleft or unvetted
+# dependency is cheap to remove now and expensive to remove later. Running this
+# in CI makes that a gate rather than a periodic audit.
+#
+# Surveyed on the current graph (2026-08-21): 117 packages, all permissive —
+# MIT / Apache-2.0 dominate, plus Zlib, Unlicense and Unicode-3.0. The only
+# copyleft mention anywhere is `r-efi`, licensed
+# "MIT OR Apache-2.0 OR LGPL-2.1-or-later" — an OR, so the permissive option
+# applies and no LGPL obligation attaches.
+
+[advisories]
+# Fail on any security advisory affecting the graph. `unmaintained` is a warning
+# rather than an error: an unmaintained-but-sound crate should not break the
+# build on the day it is flagged, but it should be visible.
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+
+[licenses]
+version = 2
+# Permissive only. Adding a license here is a deliberate act with an open-core
+# consequence, which is the point of listing them explicitly rather than using a
+# broad allow-osi.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unlicense",
+    "Unicode-3.0",
+    "CC0-1.0",
+]
+# Below this, cargo-deny will not accept a license expression as satisfied.
+confidence-threshold = 0.9
+# The allowlist is deliberately broader than the current graph: it states which
+# licences are acceptable, not which happen to be present today. An entry that
+# nothing currently uses is not dead config.
+unused-allowed-license = "allow"
+
+# Our own crates carry no `license` field and are not published. `private` is
+# the mechanism for exactly this: skip the licence check for workspace members
+# that are `publish = false` / unpublished, rather than asserting a licence for
+# them here. The repository's licensing is a Product Owner decision tied to the
+# open-core seam (E-11) and does not belong in a lint config.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Docker client libraries are a hard architectural violation (NFR-01), not a
+# style preference. scripts/check_docker_free.sh is the primary gate; this is a
+# second, independent one at the dependency-resolution layer.
+deny = [
+    { name = "bollard" },
+    { name = "shiplift" },
+    { name = "docker_credential" },
+    { name = "testcontainers" },
+]
+
+[sources]
+# Only crates.io. A git or alternate-registry dependency would be a supply-chain
+# change worth an explicit decision.
+unknown-registry = "deny"
+unknown-git = "deny"
