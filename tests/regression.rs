@@ -469,7 +469,19 @@ fn vol_fault_injection_leaves_no_orphans() {
     let paths = VolumePaths::from_env().unwrap();
 
     let result = Volume::create(&name, VS::Small, paths.clone(), FailAfterMount { inner: HelperOps::new() });
-    assert!(result.is_err(), "the injected fault must fail creation");
+    // CONTROL: assert the failure is the INJECTED one, not an earlier failure in
+    // create (name validation, sparse allocation, mkfs). Without this, an early
+    // failure would leave nothing mounted and the no-orphan assertions below
+    // would pass vacuously — the suite's only RAII-cleanup coverage silently
+    // ceasing to exercise cleanup while staying green (F-56 class).
+    let error = match result {
+        Ok(_) => panic!("the injected fault must fail creation"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{error:#}").contains("injected fault"),
+        "the failure must be the injected one, or this test proves nothing: {error:#}"
+    );
 
     // No residue: the mount genuinely happened, then failed — Drop must release it.
     assert!(!is_mounted(&paths.mount_point(&name)), "no orphaned mount after the fault");

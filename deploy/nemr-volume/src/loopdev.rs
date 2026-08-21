@@ -92,7 +92,7 @@ pub fn attach(backing_fd: &OwnedFd) -> Result<u32, String> {
     // trap we just climbed out of. If a real sub-5.8 target appears, add it then
     // with a host to test it on.
     if let Some((major, minor)) = running_kernel_version() {
-        if (major, minor) < (5, 8) {
+        if !kernel_supports_loop_configure((major, minor)) {
             return Err(format!(
                 "this kernel is {major}.{minor}; loop provisioning needs LOOP_CONFIGURE, \
                  which requires Linux 5.8 or newer (see PREREQUISITES.md). The supported \
@@ -248,6 +248,15 @@ fn running_kernel_version() -> Option<(u32, u32)> {
     parse_kernel_version(&release)
 }
 
+/// Whether a kernel version supports the `LOOP_CONFIGURE` ioctl (Linux 5.8+).
+///
+/// Factored out so the production gate and its test exercise the *same* code.
+/// When the test compared tuple literals directly, the entire floor check could
+/// be deleted with the suite staying green.
+pub fn kernel_supports_loop_configure(version: (u32, u32)) -> bool {
+    version >= (5, 8)
+}
+
 /// Parse a `major.minor...` kernel release string into `(major, minor)`.
 fn parse_kernel_version(release: &str) -> Option<(u32, u32)> {
     let mut parts = release.trim().split(['.', '-', '+']);
@@ -305,9 +314,12 @@ mod tests {
         assert_eq!(parse_kernel_version("5.4.0"), Some((5, 4)));
         assert_eq!(parse_kernel_version("6.8"), Some((6, 8)));
         assert_eq!(parse_kernel_version("garbage"), None);
-        // The gate: 5.7 is too old, 5.8 is the floor.
-        assert!((5, 7) < (5, 8));
-        assert!((5, 15) >= (5, 8));
-        assert!((6, 8) >= (5, 8));
+        // The gate itself, not tuple literals compared to tuple literals.
+        // Previously this asserted `(5,7) < (5,8)` — true regardless of any code
+        // in this crate, so the whole kernel floor could be deleted and the test
+        // stayed green (F-56 class).
+        assert!(!kernel_supports_loop_configure((5, 7)), "5.7 lacks LOOP_CONFIGURE");
+        assert!(kernel_supports_loop_configure((5, 8)), "5.8 is the floor");
+        assert!(kernel_supports_loop_configure((6, 8)), "current kernels qualify");
     }
 }

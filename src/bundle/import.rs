@@ -385,6 +385,50 @@ mod tests {
         );
     }
 
+    /// A future-schema bundle must be refused by `open()`, not merely by the
+    /// helper the manifest test calls directly.
+    ///
+    /// `a_newer_schema_is_refused_with_advice` exercises `Manifest::compatibility`
+    /// on a hand-built struct; deleting the `manifest.compatibility()?` call from
+    /// `open()` left it green while a future-version bundle would be extracted
+    /// under assumptions this build cannot know (F-56 class, guard-test audit).
+    /// This one rewrites a real bundle's manifest and goes through `open()`.
+    #[test]
+    fn a_future_schema_bundle_is_refused_by_open() {
+        let (_, bundle_path) = make_bundle("future-schema", &[("a.txt", "x")]);
+
+        // Rebuild the archive with the schema version bumped beyond this build.
+        let mut manifest: crate::bundle::manifest::Manifest = {
+            let file = std::fs::File::open(&bundle_path).unwrap();
+            let mut archive = tar::Archive::new(file);
+            let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        manifest.schema_version = crate::bundle::SCHEMA_VERSION + 1;
+
+        let future = bundle_path.with_extension("future");
+        {
+            let out = std::fs::File::create(&future).unwrap();
+            let mut builder = tar::Builder::new(out);
+            let json = serde_json::to_vec(&manifest).unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(json.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, MANIFEST_MEMBER, json.as_slice()).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let error = open(&future).expect_err("a future-schema bundle must be refused");
+        assert_eq!(error.kind(), crate::error::ErrorKind::Incompatible);
+        assert!(
+            error.to_string().contains("Upgrade nemr"),
+            "the refusal must say what to do: {error}"
+        );
+    }
+
     #[test]
     fn a_truncated_bundle_is_refused_with_a_clear_error() {
         let (_, bundle_path) = make_bundle("truncated", &[("a.txt", &"x".repeat(5000))]);
@@ -475,23 +519,65 @@ mod tests {
         assert!(safe_join(&root, "nested/ok.txt").is_ok());
     }
 
-    /// Session-critical members are written first, so a failure part-way leaves
-    /// the session usable rather than the caches restored and history missing.
+    /// Session-critical members are written before reconstructible ones, so a
+    /// failure part-way leaves the session usable rather than the caches
+    /// restored and the history missing.
+    ///
+    /// Observes the order `extract()` actually writes in: the reconstructible
+    /// member is listed first but carries a deliberately wrong digest, so
+    /// extraction aborts on it — and the session-critical file must already be
+    /// on disk. The previous version re-implemented the same sort inside the
+    /// test and asserted on its own output, which was tautological: the
+    /// production sort could be deleted with the test staying green (F-56
+    /// class, found by the guard-test audit).
     #[test]
-    fn session_critical_members_are_written_first() {
-        let (_, bundle_path) = make_bundle(
-            "ordering",
-            &[
-                (".nemr-state/backups/old.json", "reconstructible"),
-                (".nemr-state/projects/-workspace/a.jsonl", "critical"),
-            ],
-        );
-        let bundle = open(&bundle_path).unwrap();
-        let mut ordered: Vec<&MemberEntry> = bundle.manifest.members.iter().collect();
-        ordered.sort_by_key(|m| !m.is_session_critical());
+    fn session_critical_members_are_written_before_reconstructible_ones() {
+        let (_, bundle_path) = make_bundle("ordering", &[("a.txt", "content")]);
+        let mut bundle = open(&bundle_path).unwrap();
+
+        // Hand-built manifest mixing classes: the policy cannot produce a
+        // Reconstructible member from the real volume layout, so a fixture built
+        // through export() could not discriminate ordering at all.
+        let plain = b"CRITICAL-BYTESRECONSTRUCTIBLE".to_vec();
+        bundle.chunks.clear();
+        bundle
+            .chunks
+            .insert(0, zstd::encode_all(plain.as_slice(), 3).unwrap());
+        bundle.manifest.chunks = vec![crate::bundle::manifest::ChunkEntry {
+            index: 0,
+            sha256: hex(&Sha256::digest(&plain)),
+            compressed_bytes: 0,
+            plain_bytes: plain.len() as u64,
+        }];
+        bundle.manifest.members = vec![
+            MemberEntry {
+                path: "cache/regenerable.bin".into(),
+                class: crate::bundle::policy::Class::Reconstructible.as_str().into(),
+                mode: 0o100644,
+                size: 15,
+                sha256: "0".repeat(64),
+                span: crate::bundle::manifest::Span { offset: 14, length: 15 },
+            },
+            MemberEntry {
+                path: "session/history.jsonl".into(),
+                class: crate::bundle::policy::Class::SessionCritical.as_str().into(),
+                mode: 0o100644,
+                size: 14,
+                sha256: hex(&Sha256::digest(b"CRITICAL-BYTES")),
+                span: crate::bundle::manifest::Span { offset: 0, length: 14 },
+            },
+        ];
+
+        let destination = scratch("ordering-dest");
+        let error = bundle
+            .extract(&destination)
+            .expect_err("the corrupt reconstructible member must abort extraction");
+        assert_eq!(error.kind(), crate::error::ErrorKind::DataIntegrity);
+
         assert!(
-            ordered[0].is_session_critical(),
-            "the session-critical member must be restored first"
+            destination.join("session/history.jsonl").exists(),
+            "session-critical members must be written FIRST; without the production \
+             sort this file would not exist when extraction aborts"
         );
     }
 }
