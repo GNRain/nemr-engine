@@ -291,3 +291,51 @@ pub fn purge(name: &str) {
         let _ = std::fs::remove_dir(paths.mount_point(name));
     }
 }
+
+/// Extract a bundle to a scratch directory and return every file's contents
+/// concatenated, for content assertions.
+///
+/// # Why not grep the bundle file
+///
+/// F-57: a bundle's chunks are zstd-compressed, so searching the `.nemr` bytes
+/// finds a plaintext string only when the content was small enough that zstd
+/// stored it near-verbatim. Measured: a marker in a 34-byte bundle is findable
+/// in the raw file; the same marker in a 241 KiB bundle is not. Every
+/// "the secret must not appear in the bundle" test written that way therefore
+/// passes on small fixtures and stops guarding anything at realistic sizes —
+/// it degrades precisely when it matters.
+///
+/// Assertions about what a bundle does or does not contain must run against the
+/// extracted plaintext, which is also what an importer or an attacker actually
+/// sees.
+pub fn extracted_plaintext(bundle_path: &Path) -> String {
+    let bundle = nemr_engine::bundle::import::open(bundle_path)
+        .unwrap_or_else(|e| panic!("open bundle {}: {e}", bundle_path.display()));
+    let dir = std::env::temp_dir().join(format!(
+        "nemr-extract-{}-{}",
+        std::process::id(),
+        unique_name("x")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    bundle.extract(&dir).expect("extract bundle");
+
+    let mut combined = String::new();
+    let mut stack = vec![dir.clone()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                combined.push_str(&text);
+                combined.push('\n');
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    combined
+}

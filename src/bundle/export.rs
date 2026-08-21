@@ -393,6 +393,39 @@ mod tests {
         }
     }
 
+    /// Extract a bundle and return all file contents, for content assertions.
+    ///
+    /// F-57: never assert on the compressed `.nemr` bytes. A raw grep finds a
+    /// plaintext marker only while the content is small enough that zstd stores
+    /// it near-verbatim — measured, a marker visible in a 34-byte bundle is
+    /// invisible in a 241 KiB one. A "the secret must not appear" test written
+    /// that way passes on fixtures and guards nothing at real sizes.
+    fn extracted_text(bundle: &Path) -> String {
+        let opened = crate::bundle::import::open(bundle).expect("open bundle");
+        let dir = std::env::temp_dir().join(format!(
+            "nemr-xt-{}-{}",
+            std::process::id(),
+            bundle.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        opened.extract(&dir).expect("extract");
+        let mut combined = String::new();
+        let mut stack = vec![dir.clone()];
+        while let Some(current) = stack.pop() {
+            for entry in std::fs::read_dir(&current).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(text) = std::fs::read_to_string(&path) {
+                    combined.push_str(&text);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        combined
+    }
+
     #[test]
     fn the_manifest_is_the_first_archive_member() {
         let root = scratch("first-member");
@@ -431,10 +464,9 @@ mod tests {
                 .any(|m| m.path.contains("credentials")),
             "no member may reference the credential"
         );
-        let raw = std::fs::read(&out).unwrap();
         assert!(
-            !String::from_utf8_lossy(&raw).contains("SUPER-SECRET-VALUE"),
-            "the secret's bytes must not appear anywhere in the bundle (D-02)"
+            !extracted_text(&out).contains("SUPER-SECRET-VALUE"),
+            "the secret must not appear in the bundle's extracted content (D-02)"
         );
         assert!(
             summary
@@ -486,10 +518,12 @@ mod tests {
             .expect("the portable subset travels");
         assert!(portable.is_session_critical());
 
-        let raw = String::from_utf8_lossy(&std::fs::read(&out).unwrap()).to_string();
-        assert!(raw.contains("gh-mcp"), "MCP config travels");
+        let text = extracted_text(&out);
+        // Control first: a positive assertion proves the search works, so the
+        // negative one below is not vacuous.
+        assert!(text.contains("gh-mcp"), "MCP config travels");
         assert!(
-            !raw.contains("MACHINE-ID-VALUE"),
+            !text.contains("MACHINE-ID-VALUE"),
             "machine identity must not travel"
         );
         assert_eq!(

@@ -17,7 +17,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{installed_helper_matches_built, require_host, unit_only, HostRequirements, TestProject};
+use common::{extracted_plaintext, installed_helper_matches_built, require_host, unit_only, HostRequirements, TestProject};
 use nemr_engine::containerd::client::ContainerdClient;
 use nemr_engine::containerd::containers::StopOutcome;
 use nemr_engine::engine::project;
@@ -628,23 +628,121 @@ fn m9_a_real_bundle_contains_no_credential() {
         .await
         .expect("export");
 
-        let raw = std::fs::read(&bundle).expect("read bundle");
-        let text = String::from_utf8_lossy(&raw);
+        // Assert on EXTRACTED plaintext, never the compressed bundle bytes
+        // (F-57: a raw grep degrades to a no-op once zstd actually compresses).
+        let opened = nemr_engine::bundle::import::open(&bundle).expect("open");
         assert!(
-            !text.contains(".credentials.json"),
+            !opened
+                .manifest
+                .members
+                .iter()
+                .any(|m| m.path.contains(".credentials.json")),
             "no bundle member may reference the credential file (D-02)"
         );
 
+        let plaintext = extracted_plaintext(&bundle);
         // And the host's real credential contents must not appear either.
         if let Ok(host_credential) = std::fs::read_to_string(
             nemr_engine::auth::host_credentials_path().expect("credential path"),
         ) {
             for line in host_credential.lines().filter(|l| l.len() > 24) {
                 assert!(
-                    !text.contains(line.trim()),
+                    !plaintext.contains(line.trim()),
                     "a line of the host credential appeared in the bundle (D-02)"
                 );
             }
+        }
+
+        let _ = std::fs::remove_file(&bundle);
+    });
+}
+
+/// F-55 — MCP configuration travels, and identity does not.
+///
+/// # Why there is no bind-mount here
+///
+/// F-54 rules that MCP configuration must travel while machine and account
+/// identity must not. The obvious implementation was to bind-mount a filtered
+/// `.claude.json` from the volume, which would have put identity fields *on*
+/// the exportable layer and defended them with an export-time filter.
+///
+/// Claude Code makes that unnecessary. It natively supports project-scoped MCP
+/// configuration in `.mcp.json` at the project root — verified by
+/// `claude mcp list` discovering a server declared there — and the project root
+/// *is* the volume. So MCP configuration travels as an ordinary project file,
+/// while `machineID` and `oauthAccount` stay in `/root/.claude.json` on the
+/// rootfs and never reach the volume at all.
+///
+/// That is the difference between D-02 held by policy and D-02 held by
+/// structure: no filter can fail open on a field that was never there. It is
+/// also why this needed no M8 bind-mount change and therefore did not
+/// invalidate D-06.
+///
+/// This test carries a **control**: it asserts a known-present string IS found
+/// by the same search that reports identity absent, so a pass cannot come from
+/// the search being broken (the F-56 lesson).
+#[test]
+fn f55_mcp_config_travels_and_identity_does_not() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "f55", VolumeSize::Small).await;
+
+        let mount = VolumePaths::from_env().unwrap().mount_point(&project.name);
+        // Project-scoped MCP configuration, exactly where Claude Code reads it.
+        let marker = "mcp-marker-travels";
+        std::fs::write(
+            mount.join(".mcp.json"),
+            format!(r#"{{"mcpServers":{{"{marker}":{{"command":"echo"}}}}}}"#),
+        )
+        .expect("write .mcp.json");
+
+        let bundle = std::env::temp_dir().join(format!("f55-{}.nemr", std::process::id()));
+        let _ = std::fs::remove_file(&bundle);
+        project::export(
+            &client,
+            &project.name,
+            &bundle,
+            nemr_engine::bundle::policy::Policy::default(),
+        )
+        .await
+        .expect("export");
+
+        let opened = nemr_engine::bundle::import::open(&bundle).expect("open");
+
+        // MCP configuration must be a session-critical member.
+        assert!(
+            opened
+                .manifest
+                .members
+                .iter()
+                .any(|m| m.path == ".mcp.json" && m.is_session_critical()),
+            "MCP configuration must travel (F-54): {:?}",
+            opened.manifest.members.iter().map(|m| &m.path).collect::<Vec<_>>()
+        );
+
+        // Search the EXTRACTED plaintext, not the compressed bundle (F-57).
+        let plaintext = extracted_plaintext(&bundle);
+
+        // CONTROL: the same search must find something known to be present, or
+        // the identity assertions below prove nothing.
+        assert!(
+            plaintext.contains(marker),
+            "control: the marker must be findable in the extracted plaintext, or \
+             the absence assertions below are vacuous"
+        );
+
+        // And identity must be absent — held structurally, since these fields
+        // live on the rootfs and never reach the volume.
+        for identity in ["machineID", "oauthAccount"] {
+            assert!(
+                !plaintext.contains(identity),
+                "{identity} must never appear in a bundle (F-54)"
+            );
         }
 
         let _ = std::fs::remove_file(&bundle);

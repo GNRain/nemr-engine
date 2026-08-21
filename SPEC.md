@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | NEMR-SPEC-001 |
-| Version | 1.35 |
+| Version | 1.36 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -51,6 +51,7 @@
 | 1.33 | Revision | M9: added `docs/bundle-format.md` (NEMR-BUNDLE-001 schema v1) as a versioned public interface per E-11. File-level, base image by digest, manifest first, fixed 4 MiB chunks each compressed independently so the chunk boundary is a real seam for M13 deduplication and v2 encryption. Manifest carries C1's session-critical/reconstructible classification to enable lazy materialisation. Exclusion policy: credentials unconditionally (D-02), `.claude.json` by field-level allowlist with unrecognised fields staying put and logged (F-54), build artifacts by default. | Claude Code |
 | 1.34 | Revision | M9/M10: implemented bundle export and import against NEMR-BUNDLE-001 v1, with `nemr export` and `nemr import` as standalone CLI surface (E-11). Import is decide-verify-extract: schema, base image digest and quota all refuse before a byte is written; chunk and member digests are verified before extraction; member paths are refused if they escape the destination. Acceptance demonstrated end to end with the live API — a session exported from one project and imported into a fresh one recalled its codeword via `claude --continue` without reading any file. Raised F-55 (MCP configuration cannot travel: `.claude.json` is on the rootfs, not the volume). | Claude Code |
 | 1.35 | Revision | Ran the chunking spike before M11 (docs/chunking-spike.md) and converted the "M13 without a rewrite" claim in the format spec from a design assertion into a verified result: the v1 manifest absorbs content-defined chunking with no new fields, dedup across an early edit reached 79.1%, chunk identity is codec-independent, and the reserved v2 encryption seam composes. Recorded the two v1 choices that make this true (per-chunk `plain_bytes`; absolute member spans) so neither is changed casually. Code discarded as agreed. Also added the guard-test rule to `.claude/loop.md` and recorded F-56. | Claude Code |
+| 1.36 | Revision | F-55 resolved without an M8 bind-mount change: Claude Code natively supports project-scoped MCP configuration in `.mcp.json` at the project root, which is already on the volume, so MCP config travels while `machineID`/`oauthAccount` stay on the rootfs and never reach the exportable layer. D-06 therefore not invalidated; M8 and M10 acceptances re-run regardless and both pass. F-57 recorded and fixed: four secret-absence guards grepped compressed bundle bytes and degraded to no-ops at realistic sizes. | Claude Code |
 
 ---
 
