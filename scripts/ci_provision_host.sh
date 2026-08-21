@@ -141,6 +141,34 @@ export PATH="$HOME/.local/bin:$PATH"
 echo "PATH=$HOME/.local/bin:$PATH" >> "${GITHUB_ENV:-/dev/null}" || true
 buildctl --version
 
+echo "==> Placeholder Claude Code credential (CI only)"
+# AUTH-03 makes a missing host credential a hard failure at `create`, by design:
+# there is no point provisioning storage for a container that cannot
+# authenticate. A CI runner has no real credential, so without this every
+# `create` fails and neither the regression suite nor the smoke test can run.
+#
+# What this placeholder DOES prove: the AUTH-02 mount mechanics — that the file
+# is bind-mounted, read-only, at the path Claude Code expects. The smoke test
+# asserts exactly that (readable inside the container; `touch` fails with
+# "Read-only"), and a placeholder exercises the real code path.
+#
+# What it does NOT prove: that a real credential authenticates against the API.
+# CI runs with NEMR_SKIP_API=1 and the smoke test states which mode it ran in, so
+# a CI pass is a visibly weaker claim than a local run. That distinction is
+# recorded in docs/CONFORMANCE.md rather than left for a green badge to blur.
+#
+# Deliberately NOT done: weakening `resolve_credentials` or adding a skip-auth
+# flag. That would make CI exercise a different code path than users run, which
+# is the failure mode this project keeps hitting.
+if [[ ! -e "$HOME/.claude/.credentials.json" ]]; then
+    mkdir -p "$HOME/.claude"
+    cat > "$HOME/.claude/.credentials.json" <<'CRED'
+{"_comment": "CI PLACEHOLDER — not a credential. Exercises the AUTH-02 mount path only; the API round-trip is skipped in CI (NEMR_SKIP_API=1)."}
+CRED
+    chmod 600 "$HOME/.claude/.credentials.json"
+    echo "    created a placeholder at ~/.claude/.credentials.json (mode 600)"
+fi
+
 echo "==> Build and import the base image (BuildKit, daemonless — no Docker)"
 ./scripts/build_base_image.sh
 

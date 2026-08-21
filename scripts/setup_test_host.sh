@@ -38,7 +38,46 @@ fi
 
 echo "==> Building the helper (release)"
 # Build as the invoking user so the target/ tree stays user-owned.
-sudo -u "$ACCOUNT" bash -lc "cd '$HELPER_SRC_DIR' && cargo build --release"
+#
+# Finding cargo is fiddlier than it looks, because the two hosts this runs on
+# disagree in opposite directions:
+#
+#   - A clean rustup workstation has cargo in ~/.cargo/bin, added to PATH by
+#     ~/.profile. A non-login shell (`bash -c`) misses it.
+#   - A GitHub runner has cargo on the *runner process's* PATH but nothing in
+#     ~/.profile, so a login shell (`bash -lc`) misses it — which is exactly how
+#     this failed in CI with `cargo: command not found`.
+#
+# So neither shell flavour is reliable. Resolve the binary explicitly instead,
+# and fail with a clear message rather than a bare exit 127 if it is absent.
+ACCOUNT_HOME="$(getent passwd "$ACCOUNT" | cut -d: -f6)"
+if [[ -z "$ACCOUNT_HOME" ]]; then
+    echo "No passwd entry for '$ACCOUNT'. Set NEMR_ACCOUNT=<user> and retry." >&2
+    exit 1
+fi
+
+CARGO_BIN=""
+for candidate in \
+    "$ACCOUNT_HOME/.cargo/bin/cargo" \
+    "$(command -v cargo 2>/dev/null || true)" \
+    "$(sudo -u "$ACCOUNT" bash -lc 'command -v cargo' 2>/dev/null || true)"
+do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        CARGO_BIN="$candidate"
+        break
+    fi
+done
+if [[ -z "$CARGO_BIN" ]]; then
+    echo "Cannot find cargo for account '$ACCOUNT'." >&2
+    echo "Looked in $ACCOUNT_HOME/.cargo/bin, this shell's PATH, and the account's login shell." >&2
+    echo "Install the Rust toolchain (see PREREQUISITES.md) or set CARGO_BIN explicitly." >&2
+    exit 1
+fi
+echo "    using $CARGO_BIN"
+
+# HOME must be the account's, or cargo writes its registry cache into root's.
+sudo -u "$ACCOUNT" env HOME="$ACCOUNT_HOME" "$CARGO_BIN" build \
+    --release --manifest-path "$HELPER_SRC_DIR/Cargo.toml"
 
 echo "==> Installing $HELPER_DEST (root:root, 0755)"
 install -o root -g root -m 0755 "$HELPER_SRC_DIR/target/release/nemr-volume" "$HELPER_DEST"
