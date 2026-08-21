@@ -240,3 +240,21 @@ schema version; that is what allows additive change without a version bump.
 
 Neither requires a reader written against v1 to be restructured, which is the
 property the v1 layout was chosen to preserve.
+
+**This is verified, not assumed** — see [`chunking-spike.md`](chunking-spike.md).
+A rolling-hash chunker was run over realistic content through the v1 pipeline:
+round-trip passed using only fields v1 already records, dedup across an edit near
+the start of the stream reached **79.1%** (17 of 21 chunks reused, versus ~0% for
+fixed boundaries), chunk identity proved codec-independent, and per-chunk
+encryption composed with it. Two v1 choices are what make this work, and neither
+should be changed without re-running that spike:
+
+1. `plain_bytes` is recorded **per chunk**, so variable sizing needs no new field.
+2. Member spans are **absolute offsets into the concatenated stream**, not
+   `(chunk, offset)` pairs — so moving a boundary does not invalidate any span.
+
+The one change M13 may still need is *archive-level*, not manifest-level:
+content-addressed chunk naming (`chunks/<sha256>.zst`) if identical chunks are to
+be stored once inside a single file. Cross-version dedup more likely lives in
+object storage, where a bundle is a manifest plus chunk references — the
+commercial side of E-11, requiring no change to the local file at all.
