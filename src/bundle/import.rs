@@ -323,6 +323,67 @@ mod tests {
 
     const DIGEST: &str = "sha256:deadbeef";
 
+    /// Write an arbitrary bundle: any manifest, any chunk payloads.
+    ///
+    /// M11 hardening cases are about bundles a *hostile or broken* producer
+    /// creates, which `export()` cannot make by construction. Building them as
+    /// real archive files means the cases go through the real
+    /// `open()` -> `check()` -> `extract()` path rather than a hand-mutated
+    /// struct, so a guard that exists but is never *called* still fails the test
+    /// (the F-58 lesson).
+    fn write_hostile_bundle(
+        tag: &str,
+        manifest: &Manifest,
+        chunks: &[Vec<u8>],
+        manifest_first: bool,
+    ) -> PathBuf {
+        let path = scratch(tag).join("hostile.nemr");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut builder = tar::Builder::new(file);
+
+        let append = |builder: &mut tar::Builder<std::fs::File>, name: &str, bytes: &[u8]| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            builder.append_data(&mut header, name, bytes).unwrap();
+        };
+
+        let json = serde_json::to_vec(manifest).unwrap();
+        if !manifest_first {
+            append(&mut builder, "chunks/0000.zst", b"decoy");
+        }
+        append(&mut builder, MANIFEST_MEMBER, &json);
+        for (index, chunk) in chunks.iter().enumerate() {
+            append(&mut builder, &format!("chunks/{index:04}.zst"), chunk);
+        }
+        builder.finish().unwrap();
+        path
+    }
+
+    /// A minimal well-formed manifest, for hardening cases to bend.
+    fn base_manifest(members: Vec<MemberEntry>, chunks: Vec<crate::bundle::manifest::ChunkEntry>,
+                     content_bytes: u64) -> Manifest {
+        Manifest {
+            schema_version: crate::bundle::SCHEMA_VERSION,
+            engine_version: "0.1.0".into(),
+            created_at: "0".into(),
+            project: crate::bundle::manifest::ProjectInfo {
+                name: "demo".into(),
+                quota: "2GB".into(),
+                content_bytes,
+            },
+            base_image: BaseImageRef {
+                reference: "docker.io/nemr/base:0.1.0".into(),
+                digest: DIGEST.into(),
+            },
+            chunks,
+            members,
+            excluded: vec![],
+        }
+    }
+
     fn make_bundle(tag: &str, files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
         let root = scratch(tag);
         for (path, contents) in files {
@@ -560,6 +621,228 @@ mod tests {
             "nothing may be written outside the destination: {} exists",
             escaped.display()
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // M11 — hardening. Each case is a real archive a hostile or broken producer
+    // could write, driven through open() -> check() -> extract().
+    // ---------------------------------------------------------------------
+
+    /// M11: a bundle whose manifest is not the first member is refused.
+    ///
+    /// The whole "decide before reading content" guarantee rests on the manifest
+    /// being first; a reader that scanned for it would silently accept an
+    /// archive that buries it behind arbitrary content.
+    #[test]
+    fn m11_a_bundle_with_a_buried_manifest_is_refused() {
+        let manifest = base_manifest(vec![], vec![], 0);
+        let path = write_hostile_bundle("buried", &manifest, &[], false);
+
+        let error = open(&path).expect_err("a buried manifest must be refused");
+        assert_eq!(error.kind(), crate::error::ErrorKind::DataIntegrity);
+        // Assert on the SPECIFIC refusal, naming the member actually found.
+        //
+        // A first attempt asserted `contains("expected")`, which passed with the
+        // check disabled: serde's parse error for the decoy member is "expected
+        // value at line 1 column 1", so the assertion matched by coincidence.
+        // Proven vacuous by the disable-and-watch-it-fail probe — the rule
+        // catching a mistake made while applying the rule.
+        let text = error.to_string();
+        assert!(
+            text.contains("chunks/0000.zst") && text.contains(MANIFEST_MEMBER),
+            "the error must name what was found and what was expected: {text}"
+        );
+    }
+
+    /// M11: a manifest promising more chunks than the archive carries is
+    /// refused at open, before anything is written.
+    #[test]
+    fn m11_a_bundle_missing_a_promised_chunk_is_refused() {
+        let plain = b"content".to_vec();
+        let manifest = base_manifest(
+            vec![],
+            vec![
+                crate::bundle::manifest::ChunkEntry {
+                    index: 0,
+                    sha256: hex(&Sha256::digest(&plain)),
+                    compressed_bytes: 0,
+                    plain_bytes: plain.len() as u64,
+                },
+                // Promised but never written.
+                crate::bundle::manifest::ChunkEntry {
+                    index: 1,
+                    sha256: hex(&Sha256::digest(b"missing")),
+                    compressed_bytes: 0,
+                    plain_bytes: 7,
+                },
+            ],
+            plain.len() as u64,
+        );
+        let path = write_hostile_bundle(
+            "missing-chunk",
+            &manifest,
+            &[zstd::encode_all(plain.as_slice(), 3).unwrap()],
+            true,
+        );
+
+        let error = open(&path).expect_err("a missing chunk must be refused");
+        assert_eq!(error.kind(), crate::error::ErrorKind::DataIntegrity);
+        assert!(
+            error.to_string().contains("chunk 1"),
+            "the error must name the missing chunk: {error}"
+        );
+    }
+
+    /// M11: base image drift between source and destination refuses rather than
+    /// substituting a different rootfs.
+    ///
+    /// Driven through `check()` with three destination states: absent, a
+    /// different digest, and the matching digest as a control — so a pass cannot
+    /// come from `check()` refusing everything.
+    #[test]
+    fn m11_base_image_drift_refuses_and_the_matching_digest_is_accepted() {
+        let (_, bundle_path) = make_bundle("drift", &[("a.txt", "x")]);
+        let bundle = open(&bundle_path).unwrap();
+
+        for (local, label) in [
+            (None, "absent"),
+            (Some("sha256:a-different-image"), "drifted"),
+        ] {
+            let error = bundle
+                .check(&ImportChecks {
+                    local_base_image_digest: local,
+                    ..checks()
+                })
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::error::ErrorKind::HostPrerequisite,
+                "{label} base image must refuse"
+            );
+            assert!(
+                error.to_string().contains(DIGEST),
+                "{label}: the error must name the digest the bundle needs: {error}"
+            );
+        }
+
+        // CONTROL: the matching digest must be accepted, or the two refusals
+        // above prove only that check() always fails.
+        bundle
+            .check(&checks())
+            .expect("control: a matching base image must be accepted");
+    }
+
+    /// M11: quota mismatch refuses before extraction, and a sufficient
+    /// destination is accepted.
+    #[test]
+    fn m11_quota_mismatch_refuses_before_extraction() {
+        let (_, bundle_path) = make_bundle("quota-m11", &[("a.txt", &"x".repeat(10_000))]);
+        let bundle = open(&bundle_path).unwrap();
+        let needed = bundle.manifest.project.content_bytes;
+
+        let error = bundle
+            .check(&ImportChecks {
+                destination_capacity: needed - 1,
+                destination_quota: "500MB",
+                ..checks()
+            })
+            .expect_err("a destination one byte too small must refuse");
+        assert_eq!(error.kind(), crate::error::ErrorKind::CapacityExceeded);
+
+        // CONTROL: exactly enough capacity must be accepted.
+        bundle
+            .check(&ImportChecks {
+                destination_capacity: needed,
+                ..checks()
+            })
+            .expect("control: exactly-sufficient capacity must be accepted");
+    }
+
+    /// M11: a member digest mismatch is caught, names the member, and leaves
+    /// nothing of that member on disk.
+    #[test]
+    fn m11_member_digest_mismatch_names_the_member_and_writes_nothing() {
+        let plain = b"the real content".to_vec();
+        let manifest = base_manifest(
+            vec![MemberEntry {
+                path: "session/history.jsonl".into(),
+                class: crate::bundle::policy::Class::SessionCritical.as_str().into(),
+                mode: 0o100644,
+                size: plain.len() as u64,
+                sha256: "0".repeat(64), // wrong on purpose
+                span: crate::bundle::manifest::Span {
+                    offset: 0,
+                    length: plain.len() as u64,
+                },
+            }],
+            vec![crate::bundle::manifest::ChunkEntry {
+                index: 0,
+                sha256: hex(&Sha256::digest(&plain)),
+                compressed_bytes: 0,
+                plain_bytes: plain.len() as u64,
+            }],
+            plain.len() as u64,
+        );
+        let path = write_hostile_bundle(
+            "member-digest",
+            &manifest,
+            &[zstd::encode_all(plain.as_slice(), 3).unwrap()],
+            true,
+        );
+
+        let bundle = open(&path).expect("structurally valid");
+        let destination = scratch("member-digest-dest");
+        let error = bundle
+            .extract(&destination)
+            .expect_err("a member digest mismatch must be caught");
+        assert_eq!(error.kind(), crate::error::ErrorKind::DataIntegrity);
+        assert!(
+            error.to_string().contains("session/history.jsonl"),
+            "the error must name the member: {error}"
+        );
+        assert!(
+            !destination.join("session/history.jsonl").exists(),
+            "a member failing verification must not be written"
+        );
+    }
+
+    /// M11: a member span pointing past the end of the stream is refused rather
+    /// than panicking on a slice out of range.
+    #[test]
+    fn m11_a_member_span_past_the_stream_end_is_refused() {
+        let plain = b"short".to_vec();
+        let manifest = base_manifest(
+            vec![MemberEntry {
+                path: "a.txt".into(),
+                class: crate::bundle::policy::Class::SessionCritical.as_str().into(),
+                mode: 0o100644,
+                size: 9_999,
+                sha256: "0".repeat(64),
+                span: crate::bundle::manifest::Span {
+                    offset: 0,
+                    length: 9_999,
+                },
+            }],
+            vec![crate::bundle::manifest::ChunkEntry {
+                index: 0,
+                sha256: hex(&Sha256::digest(&plain)),
+                compressed_bytes: 0,
+                plain_bytes: plain.len() as u64,
+            }],
+            plain.len() as u64,
+        );
+        let path = write_hostile_bundle(
+            "span-overrun",
+            &manifest,
+            &[zstd::encode_all(plain.as_slice(), 3).unwrap()],
+            true,
+        );
+
+        let bundle = open(&path).unwrap();
+        let error = bundle
+            .extract(&scratch("span-dest"))
+            .expect_err("an out-of-range span must be refused, not panic");
+        assert_eq!(error.kind(), crate::error::ErrorKind::DataIntegrity);
     }
 
     /// A bundle is untrusted input. A member path that escapes the destination

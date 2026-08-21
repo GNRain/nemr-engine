@@ -17,7 +17,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{extracted_plaintext, installed_helper_matches_built, require_host, unit_only, HostRequirements, TestProject};
+use common::{extracted_plaintext, installed_helper_matches_built, require_host, unit_only, write_hostile_bundle, HostRequirements, TestProject};
 use nemr_engine::containerd::client::ContainerdClient;
 use nemr_engine::containerd::containers::StopOutcome;
 use nemr_engine::engine::project;
@@ -758,5 +758,125 @@ fn f55_mcp_config_travels_and_identity_does_not() {
         }
 
         let _ = std::fs::remove_file(&bundle);
+    });
+}
+
+/// M11 — a hostile bundle cannot write outside the destination.
+///
+/// The `extract()` traversal guard is unit-tested, but the defect F-58 found was
+/// that nothing asserted the extract path *used* it: swapping `safe_join` for a
+/// plain `join` left every test green while a crafted member path escaped. This
+/// is the same class as the original privileged-helper mount escalation, in new
+/// code, and reached by untrusted input — a bundle may arrive from another
+/// machine or another user.
+///
+/// So it gets a permanent, host-level regression test with a **real hostile
+/// bundle on disk**, driven through the real import path, asserting both that
+/// the import is refused and that nothing was written outside.
+#[test]
+fn m11_a_hostile_bundle_cannot_escape_the_destination() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "m11esc", VolumeSize::Small).await;
+
+        // A canary outside the destination volume. If traversal succeeds it is
+        // overwritten; the assertion is on its contents, not merely its absence,
+        // so a pass cannot come from the write landing somewhere unexpected.
+        let outside = std::env::temp_dir().join(format!("m11-canary-{}", std::process::id()));
+        std::fs::write(&outside, b"UNTOUCHED").expect("write canary");
+
+        // Build a hostile bundle by hand: export() cannot produce a traversing
+        // member path, which is exactly why this needs a crafted fixture.
+        let bundle_path = std::env::temp_dir().join(format!("m11-hostile-{}.nemr", std::process::id()));
+        let payload = b"PWNED".to_vec();
+        let mount = VolumePaths::from_env().unwrap().mount_point(&project.name);
+        let escape = format!(
+            "../../../../../../..{}",
+            outside.to_string_lossy()
+        );
+        write_hostile_bundle(&bundle_path, &escape, &payload);
+
+        let error = project::import(&client, &project.name, &bundle_path)
+            .await
+            .expect_err("a traversing member path must be refused");
+        assert_eq!(
+            error.kind(),
+            nemr_engine::error::ErrorKind::DataIntegrity,
+            "traversal must be a data-integrity refusal: {error}"
+        );
+
+        assert_eq!(
+            std::fs::read(&outside).expect("canary must still exist"),
+            b"UNTOUCHED",
+            "the hostile member must NOT have been written outside the destination"
+        );
+        assert!(
+            !mount.join("PWNED").exists(),
+            "and nothing stray inside it either"
+        );
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_file(&bundle_path);
+    });
+}
+
+/// M9 — exporting into the project's own workspace must not swallow a bundle.
+///
+/// Found by the determinism test: a second export included the first bundle as a
+/// member, so a repeatedly-exported project grows by its predecessor's size every
+/// time while every command reports success. Permanent regression test at host
+/// level, against real projects.
+#[test]
+fn m9_export_does_not_swallow_bundles_in_the_workspace() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "m9swal", VolumeSize::Small).await;
+        let mount = VolumePaths::from_env().unwrap().mount_point(&project.name);
+        std::fs::write(mount.join("notes.md"), "content").expect("seed a project file");
+
+        let policy = nemr_engine::bundle::policy::Policy::default();
+
+        // First export, written INTO the workspace.
+        let first = mount.join("backup.nemr");
+        project::export(&client, &project.name, &first, policy.clone())
+            .await
+            .expect("first export");
+        let opened = nemr_engine::bundle::import::open(&first).expect("open first");
+        assert!(
+            !opened.manifest.members.iter().any(|m| m.path.ends_with(".nemr")),
+            "a bundle must not contain itself: {:?}",
+            opened.manifest.members.iter().map(|m| &m.path).collect::<Vec<_>>()
+        );
+
+        // CONTROL: the first bundle really is sitting in the workspace, so the
+        // second export genuinely had the chance to swallow it.
+        assert!(first.exists(), "control: the first bundle is in the workspace");
+
+        let second = mount.join("backup2.nemr");
+        project::export(&client, &project.name, &second, policy)
+            .await
+            .expect("second export");
+        let opened = nemr_engine::bundle::import::open(&second).expect("open second");
+        let swallowed: Vec<&String> = opened
+            .manifest
+            .members
+            .iter()
+            .map(|m| &m.path)
+            .filter(|p| p.ends_with(".nemr"))
+            .collect();
+        assert!(
+            swallowed.is_empty(),
+            "a previous bundle must not be swallowed by the next export: {swallowed:?}"
+        );
     });
 }

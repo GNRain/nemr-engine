@@ -396,3 +396,73 @@ pub fn extracted_plaintext(bundle_path: &Path) -> String {
     let _ = std::fs::remove_dir_all(&dir);
     combined
 }
+
+/// Write a bundle whose single member has an arbitrary (possibly hostile) path.
+///
+/// `export()` cannot produce a traversing member path — which is precisely why a
+/// traversal regression test needs a crafted fixture rather than a unit test on
+/// the path-joining helper alone (F-58).
+pub fn write_hostile_bundle(destination: &Path, member_path: &str, payload: &[u8]) {
+    use sha2::{Digest, Sha256};
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "engine_version": "0.1.0",
+        "created_at": "0",
+        "project": { "name": "hostile", "quota": "500MB", "content_bytes": payload.len() },
+        "base_image": {
+            "reference": nemr_engine::config::BASE_IMAGE,
+            "digest": local_base_image_digest().unwrap_or_default(),
+        },
+        "chunks": [{
+            "index": 0,
+            "sha256": hex(&Sha256::digest(payload)),
+            "compressed_bytes": 0,
+            "plain_bytes": payload.len(),
+        }],
+        "members": [{
+            "path": member_path,
+            "class": "session-critical",
+            "mode": 33188,
+            "size": payload.len(),
+            "sha256": hex(&Sha256::digest(payload)),
+            "span": { "offset": 0, "length": payload.len() },
+        }],
+        "excluded": [],
+    });
+
+    let file = std::fs::File::create(destination).expect("create hostile bundle");
+    let mut builder = tar::Builder::new(file);
+    let append = |builder: &mut tar::Builder<std::fs::File>, name: &str, bytes: &[u8]| {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder.append_data(&mut header, name, bytes).unwrap();
+    };
+    append(&mut builder, "manifest.json", &serde_json::to_vec(&manifest).unwrap());
+    append(&mut builder, "chunks/0000.zst", &zstd::encode_all(payload, 3).unwrap());
+    builder.finish().expect("finish hostile bundle");
+}
+
+/// The base image digest on this host, so a hostile bundle passes the base-image
+/// check and reaches the extraction path under test.
+pub fn local_base_image_digest() -> Option<String> {
+    // On a dedicated thread: callers are already inside a runtime, and nesting
+    // `Runtime::new().block_on` inside one panics.
+    std::thread::spawn(|| {
+        let runtime = tokio::runtime::Runtime::new().ok()?;
+        runtime.block_on(async {
+            let client = ContainerdClient::connect().await.ok()?;
+            client
+                .image_target_digest(nemr_engine::config::BASE_IMAGE)
+                .await
+                .ok()
+        })
+    })
+    .join()
+    .ok()
+    .flatten()
+}
