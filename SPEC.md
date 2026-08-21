@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | NEMR-SPEC-001 |
-| Version | 1.32 |
+| Version | 1.33 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -48,6 +48,7 @@
 | 1.30 | Revision | WP-B: added `tracing` with span coverage across the lifecycle and a debug mode (`NEMR_DEBUG=1`, `NEMR_LOG=<filter>`). The VOL-03/NFR-04 audit trail now flows through `tracing` at `info` so it remains on by default. Acceptance is falsifiable and was demonstrated: in debug mode the VOL-05 decision point logs the mount check, its result, and the backing device, so a working directory backed by the host root device instead of a loop device is visible on the first run. Added CI gates (NFR-01 Docker-freeness with negative tests, clippy warnings-denied, cargo-deny licences/advisories, host-backed suite + smoke on a clean runner) and scripted the base-image build and CI host provisioning. | Claude Code |
 | 1.31 | Revision | Recorded three Product Owner rulings: E-11 open-core seam RESOLVED (engine + wrapper + volume layer + helper + **bundle format spec** open source; sync, lease, storage backends, identity, GUI commercial; test = "can someone use the open half productively without ever paying?"); E-12/D-07 error model RESOLVED (thiserror taxonomy now, as WP D's first commit; gRPC status mapping deferred to the daemon); F-54 `.claude.json` split RESOLVED (field-level allowlist, unrecognised fields stay and are logged). Transcribed from the Product Owner's rulings, not resolved unilaterally. | Claude Code, per Product Owner ruling |
 | 1.32 | Revision | WP-D first commit per E-12: added the engine error taxonomy (`src/error.rs`). Variants exist where a caller branches or where a diagnostic needs structured fields; everything else arrives as `Internal` with the `anyhow` chain preserved. `ErrorKind` is the stable axis callers match on (InvalidRequest, Conflict, HostPrerequisite, CapacityExceeded, DataIntegrity, Incompatible, Transient, Internal), so adding a variant does not break callers. The WP-D failure modes named in the ruling each have a home before the code that raises them is written. gRPC status mapping deferred to the daemon boundary. | Claude Code |
+| 1.33 | Revision | M9: added `docs/bundle-format.md` (NEMR-BUNDLE-001 schema v1) as a versioned public interface per E-11. File-level, base image by digest, manifest first, fixed 4 MiB chunks each compressed independently so the chunk boundary is a real seam for M13 deduplication and v2 encryption. Manifest carries C1's session-critical/reconstructible classification to enable lazy materialisation. Exclusion policy: credentials unconditionally (D-02), `.claude.json` by field-level allowlist with unrecognised fields staying put and logged (F-54), build artifacts by default. | Claude Code |
 
 ---
 
