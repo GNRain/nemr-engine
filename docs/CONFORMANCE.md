@@ -144,6 +144,7 @@ disposition tracked here.
 | F-24 | med | NFR-01 | No CI — Docker-freeness/lint/licensing unenforced | `.github/workflows/ci.yml` + `check_docker_free.sh` (negative-tested) + `deny.toml` |
 | F-37 | med | — | base-image build never scripted (README prose only) | `scripts/build_base_image.sh`, run and verified (200.5 MiB, same digest) |
 | F-53 | high | NFR-01/supply chain | **RUSTSEC-2026-0258** — `h2` unbounded empty DATA frames, reachable via `tonic` → `containerd-client` | found by the new `cargo deny` gate on its first run; `h2` 0.4.15 → 0.4.18 |
+| **F-54** | high | AUTH-02 / D-02 | `.claude.json` mixes portable config (MCP servers) with machine/account identity (`machineID`, `oauthAccount`) — a file-level include/exclude either leaks identity or drops MCP config | **Ruled 2026-08-21:** field-level **allowlist**; unrecognised fields stay and are logged. Implemented in M9's exclusion policy. |
 
 **Open — this branch / next (WP-A remnant + WP-C follow-up)**
 

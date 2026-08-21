@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | NEMR-SPEC-001 |
-| Version | 1.30 |
+| Version | 1.31 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -46,6 +46,7 @@
 | 1.28 | Revision | Recorded M8 (WP-C2): session-critical Claude Code state relocated onto the portable volume by surgically bind-mounting `/root/.claude/projects` and `/root/.claude/sessions` from `<volume>/.nemr-state/`, keeping credentials and `/root/.claude.json` identity on the rootfs (D-02). Acceptance proven both with real Claude Code (--continue recalls after unmount/remount) and by a deterministic regression test. Section 11 deviation added pending Section 3 promotion. | Claude Code |
 | 1.29 | Revision | WP-B: extracted the §3.2 wrapper layer from `src/containerd/` into a standalone `crates/nemr-containerd` crate, consumed by the engine and designed for the E-09 daemon while remaining usable standalone. Updated the §3.4 repository tree. containerd-level constants (runtime, snapshotter) moved to the wrapper crate; the product-specific cgroup prefix moved onto `ContainerSpec` so the wrapper carries no branding. The M1 connectivity baselines moved into the wrapper crate with the layer they exercise. | Claude Code |
 | 1.30 | Revision | WP-B: added `tracing` with span coverage across the lifecycle and a debug mode (`NEMR_DEBUG=1`, `NEMR_LOG=<filter>`). The VOL-03/NFR-04 audit trail now flows through `tracing` at `info` so it remains on by default. Acceptance is falsifiable and was demonstrated: in debug mode the VOL-05 decision point logs the mount check, its result, and the backing device, so a working directory backed by the host root device instead of a loop device is visible on the first run. Added CI gates (NFR-01 Docker-freeness with negative tests, clippy warnings-denied, cargo-deny licences/advisories, host-backed suite + smoke on a clean runner) and scripted the base-image build and CI host provisioning. | Claude Code |
+| 1.31 | Revision | Recorded three Product Owner rulings: E-11 open-core seam RESOLVED (engine + wrapper + volume layer + helper + **bundle format spec** open source; sync, lease, storage backends, identity, GUI commercial; test = "can someone use the open half productively without ever paying?"); E-12/D-07 error model RESOLVED (thiserror taxonomy now, as WP D's first commit; gRPC status mapping deferred to the daemon); F-54 `.claude.json` split RESOLVED (field-level allowlist, unrecognised fields stay and are logged). Transcribed from the Product Owner's rulings, not resolved unilaterally. | Claude Code, per Product Owner ruling |
 
 ---
 
@@ -893,11 +894,45 @@ resolved unilaterally, if encountered during implementation:
   compute) makes this a direct contradiction rather than a deferred concern.
   Options to cost: bundled VM, WSL2 + a macOS story, or a remote-engine fallback
   that partially reverses D-01. Ruling pending in `docs/DECISIONS.md`.
-- E-11: **Open-core seam — OPEN.** What stays in `nemr-engine` versus the
-  commercial portability/sync layer. Wants deciding while WP B is still moving
-  module boundaries, since retrofitting a seam is a multi-year tax. Ruling
-  pending in `docs/DECISIONS.md`.
-
+- E-11: **Open-core seam — RESOLVED 2026-08-21 (Product Owner).** **Open source
+  in `nemr-engine`:** the engine, `crates/nemr-containerd`, the volume layer, the
+  privileged helper, and **the bundle format specification**. **Commercial:** the
+  sync layer, the lease service, cloud storage backends, identity, and the GUI.
+  The format being open is load-bearing, not incidental: a proprietary format
+  would mean the open engine could export nothing useful, making the open core a
+  demo — which reads as bait to the developers we are selling to. An open format
+  lets a self-hoster move bundles between their own machines with rsync and get
+  real value, while sync-across-devices-with-a-login is the paid product. Git is
+  open; GitHub is the product. **The test for any later boundary question: can
+  someone use the open half productively without ever paying? If no, the line is
+  in the wrong place.** Consequences binding on design: (1) the bundle format
+  spec is a public interface — versioned, documented in-repo, breaking changes
+  treated as breaking; (2) no commercial-only escape hatches in the format — no
+  fields only the sync layer can populate or interpret, nothing that makes a
+  bundle useless without the paid tier; (3) `nemr export` and `nemr import` are
+  open-source CLI surface and must work standalone, against a local file, with no
+  account and no network.
+- E-12: **Error model — RESOLVED 2026-08-21 (Product Owner), recorded as D-07 in
+  `docs/DECISIONS.md`.** An internal `thiserror` taxonomy lands **now**, as the
+  first commit of WP D, before the export code; the gRPC status mapping is
+  deferred to the daemon boundary. The two layers are independent — the mapping
+  can be added later without touching the enum. Claude Code's recommendation to
+  defer both was rejected on its own reasoning: if guessing at the gRPC surface
+  means redoing work, then so does letting WP D invent ad-hoc error handling that
+  the daemon must later unify. WP D introduces failure modes that do not exist
+  yet — partial upload, corrupt bundle, digest mismatch, quota exceeded on
+  import, base image absent on the destination — and those want a designed
+  taxonomy before they are written, not a retrofit afterwards.
+- F-54: **`.claude.json` portable-vs-identity split — RESOLVED 2026-08-21
+  (Product Owner).** A field-level **allowlist**, not a blocklist: enumerate the
+  fields that travel; everything else stays by default, **including fields that
+  do not exist yet**. A blocklist would silently leak whatever Anthropic adds in
+  the next Claude Code release, making D-02 true only until the schema changes —
+  and we control neither that schema nor our notification of it moving. MCP
+  configuration travels. `machineID`, `oauthAccount`, and anything account- or
+  machine-shaped does not. **Anything unrecognised does not travel and is
+  logged**, so schema drift surfaces as a visible warning rather than a silent
+  inclusion or a silent drop.
 **Escalation ID namespace.** These `E-0x` IDs are the canonical escalation
 ledger, now including the former Section 7 product gates as E-09 (resolved),
 E-10 and E-11. `docs/DECISIONS.md` is the Product Owner's record of rulings and
