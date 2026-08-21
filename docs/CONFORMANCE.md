@@ -127,6 +127,7 @@ disposition tracked here.
 | F-09/F-16 | high | VOL-06/AC-3 | AC-3.x + VOL-06 tests `#[ignore]`d in volume.rs | migrated to the non-skippable suite; zero ignored tests remain |
 | F-24 | med | NFR-01 | No CI — Docker-freeness/lint/licensing unenforced | `.github/workflows/ci.yml` + `check_docker_free.sh` (negative-tested) + `deny.toml` |
 | F-37 | med | — | base-image build never scripted (README prose only) | `scripts/build_base_image.sh`, run and verified (200.5 MiB, same digest) |
+| F-53 | high | NFR-01/supply chain | **RUSTSEC-2026-0258** — `h2` unbounded empty DATA frames, reachable via `tonic` → `containerd-client` | found by the new `cargo deny` gate on its first run; `h2` 0.4.15 → 0.4.18 |
 
 **Open — this branch / next (WP-A remnant + WP-C follow-up)**
 

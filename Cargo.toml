@@ -10,6 +10,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Nemr Phase 1 — core container engine (containerd/runc, no Docker)"
 exclude = ["deploy"]
+# Not published to crates.io: this is a workspace-internal crate. Also what lets
+# cargo-deny skip the licence check for it (deny.toml `private`), rather than
+# asserting a licence the Product Owner has not chosen yet (E-11).
+publish = false
 
 # Library crate: product logic in src/engine/, re-exporting the wrapper crate as
 # `containerd` so the layering rule (SPEC §3.2) reads unchanged at call sites.
@@ -26,7 +30,7 @@ path = "src/bin/nemr.rs"
 # The engine depends on the wrapper crate, never on containerd-client directly
 # (SPEC §3.2). The connectivity baselines that DO use containerd-client directly
 # moved into the wrapper crate's own bins.
-nemr-containerd = { path = "crates/nemr-containerd" }
+nemr-containerd = { path = "crates/nemr-containerd", version = "0.1.0" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
 anyhow = "1"
 serde_json = "1.0.151"

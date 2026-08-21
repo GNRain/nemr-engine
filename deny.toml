@@ -38,19 +38,17 @@ allow = [
 ]
 # Below this, cargo-deny will not accept a license expression as satisfied.
 confidence-threshold = 0.9
+# The allowlist is deliberately broader than the current graph: it states which
+# licences are acceptable, not which happen to be present today. An entry that
+# nothing currently uses is not dead config.
+unused-allowed-license = "allow"
 
-# Our own crates carry no `license` field (they are not published). Skipping the
-# check for them is honest: the repository's licensing is a Product Owner
-# decision tied to E-11, not something to assert here by default.
-[[licenses.exceptions]]
-name = "nemr-engine"
-allow = []
-[[licenses.exceptions]]
-name = "nemr-containerd"
-allow = []
-[[licenses.exceptions]]
-name = "nemr-volume"
-allow = []
+# Our own crates carry no `license` field and are not published. `private` is
+# the mechanism for exactly this: skip the licence check for workspace members
+# that are `publish = false` / unpublished, rather than asserting a licence for
+# them here. The repository's licensing is a Product Owner decision tied to the
+# open-core seam (E-11) and does not belong in a lint config.
+private = { ignore = true }
 
 [bans]
 multiple-versions = "warn"

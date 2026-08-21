@@ -83,7 +83,9 @@ jobs:
         # dependency is cheap to remove now and expensive later.
         run: |
           cargo deny check
-          cd deploy/nemr-volume && cargo deny check
+          # The helper is a separate workspace; point it at the same policy
+          # rather than letting it fall back to cargo-deny's defaults.
+          cargo deny --manifest-path deploy/nemr-volume/Cargo.toml --config deny.toml check
 
   # ---------------------------------------------------------------------------
   # Host-backed: needs rootless containerd, the privileged helper, and the base
