@@ -1,8 +1,12 @@
 [workspace]
+# `crates/nemr-storage` is the COMMERCIAL side of E-11 and is a workspace member
+# only so it builds and tests here. `nemr-engine` must NOT depend on it — see
+# scripts/check_seam.sh, which enforces the direction.
+#
 # The wrapper layer (SPEC §3.2) is its own crate so the GUI and the resolved
 # E-09 daemon can consume it without pulling in the engine. deploy/nemr-volume
 # has its own [workspace] and stays a separate privilege domain.
-members = ["crates/nemr-containerd"]
+members = ["crates/nemr-containerd", "crates/nemr-storage"]
 
 [package]
 name = "nemr-engine"

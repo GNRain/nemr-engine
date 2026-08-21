@@ -1,0 +1,38 @@
+[package]
+name = "nemr-storage"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Object-storage seam for Nemr bundle sync (COMMERCIAL side of E-11)"
+
+# ---------------------------------------------------------------------------
+# E-11 boundary — read this before adding a dependency in either direction.
+# ---------------------------------------------------------------------------
+# Open source, in `nemr-engine`: the engine, the containerd wrapper, the volume
+# layer, the privileged helper, and the bundle format specification.
+#
+# Commercial, here: the sync layer, the lease service, cloud storage backends,
+# identity.
+#
+# The direction of dependency is what keeps that structural rather than
+# conventional: this crate depends on the bundle FORMAT (open), and
+# `nemr-engine` MUST NOT depend on this crate. If it ever did, `nemr export` and
+# `nemr import` would inherit an object-store dependency and the open half would
+# stop working standalone — the exact thing
+# `e11_export_and_import_work_with_no_network_and_no_credentials` guards.
+#
+# `scripts/check_seam.sh` enforces the direction in CI.
+
+[lib]
+name = "nemr_storage"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+tracing = "0.1"
+sha2 = "0.11.0"
+
+[dev-dependencies]
+tempfile = "3"

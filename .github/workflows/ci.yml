@@ -22,7 +22,7 @@ jobs:
   # Constraint gates — fast, no host provisioning needed.
   # ---------------------------------------------------------------------------
   docker-free:
-    name: NFR-01 — no Docker at any layer
+    name: constraints — NFR-01 Docker-freeness and the E-11 seam
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -31,6 +31,9 @@ jobs:
       # cargo tree resolves the graph, so the check sees transitive deps.
       - name: Docker-freeness check
         run: ./scripts/check_docker_free.sh
+
+      - name: E-11 seam — the open half must not depend on the commercial half
+        run: ./scripts/check_seam.sh
 
   lint:
     name: clippy (warnings denied) + fmt
