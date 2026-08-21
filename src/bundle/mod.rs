@@ -5,6 +5,8 @@
 //! standalone against a local file, with no account and no network, and nothing
 //! here may depend on the commercial sync layer.
 
+pub mod export;
+pub mod manifest;
 pub mod policy;
 
 /// Bundle schema version this build writes and can read.

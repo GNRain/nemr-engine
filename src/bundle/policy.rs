@@ -25,6 +25,11 @@ pub enum ExcludeReason {
     BuildArtifact,
     /// A field this build does not recognise. Stays put by default (F-54).
     UnrecognisedField,
+    /// Another bundle sitting inside the exported tree. Bundles are export
+    /// output, not project content: including one makes each export carry its
+    /// predecessor, so a repeatedly-exported project grows without bound while
+    /// every command reports success.
+    NestedBundle,
 }
 
 impl ExcludeReason {
@@ -35,6 +40,7 @@ impl ExcludeReason {
             Self::Cache => "cache",
             Self::BuildArtifact => "build-artifact",
             Self::UnrecognisedField => "unrecognised-field",
+            Self::NestedBundle => "nested-bundle",
         }
     }
 }
@@ -81,6 +87,9 @@ const DEFAULT_EXCLUDED_DIRS: &[(&str, ExcludeReason)] = &[
     (".git/objects", ExcludeReason::Cache),
 ];
 
+/// Extension of a written bundle. Files with this suffix are export output.
+pub const BUNDLE_EXTENSION: &str = ".nemr";
+
 /// Reconstructible Claude Code state, identified in C1.
 const RECONSTRUCTIBLE: &[&str] = &["root/.claude/backups", "root/.claude/.last-cleanup"];
 
@@ -102,7 +111,16 @@ impl Policy {
     pub fn decide(&self, path: &str) -> Decision {
         // Unconditional first, so no later rule can accidentally re-include it.
         // D-02 is not a default; it is an invariant.
-        if path == CREDENTIAL_PATH {
+        //
+        // Matched by FILE NAME anywhere in the tree, not by one absolute path.
+        // Measured on a real export: the volume's layout is `.nemr-state/...`
+        // plus project files at the root, while the container sees
+        // `/root/.claude/...` — so a single hard-coded path matches nothing that
+        // actually occurs, and a test asserting on it would pass while guarding
+        // nothing. Today the credential is a host bind-mount and never reaches
+        // the volume at all, which is what makes D-02 true; this check is the
+        // belt to that braces, and it must survive a layout change.
+        if is_credential_file(path) {
             return Decision::Exclude {
                 reason: ExcludeReason::Secret,
             };
@@ -114,6 +132,17 @@ impl Policy {
         if path == "root/.claude.json" {
             return Decision::Exclude {
                 reason: ExcludeReason::MachineSpecific,
+            };
+        }
+
+        // A bundle inside the exported tree never travels, regardless of policy.
+        // This is not the same as the build-artifact defaults: those are a size
+        // optimisation a caller may reasonably override, whereas nesting an
+        // export inside an export is always a mistake and compounds with every
+        // subsequent export.
+        if path.ends_with(BUNDLE_EXTENSION) {
+            return Decision::Exclude {
+                reason: ExcludeReason::NestedBundle,
             };
         }
 
@@ -137,6 +166,17 @@ impl Policy {
             class: Class::SessionCritical,
         }
     }
+}
+
+/// Whether `path` names the Claude Code credential file, wherever it sits.
+///
+/// Name-based rather than path-based deliberately: the export root's layout has
+/// already differed from the container's once, and a secret filter that depends
+/// on one layout is a filter that silently stops working when the layout moves.
+pub fn is_credential_file(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|name| name == ".credentials.json")
 }
 
 /// Whether `path` has `dir` as one of its components (or a `a/b` component run).
@@ -261,6 +301,56 @@ mod tests {
         }
     }
 
+    /// The credential filter must work on the layout that actually occurs.
+    ///
+    /// Measured from a real export: the volume holds `.nemr-state/projects/...`
+    /// and project files at the root — not the container's `/root/.claude/...`.
+    /// The original absolute-path check matched none of these, so its test
+    /// passed while guarding a path that cannot exist.
+    #[test]
+    fn credentials_are_caught_in_the_layout_that_really_occurs() {
+        let policy = Policy::default();
+        for path in [
+            // container-view (what the first implementation assumed)
+            "root/.claude/.credentials.json",
+            // volume-view variants, which is what an export actually walks
+            ".credentials.json",
+            ".nemr-state/.credentials.json",
+            ".nemr-state/projects/.credentials.json",
+            "some/deeply/nested/.credentials.json",
+        ] {
+            assert_eq!(
+                policy.decide(path),
+                Decision::Exclude {
+                    reason: ExcludeReason::Secret
+                },
+                "{path} must be refused wherever it sits (D-02)"
+            );
+        }
+    }
+
+    /// Real member paths from a measured export must classify sensibly.
+    #[test]
+    fn the_real_export_layout_classifies_correctly() {
+        let policy = Policy::default();
+        // Captured from an actual bundle manifest.
+        assert_eq!(
+            policy.decide(".nemr-state/projects/-workspace/a7f85305.jsonl"),
+            Decision::Include { class: Class::SessionCritical },
+            "the transcript is the session"
+        );
+        assert_eq!(
+            policy.decide("recipe.md"),
+            Decision::Include { class: Class::SessionCritical },
+            "project files at the volume root travel"
+        );
+        // Build artifacts sit at the volume root in reality, not under workspace/.
+        assert!(
+            matches!(policy.decide("target/debug/app"), Decision::Exclude { .. }),
+            "component matching still catches build output at the root"
+        );
+    }
+
     #[test]
     fn session_state_is_session_critical() {
         let policy = Policy::default();
@@ -328,6 +418,26 @@ mod tests {
             matches!(policy.decide("workspace/targets/list.txt"), Decision::Include { .. }),
             "'targets' is not 'target'"
         );
+    }
+
+    /// Bundles are export output, not project content. Including one makes each
+    /// export carry its predecessor — unbounded growth, reported as success.
+    #[test]
+    fn a_bundle_inside_the_tree_never_travels() {
+        for policy in [
+            Policy::default(),
+            Policy {
+                include_build_artifacts: true,
+            },
+        ] {
+            assert_eq!(
+                policy.decide("workspace/backup.nemr"),
+                Decision::Exclude {
+                    reason: ExcludeReason::NestedBundle
+                },
+                "a nested bundle must never travel, under any policy"
+            );
+        }
     }
 
     // --- F-54: the allowlist ------------------------------------------------

@@ -48,3 +48,5 @@ thiserror = "2"
 # step it happened in, without threading that through every call site.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tar = "0.4.46"
+zstd = "0.13.3"
