@@ -19,6 +19,22 @@ which **refuses to skip** — a missing host facility fails the test with
 instructions rather than silently passing (this is why the old `#[ignore]`d
 VOL-06 suite never ran). The end-to-end script is `scripts/e2e_smoke_test.sh`.
 
+**What CI proves, and what it does not.** All five CI jobs are green on a clean
+Ubuntu runner, including the host-backed regression suite (10/10, hash-gated) and
+the E2E smoke test. Two limits are deliberate and must not be blurred by a green
+badge:
+
+- CI runs the smoke test with `NEMR_SKIP_API=1`. It never contacts the Anthropic
+  API. Only a local run exercises the round-trip.
+- CI provisions a **placeholder** credential. That proves AUTH-02's mount
+  mechanics — bind-mounted, read-only, at the path Claude Code expects — and
+  proves nothing about whether a real credential authenticates.
+
+So a CI pass is a strictly weaker claim than a local `verify_wp_a.sh` pass. The
+smoke test prints which mode it ran in; treat "green in CI" and "works" as
+different statements, because the gap between them is where this project's
+defects have lived.
+
 **Verification note.** Host-backed rows are proven against the *installed*
 privileged helper, which `tests/common/mod.rs` enforces by refusing to run
 unless `sha256(installed) == sha256(built)` (finding F-11 / TEST-01).
