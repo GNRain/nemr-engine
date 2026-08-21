@@ -64,10 +64,28 @@ jobs:
         # backing file) and the ioctl struct-layout ABI pins.
         run: cd deploy/nemr-volume && cargo test
       - name: Regression tests that need no host
-        # require_host() refuses rather than skips; NEMR_TEST_UNIT_ONLY is the
-        # explicit, narrow opt-out for a machine with no rootless containerd.
-        # The host-backed tests run in the `host-tests` job below.
-        run: NEMR_TEST_UNIT_ONLY=1 cargo test --test regression
+        # NEMR_TEST_UNIT_ONLY is the explicit, narrow opt-out for a machine with
+        # no rootless containerd. Host-backed tests return early under it — and
+        # a test that returns early is counted as PASSED, so this job would
+        # otherwise report "16 passed" while 14 of them did nothing.
+        #
+        # So the skip count is printed and asserted to be non-zero-but-expected:
+        # this job's green means "the host-free tests pass", never "the suite
+        # passes". The real coverage claim is the host-tests job below.
+        run: |
+          set -o pipefail
+          total=$(cargo test --test regression -- --list 2>/dev/null | grep -c ': test$')
+          output=$(NEMR_TEST_UNIT_ONLY=1 cargo test --test regression -- --nocapture 2>&1)
+          status=$?
+          printf '%s\n' "$output" | tail -20
+          [ $status -eq 0 ] || exit 1
+          skipped=$(printf '%s\n' "$output" | grep -c 'skipping a host-backed regression test' || true)
+          ran=$(( total - skipped ))
+          echo "::notice::host-free coverage: $ran of $total regression tests actually executed; $skipped skipped (host required)"
+          if [ "$ran" -le 0 ]; then
+            echo "no regression test actually executed — this job proves nothing" >&2
+            exit 1
+          fi
 
   supply-chain:
     name: licenses + security advisories
@@ -109,9 +127,24 @@ jobs:
       - name: Install the engine
         run: cargo install --path . --bin nemr --root "$HOME/.local" --force
       - name: Regression suite (serial; hash-gated against the installed helper)
+        # Count assertion: every test that exists must run, and none may skip.
+        # `cargo test` exits 0 having run ZERO tests, so exit status alone is not
+        # evidence that anything was verified.
         run: |
+          set -o pipefail
           export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
-          cargo test --test regression -- --test-threads=1
+          total=$(cargo test --test regression -- --list 2>/dev/null | grep -c ': test$')
+          output=$(cargo test --test regression -- --test-threads=1 --nocapture 2>&1)
+          status=$?
+          printf '%s\n' "$output" | grep -E '^test result:' || true
+          [ $status -eq 0 ] || { printf '%s\n' "$output" | tail -40; exit 1; }
+          passed=$(printf '%s\n' "$output" | sed -n 's/.*test result: ok\. \([0-9]*\) passed.*/\1/p' | head -1)
+          skipped=$(printf '%s\n' "$output" | grep -c 'skipping a host-backed regression test' || true)
+          if [ "${passed:-0}" -ne "${total:-0}" ] || [ "${skipped:-0}" -ne 0 ]; then
+            echo "partial run: ${passed:-0}/${total:-0} ran, ${skipped:-0} skipped — not a pass" >&2
+            exit 1
+          fi
+          echo "all ${total} regression tests ran, none skipped"
       - name: E2E smoke test
         # NEMR_SKIP_API: CI has no Anthropic credentials, so the API round-trip
         # is skipped here. It is NOT skipped in the developer run, and the smoke

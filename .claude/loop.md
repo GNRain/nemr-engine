@@ -83,6 +83,26 @@ check, the validation — and the test still passes, the test guards nothing.
 Expect siblings: a defect of this shape is rarely alone. When one is found, audit
 the other guard tests in the same pass.
 
+## The count rule (a green suite that ran nothing)
+
+`cargo test` exits **0 when it runs zero tests**. A mistyped name filter prints
+`running 0 tests / test result: ok` and passes. A test that returns early is
+counted as *passed*, so a suite can report "16 passed" while 14 of them did
+nothing — which is exactly what CI's unit job did on every PR (F-60).
+
+**Standing rule: a test run is evidence only if you know how many tests ran.**
+
+- Any script or CI job that gates on a suite must assert the number that **ran**
+  against the number that **exists** (`cargo test -- --list`), and that none
+  skipped. Exit status alone is not evidence.
+- Never gate on a name-filtered selection. If a filter is unavoidable, assert the
+  expected count explicitly, because a renamed test silently selects nothing.
+- An opt-out that makes tests return early (`NEMR_TEST_UNIT_ONLY`) must report
+  how many it skipped. A job using one may claim only what it actually ran.
+
+This is the same family as the negative-assertion and guard-test rules: the
+signal is green, and the thing it is supposedly about never happened.
+
 ## Fix autonomously
 
 - A newly `#[ignore]`d or skipped test — de-skip it and make it run.
