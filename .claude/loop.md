@@ -50,6 +50,39 @@ control.** Before trusting a negative:
 Absence-because-correct and absence-because-you-looked-in-the-wrong-place are
 indistinguishable without the control. This recurs on every negative assertion.
 
+## The guard-test rule (a green signal over the *wrong* thing)
+
+The negative-assertion rule is about a green signal over *nothing*. This one is
+subtler: a green signal over the *wrong thing* — a test that exists, runs, and
+passes, while guarding a property it does not actually enforce.
+
+The reference case is F-56 (M9). `credentials_never_travel_under_any_policy`
+passed on every run, but it asserted against `root/.claude/.credentials.json` —
+the container's path — while a real export walks the *volume*, whose layout is
+`.nemr-state/…`. The path it checked cannot occur, so the test guarded nothing.
+D-02 was still true, but held **structurally** (the credential is a host
+bind-mount that never reaches the volume), not because the test enforced it. The
+test was false assurance sitting on top of a property that happened to be true
+for unrelated reasons — invisible precisely because it was green.
+
+**Standing rule: a guard test must be proven to fail when the guarded property
+is violated.** If you can delete the code the test guards — the filter, the
+check, the validation — and the test still passes, the test guards nothing.
+
+- For any test whose name or intent is "X never happens" / "Y is always
+  refused" / "Z cannot escape", confirm it goes red when X is made to happen.
+  Write the violation, watch the test fail, then restore. This is test-before-fix
+  applied to the *guard*, not just to the bug.
+- Prefer asserting against **real, measured** inputs over synthetic ones at a
+  boundary. F-56 and the `.claude.json` drift warning both passed every synthetic
+  test and failed only against the layout/keys that actually occur.
+- A guard whose property holds structurally (by construction elsewhere) is fine —
+  but the test must still enforce it, so a future refactor that removes the
+  structural guarantee turns the test red rather than leaving it falsely green.
+
+Expect siblings: a defect of this shape is rarely alone. When one is found, audit
+the other guard tests in the same pass.
+
 ## Fix autonomously
 
 - A newly `#[ignore]`d or skipped test — de-skip it and make it run.
