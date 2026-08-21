@@ -466,3 +466,43 @@ pub fn local_base_image_digest() -> Option<String> {
     .ok()
     .flatten()
 }
+
+/// Whether unprivileged user, mount and network namespaces are usable here.
+///
+/// Reported rather than silently skipped: a host without them cannot verify
+/// E-11's offline guarantee, and that is a coverage gap to surface.
+pub fn namespaces_available() -> bool {
+    Command::new("unshare")
+        .args(["-rmn", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Run the installed `nemr` CLI with **no network** and **no credential**.
+///
+/// A network namespace with only loopback makes any outbound request fail; a
+/// mount namespace with a tmpfs over `~/.claude` hides the credential *inside
+/// the namespace only*, so the real one is never moved or modified. containerd
+/// stays reachable through its local Unix socket, which is the intended
+/// reading of "no network": no internet and no sync service, not no IPC.
+pub fn run_offline(args: &[&str]) -> std::process::Output {
+    let home = std::env::var("HOME").expect("HOME");
+    let socket = ContainerdClient::default_socket_path()
+        .expect("containerd socket path")
+        .to_string_lossy()
+        .into_owned();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/nemr");
+    let quoted: Vec<String> = args.iter().map(|a| format!("'{a}'")).collect();
+
+    Command::new("unshare")
+        .args(["-rmn", "bash", "-c"])
+        .arg(format!(
+            "mount -t tmpfs none '{home}/.claude' && \
+             CONTAINERD_ADDRESS='{socket}' '{}' {}",
+            binary.display(),
+            quoted.join(" ")
+        ))
+        .output()
+        .expect("run nemr offline")
+}

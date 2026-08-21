@@ -17,7 +17,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{extracted_plaintext, installed_helper_matches_built, require_host, unit_only, write_hostile_bundle, HostRequirements, TestProject};
+use common::{extracted_plaintext, installed_helper_matches_built, namespaces_available, require_host, run_offline, unit_only, write_hostile_bundle, HostRequirements, TestProject};
 use nemr_engine::containerd::client::ContainerdClient;
 use nemr_engine::containerd::containers::StopOutcome;
 use nemr_engine::engine::project;
@@ -879,4 +879,106 @@ fn m9_export_does_not_swallow_bundles_in_the_workspace() {
             "a previous bundle must not be swallowed by the next export: {swallowed:?}"
         );
     });
+}
+
+/// E-11 — `nemr export` and `nemr import` work with no network and no
+/// credentials configured, against a local file.
+///
+/// # Why this is a test and not a comment
+///
+/// The open/commercial boundary rests on it: if the open engine ever needs the
+/// sync layer, an account, or an outbound request to move a bundle, the seam has
+/// leaked and the open half stops being useful on its own. That was true by
+/// construction and asserted nowhere, so nothing would have caught M12's storage
+/// trait accidentally becoming a dependency of the CLI surface.
+///
+/// # Method
+///
+/// The CLI runs inside a **network namespace with only loopback**, so any
+/// outbound request fails, and inside a **mount namespace with a tmpfs over
+/// `~/.claude`**, so no credential is visible. The mount namespace is what makes
+/// this safe: the real credential is hidden only inside the test's namespace and
+/// is never moved or modified.
+///
+/// containerd remains reachable because its socket is a local Unix socket, which
+/// is the point — "no network" means no internet and no sync service, not no IPC.
+#[test]
+fn e11_export_and_import_work_with_no_network_and_no_credentials() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    if !namespaces_available() {
+        panic!(
+            "unprivileged user/mount/network namespaces are unavailable, so E-11's \
+             offline guarantee cannot be tested on this host. This is a gap in \
+             coverage, not a pass."
+        );
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let (source, destination) = runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let source = TestProject::create(&client, "e11src", VolumeSize::Small).await;
+        let destination = TestProject::create(&client, "e11dst", VolumeSize::Small).await;
+        (source, destination)
+    });
+
+    let paths = VolumePaths::from_env().unwrap();
+    let marker = format!("offline-marker-{}", std::process::id());
+    std::fs::write(paths.mount_point(&source.name).join("notes.md"), &marker)
+        .expect("seed the source project");
+
+    let bundle = std::env::temp_dir().join(format!("e11-{}.nemr", std::process::id()));
+    let _ = std::fs::remove_file(&bundle);
+
+    // CONTROL: the credential really is present outside the namespace, so
+    // "it worked without one" is a meaningful claim rather than a vacuous one.
+    let credential = nemr_engine::auth::host_credentials_path().expect("credential path");
+    assert!(
+        credential.exists(),
+        "control: the host credential must exist outside the namespace, or hiding \
+         it inside proves nothing"
+    );
+
+    let export = run_offline(&[
+        "export",
+        &source.name,
+        "-o",
+        &bundle.to_string_lossy(),
+    ]);
+    assert!(
+        export.status.success(),
+        "export must work offline with no credential.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&export.stdout),
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(bundle.exists(), "the bundle must have been written");
+
+    let import = run_offline(&[
+        "import",
+        &destination.name,
+        &bundle.to_string_lossy(),
+    ]);
+    assert!(
+        import.status.success(),
+        "import must work offline with no credential.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&import.stdout),
+        String::from_utf8_lossy(&import.stderr)
+    );
+
+    // The session must actually have arrived, not merely "the command exited 0".
+    assert_eq!(
+        std::fs::read_to_string(paths.mount_point(&destination.name).join("notes.md"))
+            .expect("the imported file must exist on the destination"),
+        marker,
+        "the content must round-trip offline, byte-identical"
+    );
+
+    // And the real credential is untouched by all of this.
+    assert!(
+        credential.exists(),
+        "the real credential must survive: the tmpfs hides it inside the namespace only"
+    );
+
+    let _ = std::fs::remove_file(&bundle);
 }
