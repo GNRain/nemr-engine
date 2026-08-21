@@ -32,7 +32,9 @@
 
 use std::fmt;
 
+pub mod conformance;
 pub mod local;
+pub mod s3;
 
 /// Where an object lives within a store. Opaque, `/`-separated.
 ///

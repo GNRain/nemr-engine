@@ -27,12 +27,18 @@ description = "Object-storage seam for Nemr bundle sync (COMMERCIAL side of E-11
 name = "nemr_storage"
 path = "src/lib.rs"
 
+[[bin]]
+name = "bucket_roundtrip"
+path = "src/bin/bucket_roundtrip.rs"
+
 [dependencies]
 anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
 tracing = "0.1"
 sha2 = "0.11.0"
+object_store = { version = "0.14.1", features = ["aws"] }
+futures = "0.3.34"
 
 [dev-dependencies]
 tempfile = "3"

@@ -4,7 +4,7 @@
 | Field | Value |
 |---|---|
 | Document ID | NEMR-SPEC-001 |
-| Version | 1.38 |
+| Version | 1.39 |
 | Status | Approved for Implementation |
 | Product Owner | Rain |
 | Implementing Team | Claude Code (autonomous engineering agent) |
@@ -54,6 +54,7 @@
 | 1.36 | Revision | F-55 resolved without an M8 bind-mount change: Claude Code natively supports project-scoped MCP configuration in `.mcp.json` at the project root, which is already on the volume, so MCP config travels while `machineID`/`oauthAccount` stay on the rootfs and never reach the exportable layer. D-06 therefore not invalidated; M8 and M10 acceptances re-run regardless and both pass. F-57 recorded and fixed: four secret-absence guards grepped compressed bundle bytes and degraded to no-ops at realistic sizes. | Claude Code |
 | 1.37 | Revision | M11 hardening: buried manifest, missing chunk, base image drift, quota mismatch, member digest mismatch and out-of-range member span each refuse with a D-07 error and a test, driven through the real open/check/extract path via a hostile-bundle fixture rather than hand-mutated structs. Every guard proven to go red with its guarded code disabled — which caught one assertion of mine that matched serde's error text by coincidence. Added permanent host-level regression tests for the export self-swallow and the extract() path traversal. No format change: v1 stands. | Claude Code |
 | 1.38 | Revision | E-11's offline guarantee is now enforced by a test rather than held by construction: `nemr export` and `nemr import` run inside a loopback-only network namespace with a tmpfs hiding `~/.claude`, and the session must round-trip. Proven to fail both when export takes a network dependency and when it requires a credential — so M12's storage trait cannot silently become a dependency of the open CLI surface. | Claude Code |
+| 1.39 | Revision | M12: S3-compatible `ObjectStore` trait in `crates/nemr-storage` — the COMMERCIAL side of E-11 — with R2 first and B2 viable behind the same implementation (they differ only in configuration, never in behaviour above the trait). The seam is enforced by dependency direction and `scripts/check_seam.sh` in CI, proven to fail when the engine depends on the storage crate. The trait is shaped by D-05: `head` and `get_range` answer the common questions with no egress. A conformance suite is executed in tests against the local backend and proven to reject a corrupting one, so the live-bucket acceptance tests the backend rather than the acceptance. Bucket round-trip is the only remaining gap; it needs a credential this session does not hold. | Claude Code |
 
 ---
 
