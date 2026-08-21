@@ -324,6 +324,63 @@ That's a manifest-level split rather than a whole-file include/exclude, and it
 has to be decided before M9's exclusion policy is written. Claude Code to
 supply a recommendation; assign a real F-number from the conformance ledger.
 
+> **Implementation note (2026-08-21, Claude Code — not a status change).** This
+> entry is **F-54** in the conformance ledger; the follow-on implementation gap
+> — MCP configuration could not travel at all, because `.claude.json` lives on
+> the rootfs rather than the volume — is **F-55**.
+>
+> Ruled as option (a) with the constraint that only the portable subset reach the
+> volume. Implementing it turned out not to need a bind-mount at all: Claude Code
+> natively reads **project-scoped** MCP configuration from `.mcp.json` at the
+> project root, and the project root *is* the volume (verified — `claude mcp list`
+> discovers a server declared only there). So MCP configuration travels as an
+> ordinary member while `machineID`/`oauthAccount` stay on the rootfs and never
+> reach the exportable layer.
+>
+> That satisfies the constraint **structurally rather than by filtering**, which
+> was the point of the ruling: no filter can fail open on a field that was never
+> there. Because no bind-mount changed, **D-06 was not invalidated** — the M8 and
+> M10 acceptances were re-run regardless and both pass.
+>
+> Scope limit worth knowing: *project*-scoped MCP config travels; *user*-scoped
+> config (stored in `.claude.json`) does not, and arguably should not travel with
+> a project bundle. The `.claude.json` filtering code was removed rather than left
+> in place, since a filter no export reaches is a defence that only looks like one.
+
+---
+
+### F-58 — the guard-test rule found seventeen defects, including a path traversal
+
+**Status:** Open (record; no ruling required unless the scope below is disputed)
+**Raised by:** Claude Code · **Relates to:** F-56, F-57, the `.claude/loop.md` rule
+
+Applying the standing rule — *a guard test must be proven to fail when the
+guarded property is violated* — across the suite produced **seventeen** confirmed
+findings, not the handful expected. All are closed; each fix was verified by
+disabling the guarded code, watching the test go red, and restoring it.
+
+The most serious was a **path traversal in `extract()`**. The traversal guard
+existed and was unit-tested, but nothing asserted that the extract path *used*
+it: replacing `safe_join(destination_root, &member.path)` with a plain
+`destination_root.join(...)` left every test green while a hostile bundle wrote
+outside the destination. This is the same defect class as the original
+privileged-helper mount escalation, in new code, reached by untrusted input —
+a bundle may arrive from another machine or another user.
+
+Four others guarded nothing outright: the kernel-5.8 floor test compared tuple
+literals to tuple literals; the extraction-ordering test re-ran the production
+sort on its own data; the schema-refusal test let `open()`'s check be deleted;
+and the `.claude.json` filter tests covered a code path no real export reaches.
+Four tests were deleted rather than fixed, being tautologies or assertions
+against a constant production no longer consults.
+
+**Consequences.** The rule is worth its cost and should stay standing: it found a
+traversal that ordinary review, unit tests and an adversarial audit for *bugs*
+had all missed, because the tests were green. It also implies a habit for new
+code — a guard is not done when its test passes, only when its test has been
+seen to fail. Two of the seventeen (F-56, F-57) were found before the audit and
+motivated it; the audit found the rest.
+
 ---
 
 ## Log
@@ -344,3 +401,5 @@ supply a recommendation; assign a real F-number from the conformance ledger.
 | 2026-08-21 | D-07 | Opened — error model; Rain's position recorded, ruling pending |
 | 2026-08-21 | F-12 | Opened — credential bind-mount inode pin |
 | 2026-08-21 | F-XX | Opened — `.claude.json` MCP-vs-identity split |
+| 2026-08-21 | F-XX | Implementation note appended — ledger number is F-54; resolved via project-scoped `.mcp.json`, structurally, no bind-mount change, D-06 intact (Claude Code) |
+| 2026-08-21 | F-58 | Opened — guard-test rule produced 17 findings incl. an `extract()` path traversal; all closed (Claude Code) |
