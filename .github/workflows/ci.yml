@@ -1,0 +1,120 @@
+name: CI
+
+# Gates the constraints that were previously defended only by memory:
+# NFR-01 (no Docker, at any layer, transitively included), lint, and dependency
+# licensing/advisories. The host-backed regression suite and the E2E smoke test
+# need a provisioned rootless host and run in the `host-tests` job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the build on any warning. The tree is warnings-clean; keeping it that
+  # way is cheaper than a periodic cleanup pass.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Constraint gates — fast, no host provisioning needed.
+  # ---------------------------------------------------------------------------
+  docker-free:
+    name: NFR-01 — no Docker at any layer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      # cargo tree resolves the graph, so the check sees transitive deps.
+      - name: Docker-freeness check
+        run: ./scripts/check_docker_free.sh
+
+  lint:
+    name: clippy (warnings denied) + fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - name: Install protoc
+        # containerd-client's build script generates gRPC bindings from .proto
+        # sources and needs protoc at compile time (PREREQUISITES.md).
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: clippy — engine workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: clippy — privileged helper (separate workspace)
+        run: cd deploy/nemr-volume && cargo clippy --all-targets -- -D warnings
+
+  unit-tests:
+    name: unit tests (no host required)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Engine + wrapper unit tests
+        run: cargo test --workspace --lib
+      - name: Privileged helper unit tests
+        # Includes the attack-rejection tests (symlinked mount point, symlinked
+        # backing file) and the ioctl struct-layout ABI pins.
+        run: cd deploy/nemr-volume && cargo test
+      - name: Regression tests that need no host
+        # require_host() refuses rather than skips; NEMR_TEST_UNIT_ONLY is the
+        # explicit, narrow opt-out for a machine with no rootless containerd.
+        # The host-backed tests run in the `host-tests` job below.
+        run: NEMR_TEST_UNIT_ONLY=1 cargo test --test regression
+
+  supply-chain:
+    name: licenses + security advisories
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Check advisories, licenses, sources, bans
+        # Matters for the open-core split (E-11): a copyleft or unvetted
+        # dependency is cheap to remove now and expensive later.
+        run: |
+          cargo deny check
+          cd deploy/nemr-volume && cargo deny check
+
+  # ---------------------------------------------------------------------------
+  # Host-backed: needs rootless containerd, the privileged helper, and the base
+  # image. Runs on a clean Ubuntu runner, provisioned by the same scripts a
+  # developer uses — which is what makes AC-7.1 ("clean host") a tested claim.
+  # ---------------------------------------------------------------------------
+  host-tests:
+    name: regression suite + E2E smoke (clean Ubuntu runner)
+    runs-on: ubuntu-24.04
+    # Provisioning rootless containerd on a runner is the long pole; keep it off
+    # the critical path for a lint typo but never let it be silently skipped.
+    needs: [docker-free, lint, unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Provision the host (rootless containerd, helper, base image)
+        run: ./scripts/ci_provision_host.sh
+      - name: Install the privileged helper
+        run: sudo ./scripts/setup_test_host.sh
+      - name: Install the engine
+        run: cargo install --path . --bin nemr --root "$HOME/.local" --force
+      - name: Regression suite (serial; hash-gated against the installed helper)
+        run: |
+          export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
+          cargo test --test regression -- --test-threads=1
+      - name: E2E smoke test
+        # NEMR_SKIP_API: CI has no Anthropic credentials, so the API round-trip
+        # is skipped here. It is NOT skipped in the developer run, and the smoke
+        # test states which mode it ran in — a CI pass is therefore a weaker
+        # claim than a local pass, deliberately and visibly.
+        run: |
+          export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
+          NEMR_SKIP_API=1 ./scripts/e2e_smoke_test.sh
