@@ -464,6 +464,14 @@ mod tests {
             .extract(&destination)
             .expect_err("a chunk digest mismatch must be caught");
         assert_eq!(error.kind(), crate::error::ErrorKind::DataIntegrity);
+        // Assert WHICH layer caught it. Without this, deleting the chunk-digest
+        // check in plaintext() left the test green — the tampered bytes flowed on
+        // and the per-member check rejected them with the same kind, so the
+        // chunk-level guard could vanish unnoticed (F-58).
+        assert!(
+            error.to_string().contains("chunk 0"),
+            "corruption must be caught at the CHUNK layer: {error}"
+        );
         assert!(
             !destination.join("a.txt").exists(),
             "nothing may be written when verification fails"
@@ -502,6 +510,56 @@ mod tests {
             })
             .expect_err("a too-small destination must refuse");
         assert_eq!(error.kind(), crate::error::ErrorKind::CapacityExceeded);
+    }
+
+    /// `extract()` must *use* the traversal guard, not merely have one.
+    ///
+    /// The unit test below exercises `safe_join` directly; replacing the call
+    /// site with a plain `destination_root.join(&member.path)` left every test
+    /// green while a hostile bundle wrote outside the destination (F-58). A
+    /// bundle is untrusted input, so this drives a malicious member path through
+    /// the real extract path. Proven to fail when the call site is bypassed.
+    #[test]
+    fn extract_refuses_a_member_path_that_escapes_the_destination() {
+        let (_, bundle_path) = make_bundle("escape", &[("a.txt", "content")]);
+        let mut bundle = open(&bundle_path).unwrap();
+
+        let plain = b"PWNED".to_vec();
+        bundle.chunks.clear();
+        bundle
+            .chunks
+            .insert(0, zstd::encode_all(plain.as_slice(), 3).unwrap());
+        bundle.manifest.chunks = vec![crate::bundle::manifest::ChunkEntry {
+            index: 0,
+            sha256: hex(&Sha256::digest(&plain)),
+            compressed_bytes: 0,
+            plain_bytes: plain.len() as u64,
+        }];
+        bundle.manifest.members = vec![MemberEntry {
+            path: "../escaped.txt".into(),
+            class: crate::bundle::policy::Class::SessionCritical.as_str().into(),
+            mode: 0o100644,
+            size: plain.len() as u64,
+            sha256: hex(&Sha256::digest(&plain)),
+            span: crate::bundle::manifest::Span {
+                offset: 0,
+                length: plain.len() as u64,
+            },
+        }];
+
+        let destination = scratch("escape-dest").join("inner");
+        std::fs::create_dir_all(&destination).unwrap();
+        let error = bundle
+            .extract(&destination)
+            .expect_err("a member path escaping the destination must be refused");
+        assert_eq!(error.kind(), crate::error::ErrorKind::DataIntegrity);
+
+        let escaped = destination.parent().unwrap().join("escaped.txt");
+        assert!(
+            !escaped.exists(),
+            "nothing may be written outside the destination: {} exists",
+            escaped.display()
+        );
     }
 
     /// A bundle is untrusted input. A member path that escapes the destination

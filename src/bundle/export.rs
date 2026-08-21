@@ -21,7 +21,7 @@ use super::manifest::{
     BaseImageRef, ChunkEntry, ExcludedEntry, Manifest, MemberEntry, ProjectInfo, Span, CHUNK_PREFIX,
     CHUNK_SIZE, MANIFEST_MEMBER,
 };
-use super::policy::{filter_claude_json, Class, Decision, ExcludeReason, Policy};
+use super::policy::{Class, Decision, Policy};
 use super::SCHEMA_VERSION;
 
 /// Everything the exporter needs that it cannot discover from the volume.
@@ -62,12 +62,10 @@ pub fn export(request: &ExportRequest<'_>, destination: &Path) -> Result<ExportS
     let mut members: Vec<MemberEntry> = Vec::new();
 
     for item in &mut plan.included {
-        let bytes = match &item.content {
-            Content::File(path) => std::fs::read(path).map_err(|e| {
-                Error::Internal(anyhow::Error::from(e).context(format!("reading {}", path.display())))
-            })?,
-            Content::Inline(bytes) => bytes.clone(),
-        };
+        let Content::File(path) = &item.content;
+        let bytes = std::fs::read(path).map_err(|e| {
+            Error::Internal(anyhow::Error::from(e).context(format!("reading {}", path.display())))
+        })?;
 
         let offset = stream.len() as u64;
         stream.extend_from_slice(&bytes);
@@ -173,10 +171,12 @@ fn append<W: Write>(archive: &mut tar::Builder<W>, name: &str, bytes: &[u8]) -> 
 // Planning: what goes in, what stays out
 // ---------------------------------------------------------------------------
 
+/// Where a planned member's bytes come from.
+///
+/// Only real files today. A synthesised variant existed for the filtered
+/// `.claude.json`, which was dead code (F-58) and has been removed with it.
 enum Content {
     File(PathBuf),
-    /// Synthesised content — currently the filtered `.claude.json` (F-54).
-    Inline(Vec<u8>),
 }
 
 struct PlannedMember {
@@ -257,11 +257,6 @@ fn plan_members(request: &ExportRequest<'_>, destination: &Path) -> Result<Plan>
 
             match request.policy.decide(&relative) {
                 Decision::Exclude { reason } => {
-                    // `.claude.json` is excluded as a whole file, then a
-                    // filtered copy is re-added (F-54).
-                    if relative == CLAUDE_JSON {
-                        add_filtered_claude_json(&path, &mut plan)?;
-                    }
                     plan.excluded.push(ExcludedEntry::new(relative, reason));
                 }
                 Decision::Include { class } => {
@@ -283,56 +278,20 @@ fn plan_members(request: &ExportRequest<'_>, destination: &Path) -> Result<Plan>
     Ok(plan)
 }
 
-const CLAUDE_JSON: &str = "root/.claude.json";
-/// Where the filtered, portable subset of `.claude.json` is written in the
-/// bundle. A distinct name so it can never be mistaken for the original.
-const CLAUDE_JSON_PORTABLE: &str = "root/.claude.portable.json";
-
-/// Re-add the portable subset of `.claude.json` under a distinct name (F-54).
-fn add_filtered_claude_json(path: &Path, plan: &mut Plan) -> Result<()> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return Ok(());
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        // Unparseable config is not a reason to fail an export; it simply does
-        // not travel, and the exclusion entry already records that.
-        return Ok(());
-    };
-
-    let filter = filter_claude_json(&value);
-    for field in &filter.dropped_unrecognised {
-        // The F-54 signal: visible drift, not a silent drop.
-        tracing::warn!(
-            field = %field,
-            "unrecognised field in .claude.json was NOT included in the bundle; \
-             if it should travel, add it to the portable allowlist"
-        );
-    }
-    plan.unrecognised_fields
-        .extend(filter.dropped_unrecognised.iter().cloned());
-
-    for field in &filter.dropped_unrecognised {
-        plan.excluded.push(ExcludedEntry::new(
-            format!("{CLAUDE_JSON}#{field}"),
-            ExcludeReason::UnrecognisedField,
-        ));
-    }
-
-    if filter.kept.is_empty() {
-        return Ok(());
-    }
-    let portable = serde_json::Value::Object(filter.kept.into_iter().collect());
-    let bytes = serde_json::to_vec_pretty(&portable).map_err(|e| {
-        Error::Internal(anyhow::Error::from(e).context("serialising the portable config subset"))
-    })?;
-    plan.included.push(PlannedMember {
-        path: CLAUDE_JSON_PORTABLE.to_string(),
-        class: Class::SessionCritical,
-        mode: 0o100644,
-        content: Content::Inline(bytes),
-    });
-    Ok(())
-}
+// NOTE: `.claude.json` is deliberately NOT staged into a bundle.
+//
+// F-54 requires MCP configuration to travel and machine identity not to. That is
+// satisfied structurally rather than by filtering: Claude Code reads
+// project-scoped MCP configuration from `.mcp.json` at the project root, which
+// IS the volume, so it travels as an ordinary member — while `.claude.json`
+// (holding `machineID`/`oauthAccount`) stays on the rootfs and never reaches the
+// exportable layer (F-55).
+//
+// A filtering path used to exist here, gated on the container-view path
+// `root/.claude.json`, which an export walking the volume never encounters. It
+// was dead code whose unit tests passed while the property they described was
+// false in production (F-58), so it has been removed rather than left to look
+// like a working defence.
 
 /// Canonical identity of a path that may not exist yet.
 fn canonical_destination(path: &Path) -> Option<PathBuf> {
@@ -493,44 +452,6 @@ mod tests {
             "build output must not travel: {paths:?}"
         );
         assert!(summary.manifest.excluded.iter().any(|e| e.path.contains("target")));
-    }
-
-    /// F-54 end to end: MCP config travels under a distinct name, identity does
-    /// not, and an unrecognised field is reported rather than silently dropped.
-    #[test]
-    fn claude_json_is_filtered_by_field_and_drift_is_surfaced() {
-        let root = scratch("claude-json");
-        write(
-            &root,
-            "root/.claude.json",
-            r#"{"mcpServers":{"gh":{"command":"gh-mcp"}},
-                "machineID":"MACHINE-ID-VALUE",
-                "brandNewFieldFromNextRelease":"whatever"}"#,
-        );
-        let out = root.join("b.nemr");
-        let summary = export(&request("demo", &root), &out).unwrap();
-
-        let portable = summary
-            .manifest
-            .members
-            .iter()
-            .find(|m| m.path == CLAUDE_JSON_PORTABLE)
-            .expect("the portable subset travels");
-        assert!(portable.is_session_critical());
-
-        let text = extracted_text(&out);
-        // Control first: a positive assertion proves the search works, so the
-        // negative one below is not vacuous.
-        assert!(text.contains("gh-mcp"), "MCP config travels");
-        assert!(
-            !text.contains("MACHINE-ID-VALUE"),
-            "machine identity must not travel"
-        );
-        assert_eq!(
-            summary.unrecognised_fields,
-            vec!["brandNewFieldFromNextRelease".to_string()],
-            "drift must be reported to the caller"
-        );
     }
 
     /// Chunk digests are over plaintext, so chunk identity does not depend on

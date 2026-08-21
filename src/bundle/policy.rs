@@ -71,12 +71,6 @@ impl Class {
     }
 }
 
-/// The credential file, relative to the volume-relative export root.
-///
-/// Its own constant because D-02 makes it the one unconditional exclusion, and a
-/// literal buried in a match arm is easy to lose in a refactor.
-pub const CREDENTIAL_PATH: &str = "root/.claude/.credentials.json";
-
 /// Directories whose contents are build output or caches. Excluded by default;
 /// a caller may opt back in (they are `overridable`).
 const DEFAULT_EXCLUDED_DIRS: &[(&str, ExcludeReason)] = &[
@@ -91,7 +85,14 @@ const DEFAULT_EXCLUDED_DIRS: &[(&str, ExcludeReason)] = &[
 pub const BUNDLE_EXTENSION: &str = ".nemr";
 
 /// Reconstructible Claude Code state, identified in C1.
-const RECONSTRUCTIBLE: &[&str] = &["root/.claude/backups", "root/.claude/.last-cleanup"];
+///
+/// **Volume-relative**, matching what an export actually walks. These were
+/// originally the container-view paths (`root/.claude/backups`), which no export
+/// ever sees — so the constant and its test agreed with each other and both
+/// disagreed with reality, and the whole rule could be deleted with no
+/// production change (F-58). M8 relocates session state under `.nemr-state/`,
+/// so that is where reconstructible state appears if it ever does.
+const RECONSTRUCTIBLE: &[&str] = &[".nemr-state/backups", ".nemr-state/.last-cleanup"];
 
 /// The exclusion policy. Pluggable so the defaults can be relaxed per export
 /// without the unconditional rules ever becoming negotiable.
@@ -281,26 +282,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// D-02's invariant. Not a default, not overridable: no policy setting may
-    /// cause the credential to travel.
-    #[test]
-    fn credentials_never_travel_under_any_policy() {
-        for policy in [
-            Policy::default(),
-            Policy {
-                include_build_artifacts: true,
-            },
-        ] {
-            assert_eq!(
-                policy.decide(CREDENTIAL_PATH),
-                Decision::Exclude {
-                    reason: ExcludeReason::Secret
-                },
-                "the credential must never travel (D-02)"
-            );
-        }
-    }
-
     /// The credential filter must work on the layout that actually occurs.
     ///
     /// Measured from a real export: the volume holds `.nemr-state/projects/...`
@@ -309,7 +290,11 @@ mod tests {
     /// passed while guarding a path that cannot exist.
     #[test]
     fn credentials_are_caught_in_the_layout_that_really_occurs() {
-        let policy = Policy::default();
+        // Every policy, not just the default: D-02 is an invariant, not a
+        // setting. (Absorbs the deleted `credentials_never_travel_under_any_policy`,
+        // which asserted on a container-view path that cannot occur and against a
+        // `CREDENTIAL_PATH` constant production no longer consulted — F-58.)
+        for policy in [Policy::default(), Policy { include_build_artifacts: true }] {
         for path in [
             // container-view (what the first implementation assumed)
             "root/.claude/.credentials.json",
@@ -324,8 +309,9 @@ mod tests {
                 Decision::Exclude {
                     reason: ExcludeReason::Secret
                 },
-                "{path} must be refused wherever it sits (D-02)"
+                "{path} must be refused wherever it sits, under any policy (D-02)"
             );
+        }
         }
     }
 
@@ -351,36 +337,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn session_state_is_session_critical() {
-        let policy = Policy::default();
-        for path in [
-            "workspace/notes.md",
-            "root/.claude/projects/-workspace/a.jsonl",
-            "root/.claude/sessions/state",
-        ] {
-            assert_eq!(
-                policy.decide(path),
-                Decision::Include {
-                    class: Class::SessionCritical
-                },
-                "{path} carries the session"
-            );
-        }
-    }
-
+    /// Reconstructible state is classified from the layout an export really
+    /// walks, not the container's view.
+    ///
+    /// The prefixes were previously container-view (`root/.claude/backups`),
+    /// which no export encounters — test and constant agreed with each other and
+    /// both disagreed with reality (F-58).
     #[test]
     fn caches_and_housekeeping_are_reconstructible() {
         let policy = Policy::default();
-        for path in ["root/.claude/backups/x.json", "root/.claude/.last-cleanup"] {
+        for path in [".nemr-state/backups/x.json", ".nemr-state/.last-cleanup"] {
             assert_eq!(
                 policy.decide(path),
                 Decision::Include {
                     class: Class::Reconstructible
                 },
-                "{path} is regenerable"
+                "{path} is regenerable and must not be session-critical"
             );
         }
+        // Control: session state under the same prefix must stay critical, or
+        // the rule would be over-broad.
+        assert_eq!(
+            policy.decide(".nemr-state/projects/-workspace/a.jsonl"),
+            Decision::Include { class: Class::SessionCritical },
+            "the transcript must remain session-critical"
+        );
     }
 
     #[test]

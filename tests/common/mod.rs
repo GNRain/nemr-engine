@@ -164,6 +164,32 @@ pub fn installed_helper_matches_built() -> Result<(), String> {
         ));
     }
 
+    // F-58: hashing installed-vs-built is not enough. Neither hash is tied to
+    // the *source*, so "helper edited but never rebuilt" leaves both binaries
+    // identically stale and the gate green — contradicting this gate's own
+    // promise that a source change which was not reinstalled fails loudly.
+    // Nothing else rebuilds the helper: only scripts/setup_test_host.sh does,
+    // and the suite never runs it.
+    //
+    // So compare the built artifact against the source that produced it. A
+    // source file newer than the binary means the binary is stale, whatever its
+    // hash agrees with.
+    if let Some((newest, mtime)) = newest_helper_source()? {
+        let built_mtime = std::fs::metadata(&built)
+            .and_then(|m| m.modified())
+            .map_err(|e| format!("cannot stat {}: {e}", built.display()))?;
+        if mtime > built_mtime {
+            return Err(format!(
+                "the helper's source is newer than its built binary:\n     \
+                 {} is newer than {}\n     \
+                 The installed helper cannot be the source under test.\n     \
+                 fix: sudo ./scripts/setup_test_host.sh",
+                newest.display(),
+                built.display()
+            ));
+        }
+    }
+
     let installed_hash = sha256_of(&installed)
         .map_err(|e| format!("cannot hash the installed helper {}: {e}", installed.display()))?;
     let built_hash = sha256_of(&built)
@@ -180,6 +206,37 @@ pub fn installed_helper_matches_built() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Newest source file of the helper crate, with its mtime.
+///
+/// Covers `src/**` plus the manifests, which together determine the binary.
+fn newest_helper_source() -> Result<Option<(PathBuf, std::time::SystemTime)>, String> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("deploy/nemr-volume");
+    let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
+    let mut stack = vec![root.join("src")];
+    for manifest in ["Cargo.toml", "Cargo.lock"] {
+        let path = root.join(manifest);
+        if path.exists() {
+            stack.push(path);
+        }
+    }
+    while let Some(path) = stack.pop() {
+        if path.is_dir() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            stack.extend(entries.flatten().map(|e| e.path()));
+            continue;
+        }
+        let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(_, best)| mtime > *best) {
+            newest = Some((path, mtime));
+        }
+    }
+    Ok(newest)
 }
 
 /// Path to the helper crate's release binary, relative to this crate's root.

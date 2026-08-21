@@ -73,6 +73,20 @@ pub const LABEL_PROJECT: &str = "nemr.project";
 pub const LABEL_VOLUME: &str = "nemr.volume";
 pub const LABEL_SIZE: &str = "nemr.size";
 
+/// Labels written onto a project's container record.
+///
+/// Factored out of `create` so the round trip `list` and `reconcile_orphans`
+/// depend on is testable without containerd: both key on these exact keys, so a
+/// silent change here makes projects invisible to `list` and makes every volume
+/// look like an orphan to reconciliation.
+pub fn project_labels(name: &str, volume_path: &str, size: VolumeSize) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    labels.insert(LABEL_PROJECT.to_string(), name.to_string());
+    labels.insert(LABEL_VOLUME.to_string(), volume_path.to_string());
+    labels.insert(LABEL_SIZE.to_string(), size.to_string());
+    labels
+}
+
 /// Create a project: a quota-bounded volume plus a ready-to-start container.
 ///
 /// # Ordering
@@ -138,10 +152,7 @@ pub async fn create(
             .with_context(|| format!("failed to create session-state dir {}", dir.display()))?;
     }
 
-    let mut labels = HashMap::new();
-    labels.insert(LABEL_PROJECT.to_string(), name.to_string());
-    labels.insert(LABEL_VOLUME.to_string(), mount_point.to_string_lossy().to_string());
-    labels.insert(LABEL_SIZE.to_string(), size.to_string());
+    let labels = project_labels(name, &mount_point.to_string_lossy(), size);
 
     let mut mounts = vec![
         // The project volume becomes the container's working directory.
@@ -225,9 +236,22 @@ pub struct ProjectSummary {
 mod tests {
     use super::*;
 
+    /// The labels `list` and `reconcile_orphans` key on must actually be written.
+    ///
+    /// The previous version asserted a prefix on three string constants declared
+    /// in the same file — true by construction, and the entire label-writing
+    /// block in `create` could be deleted with it green, while `list` would show
+    /// no projects and `reconcile_orphans` would treat every volume as an orphan
+    /// and release its mount (F-58). Proven to fail when the labels are dropped.
     #[test]
-    fn label_keys_are_namespaced() {
-        for key in [LABEL_PROJECT, LABEL_VOLUME, LABEL_SIZE] {
+    fn create_writes_the_labels_list_and_reconcile_depend_on() {
+        let labels = project_labels("demo", "/mnt/demo", VolumeSize::Medium);
+
+        assert_eq!(labels.get(LABEL_PROJECT).map(String::as_str), Some("demo"));
+        assert_eq!(labels.get(LABEL_VOLUME).map(String::as_str), Some("/mnt/demo"));
+        assert_eq!(labels.get(LABEL_SIZE).map(String::as_str), Some("2GB"));
+
+        for key in labels.keys() {
             assert!(key.starts_with("nemr."), "{key} should be namespaced");
         }
     }

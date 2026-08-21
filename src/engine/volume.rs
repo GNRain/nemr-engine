@@ -812,23 +812,48 @@ mod tests {
         );
     }
 
-    /// The device parser backs the VOL-05 debug line. Field 5 is the target;
-    /// the source sits after the " - " separator, so the optional-fields
-    /// section has to be skipped rather than counted past — a fixed field index
-    /// would read the wrong token whenever the optional count changes.
+    /// The device parser backs the VOL-05 debug line.
+    ///
+    /// Field 5 is the target; the source sits after the " - " separator, so the
+    /// optional-fields section must be **skipped**, not counted past. The
+    /// previous version tested a single line shape with two optional fields, so
+    /// a fixed-index implementation (`split(' ').nth(10)`) passed it while
+    /// returning the wrong token on this host's real mountinfo, which has one
+    /// optional field (F-58). Every optional-field count is now covered.
     #[test]
-    fn mountinfo_device_is_read_after_the_separator() {
-        let table = "301 29 7:19 / /home/u/.local/share/nemr/mounts/p rw,relatime \
-shared:277 master:2 - ext4 /dev/loop7 rw\n"
-            .replace(" \\\n", " ");
-        assert_eq!(
-            mountinfo_device_for(&table, Path::new("/home/u/.local/share/nemr/mounts/p")),
-            Some("/dev/loop7".to_string()),
+    fn mountinfo_device_is_read_after_the_separator_at_any_optional_count() {
+        // Real shapes: zero, one and two optional fields, each a different device.
+        let table = concat!(
+            "20 25 0:19 / /zero rw,nosuid - tmpfs tmpfs-zero rw\n",
+            "24 29 0:22 / /one rw,nosuid shared:7 - sysfs sysfs-one rw\n",
+            "301 29 7:19 / /two rw,relatime shared:277 master:2 - ext4 /dev/loop7 rw\n",
         );
+        for (mount_point, expected) in [
+            ("/zero", "tmpfs-zero"),
+            ("/one", "sysfs-one"),
+            ("/two", "/dev/loop7"),
+        ] {
+            assert_eq!(
+                mountinfo_device_for(table, Path::new(mount_point)),
+                Some(expected.to_string()),
+                "{mount_point} must resolve past its optional fields"
+            );
+        }
         // A path that is not a mount point has no device — the VOL-05 condition.
-        assert_eq!(
-            mountinfo_device_for(&table, Path::new("/home/u/.local/share/nemr/mounts/other")),
-            None,
+        assert_eq!(mountinfo_device_for(table, Path::new("/absent")), None);
+    }
+
+    /// The parser must agree with this host's actual /proc/self/mountinfo.
+    #[test]
+    fn mountinfo_device_matches_this_host() {
+        let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else {
+            return;
+        };
+        // Control: the root mount always exists, so a None here means the parser
+        // is broken rather than that the mount is absent.
+        assert!(
+            mountinfo_device_for(&table, Path::new("/")).is_some(),
+            "the parser must find a device for / on a real mountinfo"
         );
     }
 
