@@ -112,6 +112,35 @@ export CONTAINERD_ADDRESS="$sock"
 echo "CONTAINERD_ADDRESS=$sock" >> "${GITHUB_ENV:-/dev/null}" || true
 ctr version
 
+echo "==> Install BuildKit (daemonless OCI builder, SPEC §3.1)"
+# Not in the Ubuntu archive, so it comes from the upstream release tarball —
+# pinned to the version the reference host uses, so CI and a developer build the
+# base image with the same builder. The checksum is verified: this is the one
+# binary the provisioning path fetches from outside the distribution, and an
+# unverified download would be the weakest link in an otherwise Docker-free,
+# archive-only supply chain.
+BUILDKIT_VERSION="${BUILDKIT_VERSION:-0.32.2}"
+BUILDKIT_SHA256="${BUILDKIT_SHA256:-2975d0f651ad96ba8b80b9992ae1f9a964f4408569af5b6dc36544165c3926af}"
+mkdir -p "$HOME/.local/bin"
+if ! command -v buildctl >/dev/null 2>&1; then
+    tarball="buildkit-v${BUILDKIT_VERSION}.linux-amd64.tar.gz"
+    url="https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/${tarball}"
+    curl -fsSL --proto '=https' --tlsv1.2 -o "/tmp/${tarball}" "$url"
+    if [[ -n "$BUILDKIT_SHA256" ]]; then
+        echo "${BUILDKIT_SHA256}  /tmp/${tarball}" | sha256sum -c -
+    else
+        # No pinned digest supplied: record what was fetched so a change in the
+        # upstream artifact is at least visible in the log rather than silent.
+        echo "    WARNING: BUILDKIT_SHA256 not set; fetched digest is $(sha256sum "/tmp/${tarball}" | cut -d' ' -f1)"
+    fi
+    tar -xzf "/tmp/${tarball}" -C /tmp
+    install -m 0755 /tmp/bin/buildctl /tmp/bin/buildkitd "$HOME/.local/bin/"
+    rm -rf "/tmp/${tarball}" /tmp/bin
+fi
+export PATH="$HOME/.local/bin:$PATH"
+echo "PATH=$HOME/.local/bin:$PATH" >> "${GITHUB_ENV:-/dev/null}" || true
+buildctl --version
+
 echo "==> Build and import the base image (BuildKit, daemonless — no Docker)"
 ./scripts/build_base_image.sh
 

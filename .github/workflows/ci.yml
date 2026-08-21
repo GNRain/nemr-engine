@@ -25,7 +25,7 @@ jobs:
     name: NFR-01 — no Docker at any layer
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
       # cargo tree resolves the graph, so the check sees transitive deps.
@@ -36,7 +36,7 @@ jobs:
     name: clippy (warnings denied) + fmt
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
       - name: Install protoc
@@ -52,7 +52,7 @@ jobs:
     name: unit tests (no host required)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
       - name: Install protoc
@@ -73,7 +73,7 @@ jobs:
     name: licenses + security advisories
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
       - name: Install cargo-deny
@@ -99,7 +99,7 @@ jobs:
     # the critical path for a lint typo but never let it be silently skipped.
     needs: [docker-free, lint, unit-tests]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
       - name: Provision the host (rootless containerd, helper, base image)
