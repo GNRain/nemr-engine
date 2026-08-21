@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use super::client::ContainerdClient;
 
-/// One image, reduced to the fields the engine actually uses.
+/// One image, reduced to the fields a consumer actually uses.
 ///
 /// A projection rather than a re-export of the generated protobuf `Image`:
 /// the generated type carries timestamps, labels and a nested descriptor that
@@ -257,7 +257,7 @@ mod chain_id_tests {
     }
 }
 
-/// The parts of an image's config the engine needs to build a runtime spec.
+/// The parts of an image's config needed to build a runtime spec.
 #[derive(Debug, Clone, Default)]
 pub struct ImageConfig {
     pub env: Vec<String>,
@@ -280,7 +280,7 @@ impl ContainerdClient {
     ///
     /// The engine builds its runtime spec from this rather than hardcoding the
     /// base image's values, so a change to `image/Dockerfile` does not silently
-    /// desynchronise from the engine.
+    /// desynchronise from the caller.
     pub async fn image_config(&self, name: &str) -> Result<ImageConfig> {
         let manifest_digest = self.image_target_digest(name).await?;
         let manifest: serde_json::Value =
