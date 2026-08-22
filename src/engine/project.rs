@@ -1059,7 +1059,45 @@ pub async fn reconcile_orphans(client: &ContainerdClient) -> Result<ReconcileRep
         }
     }
 
-    // 3. Orphan snapshots: an engine-created snapshot key with no container.
+    // 3. Stranded loop devices: attached to an image under the managed volume
+    //    directory whose file AND mount point are both gone (F-79).
+    //
+    //    Steps 1 and 2 enumerate *directories* and *files*. A loop device whose
+    //    backing image was deleted and whose mount point was removed appears in
+    //    neither, so it was invisible to reconciliation while still pinning the
+    //    unlinked inode — the disk stays full and nothing can find it. On the
+    //    reference host that was 57 devices, with `nemr list` reporting all 57
+    //    and `nemr reconcile` answering "nothing to reconcile": two commands
+    //    disagreeing about the same host state, and the cleanup one giving the
+    //    false all-clear.
+    //
+    //    /sys is the authoritative enumeration — it is what `untracked_volumes`
+    //    already reads for `list`, so the two commands now share a source
+    //    rather than each guessing from a different one.
+    for name in untracked_volumes(client).await? {
+        if report.released.contains(&name)
+            || report.not_released.contains(&name)
+            || report.orphan_backing_files.contains(&name)
+        {
+            continue;
+        }
+        if let Err(error) = helper.unmount_and_detach(&name) {
+            eprintln!("[nemr:reconcile] could not release stranded volume {name:?}: {error:#}");
+            report.not_released.push(name);
+            continue;
+        }
+        if crate::engine::volume::attached_loop_device(&paths.image_file(&name)).is_none() {
+            report.released.push(name);
+        } else {
+            eprintln!(
+                "[nemr:reconcile] {name:?} is still loop-attached after release; its disk \
+                 space is not reclaimed"
+            );
+            report.not_released.push(name);
+        }
+    }
+
+    // 4. Orphan snapshots: an engine-created snapshot key with no container.
     for key in client.list_snapshot_keys().await? {
         if key.starts_with(config::CONTAINER_PREFIX) && !known_ids.contains(key.as_str()) {
             match client.remove_snapshot(&key).await {

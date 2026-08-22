@@ -1703,3 +1703,72 @@ fn f28_a_foreign_filesystem_at_the_mount_point_is_refused() {
     let _ = std::fs::remove_dir(&mount_point);
     common::purge(&name);
 }
+
+/// F-79 — `list` and `reconcile` must agree about what is on the host.
+///
+/// They disagreed: `nemr list` reported 57 untracked volumes while `nemr
+/// reconcile` answered "nothing to reconcile: no orphaned mounts, loop devices
+/// or snapshots". Both were reading the host; they were reading *different
+/// parts* of it. `list` enumerated loop devices from `/sys`; `reconcile`
+/// enumerated mount-point directories and image files, and 57 loop devices had
+/// neither — their images deleted, their mount points removed — so they were
+/// invisible to the one command whose job is to reclaim them. 24 GB was held
+/// by artifacts the cleanup command reported as absent.
+///
+/// A false all-clear from a cleanup command is worse than a noisy one: it ends
+/// the investigation.
+///
+/// This asserts the structural property rather than a count: every volume
+/// `list` calls untracked must be something `reconcile` acts on.
+#[test]
+fn f79_reconcile_acts_on_everything_list_reports_as_untracked() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+
+        let reported = project::untracked_volumes(&client)
+            .await
+            .expect("list untracked");
+
+        let report = project::reconcile_orphans(&client)
+            .await
+            .expect("reconcile");
+
+        // Anything reported as untracked must appear in reconcile's account of
+        // what it did — released, refused, or explicitly kept. Silence is the
+        // failure mode: it is what "nothing to reconcile" was.
+        let accounted: std::collections::BTreeSet<&String> = report
+            .released
+            .iter()
+            .chain(report.not_released.iter())
+            .chain(report.orphan_backing_files.iter())
+            .collect();
+
+        let unaccounted: Vec<&String> = reported
+            .iter()
+            .filter(|name| !accounted.contains(name))
+            .collect();
+
+        assert!(
+            unaccounted.is_empty(),
+            "`list` reports {unaccounted:?} as untracked and `reconcile` did not account for \
+             them. Two commands reading the same host and disagreeing is how 24 GB sat behind \
+             \"nothing to reconcile\"."
+        );
+
+        // CONTROL: after reconciling, nothing should remain untracked — so the
+        // assertion above cannot pass merely because `list` found nothing.
+        let after = project::untracked_volumes(&client)
+            .await
+            .expect("list untracked again");
+        assert!(
+            after.is_empty(),
+            "still untracked after reconcile: {after:?}"
+        );
+    });
+}
