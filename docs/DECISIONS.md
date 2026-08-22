@@ -566,6 +566,78 @@ motivated it; the audit found the rest.
 
 ---
 
+### E-13 — Authenticating on a second machine revoked the first one's credential
+
+**Status:** Open — **escalation, raised for understanding before design.**
+**Raised by:** Rain (cross-machine validation) · **Contradicts:** D-02
+**Blocks:** nothing yet; **invalidates** an assumption D-02 rests on
+
+**What was observed, precisely.** Authenticating Claude Code on the second
+machine invalidated the session on the first. Same account. The first machine's
+subsequent API call failed with:
+
+```
+Failed to authenticate. API Error: 401 OAuth access token has been revoked.
+```
+
+Not expiry — *revocation*. The host credential file was still present and
+well-formed; the token it held had been invalidated server-side.
+
+**Why this matters more than a login annoyance.** D-02 rules that credentials
+are per-device, injected at attach, never synced — and the reason that ruling
+is safe is the assumption that **each device can hold its own credential
+simultaneously**. If authenticating on device B revokes device A, that
+assumption is false, and the product's core promise reads:
+
+> Your session moves between machines — and attaching on your laptop signs you
+> out of your desktop.
+
+For a product whose entire premise is machine mobility, that is a product-level
+problem, not an operational one. D-02 did not anticipate it because a
+single-machine test cannot surface it.
+
+**What is NOT established, and I am not going to guess at it.** The observation
+is one event on one account. All of these remain open:
+
+- Is revocation **account-wide**, or scoped to a session/device slot?
+- Is there a **concurrent session limit** (one? a small N?) rather than an
+  outright replace-on-login?
+- Is it **plan-dependent** — would a different subscription tier behave
+  differently?
+- Is it a property of the **OAuth flow** Claude Code uses, versus API-key auth,
+  which may not have the same behaviour at all?
+
+Answering any of these from the outside would be inventing facts about someone
+else's auth service, and the error string is the only direct evidence we have.
+
+**What would settle it**, cheaply and without guessing: authenticate on machine
+A, confirm a call succeeds; authenticate on B; re-test A. That is the experiment
+already run, once. Repeating it deliberately — and separately trying API-key
+authentication rather than the OAuth flow — distinguishes "replace-on-login" from
+"limit of N" and distinguishes flow-specific from account-wide.
+
+**Options, none of them ruled:**
+
+| # | Option | What it buys | What it costs |
+|---|---|---|---|
+| a | **Accept and document** — one active machine at a time, re-authenticate on arrival | Nothing to build. Honest. | Directly contradicts the product's premise; re-auth on every move is precisely the friction the product exists to remove |
+| b | **Long-lived API key instead of the OAuth session** for engine-run containers | Likely sidesteps session revocation entirely | A long-lived key is a much worse secret to hold (no session expiry), and D-02's "never synced" becomes more load-bearing, not less |
+| c | **Treat the credential as part of what moves** | Restores continuity | **Reverses D-02.** The credential would travel, which is the one thing three packages of structural enforcement exist to prevent. Recorded for completeness; recommending it would be arguing against the project's own posture |
+| d | **Establish the actual behaviour first**, then decide | Costs one experiment | Delays a decision that is not yet blocking anything |
+
+**Recommendation: (d), then most likely (a) with a documented limitation until
+the behaviour is understood.** (b) is worth investigating only after the
+mechanism is known — it may not help, and it trades a session secret for a
+permanent one. (c) should stay on the table only as the thing we are choosing
+*not* to do.
+
+**Consequence of leaving it open:** F-12 (the credential bind-mount pinning an
+inode) is now scheduled, and its fix should not be designed until this is
+understood. Fixing rotation propagation while the underlying model is "only one
+machine can be authenticated" would be solving the wrong problem carefully.
+
+---
+
 ### D-11 — No user-facing path moves a bundle through storage
 
 **Status:** Open — **scope statement, not a build request.**
@@ -742,6 +814,7 @@ is overstating what has been demonstrated.
 | 2026-08-22 | D-08 | Opened — base-image hosting; four options, recommendation (c)-then-(b), **not decided** (Claude Code) |
 | 2026-08-22 | D-09 | Opened — B2 implemented but never run against a live bucket; tracking item (Claude Code) |
 | 2026-08-22 | D-08 | **Resolved** — GHCR by digest + local-cache fallback + `export --with-base-image`; recommendation (c)-then-(b) superseded (Rain) |
+| 2026-08-22 | E-13 | Opened — authenticating on a second machine revoked the first's credential; contradicts an assumption D-02 rests on (Rain) |
 | 2026-08-22 | F-12 | **Scheduled** — confirmed in production during the cross-machine validation; recovery required delete+recreate (Rain) |
 | 2026-08-22 | D-11 | Opened — no user-facing path moves a bundle through storage; sync layer is commercial scope (Claude Code) |
 | 2026-08-22 | D-12 | Opened — import needs a pre-existing project and an invented quota the bundle already records (Claude Code) |

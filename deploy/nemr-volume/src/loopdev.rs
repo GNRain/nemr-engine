@@ -207,6 +207,47 @@ pub fn find_by_backing(backing_fd: &impl AsRawFd) -> Result<Option<u32>, String>
 /// The device must not be mounted; the caller unmounts first. A device whose
 /// backing file was unlinked auto-clears once its last mount is gone, so a
 /// missing device here is not an error.
+/// Find a loop device by the *path* of its backing file, including when that
+/// file has been deleted.
+///
+/// # Why a path match, when inode matching is the safe one (F-77)
+///
+/// [`find_by_backing`] compares device+inode, which is correct and immune to
+/// path tricks — but it needs the file to still exist. A loop device left
+/// attached to a deleted image cannot be found that way, and that is exactly
+/// the residue this is for: the kernel keeps the inode alive, so a
+/// fully-allocated 500 MB image occupies disk that no `rm` can reclaim.
+///
+/// `/sys/block/loopN/loop/backing_file` reports the original path, with a
+/// ` (deleted)` suffix once unlinked. The match is anchored to the caller's
+/// exact expected path, so it can only ever select a device this helper
+/// attached for this project — not an arbitrary loop device.
+pub fn find_by_backing_path(expected: &std::path::Path) -> Result<Option<u32>, String> {
+    let expected = expected.to_string_lossy();
+    let deleted = format!("{expected} (deleted)");
+
+    let entries =
+        std::fs::read_dir("/sys/block").map_err(|e| format!("cannot read /sys/block: {e}"))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(digits) = name.strip_prefix("loop") else {
+            continue;
+        };
+        let Ok(number) = digits.parse::<u32>() else {
+            continue;
+        };
+        let Ok(backing) = std::fs::read_to_string(entry.path().join("loop/backing_file")) else {
+            continue;
+        };
+        let backing = backing.trim_end_matches('\n');
+        if backing == expected || backing == deleted {
+            return Ok(Some(number));
+        }
+    }
+    Ok(None)
+}
+
 pub fn detach(number: u32) -> Result<(), String> {
     let path = format!("/dev/loop{number}");
     let device = match OpenOptions::new()

@@ -131,14 +131,17 @@ pub enum Error {
     HelperProtocolMismatch { expected: u32, found: String },
 
     // --- capacity --------------------------------------------------------
-    #[error("{what} exceeded: needs {needed} bytes, {available} available{}",
-            .context.as_ref().map(|c| format!(" ({c})")).unwrap_or_default())]
-    CapacityExceeded {
-        what: &'static str,
-        needed: u64,
-        available: u64,
-        context: Option<String>,
-    },
+    //
+    // F-70: there was a second capacity variant here, `CapacityExceeded`,
+    // carrying what/needed/available/context. It was constructed by nothing —
+    // its `Display` had never been rendered — and it duplicated
+    // `QuotaMismatch`, which IS produced, by the import capacity check. Two
+    // variants for one condition, one of them unreachable, is the taxonomy
+    // half-applied rather than a richer taxonomy.
+    //
+    // Deleted rather than wired to an invented call site. `ErrorKind::
+    // CapacityExceeded` remains and is what `QuotaMismatch` maps to, so the
+    // *class* a daemon switches on is unchanged.
 
     // --- bundle: the WP-D failure modes ----------------------------------
     /// The bundle is not readable as a bundle at all — truncated, not an
@@ -224,7 +227,6 @@ impl Error {
             Self::WrongState { .. } => ErrorKind::Conflict,
             Self::HostPrerequisite { .. } => ErrorKind::HostPrerequisite,
             Self::HelperProtocolMismatch { .. } => ErrorKind::Incompatible,
-            Self::CapacityExceeded { .. } => ErrorKind::CapacityExceeded,
             Self::BundleCorrupt { .. } => ErrorKind::DataIntegrity,
             Self::ChecksumMismatch { .. } => ErrorKind::DataIntegrity,
             Self::BundleVersionUnsupported { .. } => ErrorKind::Incompatible,
@@ -251,6 +253,61 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-70 — every `Error` variant must render a message that names its subject.
+    ///
+    /// Three variants (`ProjectExists`, `InvalidName`, and a now-deleted
+    /// duplicate capacity variant) sat in this enum reachable by nothing, while
+    /// the engine reported those exact conditions as untyped `anyhow` strings.
+    /// A daemon mapping `kind()` onto a gRPC status would have answered
+    /// `Internal` for what are plainly caller errors. Their `Display` had never
+    /// been rendered by anything; this renders it.
+    #[test]
+    fn the_caller_error_variants_render_their_subject() {
+        // Each with the kind a daemon must map it to. Lumping them under one
+        // kind was my first version of this test, and it was wrong:
+        // `ProjectExists` is a Conflict, not a bad request, and the difference
+        // is the difference between 409 and 400.
+        let cases = [
+            (
+                Error::InvalidName {
+                    name: "bad/name".into(),
+                    reason: "contains '/'".into(),
+                },
+                ErrorKind::InvalidRequest,
+            ),
+            (
+                Error::ProjectExists {
+                    name: "demo".into(),
+                },
+                ErrorKind::Conflict,
+            ),
+            (
+                Error::NoSuchProject {
+                    name: "demo".into(),
+                },
+                ErrorKind::InvalidRequest,
+            ),
+        ];
+        for (error, expected_kind) in cases {
+            let message = error.to_string();
+            assert!(
+                message.contains("demo") || message.contains("bad/name"),
+                "a variant's message does not name its own subject: {message}"
+            );
+            assert_eq!(
+                error.kind(),
+                expected_kind,
+                "a caller error misclassified; these are what a daemon turns into a \
+                 status code, and none of them may be Internal: {message}"
+            );
+            assert_ne!(
+                error.kind(),
+                ErrorKind::Internal,
+                "a caller error must never classify as Internal: {message}"
+            );
+        }
+    }
 
     /// Every variant must map to a kind. A new variant without a `kind()` arm
     /// fails to compile, but a *wrong* arm would not — so the mapping that

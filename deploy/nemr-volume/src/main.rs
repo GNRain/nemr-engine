@@ -395,6 +395,11 @@ fn cmd_unmount(invoker: &Invoker, name: &str) -> Result<(), String> {
     // descriptor *into* the mount, which would make umount fail EBUSY. The
     // parent's ancestors are pinned; the mount-point name cannot be renamed
     // while it is a mount point. Tolerate the parent being gone (cleanup paths).
+    // F-77: capture the loop device from the mount table BEFORE unmounting.
+    // Afterwards the mount is gone and, if the backing file was deleted, there
+    // is nothing left that says which loop device to release.
+    let loop_from_mount = safe::loop_number_for_mount(&mount_path);
+
     if safe::is_mounted(&mount_path) {
         match safe::open_parent_and_name(&mount_path) {
             Ok((parent_fd, child)) => {
@@ -437,10 +442,45 @@ fn cmd_unmount(invoker: &Invoker, name: &str) -> Result<(), String> {
                 image_path.display()
             )),
         },
-        None => audit(&format!(
-            "backing file {} is gone; nothing to detach by inode",
-            image_path.display()
-        )),
+        None => match loop_from_mount {
+            // F-77: the backing file is gone, so inode lookup cannot work — but
+            // the mount table named the device before we unmounted it. Without
+            // this the loop device stays attached to a deleted, fully-allocated
+            // image and the space is never reclaimed; `rm` on the image reports
+            // success and frees nothing, because the kernel still holds the
+            // inode open.
+            //
+            // Scope: this detaches a loop device that was the source of a mount
+            // point under the managed directory, whose name has already been
+            // validated. It is the same loop lifecycle this helper already owns
+            // (it attached the device in the first place), not a new capability.
+            Some(number) => {
+                loopdev::detach(number)?;
+                audit(&format!(
+                    "backing file {} is gone; detached /dev/loop{number} identified from the \
+                     mount table before unmounting",
+                    image_path.display()
+                ));
+            }
+            // Last resort: the volume may already be unmounted, so the mount
+            // table says nothing either. /sys reports the backing path even
+            // after the file is unlinked, and the match is anchored to this
+            // project's exact image path.
+            None => match loopdev::find_by_backing_path(&image_path)? {
+                Some(number) => {
+                    loopdev::detach(number)?;
+                    audit(&format!(
+                        "backing file {} is gone and it was not mounted; detached \
+                         /dev/loop{number} found by backing path in /sys",
+                        image_path.display()
+                    ));
+                }
+                None => audit(&format!(
+                    "backing file {} is gone and no loop device references it; nothing to detach",
+                    image_path.display()
+                )),
+            },
+        },
     }
 
     Ok(())

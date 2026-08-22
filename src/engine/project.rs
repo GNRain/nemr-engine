@@ -118,18 +118,21 @@ pub async fn create(
     // half-owned pair. Check both halves — either one existing means the name
     // is taken, and a project with only one half is a broken state we should
     // report rather than silently complete.
+    // F-70: typed, so a daemon mapping ErrorKind to a gRPC status returns
+    // Conflict rather than Internal. These conditions were reported as untyped
+    // anyhow strings while `Error::ProjectExists` sat in the enum, reachable by
+    // nothing — the taxonomy declared and never applied.
     if client.container_exists(&container_id).await? {
-        bail!(
-            "project {name:?} already exists (container {container_id:?}).\n\
-             Choose a different name, or delete the existing project first."
-        );
+        return Err(crate::error::Error::ProjectExists {
+            name: name.to_string(),
+        }
+        .into());
     }
     if paths.image_file(name).exists() {
-        bail!(
-            "project {name:?} already has a volume at {}, but no container.\n\
-             This is a partially-created project; remove the volume file before retrying.",
-            paths.image_file(name).display()
-        );
+        return Err(crate::error::Error::ProjectExists {
+            name: name.to_string(),
+        }
+        .into());
     }
 
     // AUTH-01/02/03: credentials come from the host, read-only, and their
@@ -404,6 +407,45 @@ pub fn ensure_volume_mounted(name: &str) -> Result<()> {
     );
 
     if mounted {
+        // F-28: "something is mounted here" is not "our volume is mounted here".
+        // The mount point is a plain directory until a mount lands on it, and a
+        // wrong mount is indistinguishable from the right one by presence
+        // alone — the container is simply handed a foreign filesystem, usually
+        // an empty one, and reports nothing. That is the shape F-63a was seen
+        // in: mounted=true, a real loop device, and a volume containing only
+        // lost+found.
+        //
+        // Refuse rather than proceed. A project that will not start is
+        // recoverable; a session silently restored onto someone else's volume
+        // is not.
+        let expected = paths.image_file(name);
+        let actual = crate::engine::volume::mounted_image_path(&mount_point);
+        match crate::engine::volume::mount_identity(&expected, actual.as_deref()) {
+            Ok(()) => {}
+            Err(crate::engine::volume::MountIdentityError::WrongVolume { actual }) => bail!(
+                "the filesystem mounted at {} is not this project's volume.\n\
+                 expected backing image: {}\n\
+                 actually backed by:     {}\n\
+                 Refusing to start: continuing would hand the container a volume \
+                 belonging to something else. Run `nemr reconcile`, then try again.",
+                mount_point.display(),
+                expected.display(),
+                actual.display()
+            ),
+            Err(crate::engine::volume::MountIdentityError::NotLoopBacked) => {
+                // Not a loop-backed mount at all — so whatever is there, it is
+                // not a volume this engine provisioned.
+                bail!(
+                    "the filesystem mounted at {} is not loop-backed, so it is not a \
+                     nemr volume.\n\
+                     Refusing to start: the container would run against an \
+                     unmanaged filesystem with no quota (VOL-05).\n\
+                     Inspect it with: findmnt {}",
+                    mount_point.display(),
+                    mount_point.display()
+                )
+            }
+        }
         return Ok(());
     }
 
@@ -897,6 +939,10 @@ pub struct ReconcileReport {
     /// Orphan mounts/loop devices released (mounted, or a backing file present,
     /// with no owning container record).
     pub released: Vec<String>,
+    /// Orphans the helper reported releasing but the host still shows as
+    /// mounted or loop-attached (F-77). Kept separate from `released` because
+    /// merging them is how "nine released, zero bytes reclaimed" happened.
+    pub not_released: Vec<String>,
     /// Orphan snapshots removed (a snapshot key with no matching container).
     pub snapshots_removed: Vec<String>,
     /// Backing files with no owning container record. **Reported, not deleted** —
@@ -908,6 +954,7 @@ pub struct ReconcileReport {
 impl ReconcileReport {
     pub fn is_empty(&self) -> bool {
         self.released.is_empty()
+            && self.not_released.is_empty()
             && self.snapshots_removed.is_empty()
             && self.orphan_backing_files.is_empty()
     }
@@ -955,14 +1002,42 @@ pub async fn reconcile_orphans(client: &ContainerdClient) -> Result<ReconcileRep
             if known_names.contains(&name) || crate::engine::volume::validate_name(&name).is_err() {
                 continue;
             }
-            if crate::engine::volume::is_mounted(&paths.mount_point(&name)) {
-                match helper.unmount_and_detach(&name) {
-                    Ok(()) => report.released.push(name),
-                    Err(error) => {
-                        eprintln!(
-                            "[nemr:reconcile] could not release orphan mount {name:?}: {error:#}"
-                        )
-                    }
+            // F-77: deliberately NOT gated on `is_mounted`. A volume can be
+            // unmounted and still have its loop device attached to a deleted
+            // image — which is what an interrupted run leaves behind, and what
+            // holds the disk: the kernel keeps the unlinked inode alive, so the
+            // space is unreclaimable and `rm` on the image frees nothing while
+            // reporting success. Gating on `is_mounted` skipped exactly the
+            // state that needed reclaiming.
+            // F-77: report what is TRUE afterwards, not that the call returned
+            // Ok. The old code pushed to `released` on Ok and printed
+            // "released ... (mount + loop device)" — while the helper had
+            // detached nothing, because it could not find the loop device for a
+            // deleted backing file. Nine volumes were reported released, zero
+            // bytes were reclaimed, and the report was the only evidence anyone
+            // had. Success asserted rather than observed is the defect class
+            // this project keeps finding; a cleanup command is the last place it
+            // should live.
+            if let Err(error) = helper.unmount_and_detach(&name) {
+                eprintln!("[nemr:reconcile] could not release orphan mount {name:?}: {error:#}");
+                continue;
+            }
+            let still_mounted = crate::engine::volume::is_mounted(&paths.mount_point(&name));
+            let still_attached =
+                crate::engine::volume::attached_loop_device(&paths.image_file(&name));
+            match (still_mounted, still_attached) {
+                (false, None) => report.released.push(name),
+                _ => {
+                    eprintln!(
+                        "[nemr:reconcile] {name:?} was NOT fully released: mounted={still_mounted}, \
+                         loop={}. The helper reported success; the host disagrees. An attached \
+                         loop device holds its (possibly deleted) image open, so this space is \
+                         not reclaimed.",
+                        still_attached
+                            .map(|n| format!("/dev/loop{n}"))
+                            .unwrap_or_else(|| "none".into())
+                    );
+                    report.not_released.push(name);
                 }
             }
         }
@@ -999,6 +1074,70 @@ pub async fn reconcile_orphans(client: &ContainerdClient) -> Result<ReconcileRep
     }
 
     Ok(report)
+}
+
+/// Volume artifacts on disk that belong to no project (F-77).
+///
+/// `list` reports containers, because containerd is the source of truth for
+/// what a project *is*. That is right, and it means an interrupted run's
+/// leftovers — an image, a mount, a loop device with no container record — are
+/// invisible. "Here are your projects" while 140 orphaned images fill the disk
+/// is true and misleading, and the disk filling is not self-explanatory when it
+/// happens.
+///
+/// Reported, never reclaimed here: `list` is a read-only command and an image
+/// may hold data. `nemr reconcile` is the command that acts.
+pub async fn untracked_volumes(client: &ContainerdClient) -> Result<Vec<String>> {
+    use std::collections::HashSet;
+    let paths = VolumePaths::from_env()?;
+    let known: HashSet<String> = client
+        .list_containers()
+        .await?
+        .iter()
+        .filter_map(|c| c.labels.get(LABEL_PROJECT).cloned())
+        .collect();
+
+    let mut found = std::collections::BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(paths.image_dir()) {
+        for entry in entries.flatten() {
+            let raw = entry.file_name().to_string_lossy().into_owned();
+            let Some(name) = raw.strip_suffix(".img") else {
+                continue;
+            };
+            if !known.contains(name) && crate::engine::volume::validate_name(name).is_ok() {
+                found.insert(name.to_string());
+            }
+        }
+    }
+
+    // Loop devices whose backing file is DELETED are invisible to the scan
+    // above — there is no file left to list — and they are precisely the case
+    // that fills a disk: the kernel holds the unlinked inode, so a
+    // fully-allocated image occupies space that no `rm` can reclaim. Scanning
+    // only the image directory would have reported "nothing untracked" on a
+    // host with 3.5 GB stranded exactly this way.
+    let prefix = paths.image_dir().to_string_lossy().into_owned();
+    if let Ok(entries) = std::fs::read_dir("/sys/block") {
+        for entry in entries.flatten() {
+            let Ok(backing) = std::fs::read_to_string(entry.path().join("loop/backing_file"))
+            else {
+                continue;
+            };
+            let backing = backing.trim_end();
+            let path = backing.strip_suffix(" (deleted)").unwrap_or(backing);
+            let Some(rest) = path.strip_prefix(&prefix) else {
+                continue;
+            };
+            let name = rest.trim_start_matches('/').trim_end_matches(".img");
+            if !name.is_empty()
+                && !known.contains(name)
+                && crate::engine::volume::validate_name(name).is_ok()
+            {
+                found.insert(name.to_string());
+            }
+        }
+    }
+    Ok(found.into_iter().collect())
 }
 
 /// A project as reported by `list`.

@@ -20,6 +20,30 @@
 # and it finishes by running the acceptance suite — setup is not done because
 # commands exited zero, it is done when the host passes verification.
 #
+# WHAT IS TESTED, AND WHAT IS NOT — read this before trusting a green run.
+#
+# TESTED: the preflight checks, each refusal path (kernel too old, cgroup v1,
+# apparmor_restrict_unprivileged_userns=1, missing subuid/subgid warning rather
+# than blocking), and the reboot gate including its distinct exit code 3. Those
+# were exercised by injecting the failing condition and checking both the
+# message and the exit status.
+#
+# NOT TESTED: everything from "Packages" onward. Those steps need root, and the
+# only host available to develop on was already provisioned — so the privileged
+# half of this script has never been executed end to end on a clean machine.
+#
+# That matters most for the steps that are hardest to get right on a host that
+# does not already work: the package set, disabling the system containerd, the
+# helper install, and the first base-image build. If this script fails for you
+# somewhere below the reboot gate, that is the untested half, and
+# PREREQUISITES.md is the reference for what each step is trying to achieve.
+#
+# CI provisions a clean Ubuntu runner via scripts/ci_provision_host.sh, which
+# covers the same ground for the steps they share (packages, containerd
+# disable, delegation, units, BuildKit, base image) — so those are exercised on
+# a clean machine every run, just not through THIS script. The parts CI does
+# not cover at all are the reboot resumption and the helper install.
+#
 # No failure is suppressed. `2>/dev/null` appears only on probes whose failure
 # is the answer being measured, never on an action whose failure matters.
 

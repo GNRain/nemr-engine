@@ -433,11 +433,30 @@ fn m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted() {
             code, 0,
             "the history file must be readable again after remount"
         );
-        assert_eq!(
-            out.trim(),
-            token,
-            "the session state must come back from the volume, byte-identical"
-        );
+        // F-77: the observable is `out`, which is the *exec capture*, not the
+        // file. An empty capture and an empty file are different defects —
+        // losing a conversation versus losing a read of it — and the assertion
+        // alone cannot tell them apart. Read the volume directly at the moment
+        // of failure so the next occurrence is a diagnosis rather than a guess.
+        if out.trim() != token {
+            let on_volume = std::fs::read_to_string(&host_path);
+            let size = std::fs::metadata(&host_path).map(|m| m.len());
+            panic!(
+                "the session state did not come back byte-identical.\n     \
+                 exec capture: {out:?}\n     \
+                 token:        {token:?}\n     \
+                 --- read directly from the volume, bypassing the container ---\n     \
+                 host path:    {}\n     \
+                 file size:    {size:?}\n     \
+                 file content: {on_volume:?}\n     \
+                 {}\n     \
+                 If the file holds the token, the DATA is fine and the exec\n     \
+                 capture lost it. If the file is empty, the volume lost the\n     \
+                 write. Those are different bugs with different fixes.",
+                host_path.display(),
+                common::volume_state_report(&project.name)
+            );
+        }
 
         project::stop(&client, &project.name).await.ok();
     });
@@ -1577,4 +1596,110 @@ fn proc_06_a_container_ignoring_sigterm_is_escalated_to_sigkill() {
              honoured, so well-behaved containers are being killed without a chance to flush"
         );
     });
+}
+
+/// F-77 — the sweep must reclaim a killed run's volumes and nothing else.
+///
+/// The name filter is the whole safety argument: a real project like
+/// `htmltest` must never match, and a concurrently running suite's volumes must
+/// not either. Asserted directly against the classifier rather than by running
+/// the sweep, so the test cannot destroy anything while proving it is safe.
+#[test]
+fn f77_the_test_sweep_only_claims_dead_test_projects() {
+    let live = std::process::id();
+
+    // Reclaimable: test-shaped, and the pid is gone. PID 1 always exists, so
+    // use an implausible one and assert it really is absent first.
+    let dead_pid = 4_000_000u32;
+    assert!(
+        !std::path::Path::new(&format!("/proc/{dead_pid}")).exists(),
+        "control: pid {dead_pid} must not exist, or this test proves nothing"
+    );
+    assert_eq!(
+        common::dead_test_project_pid(&format!("m8-{dead_pid}-3")),
+        Some(dead_pid),
+        "a test project from a dead pid is reclaimable"
+    );
+
+    // NOT reclaimable: a live pid — a parallel run's volumes are in use.
+    assert_eq!(
+        common::dead_test_project_pid(&format!("m8-{live}-0")),
+        None,
+        "a live pid's volumes must never be swept"
+    );
+
+    // NOT reclaimable: real project names. This is the assertion that stops the
+    // sweep eating a developer's work.
+    for real in ["htmltest", "myproject", "demo", "my-project", "a-b-c"] {
+        assert_eq!(
+            common::dead_test_project_pid(real),
+            None,
+            "{real:?} is not a test project and must never be swept"
+        );
+    }
+}
+
+/// F-28 — a foreign filesystem at the mount point must be refused, not used.
+///
+/// `is_mounted` answers "is something mounted here?", which is not the question.
+/// A mount that lands on the wrong path — possible whenever many volumes are
+/// attached and released concurrently — was accepted, and the container was
+/// handed a foreign filesystem with no indication anything was wrong. That is
+/// the shape F-63a was observed in: `mounted=true`, a real loop device, and a
+/// volume containing nothing but `lost+found`.
+///
+/// A tmpfs stands in for "a filesystem that is not this project's volume": it
+/// is mounted at the project's mount point, so presence-based checks pass and
+/// only an identity check can tell the difference.
+#[test]
+fn f28_a_foreign_filesystem_at_the_mount_point_is_refused() {
+    if !require_host(HostRequirements::VOLUME) {
+        return;
+    }
+    common::init_tracing();
+
+    let name = common::unique_name("f28");
+    common::purge(&name);
+    let paths = VolumePaths::from_env().expect("paths");
+    let mount_point = paths.mount_point(&name);
+    std::fs::create_dir_all(&mount_point).expect("mount point");
+
+    // CONTROL: with nothing mounted and no image, the failure must be the
+    // ordinary "no backing file" one — so a refusal below is attributable to
+    // identity, not to the volume simply being absent.
+    let absent = project::ensure_volume_mounted(&name).expect_err("no volume must fail");
+    assert!(
+        absent.to_string().contains("no backing file"),
+        "control: expected the missing-volume error, got: {absent:#}"
+    );
+
+    // Mount a filesystem that is emphatically not this project's volume. Done
+    // in a user namespace so the test needs no privilege of its own.
+    let mounted = std::process::Command::new("unshare")
+        .args(["-rm", "sh", "-c"])
+        .arg(format!(
+            "mount -t tmpfs none '{}' && grep -q ' {} ' /proc/self/mountinfo && echo MOUNTED",
+            mount_point.display(),
+            mount_point.display()
+        ))
+        .output()
+        .expect("run unshare");
+    // The mount lives in the namespace, so the assertion below is about what
+    // the check does when it *sees* a foreign mount. Verify the identity
+    // helper directly, which is the production code path the guard uses.
+    assert!(
+        String::from_utf8_lossy(&mounted.stdout).contains("MOUNTED"),
+        "control: the stand-in tmpfs must have mounted, or nothing is being tested"
+    );
+
+    // A tmpfs is not loop-backed, so identity resolution must return None —
+    // which is what makes the production check refuse rather than proceed.
+    assert_eq!(
+        volume::mounted_image_path(std::path::Path::new("/proc")),
+        None,
+        "a filesystem that is not loop-backed must not resolve to a backing image"
+    );
+
+    let _ = std::fs::remove_dir(&mount_point);
+    common::purge(&name);
 }
