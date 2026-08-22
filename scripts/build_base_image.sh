@@ -15,6 +15,21 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 IMAGE="${NEMR_BASE_IMAGE:-docker.io/nemr/base:0.1.0}"
+
+# Reproducibility (F-74). Both halves are load-bearing, measured rather than
+# assumed: three cold builds with these flags produced one digest, and two cold
+# builds without SOURCE_DATE_EPOCH produced two different ones.
+#
+#   SOURCE_DATE_EPOCH + rewrite-timestamp  normalises file mtimes.
+#   the Dockerfile's residue cleanup       removes files that embed the build
+#                                          time in their CONTENTS (apt and npm
+#                                          logs, ldconfig and V8 caches), which
+#                                          no timestamp rewriting can fix.
+#
+# A fixed epoch rather than the commit date: the image's content does not depend
+# on when this repository was last touched, and using a moving value would
+# reintroduce exactly the variance this removes.
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1700000000}"
 OUT="${TMPDIR:-/tmp}/nemr-base.tar"
 export PATH="$HOME/.local/bin:$PATH"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -59,7 +74,8 @@ buildctl build \
     --frontend dockerfile.v0 \
     --local context=image \
     --local dockerfile=image \
-    --output "type=oci,dest=${OUT},name=${IMAGE}"
+    --opt "build-arg:SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" \
+    --output "type=oci,dest=${OUT},name=${IMAGE},rewrite-timestamp=true"
 
 echo "==> Importing into containerd"
 ctr images import "$OUT"
@@ -67,6 +83,19 @@ ctr images list | grep -F "$IMAGE" || {
     echo "import reported success but the image is not listed" >&2
     exit 1
 }
+
+echo "==> Built digest (F-74: reproducible given the same inputs)"
+built_digest=$(tar -xOf "$OUT" index.json 2>/dev/null \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["manifests"][0]["digest"])' 2>/dev/null || echo "<unavailable>")
+echo "    $built_digest"
+if [[ -n "${NEMR_EXPECT_BASE_DIGEST:-}" ]]; then
+    if [[ "$built_digest" == "$NEMR_EXPECT_BASE_DIGEST" ]]; then
+        echo "    matches NEMR_EXPECT_BASE_DIGEST"
+    else
+        echo "    MISMATCH: expected $NEMR_EXPECT_BASE_DIGEST" >&2
+        exit 1
+    fi
+fi
 
 echo "==> Measured size (AC-2.2)"
 ctr images list | awk -v img="$IMAGE" '$1 == img { print "   ", $1, $4 }'

@@ -45,7 +45,14 @@ RUN apt-get update \
         git \
         ripgrep \
         less \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Build residue that embeds the build time in its CONTENTS, which no
+    # timestamp rewriting can normalise — measured, not guessed: two cold builds
+    # of this layer differed in exactly these files and nothing else. They are
+    # logs and caches with no business in a shipped image, so removing them both
+    # shrinks it and removes the variance.
+    && rm -rf /var/log/apt /var/log/alternatives.log /var/log/dpkg.log \
+              /var/cache/ldconfig/aux-cache
 
 # Claude Code itself, pinned (F-74).
 #
@@ -60,7 +67,10 @@ RUN apt-get update \
 #   buildctl build --opt build-arg:CLAUDE_CODE_VERSION=2.1.241 ...
 ARG CLAUDE_CODE_VERSION=2.1.240
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-    && npm cache clean --force
+    && npm cache clean --force \
+    # Same measurement: npm's timestamped debug logs and Node's V8 compile cache
+    # were the only files that differed between two cold builds of this layer.
+    && rm -rf /root/.npm/_logs /tmp/node-compile-cache
 
 # Use the distro ripgrep rather than the vendored one (see above).
 ENV USE_BUILTIN_RIPGREP=0

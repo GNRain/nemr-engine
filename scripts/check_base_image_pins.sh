@@ -52,6 +52,19 @@ while read -r line; do
     fi
 done < <(grep -E 'npm install' "$DOCKERFILE" || true)
 
+# 3. The build script must pass the reproducibility flags. Pinning inputs is
+#    necessary and not sufficient: measured, two cold builds of fully pinned
+#    source still differed until timestamps were normalised and build residue
+#    removed.
+for needle in "SOURCE_DATE_EPOCH" "rewrite-timestamp=true"; do
+    if grep -q -- "$needle" scripts/build_base_image.sh; then
+        ok "build_base_image.sh passes $needle"
+    else
+        bad "build_base_image.sh does not pass $needle
+            fix: without it the image is not reproducible even with pinned inputs"
+    fi
+done
+
 # CONTROL: this file must actually contain the constructs being checked. Without
 # it, renaming the Dockerfile or rewording a directive makes every grep match
 # nothing and the script reports a clean pass over an empty search.
