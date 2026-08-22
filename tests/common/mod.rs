@@ -801,7 +801,7 @@ pub fn volume_state_report(name: &str) -> String {
     };
 
     format!(
-        "  mount point:   {}\n                is_mounted:    {}\n                backing dev:   {}\n                image file:    {} ({})\n                dir contents:  {}\n                .nemr-state/projects exists: {}",
+        "  mount point:   {}\n                is_mounted:    {}\n                backing dev:   {}\n                image file:    {} ({})\n                dir contents:  {}\n                .nemr-state/projects exists: {}\n                mounted image: {:?}   <-- must equal the image file above (F-28)",
         mount_point.display(),
         volume::is_mounted(&mount_point),
         volume::backing_device(&mount_point).unwrap_or_else(|| "<none>".into()),
@@ -809,6 +809,7 @@ pub fn volume_state_report(name: &str) -> String {
         if image.exists() { "present" } else { "MISSING" },
         listing,
         mount_point.join(".nemr-state/projects").exists(),
+        volume::mounted_image_path(&mount_point),
     )
 }
 

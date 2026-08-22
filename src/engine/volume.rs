@@ -337,6 +337,70 @@ impl Usage {
 /// already-mounted volume and stack a second loop device and ext4 mount over
 /// the same backing bytes — the exact silent-corruption shape VOL-06 exists to
 /// prevent. Same defect, same fix, as the privileged helper's parser.
+/// Whether the filesystem mounted at a project's mount point is that project's
+/// own volume (F-28).
+///
+/// Pure, so the decision that gates `start` is testable without mounting
+/// anything — the production path and its guard are then the same code, which
+/// is the F-58 lesson.
+///
+/// `actual` is what [`mounted_image_path`] resolved: `None` means the mount is
+/// not loop-backed and therefore not a volume this engine provisioned.
+pub fn mount_identity(expected: &Path, actual: Option<&Path>) -> Result<(), MountIdentityError> {
+    match actual {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(MountIdentityError::WrongVolume {
+            actual: actual.to_path_buf(),
+        }),
+        None => Err(MountIdentityError::NotLoopBacked),
+    }
+}
+
+/// Why a mount point does not hold the project's own volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountIdentityError {
+    /// A loop-backed filesystem, but backed by a different image.
+    WrongVolume { actual: std::path::PathBuf },
+    /// Not loop-backed at all, so not a volume this engine provisioned.
+    NotLoopBacked,
+}
+
+/// The backing image path of whatever filesystem is mounted at `mount_point`.
+///
+/// The inverse of [`attached_loop_device`], and the missing half of the
+/// mount check (F-28). `is_mounted` answers "is *something* mounted here?";
+/// this answers "is it *ours*?". Without it, a mount landing on the wrong path
+/// — which is a live possibility whenever many volumes are attached and
+/// released concurrently — is indistinguishable from the right one, and the
+/// container is handed a foreign, usually empty, filesystem.
+pub fn mounted_image_path(mount_point: &Path) -> Option<std::path::PathBuf> {
+    const LOOP_MAJOR: u32 = 7;
+    let table = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let wanted = mount_point.as_os_str().as_bytes();
+
+    let mut device = None;
+    for line in table.lines() {
+        let mut fields = line.split(' ');
+        let dev = fields.nth(2)?;
+        let target = fields.nth(1)?;
+        if unescape_octal(target) == wanted {
+            device = Some(dev.to_string());
+            break;
+        }
+    }
+    let device = device?;
+    let (major, minor) = device.split_once(':')?;
+    if major.parse::<u32>().ok()? != LOOP_MAJOR {
+        return None;
+    }
+    let backing =
+        std::fs::read_to_string(format!("/sys/block/loop{minor}/loop/backing_file")).ok()?;
+    let backing = backing.trim_end();
+    Some(std::path::PathBuf::from(
+        backing.strip_suffix(" (deleted)").unwrap_or(backing),
+    ))
+}
+
 /// The loop device still attached to `image_path`, if any — including when the
 /// file has been deleted (F-77).
 ///
@@ -921,6 +985,29 @@ mod tests {
         assert!(
             mountinfo_device_for(&table, Path::new("/")).is_some(),
             "the parser must find a device for / on a real mountinfo"
+        );
+    }
+
+    /// F-28 — the identity decision that gates `start`.
+    #[test]
+    fn mount_identity_accepts_only_the_projects_own_image() {
+        let expected = Path::new("/v/demo.img");
+
+        assert!(mount_identity(expected, Some(expected)).is_ok());
+
+        assert_eq!(
+            mount_identity(expected, Some(Path::new("/v/other.img"))),
+            Err(MountIdentityError::WrongVolume {
+                actual: Path::new("/v/other.img").to_path_buf()
+            }),
+            "a different image must be refused: accepting it hands the container someone \
+             else's volume, silently"
+        );
+
+        assert_eq!(
+            mount_identity(expected, None),
+            Err(MountIdentityError::NotLoopBacked),
+            "a mount that is not loop-backed is not a nemr volume"
         );
     }
 

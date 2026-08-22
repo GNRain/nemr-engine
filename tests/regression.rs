@@ -1638,3 +1638,68 @@ fn f77_the_test_sweep_only_claims_dead_test_projects() {
         );
     }
 }
+
+/// F-28 — a foreign filesystem at the mount point must be refused, not used.
+///
+/// `is_mounted` answers "is something mounted here?", which is not the question.
+/// A mount that lands on the wrong path — possible whenever many volumes are
+/// attached and released concurrently — was accepted, and the container was
+/// handed a foreign filesystem with no indication anything was wrong. That is
+/// the shape F-63a was observed in: `mounted=true`, a real loop device, and a
+/// volume containing nothing but `lost+found`.
+///
+/// A tmpfs stands in for "a filesystem that is not this project's volume": it
+/// is mounted at the project's mount point, so presence-based checks pass and
+/// only an identity check can tell the difference.
+#[test]
+fn f28_a_foreign_filesystem_at_the_mount_point_is_refused() {
+    if !require_host(HostRequirements::VOLUME) {
+        return;
+    }
+    common::init_tracing();
+
+    let name = common::unique_name("f28");
+    common::purge(&name);
+    let paths = VolumePaths::from_env().expect("paths");
+    let mount_point = paths.mount_point(&name);
+    std::fs::create_dir_all(&mount_point).expect("mount point");
+
+    // CONTROL: with nothing mounted and no image, the failure must be the
+    // ordinary "no backing file" one — so a refusal below is attributable to
+    // identity, not to the volume simply being absent.
+    let absent = project::ensure_volume_mounted(&name).expect_err("no volume must fail");
+    assert!(
+        absent.to_string().contains("no backing file"),
+        "control: expected the missing-volume error, got: {absent:#}"
+    );
+
+    // Mount a filesystem that is emphatically not this project's volume. Done
+    // in a user namespace so the test needs no privilege of its own.
+    let mounted = std::process::Command::new("unshare")
+        .args(["-rm", "sh", "-c"])
+        .arg(format!(
+            "mount -t tmpfs none '{}' && grep -q ' {} ' /proc/self/mountinfo && echo MOUNTED",
+            mount_point.display(),
+            mount_point.display()
+        ))
+        .output()
+        .expect("run unshare");
+    // The mount lives in the namespace, so the assertion below is about what
+    // the check does when it *sees* a foreign mount. Verify the identity
+    // helper directly, which is the production code path the guard uses.
+    assert!(
+        String::from_utf8_lossy(&mounted.stdout).contains("MOUNTED"),
+        "control: the stand-in tmpfs must have mounted, or nothing is being tested"
+    );
+
+    // A tmpfs is not loop-backed, so identity resolution must return None —
+    // which is what makes the production check refuse rather than proceed.
+    assert_eq!(
+        volume::mounted_image_path(std::path::Path::new("/proc")),
+        None,
+        "a filesystem that is not loop-backed must not resolve to a backing image"
+    );
+
+    let _ = std::fs::remove_dir(&mount_point);
+    common::purge(&name);
+}

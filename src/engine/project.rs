@@ -404,6 +404,45 @@ pub fn ensure_volume_mounted(name: &str) -> Result<()> {
     );
 
     if mounted {
+        // F-28: "something is mounted here" is not "our volume is mounted here".
+        // The mount point is a plain directory until a mount lands on it, and a
+        // wrong mount is indistinguishable from the right one by presence
+        // alone — the container is simply handed a foreign filesystem, usually
+        // an empty one, and reports nothing. That is the shape F-63a was seen
+        // in: mounted=true, a real loop device, and a volume containing only
+        // lost+found.
+        //
+        // Refuse rather than proceed. A project that will not start is
+        // recoverable; a session silently restored onto someone else's volume
+        // is not.
+        let expected = paths.image_file(name);
+        let actual = crate::engine::volume::mounted_image_path(&mount_point);
+        match crate::engine::volume::mount_identity(&expected, actual.as_deref()) {
+            Ok(()) => {}
+            Err(crate::engine::volume::MountIdentityError::WrongVolume { actual }) => bail!(
+                "the filesystem mounted at {} is not this project's volume.\n\
+                 expected backing image: {}\n\
+                 actually backed by:     {}\n\
+                 Refusing to start: continuing would hand the container a volume \
+                 belonging to something else. Run `nemr reconcile`, then try again.",
+                mount_point.display(),
+                expected.display(),
+                actual.display()
+            ),
+            Err(crate::engine::volume::MountIdentityError::NotLoopBacked) => {
+                // Not a loop-backed mount at all — so whatever is there, it is
+                // not a volume this engine provisioned.
+                bail!(
+                    "the filesystem mounted at {} is not loop-backed, so it is not a \
+                     nemr volume.\n\
+                     Refusing to start: the container would run against an \
+                     unmanaged filesystem with no quota (VOL-05).\n\
+                     Inspect it with: findmnt {}",
+                    mount_point.display(),
+                    mount_point.display()
+                )
+            }
+        }
         return Ok(());
     }
 

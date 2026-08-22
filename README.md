@@ -156,6 +156,15 @@ and E-09, a user installs a package, a daemon starts, and they log in.
 `PREREQUISITES.md` remains the reference for *what* the script does and why,
 and is what to read when a preflight check refuses.
 
+**Known gap, stated rather than discovered:** the preflight checks, every
+refusal path and the reboot gate are tested. Everything from "Packages" onward
+needs root and has **never been run end to end on a clean machine** — the only
+development host available was already provisioned. CI exercises the same
+ground for the steps it shares (via `scripts/ci_provision_host.sh`) on a clean
+runner every build, so those are covered, just not through this script; the
+reboot resumption and the helper install are covered by neither. If setup fails
+below the reboot gate, that is the untested half.
+
 ## Build
 
 Requires the host setup in `PREREQUISITES.md`.
