@@ -1,0 +1,59 @@
+# Rootless containerd for Nemr (PRIV-01).
+#
+# Ships as a file, not as a heredoc in a script and not as markdown to
+# copy-paste. It was previously both of the latter, and provisioning a second
+# host meant hand-transcribing it out of PREREQUISITES.md.
+#
+# Installed to ~/.config/systemd/user/containerd-rootless.service by
+# scripts/setup_host.sh (developer hosts) and scripts/ci_provision_host.sh (CI),
+# both of which copy this exact file.
+[Unit]
+Description=containerd (rootless) — Nemr, PRIV-01
+Documentation=https://github.com/containerd/nerdctl/blob/main/docs/rootless.md
+Documentation=file:///usr/share/doc/containerd/rootless.md
+
+[Service]
+Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# RootlessKit creates unprivileged user + mount + network namespaces, then runs
+# containerd inside them. --copy-up gives us writable tmpfs overlays on /etc,
+# /run and /var/lib so the child can bind-mount user-owned directories over
+# containerd's hardcoded default paths. Because the child bind-mounts
+# %t/containerd onto /run/containerd, the resulting socket is the same inode as
+# %t/containerd/containerd.sock and is therefore reachable from the host mount
+# namespace without nsenter.
+#
+# The child then needs no containerd config file at all: containerd's defaults
+# (root=/var/lib/containerd, state=/run/containerd,
+# address=/run/containerd/containerd.sock) already resolve into the
+# user-owned directories via those bind mounts.
+ExecStart=/usr/bin/rootlesskit \
+    --state-dir=%t/containerd-rootless \
+    --net=slirp4netns \
+    --mtu=65520 \
+    --slirp4netns-sandbox=auto \
+    --slirp4netns-seccomp=auto \
+    --disable-host-loopback \
+    --port-driver=builtin \
+    --copy-up=/etc \
+    --copy-up=/run \
+    --copy-up=/var/lib \
+    --propagation=rslave \
+    /bin/sh -c 'rm -f /run/containerd /var/lib/containerd /etc/containerd; \
+        mkdir -p %t/containerd /run/containerd && \
+        mount --bind %t/containerd /run/containerd && \
+        mkdir -p %h/.local/share/containerd /var/lib/containerd && \
+        mount --bind %h/.local/share/containerd /var/lib/containerd && \
+        mkdir -p %h/.config/containerd /etc/containerd && \
+        mount --bind %h/.config/containerd /etc/containerd && \
+        exec containerd'
+
+Restart=on-failure
+RestartSec=2
+Delegate=yes
+KillMode=mixed
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=default.target
