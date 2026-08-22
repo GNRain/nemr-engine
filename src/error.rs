@@ -322,15 +322,24 @@ mod tests {
             actual: "bbb".into(),
         };
         let text = e.to_string();
-        assert!(text.contains("state/history.jsonl"), "names the member: {text}");
-        assert!(text.contains("aaa") && text.contains("bbb"), "shows both digests: {text}");
+        assert!(
+            text.contains("state/history.jsonl"),
+            "names the member: {text}"
+        );
+        assert!(
+            text.contains("aaa") && text.contains("bbb"),
+            "shows both digests: {text}"
+        );
 
         let e = Error::HelperProtocolMismatch {
             expected: 2,
             found: "1".into(),
         };
         let text = e.to_string();
-        assert!(text.contains("setup_test_host.sh"), "gives the remedy: {text}");
+        assert!(
+            text.contains("setup_test_host.sh"),
+            "gives the remedy: {text}"
+        );
     }
 
     /// An anyhow chain must survive being wrapped, or the catch-all variant
@@ -341,7 +350,10 @@ mod tests {
         let error: Error = root.into();
         assert_eq!(error.kind(), ErrorKind::Internal);
         let text = format!("{:#}", anyhow::Error::from(error));
-        assert!(text.contains("attaching the loop device"), "context kept: {text}");
+        assert!(
+            text.contains("attaching the loop device"),
+            "context kept: {text}"
+        );
         assert!(text.contains("losetup failed"), "root cause kept: {text}");
     }
 }

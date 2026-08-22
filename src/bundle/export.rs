@@ -18,8 +18,8 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 
 use super::manifest::{
-    BaseImageRef, ChunkEntry, ExcludedEntry, Manifest, MemberEntry, ProjectInfo, Span, CHUNK_PREFIX,
-    CHUNK_SIZE, MANIFEST_MEMBER,
+    BaseImageRef, ChunkEntry, ExcludedEntry, Manifest, MemberEntry, ProjectInfo, Span,
+    CHUNK_PREFIX, CHUNK_SIZE, MANIFEST_MEMBER,
 };
 use super::policy::{Class, Decision, Policy};
 use super::SCHEMA_VERSION;
@@ -144,7 +144,11 @@ fn write_archive(destination: &Path, manifest: &Manifest, chunks: &[Vec<u8>]) ->
     append(&mut archive, MANIFEST_MEMBER, &manifest_json)?;
 
     for (index, chunk) in chunks.iter().enumerate() {
-        append(&mut archive, &format!("{CHUNK_PREFIX}{index:04}.zst"), chunk)?;
+        append(
+            &mut archive,
+            &format!("{CHUNK_PREFIX}{index:04}.zst"),
+            chunk,
+        )?;
     }
 
     archive
@@ -445,13 +449,22 @@ mod tests {
         let out = root.join("b.nemr");
         let summary = export(&request("demo", &root), &out).unwrap();
 
-        let paths: Vec<&str> = summary.manifest.members.iter().map(|m| m.path.as_str()).collect();
+        let paths: Vec<&str> = summary
+            .manifest
+            .members
+            .iter()
+            .map(|m| m.path.as_str())
+            .collect();
         assert!(paths.contains(&"workspace/src/main.rs"));
         assert!(
             !paths.iter().any(|p| p.contains("target/")),
             "build output must not travel: {paths:?}"
         );
-        assert!(summary.manifest.excluded.iter().any(|e| e.path.contains("target")));
+        assert!(summary
+            .manifest
+            .excluded
+            .iter()
+            .any(|e| e.path.contains("target")));
     }
 
     /// Chunk digests are over plaintext, so chunk identity does not depend on
@@ -503,7 +516,10 @@ mod tests {
         // created_at is a wall-clock stamp and is expected to differ.
         a.manifest.created_at = String::new();
         b.manifest.created_at = String::new();
-        assert_eq!(a.manifest, b.manifest, "manifests must match but for the timestamp");
+        assert_eq!(
+            a.manifest, b.manifest,
+            "manifests must match but for the timestamp"
+        );
     }
 
     /// Exporting into the project's own workspace must not swallow the bundle
@@ -521,13 +537,26 @@ mod tests {
         let inside = root.join("workspace/backup.nemr");
         let first = export(&request("demo", &root), &inside).unwrap();
         assert!(
-            !first.manifest.members.iter().any(|m| m.path.ends_with(".nemr")),
+            !first
+                .manifest
+                .members
+                .iter()
+                .any(|m| m.path.ends_with(".nemr")),
             "the bundle must not contain itself: {:?}",
-            first.manifest.members.iter().map(|m| &m.path).collect::<Vec<_>>()
+            first
+                .manifest
+                .members
+                .iter()
+                .map(|m| &m.path)
+                .collect::<Vec<_>>()
         );
 
         // And a second export must not pick up the first one either.
-        let second = export(&request("demo", &root), &root.join("workspace/backup2.nemr")).unwrap();
+        let second = export(
+            &request("demo", &root),
+            &root.join("workspace/backup2.nemr"),
+        )
+        .unwrap();
         let swallowed: Vec<&String> = second
             .manifest
             .members

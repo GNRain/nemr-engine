@@ -86,7 +86,10 @@ impl ContainerdClient {
         }
 
         let inner = Client::from_path(&socket_path).await.with_context(|| {
-            format!("failed to connect to containerd at {}", socket_path.display())
+            format!(
+                "failed to connect to containerd at {}",
+                socket_path.display()
+            )
         })?;
 
         Ok(Self {

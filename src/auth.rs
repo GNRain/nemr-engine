@@ -115,7 +115,13 @@ mod tests {
         }
 
         let error = result.unwrap_err().to_string();
-        assert!(error.contains(".credentials.json"), "should name the file: {error}");
-        assert!(error.contains("Authenticate on the host"), "should say what to do: {error}");
+        assert!(
+            error.contains(".credentials.json"),
+            "should name the file: {error}"
+        );
+        assert!(
+            error.contains("Authenticate on the host"),
+            "should say what to do: {error}"
+        );
     }
 }

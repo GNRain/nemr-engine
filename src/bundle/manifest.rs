@@ -209,10 +209,14 @@ mod tests {
         ] {
             assert!(json.get(field).is_some(), "manifest must carry `{field}`");
         }
-        assert!(json["project"].get("content_bytes").is_some(),
-            "content_bytes is what lets import check quota before extracting");
-        assert!(json["base_image"].get("digest").is_some(),
-            "digest is the authoritative base image identity");
+        assert!(
+            json["project"].get("content_bytes").is_some(),
+            "content_bytes is what lets import check quota before extracting"
+        );
+        assert!(
+            json["base_image"].get("digest").is_some(),
+            "digest is the authoritative base image identity"
+        );
     }
 
     #[test]
@@ -233,7 +237,10 @@ mod tests {
                 mode: 0o100644,
                 size: 10,
                 sha256: "a".into(),
-                span: Span { offset: 0, length: 10 },
+                span: Span {
+                    offset: 0,
+                    length: 10,
+                },
             },
             MemberEntry {
                 path: "root/.claude/backups/x".into(),
@@ -241,10 +248,16 @@ mod tests {
                 mode: 0o100644,
                 size: 5,
                 sha256: "b".into(),
-                span: Span { offset: 10, length: 5 },
+                span: Span {
+                    offset: 10,
+                    length: 5,
+                },
             },
         ];
-        let critical: Vec<&str> = manifest.session_critical().map(|m| m.path.as_str()).collect();
+        let critical: Vec<&str> = manifest
+            .session_critical()
+            .map(|m| m.path.as_str())
+            .collect();
         assert_eq!(critical, vec!["workspace/notes.md"]);
     }
 }

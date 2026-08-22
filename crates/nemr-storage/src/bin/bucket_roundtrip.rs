@@ -103,7 +103,10 @@ async fn run() -> anyhow::Result<()> {
     let (report, location) = match &local_dir {
         Some(dir) => {
             let store = LocalStore::new(std::path::Path::new(dir));
-            println!("store:  {} (NO credential — this checks the harness, not a bucket)", store.describe());
+            println!(
+                "store:  {} (NO credential — this checks the harness, not a bucket)",
+                store.describe()
+            );
             (
                 run_acceptance(&store, &key, &bundle, cleanup).await?,
                 format!("{dir}/{key}"),
@@ -117,7 +120,9 @@ async fn run() -> anyhow::Result<()> {
             "\nPASS — the acceptance harness round-trips a bundle byte-identically.\n\
              This says nothing about any bucket; run without --local for that."
         ),
-        None => println!("\nPASS — the bundle round-tripped byte-identically against a real bucket."),
+        None => {
+            println!("\nPASS — the bundle round-tripped byte-identically against a real bucket.")
+        }
     }
 
     report_artifact(&report, &location, &bundle_path);

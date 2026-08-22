@@ -190,8 +190,12 @@ pub fn installed_helper_matches_built() -> Result<(), String> {
         }
     }
 
-    let installed_hash = sha256_of(&installed)
-        .map_err(|e| format!("cannot hash the installed helper {}: {e}", installed.display()))?;
+    let installed_hash = sha256_of(&installed).map_err(|e| {
+        format!(
+            "cannot hash the installed helper {}: {e}",
+            installed.display()
+        )
+    })?;
     let built_hash = sha256_of(&built)
         .map_err(|e| format!("cannot hash the built helper {}: {e}", built.display()))?;
 
@@ -277,7 +281,9 @@ pub fn installed_engine_path() -> PathBuf {
     if let Some(path) = std::env::var_os("NEMR_INSTALLED_BIN") {
         return PathBuf::from(path);
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     home.join(".local/bin/nemr")
 }
 
@@ -341,8 +347,12 @@ pub fn installed_engine_matches_built() -> Result<(), String> {
         }
     }
 
-    let installed_hash = sha256_of(&installed)
-        .map_err(|e| format!("cannot hash the installed engine {}: {e}", installed.display()))?;
+    let installed_hash = sha256_of(&installed).map_err(|e| {
+        format!(
+            "cannot hash the installed engine {}: {e}",
+            installed.display()
+        )
+    })?;
     let built_hash = sha256_of(&built)
         .map_err(|e| format!("cannot hash the built engine {}: {e}", built.display()))?;
     if installed_hash != built_hash {
@@ -360,8 +370,7 @@ pub fn installed_engine_matches_built() -> Result<(), String> {
 
 /// Path to the helper crate's release binary, relative to this crate's root.
 pub fn built_helper_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("deploy/nemr-volume/target/release/nemr-volume")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("deploy/nemr-volume/target/release/nemr-volume")
 }
 
 fn sha256_of(path: &Path) -> std::io::Result<String> {
@@ -561,8 +570,16 @@ pub fn write_hostile_bundle(destination: &Path, member_path: &str, payload: &[u8
         header.set_cksum();
         builder.append_data(&mut header, name, bytes).unwrap();
     };
-    append(&mut builder, "manifest.json", &serde_json::to_vec(&manifest).unwrap());
-    append(&mut builder, "chunks/0000.zst", &zstd::encode_all(payload, 3).unwrap());
+    append(
+        &mut builder,
+        "manifest.json",
+        &serde_json::to_vec(&manifest).unwrap(),
+    );
+    append(
+        &mut builder,
+        "chunks/0000.zst",
+        &zstd::encode_all(payload, 3).unwrap(),
+    );
     builder.finish().expect("finish hostile bundle");
 }
 

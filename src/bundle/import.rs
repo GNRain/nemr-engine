@@ -192,12 +192,11 @@ impl Bundle {
                 .chunks
                 .get(&entry.index)
                 .expect("presence checked in open()");
-            let plain = zstd::decode_all(compressed.as_slice()).map_err(|e| {
-                Error::BundleCorrupt {
+            let plain =
+                zstd::decode_all(compressed.as_slice()).map_err(|e| Error::BundleCorrupt {
                     path: Path::new("<bundle>").to_path_buf(),
                     detail: format!("chunk {} does not decompress: {e}", entry.index),
-                }
-            })?;
+                })?;
 
             let actual = hex(&Sha256::digest(&plain));
             if actual != entry.sha256 {
@@ -363,8 +362,11 @@ mod tests {
     }
 
     /// A minimal well-formed manifest, for hardening cases to bend.
-    fn base_manifest(members: Vec<MemberEntry>, chunks: Vec<crate::bundle::manifest::ChunkEntry>,
-                     content_bytes: u64) -> Manifest {
+    fn base_manifest(
+        members: Vec<MemberEntry>,
+        chunks: Vec<crate::bundle::manifest::ChunkEntry>,
+        content_bytes: u64,
+    ) -> Manifest {
         Manifest {
             schema_version: crate::bundle::SCHEMA_VERSION,
             engine_version: "0.1.0".into(),
@@ -423,7 +425,10 @@ mod tests {
         let (_, bundle_path) = make_bundle(
             "roundtrip",
             &[
-                (".nemr-state/projects/-workspace/a.jsonl", "conversation history"),
+                (
+                    ".nemr-state/projects/-workspace/a.jsonl",
+                    "conversation history",
+                ),
                 ("notes.md", "project file"),
             ],
         );
@@ -478,7 +483,9 @@ mod tests {
             header.set_size(json.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            builder.append_data(&mut header, MANIFEST_MEMBER, json.as_slice()).unwrap();
+            builder
+                .append_data(&mut header, MANIFEST_MEMBER, json.as_slice())
+                .unwrap();
             builder.finish().unwrap();
         }
 
@@ -598,7 +605,9 @@ mod tests {
         }];
         bundle.manifest.members = vec![MemberEntry {
             path: "../escaped.txt".into(),
-            class: crate::bundle::policy::Class::SessionCritical.as_str().into(),
+            class: crate::bundle::policy::Class::SessionCritical
+                .as_str()
+                .into(),
             mode: 0o100644,
             size: plain.len() as u64,
             sha256: hex(&Sha256::digest(&plain)),
@@ -766,7 +775,9 @@ mod tests {
         let manifest = base_manifest(
             vec![MemberEntry {
                 path: "session/history.jsonl".into(),
-                class: crate::bundle::policy::Class::SessionCritical.as_str().into(),
+                class: crate::bundle::policy::Class::SessionCritical
+                    .as_str()
+                    .into(),
                 mode: 0o100644,
                 size: plain.len() as u64,
                 sha256: "0".repeat(64), // wrong on purpose
@@ -814,7 +825,9 @@ mod tests {
         let manifest = base_manifest(
             vec![MemberEntry {
                 path: "a.txt".into(),
-                class: crate::bundle::policy::Class::SessionCritical.as_str().into(),
+                class: crate::bundle::policy::Class::SessionCritical
+                    .as_str()
+                    .into(),
                 mode: 0o100644,
                 size: 9_999,
                 sha256: "0".repeat(64),
@@ -893,19 +906,29 @@ mod tests {
         bundle.manifest.members = vec![
             MemberEntry {
                 path: "cache/regenerable.bin".into(),
-                class: crate::bundle::policy::Class::Reconstructible.as_str().into(),
+                class: crate::bundle::policy::Class::Reconstructible
+                    .as_str()
+                    .into(),
                 mode: 0o100644,
                 size: 15,
                 sha256: "0".repeat(64),
-                span: crate::bundle::manifest::Span { offset: 14, length: 15 },
+                span: crate::bundle::manifest::Span {
+                    offset: 14,
+                    length: 15,
+                },
             },
             MemberEntry {
                 path: "session/history.jsonl".into(),
-                class: crate::bundle::policy::Class::SessionCritical.as_str().into(),
+                class: crate::bundle::policy::Class::SessionCritical
+                    .as_str()
+                    .into(),
                 mode: 0o100644,
                 size: 14,
                 sha256: hex(&Sha256::digest(b"CRITICAL-BYTES")),
-                span: crate::bundle::manifest::Span { offset: 0, length: 14 },
+                span: crate::bundle::manifest::Span {
+                    offset: 0,
+                    length: 14,
+                },
             },
         ];
 

@@ -17,11 +17,16 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{extracted_plaintext, installed_helper_matches_built, namespaces_available, require_host, run_offline, unit_only, write_hostile_bundle, HostRequirements, TestProject};
+use common::{
+    extracted_plaintext, installed_helper_matches_built, namespaces_available, require_host,
+    run_offline, unit_only, write_hostile_bundle, HostRequirements, TestProject,
+};
 use nemr_engine::containerd::client::ContainerdClient;
 use nemr_engine::containerd::containers::StopOutcome;
 use nemr_engine::engine::project;
-use nemr_engine::engine::volume::{self, is_mounted, HelperOps, PrivilegedOps, Volume, VolumePaths, VolumeSize};
+use nemr_engine::engine::volume::{
+    self, is_mounted, HelperOps, PrivilegedOps, Volume, VolumePaths, VolumeSize,
+};
 
 /// TEST-01 — the installed helper must be the one this suite is testing.
 ///
@@ -174,8 +179,10 @@ fn vol_provision_mount_and_ownership_success_path() {
     common::purge(&name);
 
     let paths = VolumePaths::from_env().expect("HOME set");
-    let volume = Volume::create(&name, VolumeSize::Small, paths, HelperOps::new())
-        .unwrap_or_else(|e| panic!("provisioning must succeed against the installed helper: {e:#}"));
+    let volume =
+        Volume::create(&name, VolumeSize::Small, paths, HelperOps::new()).unwrap_or_else(|e| {
+            panic!("provisioning must succeed against the installed helper: {e:#}")
+        });
     let mount_point = volume.mount_point();
 
     // 1. The volume is genuinely mounted (loop attach + mount both worked).
@@ -190,9 +197,13 @@ fn vol_provision_mount_and_ownership_success_path() {
     //    PRIV-06 chown this write fails with EACCES — and the container (which
     //    maps to this uid) could not use its own volume.
     let marker = mount_point.join("provision-marker");
-    std::fs::write(&marker, b"written by the invoking user")
-        .unwrap_or_else(|e| panic!("the volume must be writable by the invoking user (PRIV-06 chown): {e}"));
-    assert_eq!(std::fs::read(&marker).unwrap(), b"written by the invoking user");
+    std::fs::write(&marker, b"written by the invoking user").unwrap_or_else(|e| {
+        panic!("the volume must be writable by the invoking user (PRIV-06 chown): {e}")
+    });
+    assert_eq!(
+        std::fs::read(&marker).unwrap(),
+        b"written by the invoking user"
+    );
 
     // 3. The quota is real: the filesystem's total does not exceed the request.
     let usage = volume::usage(&mount_point).expect("a mounted volume reports usage");
@@ -248,7 +259,10 @@ fn vol_06_start_remounts_a_volume_lost_to_reboot() {
     HelperOps::new()
         .unmount_and_detach(&name)
         .expect("simulated reboot teardown");
-    assert!(!is_mounted(&mount_point), "precondition: unmounted after simulated reboot");
+    assert!(
+        !is_mounted(&mount_point),
+        "precondition: unmounted after simulated reboot"
+    );
     assert!(!marker.exists(), "data is invisible while unmounted");
     assert!(
         paths.image_file(&name).exists(),
@@ -260,7 +274,10 @@ fn vol_06_start_remounts_a_volume_lost_to_reboot() {
     project::ensure_volume_mounted(&name)
         .unwrap_or_else(|e| panic!("VOL-06: start must remount, not proceed unmounted: {e:#}"));
 
-    assert!(is_mounted(&mount_point), "VOL-06: the volume must be mounted again");
+    assert!(
+        is_mounted(&mount_point),
+        "VOL-06: the volume must be mounted again"
+    );
     assert_eq!(
         std::fs::read(&marker).expect("marker must be back"),
         b"before the simulated reboot",
@@ -342,7 +359,11 @@ fn m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted() {
         let (code, _) = project::exec_capture(
             &client,
             &project.name,
-            &["/bin/sh", "-c", &format!("printf '%s' '{token}' > {container_path}")],
+            &[
+                "/bin/sh",
+                "-c",
+                &format!("printf '%s' '{token}' > {container_path}"),
+            ],
         )
         .await
         .expect("write inside container");
@@ -378,15 +399,17 @@ fn m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted() {
 
         // 5. Remount (start) and read it back inside the container — sourced
         //    from the volume, intact.
-        project::start(&client, &project.name).await.expect("restart");
-        let (code, out) = project::exec_capture(
-            &client,
-            &project.name,
-            &["/bin/cat", container_path],
-        )
-        .await
-        .expect("read back inside container");
-        assert_eq!(code, 0, "the history file must be readable again after remount");
+        project::start(&client, &project.name)
+            .await
+            .expect("restart");
+        let (code, out) =
+            project::exec_capture(&client, &project.name, &["/bin/cat", container_path])
+                .await
+                .expect("read back inside container");
+        assert_eq!(
+            code, 0,
+            "the history file must be readable again after remount"
+        );
         assert_eq!(
             out.trim(),
             token,
@@ -435,7 +458,10 @@ fn vol_write_past_quota_fails_with_enospc() {
         Some(28),
         "expected ENOSPC (28) at the quota, got {error:?}"
     );
-    assert!(written < VolumeSize::Small.bytes(), "must not exceed the volume size");
+    assert!(
+        written < VolumeSize::Small.bytes(),
+        "must not exceed the volume size"
+    );
     drop(volume);
     common::purge(&name);
 }
@@ -468,7 +494,14 @@ fn vol_fault_injection_leaves_no_orphans() {
     common::purge(&name);
     let paths = VolumePaths::from_env().unwrap();
 
-    let result = Volume::create(&name, VS::Small, paths.clone(), FailAfterMount { inner: HelperOps::new() });
+    let result = Volume::create(
+        &name,
+        VS::Small,
+        paths.clone(),
+        FailAfterMount {
+            inner: HelperOps::new(),
+        },
+    );
     // CONTROL: assert the failure is the INJECTED one, not an earlier failure in
     // create (name validation, sparse allocation, mkfs). Without this, an early
     // failure would leave nothing mounted and the no-orphan assertions below
@@ -484,7 +517,10 @@ fn vol_fault_injection_leaves_no_orphans() {
     );
 
     // No residue: the mount genuinely happened, then failed — Drop must release it.
-    assert!(!is_mounted(&paths.mount_point(&name)), "no orphaned mount after the fault");
+    assert!(
+        !is_mounted(&paths.mount_point(&name)),
+        "no orphaned mount after the fault"
+    );
     let loop_attached = std::process::Command::new("losetup")
         .arg("-a")
         .output()
@@ -523,7 +559,10 @@ fn vol_remount_is_idempotent() {
     let after = device_of();
 
     assert!(is_mounted(&mount_point), "still mounted");
-    assert_eq!(before, after, "repeated remount must not attach a second loop device");
+    assert_eq!(
+        before, after,
+        "repeated remount must not attach a second loop device"
+    );
     assert_eq!(after, 1, "exactly one loop device backs the image");
     common::purge(&name);
 }
@@ -596,7 +635,12 @@ fn m10_bundle_round_trip_carries_the_session_to_another_project() {
                 .iter()
                 .any(|m| m.path.ends_with("session.jsonl") && m.is_session_critical()),
             "the transcript must be a session-critical member: {:?}",
-            opened.manifest.members.iter().map(|m| &m.path).collect::<Vec<_>>()
+            opened
+                .manifest
+                .members
+                .iter()
+                .map(|m| &m.path)
+                .collect::<Vec<_>>()
         );
 
         project::import(&client, &destination.name, &bundle)
@@ -604,7 +648,8 @@ fn m10_bundle_round_trip_carries_the_session_to_another_project() {
             .expect("import");
 
         assert_eq!(
-            std::fs::read_to_string(&restored).expect("the transcript must exist on the destination"),
+            std::fs::read_to_string(&restored)
+                .expect("the transcript must exist on the destination"),
             token,
             "the session must arrive byte-identical at the path Claude Code reads"
         );
@@ -734,7 +779,12 @@ fn f55_mcp_config_travels_and_identity_does_not() {
                 .iter()
                 .any(|m| m.path == ".mcp.json" && m.is_session_critical()),
             "MCP configuration must travel (F-54): {:?}",
-            opened.manifest.members.iter().map(|m| &m.path).collect::<Vec<_>>()
+            opened
+                .manifest
+                .members
+                .iter()
+                .map(|m| &m.path)
+                .collect::<Vec<_>>()
         );
 
         // Search the EXTRACTED plaintext, not the compressed bundle (F-57).
@@ -792,13 +842,11 @@ fn m11_a_hostile_bundle_cannot_escape_the_destination() {
 
         // Build a hostile bundle by hand: export() cannot produce a traversing
         // member path, which is exactly why this needs a crafted fixture.
-        let bundle_path = std::env::temp_dir().join(format!("m11-hostile-{}.nemr", std::process::id()));
+        let bundle_path =
+            std::env::temp_dir().join(format!("m11-hostile-{}.nemr", std::process::id()));
         let payload = b"PWNED".to_vec();
         let mount = VolumePaths::from_env().unwrap().mount_point(&project.name);
-        let escape = format!(
-            "../../../../../../..{}",
-            outside.to_string_lossy()
-        );
+        let escape = format!("../../../../../../..{}", outside.to_string_lossy());
         write_hostile_bundle(&bundle_path, &escape, &payload);
 
         let error = project::import(&client, &project.name, &bundle_path)
@@ -853,14 +901,26 @@ fn m9_export_does_not_swallow_bundles_in_the_workspace() {
             .expect("first export");
         let opened = nemr_engine::bundle::import::open(&first).expect("open first");
         assert!(
-            !opened.manifest.members.iter().any(|m| m.path.ends_with(".nemr")),
+            !opened
+                .manifest
+                .members
+                .iter()
+                .any(|m| m.path.ends_with(".nemr")),
             "a bundle must not contain itself: {:?}",
-            opened.manifest.members.iter().map(|m| &m.path).collect::<Vec<_>>()
+            opened
+                .manifest
+                .members
+                .iter()
+                .map(|m| &m.path)
+                .collect::<Vec<_>>()
         );
 
         // CONTROL: the first bundle really is sitting in the workspace, so the
         // second export genuinely had the chance to swallow it.
-        assert!(first.exists(), "control: the first bundle is in the workspace");
+        assert!(
+            first.exists(),
+            "control: the first bundle is in the workspace"
+        );
 
         let second = mount.join("backup2.nemr");
         project::export(&client, &project.name, &second, policy)
@@ -940,12 +1000,7 @@ fn e11_export_and_import_work_with_no_network_and_no_credentials() {
          it inside proves nothing"
     );
 
-    let export = run_offline(&[
-        "export",
-        &source.name,
-        "-o",
-        &bundle.to_string_lossy(),
-    ]);
+    let export = run_offline(&["export", &source.name, "-o", &bundle.to_string_lossy()]);
     assert!(
         export.status.success(),
         "export must work offline with no credential.\nstdout: {}\nstderr: {}",
@@ -954,11 +1009,7 @@ fn e11_export_and_import_work_with_no_network_and_no_credentials() {
     );
     assert!(bundle.exists(), "the bundle must have been written");
 
-    let import = run_offline(&[
-        "import",
-        &destination.name,
-        &bundle.to_string_lossy(),
-    ]);
+    let import = run_offline(&["import", &destination.name, &bundle.to_string_lossy()]);
     assert!(
         import.status.success(),
         "import must work offline with no credential.\nstdout: {}\nstderr: {}",

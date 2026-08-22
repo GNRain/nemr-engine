@@ -113,16 +113,21 @@ impl S3Config {
             return Ok(None);
         };
 
-        let provider = match std::env::var("NEMR_S3_PROVIDER").unwrap_or_default().as_str() {
+        let provider = match std::env::var("NEMR_S3_PROVIDER")
+            .unwrap_or_default()
+            .as_str()
+        {
             "r2" => Provider::R2,
             "b2" => Provider::B2,
             _ => Provider::Other,
         };
 
-        let missing = |name: &str| StorageError::Other(anyhow::anyhow!(
-            "{name} is not set. An S3 backend needs NEMR_S3_BUCKET, NEMR_S3_ENDPOINT, \
+        let missing = |name: &str| {
+            StorageError::Other(anyhow::anyhow!(
+                "{name} is not set. An S3 backend needs NEMR_S3_BUCKET, NEMR_S3_ENDPOINT, \
              NEMR_S3_ACCESS_KEY_ID and NEMR_S3_SECRET_ACCESS_KEY."
-        ));
+            ))
+        };
 
         Ok(Some(Self {
             provider,
@@ -157,7 +162,9 @@ impl S3Store {
             .with_virtual_hosted_style_request(false)
             .with_allow_http(config.endpoint.starts_with("http://"))
             .build()
-            .map_err(|e| StorageError::Other(anyhow::Error::from(e).context("building the S3 client")))?;
+            .map_err(|e| {
+                StorageError::Other(anyhow::Error::from(e).context("building the S3 client"))
+            })?;
 
         Ok(Self {
             inner,
@@ -230,10 +237,7 @@ impl ObjectStore for S3Store {
             .get(&Self::path(key))
             .await
             .map_err(|e| Self::map("get", key, e))?;
-        let bytes = result
-            .bytes()
-            .await
-            .map_err(|e| Self::map("get", key, e))?;
+        let bytes = result.bytes().await.map_err(|e| Self::map("get", key, e))?;
         Ok(bytes.to_vec())
     }
 
@@ -330,8 +334,14 @@ mod tests {
         );
         // Control: the fields that SHOULD appear do, so this is not passing
         // merely because Debug prints nothing.
-        assert!(rendered.contains("nemr-bundles"), "bucket should appear: {rendered}");
-        assert!(rendered.contains("r2.cloudflarestorage.com"), "endpoint should appear");
+        assert!(
+            rendered.contains("nemr-bundles"),
+            "bucket should appear: {rendered}"
+        );
+        assert!(
+            rendered.contains("r2.cloudflarestorage.com"),
+            "endpoint should appear"
+        );
     }
 
     /// An unconfigured environment is not an error: it is the normal state for

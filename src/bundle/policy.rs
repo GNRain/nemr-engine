@@ -183,7 +183,9 @@ pub fn is_credential_file(path: &str) -> bool {
 /// Whether `path` has `dir` as one of its components (or a `a/b` component run).
 fn path_contains_dir(path: &str, dir: &str) -> bool {
     if dir.contains('/') {
-        return path == dir || path.starts_with(&format!("{dir}/")) || path.contains(&format!("/{dir}/"));
+        return path == dir
+            || path.starts_with(&format!("{dir}/"))
+            || path.contains(&format!("/{dir}/"));
     }
     path.split('/').any(|component| component == dir)
 }
@@ -294,24 +296,29 @@ mod tests {
         // setting. (Absorbs the deleted `credentials_never_travel_under_any_policy`,
         // which asserted on a container-view path that cannot occur and against a
         // `CREDENTIAL_PATH` constant production no longer consulted — F-58.)
-        for policy in [Policy::default(), Policy { include_build_artifacts: true }] {
-        for path in [
-            // container-view (what the first implementation assumed)
-            "root/.claude/.credentials.json",
-            // volume-view variants, which is what an export actually walks
-            ".credentials.json",
-            ".nemr-state/.credentials.json",
-            ".nemr-state/projects/.credentials.json",
-            "some/deeply/nested/.credentials.json",
+        for policy in [
+            Policy::default(),
+            Policy {
+                include_build_artifacts: true,
+            },
         ] {
-            assert_eq!(
-                policy.decide(path),
-                Decision::Exclude {
-                    reason: ExcludeReason::Secret
-                },
-                "{path} must be refused wherever it sits, under any policy (D-02)"
-            );
-        }
+            for path in [
+                // container-view (what the first implementation assumed)
+                "root/.claude/.credentials.json",
+                // volume-view variants, which is what an export actually walks
+                ".credentials.json",
+                ".nemr-state/.credentials.json",
+                ".nemr-state/projects/.credentials.json",
+                "some/deeply/nested/.credentials.json",
+            ] {
+                assert_eq!(
+                    policy.decide(path),
+                    Decision::Exclude {
+                        reason: ExcludeReason::Secret
+                    },
+                    "{path} must be refused wherever it sits, under any policy (D-02)"
+                );
+            }
         }
     }
 
@@ -322,12 +329,16 @@ mod tests {
         // Captured from an actual bundle manifest.
         assert_eq!(
             policy.decide(".nemr-state/projects/-workspace/a7f85305.jsonl"),
-            Decision::Include { class: Class::SessionCritical },
+            Decision::Include {
+                class: Class::SessionCritical
+            },
             "the transcript is the session"
         );
         assert_eq!(
             policy.decide("recipe.md"),
-            Decision::Include { class: Class::SessionCritical },
+            Decision::Include {
+                class: Class::SessionCritical
+            },
             "project files at the volume root travel"
         );
         // Build artifacts sit at the volume root in reality, not under workspace/.
@@ -359,7 +370,9 @@ mod tests {
         // the rule would be over-broad.
         assert_eq!(
             policy.decide(".nemr-state/projects/-workspace/a.jsonl"),
-            Decision::Include { class: Class::SessionCritical },
+            Decision::Include {
+                class: Class::SessionCritical
+            },
             "the transcript must remain session-critical"
         );
     }
@@ -392,11 +405,17 @@ mod tests {
     fn directory_exclusions_match_components_not_substrings() {
         let policy = Policy::default();
         assert!(
-            matches!(policy.decide("workspace/my-target-notes.md"), Decision::Include { .. }),
+            matches!(
+                policy.decide("workspace/my-target-notes.md"),
+                Decision::Include { .. }
+            ),
             "a file whose name merely contains 'target' must travel"
         );
         assert!(
-            matches!(policy.decide("workspace/targets/list.txt"), Decision::Include { .. }),
+            matches!(
+                policy.decide("workspace/targets/list.txt"),
+                Decision::Include { .. }
+            ),
             "'targets' is not 'target'"
         );
     }
@@ -447,7 +466,10 @@ mod tests {
         let filter = filter_claude_json(&config);
 
         assert!(filter.kept.contains_key("mcpServers"), "MCP config travels");
-        assert!(filter.kept.contains_key("projects"), "project trust travels");
+        assert!(
+            filter.kept.contains_key("projects"),
+            "project trust travels"
+        );
         for identity in ["machineID", "userID", "oauthAccount"] {
             assert!(
                 !filter.kept.contains_key(identity),
@@ -459,7 +481,9 @@ mod tests {
             );
         }
         assert!(
-            filter.dropped_known.contains(&"cachedGrowthBookFeatures".to_string()),
+            filter
+                .dropped_known
+                .contains(&"cachedGrowthBookFeatures".to_string()),
             "cache blocks are dropped as known"
         );
         assert!(
@@ -481,7 +505,9 @@ mod tests {
         let filter = filter_claude_json(&config);
 
         assert!(
-            !filter.kept.contains_key("somethingAnthropicAddedLastTuesday"),
+            !filter
+                .kept
+                .contains_key("somethingAnthropicAddedLastTuesday"),
             "an unrecognised field must NOT travel — a blocklist would have leaked it"
         );
         assert_eq!(
@@ -502,14 +528,31 @@ mod tests {
     #[test]
     fn the_real_measured_key_set_produces_no_drift_warnings() {
         const MEASURED_KEYS: &[&str] = &[
-            "installMethod", "autoUpdates", "cachedGrowthBookFeatures", "firstStartTime",
-            "machineID", "opusProMigrationComplete", "sonnet1m45MigrationComplete",
-            "seenNotifications", "hasResetAutoModeOptInForDefaultOffer", "migrationVersion",
-            "userID", "oauthAccount", "cachedExperimentFeatures", "cachedExperimentData",
-            "cachedGrowthBookFeaturesAt", "clientDataCacheSlots", "additionalModelOptionsCache",
-            "additionalModelCostsCache", "modelAccessCache", "orgModelDefaultCache",
-            "autoCompactWindowsCache", "cachedExtraUsageDisabledReason", "groveConfigCache",
-            "passesEligibilityCache", "mcpServers",
+            "installMethod",
+            "autoUpdates",
+            "cachedGrowthBookFeatures",
+            "firstStartTime",
+            "machineID",
+            "opusProMigrationComplete",
+            "sonnet1m45MigrationComplete",
+            "seenNotifications",
+            "hasResetAutoModeOptInForDefaultOffer",
+            "migrationVersion",
+            "userID",
+            "oauthAccount",
+            "cachedExperimentFeatures",
+            "cachedExperimentData",
+            "cachedGrowthBookFeaturesAt",
+            "clientDataCacheSlots",
+            "additionalModelOptionsCache",
+            "additionalModelCostsCache",
+            "modelAccessCache",
+            "orgModelDefaultCache",
+            "autoCompactWindowsCache",
+            "cachedExtraUsageDisabledReason",
+            "groveConfigCache",
+            "passesEligibilityCache",
+            "mcpServers",
         ];
         let mut object = serde_json::Map::new();
         for key in MEASURED_KEYS {
@@ -536,7 +579,10 @@ mod tests {
 
     #[test]
     fn a_non_object_config_yields_nothing_rather_than_panicking() {
-        assert_eq!(filter_claude_json(&json!("not an object")), FieldFilter::default());
+        assert_eq!(
+            filter_claude_json(&json!("not an object")),
+            FieldFilter::default()
+        );
         assert_eq!(filter_claude_json(&json!(null)), FieldFilter::default());
     }
 }

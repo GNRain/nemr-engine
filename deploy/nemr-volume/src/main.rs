@@ -111,10 +111,7 @@ fn require_arg<'a>(args: &'a [String], index: usize, what: &str) -> Result<&'a s
 /// Refuse unexpected trailing arguments rather than ignoring them.
 fn reject_extra_args(args: &[String], expected: usize) -> Result<(), String> {
     if args.len() > expected {
-        return Err(format!(
-            "unexpected extra argument {:?}",
-            args[expected]
-        ));
+        return Err(format!("unexpected extra argument {:?}", args[expected]));
     }
     Ok(())
 }
@@ -164,7 +161,9 @@ impl Invoker {
     }
 
     fn image_file(&self, name: &str) -> PathBuf {
-        self.managed_root().join("volumes").join(format!("{name}.img"))
+        self.managed_root()
+            .join("volumes")
+            .join(format!("{name}.img"))
     }
 
     fn mount_point(&self, name: &str) -> PathBuf {
@@ -174,8 +173,8 @@ impl Invoker {
 
 /// Look up a uid's home directory in `/etc/passwd`.
 fn home_dir_of(uid: u32) -> Result<PathBuf, String> {
-    let passwd = fs::read_to_string("/etc/passwd")
-        .map_err(|e| format!("cannot read /etc/passwd: {e}"))?;
+    let passwd =
+        fs::read_to_string("/etc/passwd").map_err(|e| format!("cannot read /etc/passwd: {e}"))?;
     home_dir_from_passwd(&passwd, uid)
 }
 
@@ -454,8 +453,8 @@ mod tests {
     #[test]
     fn rejects_traversal_and_injection_names() {
         for name in [
-            "../etc", "..", ".", "a/b", "/abs", "a b", "a;b", "a$b", "a\\b", "a\nb", "UPPER", "-lead",
-            "a.img", "",
+            "../etc", "..", ".", "a/b", "/abs", "a b", "a;b", "a$b", "a\\b", "a\nb", "UPPER",
+            "-lead", "a.img", "",
         ] {
             assert!(validate_name(name).is_err(), "{name:?} must be rejected");
         }
@@ -537,14 +536,17 @@ mod tests {
     #[test]
     fn a_relative_home_is_refused() {
         const PASSWD: &str = "bad:x:1001:1001:Bad:relative/path:/bin/sh\n";
-        let error = home_dir_from_passwd(PASSWD, 1001)
-            .expect_err("a non-absolute home must be refused");
+        let error =
+            home_dir_from_passwd(PASSWD, 1001).expect_err("a non-absolute home must be refused");
         assert!(error.contains("absolute"), "error should say why: {error}");
     }
 
     #[test]
     fn extra_arguments_are_refused() {
-        let args: Vec<String> = ["mount", "a", "2GB", "extra"].iter().map(|s| s.to_string()).collect();
+        let args: Vec<String> = ["mount", "a", "2GB", "extra"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert!(reject_extra_args(&args, 3).is_err());
     }
 }

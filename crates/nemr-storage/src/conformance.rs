@@ -106,8 +106,13 @@ pub async fn round_trip(
 
     // 4. A range past the end must clamp rather than error, per the trait.
     print!("get_range (clamped past end) … ");
-    let clamped = store.get_range(key, bundle.len() as u64..bundle.len() as u64 + 4096).await?;
-    anyhow::ensure!(clamped.is_empty(), "a range past the end must clamp to empty");
+    let clamped = store
+        .get_range(key, bundle.len() as u64..bundle.len() as u64 + 4096)
+        .await?;
+    anyhow::ensure!(
+        clamped.is_empty(),
+        "a range past the end must clamp to empty"
+    );
     println!("ok");
 
     // 5. The whole object must come back byte-identical. This is the acceptance.
@@ -269,7 +274,10 @@ mod tests {
         // The object is still there, and is byte-identical to what went in —
         // which is the property the operator will check by hand.
         assert_eq!(
-            store.get(&key).await.expect("the kept object must still exist"),
+            store
+                .get(&key)
+                .await
+                .expect("the kept object must still exist"),
             bundle,
             "the kept artifact must be byte-identical to the uploaded bundle"
         );
@@ -367,7 +375,10 @@ mod tests {
             "the pre-flight failure must stay distinguishable, got: {error}"
         );
         assert_eq!(
-            store.get(&key).await.expect("the foreign object must survive"),
+            store
+                .get(&key)
+                .await
+                .expect("the foreign object must survive"),
             b"not ours",
             "cleanup must not delete an object this run did not create"
         );

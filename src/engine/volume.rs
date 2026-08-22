@@ -159,10 +159,13 @@ impl VolumePaths {
     /// Matching the helper's stricter rule keeps them in agreement by
     /// construction.
     pub fn from_env() -> Result<Self> {
-        let home = std::env::var_os("HOME")
-            .context("HOME is not set; cannot locate volume storage")?;
+        let home =
+            std::env::var_os("HOME").context("HOME is not set; cannot locate volume storage")?;
         Ok(Self {
-            root: PathBuf::from(home).join(".local").join("share").join("nemr"),
+            root: PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("nemr"),
         })
     }
 
@@ -447,7 +450,11 @@ pub fn usage(mount_point: &Path) -> Option<Usage> {
     let used = total.saturating_sub(stat.f_bfree as u64 * block);
     let available = stat.f_bavail as u64 * block;
 
-    Some(Usage { used, available, total })
+    Some(Usage {
+        used,
+        available,
+        total,
+    })
 }
 
 /// Format a byte count for human reading.
@@ -679,9 +686,9 @@ fn format_ext4(path: &Path) -> Result<()> {
         .arg(path)
         .output()
         .map_err(|error| match error.kind() {
-            io::ErrorKind::NotFound => anyhow::anyhow!(
-                "mkfs.ext4 not found. Install e2fsprogs (see PREREQUISITES.md)."
-            ),
+            io::ErrorKind::NotFound => {
+                anyhow::anyhow!("mkfs.ext4 not found. Install e2fsprogs (see PREREQUISITES.md).")
+            }
             _ => anyhow::Error::from(error),
         })
         .with_context(|| format!("failed to run mkfs.ext4 on {}", path.display()))?;
@@ -718,8 +725,14 @@ mod tests {
     #[test]
     fn unknown_size_is_rejected_with_valid_options() {
         let error = "7GB".parse::<VolumeSize>().unwrap_err().to_string();
-        assert!(error.contains("500MB"), "error should list valid sizes: {error}");
-        assert!(error.contains("10GB"), "error should list valid sizes: {error}");
+        assert!(
+            error.contains("500MB"),
+            "error should list valid sizes: {error}"
+        );
+        assert!(
+            error.contains("10GB"),
+            "error should list valid sizes: {error}"
+        );
     }
 
     #[test]
@@ -773,21 +786,44 @@ mod tests {
     #[test]
     fn usage_percent_matches_df_definition() {
         // 100 used, 300 available, 500 total (100 reserved, neither used nor avail).
-        let u = Usage { used: 100, available: 300, total: 500 };
+        let u = Usage {
+            used: 100,
+            available: 300,
+            total: 500,
+        };
         // df: 100 / (100 + 300) = 25%, NOT 100/500 = 20%.
-        assert!((u.percent() - 25.0).abs() < 1e-9, "percent should be 25.0, got {}", u.percent());
+        assert!(
+            (u.percent() - 25.0).abs() < 1e-9,
+            "percent should be 25.0, got {}",
+            u.percent()
+        );
     }
 
     #[test]
     fn usage_percent_is_zero_on_empty_filesystem() {
-        let u = Usage { used: 0, available: 0, total: 0 };
-        assert_eq!(u.percent(), 0.0, "an empty/degenerate fs must not divide by zero");
+        let u = Usage {
+            used: 0,
+            available: 0,
+            total: 0,
+        };
+        assert_eq!(
+            u.percent(),
+            0.0,
+            "an empty/degenerate fs must not divide by zero"
+        );
     }
 
     #[test]
     fn usage_percent_full_is_100() {
-        let u = Usage { used: 400, available: 0, total: 500 };
-        assert!((u.percent() - 100.0).abs() < 1e-9, "no space available reads as 100%");
+        let u = Usage {
+            used: 400,
+            available: 0,
+            total: 500,
+        };
+        assert!(
+            (u.percent() - 100.0).abs() < 1e-9,
+            "no space available reads as 100%"
+        );
     }
 
     #[test]
@@ -798,16 +834,25 @@ mod tests {
                      rw,relatime shared:277 master:2 - ext4 /dev/loop7 rw\n";
 
         assert!(
-            mountinfo_has_target(table, Path::new("/home/john doe/.local/share/nemr/mounts/p")),
+            mountinfo_has_target(
+                table,
+                Path::new("/home/john doe/.local/share/nemr/mounts/p")
+            ),
             "a mount point with a space must be recognised despite the \\040 escape"
         );
         assert!(
-            !mountinfo_has_target(table, Path::new("/home/john doe/.local/share/nemr/mounts/other")),
+            !mountinfo_has_target(
+                table,
+                Path::new("/home/john doe/.local/share/nemr/mounts/other")
+            ),
             "a different path must not match"
         );
         // The naive (broken) comparison would have matched the escaped form:
         assert!(
-            !mountinfo_has_target(table, Path::new("/home/john\\040doe/.local/share/nemr/mounts/p")),
+            !mountinfo_has_target(
+                table,
+                Path::new("/home/john\\040doe/.local/share/nemr/mounts/p")
+            ),
             "the escaped literal must NOT match — that was the bug"
         );
     }

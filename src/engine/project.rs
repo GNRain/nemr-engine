@@ -172,7 +172,12 @@ pub async fn create(
         mounts,
         working_dir: Some(config::CONTAINER_WORKDIR.to_string()),
         extra_env: vec![],
-        args: Some(config::SUPERVISOR_ARGS.iter().map(|s| s.to_string()).collect()),
+        args: Some(
+            config::SUPERVISOR_ARGS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
         // Bare project name: the scope is `nemr-<name>.scope`, and passing the
         // container id (already `nemr-` prefixed) would double it.
         cgroup_name: Some(name.to_string()),
@@ -248,7 +253,10 @@ mod tests {
         let labels = project_labels("demo", "/mnt/demo", VolumeSize::Medium);
 
         assert_eq!(labels.get(LABEL_PROJECT).map(String::as_str), Some("demo"));
-        assert_eq!(labels.get(LABEL_VOLUME).map(String::as_str), Some("/mnt/demo"));
+        assert_eq!(
+            labels.get(LABEL_VOLUME).map(String::as_str),
+            Some("/mnt/demo")
+        );
         assert_eq!(labels.get(LABEL_SIZE).map(String::as_str), Some("2GB"));
 
         for key in labels.keys() {
@@ -322,9 +330,7 @@ pub async fn stop(client: &ContainerdClient, name: &str) -> Result<StopOutcome> 
 
     // AC-5.3: stopping an already-stopped project must fail clearly rather
     // than report success for work it did not do.
-    if client.task_state(&container_id).await?
-        == crate::containerd::containers::TaskState::None
-    {
+    if client.task_state(&container_id).await? == crate::containerd::containers::TaskState::None {
         bail!(
             "project {name:?} is not running.\n\
              Start it with: nemr start {name}"
@@ -537,7 +543,9 @@ pub async fn exec_capture(
         "noNewPrivileges": true
     });
 
-    client.exec_process(&container_id, &exec_id, process, &io).await?;
+    client
+        .exec_process(&container_id, &exec_id, process, &io)
+        .await?;
 
     let stdin_fifo = tty::open_fifo(&io.stdin)?;
     let stdout_fifo = tty::open_fifo(&io.stdout)?;
@@ -555,8 +563,9 @@ pub async fn exec_capture(
     let stop = Arc::new(AtomicBool::new(false));
     let out_writer = SharedWriter(collected.clone());
     let out_stop = stop.clone();
-    let out_thread =
-        std::thread::spawn(move || tty::pump_until_stopped(stdout_fifo, out_writer, out_stop, None));
+    let out_thread = std::thread::spawn(move || {
+        tty::pump_until_stopped(stdout_fifo, out_writer, out_stop, None)
+    });
     let err_thread = stderr_fifo.map(|fifo| {
         let stop = stop.clone();
         std::thread::spawn(move || tty::pump_until_stopped(fifo, std::io::sink(), stop, None))
@@ -702,7 +711,9 @@ pub async fn attach(client: &ContainerdClient, name: &str) -> Result<u32> {
     client.start_exec(&container_id, &exec_id).await?;
 
     if let Some((width, height)) = tty::window_size() {
-        let _ = client.resize_pty(&container_id, &exec_id, width, height).await;
+        let _ = client
+            .resize_pty(&container_id, &exec_id, width, height)
+            .await;
     }
 
     // Blocking IO off the async runtime. The gRPC side stays async; mixing is
@@ -948,7 +959,9 @@ pub async fn reconcile_orphans(client: &ContainerdClient) -> Result<ReconcileRep
                 match helper.unmount_and_detach(&name) {
                     Ok(()) => report.released.push(name),
                     Err(error) => {
-                        eprintln!("[nemr:reconcile] could not release orphan mount {name:?}: {error:#}")
+                        eprintln!(
+                            "[nemr:reconcile] could not release orphan mount {name:?}: {error:#}"
+                        )
                     }
                 }
             }
@@ -977,7 +990,9 @@ pub async fn reconcile_orphans(client: &ContainerdClient) -> Result<ReconcileRep
             match client.remove_snapshot(&key).await {
                 Ok(()) => report.snapshots_removed.push(key),
                 Err(error) => {
-                    eprintln!("[nemr:reconcile] could not remove orphan snapshot {key:?}: {error:#}")
+                    eprintln!(
+                        "[nemr:reconcile] could not remove orphan snapshot {key:?}: {error:#}"
+                    )
                 }
             }
         }

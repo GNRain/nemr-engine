@@ -165,10 +165,9 @@ impl ObjectStore for LocalStore {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    return Err(StorageError::Other(anyhow::Error::from(e).context(format!(
-                        "listing {}",
-                        directory.display()
-                    ))))
+                    return Err(StorageError::Other(
+                        anyhow::Error::from(e).context(format!("listing {}", directory.display())),
+                    ))
                 }
             };
             while let Ok(Some(entry)) = entries.next_entry().await {
@@ -254,7 +253,10 @@ mod tests {
     async fn missing_objects_report_not_found_rather_than_a_transient() {
         let (store, _dir) = store();
         let error = store.get(&key("absent")).await.unwrap_err();
-        assert!(matches!(error, StorageError::NotFound { .. }), "got {error:?}");
+        assert!(
+            matches!(error, StorageError::NotFound { .. }),
+            "got {error:?}"
+        );
         assert!(
             !error.is_retryable(),
             "a missing object must not be retried — it burns egress on a certainty"
@@ -301,7 +303,13 @@ mod tests {
         // Simulate a crashed upload leaving its temporary behind.
         std::fs::write(dir.path().join("stale.partial"), b"half").unwrap();
 
-        let listed: Vec<String> = store.list("").await.unwrap().iter().map(|k| k.to_string()).collect();
+        let listed: Vec<String> = store
+            .list("")
+            .await
+            .unwrap()
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
         assert_eq!(
             listed,
             vec!["real.bin"],

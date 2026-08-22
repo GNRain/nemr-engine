@@ -71,7 +71,8 @@ impl ObjectKey {
         }) {
             return Err(StorageError::InvalidKey {
                 key,
-                reason: "segments must be non-empty and must not be '.', '..' or contain '\\'".into(),
+                reason: "segments must be non-empty and must not be '.', '..' or contain '\\'"
+                    .into(),
             });
         }
         if key.contains('\0') {

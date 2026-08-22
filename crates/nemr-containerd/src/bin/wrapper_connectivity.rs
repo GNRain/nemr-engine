@@ -28,7 +28,10 @@ async fn main() -> Result<()> {
     let containers = client.list_containers().await?;
     println!("containers: {}", containers.len());
     for container in &containers {
-        println!("{}\t{}\t{}", container.id, container.image, container.runtime);
+        println!(
+            "{}\t{}\t{}",
+            container.id, container.image, container.runtime
+        );
     }
 
     Ok(())

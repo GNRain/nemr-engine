@@ -164,8 +164,8 @@ pub fn attach(backing_fd: &OwnedFd) -> Result<u32, String> {
 pub fn find_by_backing(backing_fd: &impl AsRawFd) -> Result<Option<u32>, String> {
     let st = crate::safe::fstat(backing_fd)?;
 
-    let entries = std::fs::read_dir("/sys/block")
-        .map_err(|e| format!("cannot read /sys/block: {e}"))?;
+    let entries =
+        std::fs::read_dir("/sys/block").map_err(|e| format!("cannot read /sys/block: {e}"))?;
 
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -188,8 +188,7 @@ pub fn find_by_backing(backing_fd: &impl AsRawFd) -> Result<Option<u32>, String>
 
         let mut info = LoopInfo64::default();
         // SAFETY: device is valid; info is a valid, correctly-sized target.
-        let rc =
-            unsafe { libc::ioctl(device.as_raw_fd(), LOOP_GET_STATUS64, &mut info as *mut _) };
+        let rc = unsafe { libc::ioctl(device.as_raw_fd(), LOOP_GET_STATUS64, &mut info as *mut _) };
         if rc != 0 {
             // ENXIO for an unbound device, etc. — not the one we want.
             continue;
@@ -298,13 +297,29 @@ mod tests {
 
         // The identity pair `find_by_backing` compares must sit where the kernel
         // writes them, or a device would be matched to the wrong backing file.
-        assert_eq!(offset_of!(LoopInfo64, lo_device), 0, "lo_device must be field 0");
-        assert_eq!(offset_of!(LoopInfo64, lo_inode), 8, "lo_inode must be field 1");
+        assert_eq!(
+            offset_of!(LoopInfo64, lo_device),
+            0,
+            "lo_device must be field 0"
+        );
+        assert_eq!(
+            offset_of!(LoopInfo64, lo_inode),
+            8,
+            "lo_inode must be field 1"
+        );
 
         // The backing descriptor must be the very first field of loop_config, or
         // LOOP_CONFIGURE binds the wrong fd.
-        assert_eq!(offset_of!(LoopConfig, fd), 0, "loop_config.fd must be field 0");
-        assert_eq!(offset_of!(LoopConfig, info), 8, "loop_config.info follows fd+block_size");
+        assert_eq!(
+            offset_of!(LoopConfig, fd),
+            0,
+            "loop_config.fd must be field 0"
+        );
+        assert_eq!(
+            offset_of!(LoopConfig, info),
+            8,
+            "loop_config.info follows fd+block_size"
+        );
     }
 
     #[test]
@@ -318,8 +333,14 @@ mod tests {
         // Previously this asserted `(5,7) < (5,8)` — true regardless of any code
         // in this crate, so the whole kernel floor could be deleted and the test
         // stayed green (F-56 class).
-        assert!(!kernel_supports_loop_configure((5, 7)), "5.7 lacks LOOP_CONFIGURE");
+        assert!(
+            !kernel_supports_loop_configure((5, 7)),
+            "5.7 lacks LOOP_CONFIGURE"
+        );
         assert!(kernel_supports_loop_configure((5, 8)), "5.8 is the floor");
-        assert!(kernel_supports_loop_configure((6, 8)), "current kernels qualify");
+        assert!(
+            kernel_supports_loop_configure((6, 8)),
+            "current kernels qualify"
+        );
     }
 }
