@@ -1467,3 +1467,81 @@ fn d08_the_unresolved_base_image_error_is_honest_about_not_fetching() {
         );
     });
 }
+
+/// PROC-06 — the SIGKILL escalation path must actually work.
+///
+/// # The gap this closes (F-69)
+///
+/// `proc_06_stop_terminates_gracefully_without_escalating_to_sigkill` asserts
+/// that stopping a well-behaved container does **not** escalate. Nothing
+/// asserted that escalation happens when it should, so
+/// `StopOutcome::Killed` was never produced anywhere in the tree — not by a
+/// test, not by any other code path. If the timeout branch in `stop_task` were
+/// dead, every existing test would still pass: a container ignoring SIGTERM
+/// would hang forever and no guard would notice.
+///
+/// The message a user sees in that case (`nemr.rs`, "had to be killed") had
+/// likewise never been produced. Same shape as F-65 and F-67 — machinery for a
+/// failure, never run on one.
+///
+/// Runs a PID 1 that explicitly traps and ignores SIGTERM, so escalation is the
+/// only way the task can end.
+#[test]
+fn proc_06_a_container_ignoring_sigterm_is_escalated_to_sigkill() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let name = common::unique_name("proc06kill");
+        common::purge(&name);
+
+        // A supervisor that refuses to die on SIGTERM. `trap '' TERM` sets the
+        // disposition to ignore, which survives into the shell's wait loop.
+        let spec = nemr_engine::containerd::containers::ContainerSpec {
+            id: format!("nemr-{name}"),
+            image: nemr_engine::config::BASE_IMAGE.to_string(),
+            mounts: vec![],
+            working_dir: None,
+            extra_env: vec![],
+            args: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "trap '' TERM; while :; do sleep 1; done".to_string(),
+            ]),
+            cgroup_name: Some(name.clone()),
+            cgroup_prefix: nemr_engine::config::CGROUP_PREFIX.to_string(),
+            labels: Default::default(),
+        };
+        let id = spec.id.clone();
+
+        client.create_container(&spec).await.expect("create");
+        client.start_task(&id).await.expect("start the task");
+
+        let started = Instant::now();
+        let outcome = client.stop_task(&id).await.expect("stop must not error");
+        let elapsed = started.elapsed();
+
+        let _ = client.delete_container(&id).await;
+        let _ = client.remove_snapshot(&id).await;
+        common::purge(&name);
+
+        assert_eq!(
+            outcome,
+            StopOutcome::Killed,
+            "a PID 1 that ignores SIGTERM must be escalated to SIGKILL and reported as \
+             Killed, not silently reported as a graceful stop"
+        );
+        // It must have actually waited for the grace period rather than
+        // escalating immediately — killing straight away would defeat the point
+        // of a graceful stop for every well-behaved container.
+        assert!(
+            elapsed >= GRACE_PERIOD,
+            "escalated after only {elapsed:?}; the {GRACE_PERIOD:?} grace period was not \
+             honoured, so well-behaved containers are being killed without a chance to flush"
+        );
+    });
+}
