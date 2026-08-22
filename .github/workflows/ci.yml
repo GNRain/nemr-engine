@@ -87,10 +87,16 @@ jobs:
         run: |
           set -o pipefail
           total=$(cargo test --test regression -- --list 2>/dev/null | grep -c ': test$')
-          output=$(NEMR_TEST_UNIT_ONLY=1 cargo test --test regression -- --nocapture 2>&1)
-          status=$?
+          # F-65: `output=$(failing-cmd)` under `bash -e` (GitHub's default
+          # shell) aborts the step at the assignment, so `status=$?` and every
+          # diagnostic below it were unreachable — a failure printed nothing but
+          # cargo's exit code. An assignment inside an `if` condition is exempt
+          # from -e, so the output survives to be shown.
+          if ! output=$(NEMR_TEST_UNIT_ONLY=1 cargo test --test regression -- --nocapture 2>&1); then
+            printf '%s\n' "$output" | tail -40
+            exit 1
+          fi
           printf '%s\n' "$output" | tail -20
-          [ $status -eq 0 ] || exit 1
           skipped=$(printf '%s\n' "$output" | grep -c 'skipping a host-backed regression test' || true)
           ran=$(( total - skipped ))
           echo "::notice::host-free coverage: $ran of $total regression tests actually executed; $skipped skipped (host required)"
@@ -137,7 +143,12 @@ jobs:
       - name: Install the privileged helper
         run: sudo ./scripts/setup_test_host.sh
       - name: Install the engine
-        run: cargo install --path . --bin nemr --root "$HOME/.local" --force
+        # NOT `cargo install --path .` (F-62): it rebuilds in its own target
+        # directory and emits a binary that cannot equal target/release/nemr, so
+        # the installed-matches-source gate could never pass here. This builds
+        # once and copies the artifact, which is what makes "verified against the
+        # installed artifacts" a checkable claim rather than a hope.
+        run: ./scripts/install_engine.sh
       - name: Regression suite (serial; hash-gated against the installed helper)
         # Count assertion: every test that exists must run, and none may skip.
         # `cargo test` exits 0 having run ZERO tests, so exit status alone is not
@@ -146,10 +157,14 @@ jobs:
           set -o pipefail
           export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
           total=$(cargo test --test regression -- --list 2>/dev/null | grep -c ': test$')
-          output=$(cargo test --test regression -- --test-threads=1 --nocapture 2>&1)
-          status=$?
+          # F-65: see the unit job — the assignment must sit inside an `if`
+          # condition or `bash -e` kills the step before the diagnostic runs.
+          if ! output=$(cargo test --test regression -- --test-threads=1 --nocapture 2>&1); then
+            printf '%s\n' "$output" | grep -E '^test result:' || true
+            printf '%s\n' "$output" | tail -40
+            exit 1
+          fi
           printf '%s\n' "$output" | grep -E '^test result:' || true
-          [ $status -eq 0 ] || { printf '%s\n' "$output" | tail -40; exit 1; }
           passed=$(printf '%s\n' "$output" | sed -n 's/.*test result: ok\. \([0-9]*\) passed.*/\1/p' | head -1)
           skipped=$(printf '%s\n' "$output" | grep -c 'skipping a host-backed regression test' || true)
           if [ "${passed:-0}" -ne "${total:-0}" ] || [ "${skipped:-0}" -ne 0 ]; then

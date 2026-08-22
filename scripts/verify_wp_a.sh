@@ -48,15 +48,18 @@ echo "==> Regression suite (host-backed, serial)"
 # the harness rather than the code, so this gate asserts on counts: every test
 # that exists must run, and none may skip.
 regression_total=$(cargo test --test regression -- --list 2>/dev/null | grep -c ': test$')
-regression_output=$(cargo test --test regression -- --test-threads=1 --nocapture 2>&1)
-regression_status=$?
-printf '%s\n' "$regression_output" | grep -E '^test result:' || true
-
-if [[ $regression_status -ne 0 ]]; then
+# F-65: under `set -euo pipefail`, `x=$(failing-cmd)` aborts the script at the
+# assignment — so `regression_status=$?` never ran and the tail -40 below it was
+# unreachable. This verification script would die printing nothing on exactly
+# the failure it exists to report. An assignment in an `if` condition is exempt
+# from -e, so the output survives.
+if ! regression_output=$(cargo test --test regression -- --test-threads=1 --nocapture 2>&1); then
+    printf '%s\n' "$regression_output" | grep -E '^test result:' || true
     printf '%s\n' "$regression_output" | tail -40
     echo "    regression suite FAILED" >&2
     exit 1
 fi
+printf '%s\n' "$regression_output" | grep -E '^test result:' || true
 
 regression_passed=$(printf '%s\n' "$regression_output" \
     | sed -n 's/.*test result: ok\. \([0-9]*\) passed.*/\1/p' | head -1)
