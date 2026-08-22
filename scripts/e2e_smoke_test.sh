@@ -220,8 +220,41 @@ if [[ "${NEMR_SKIP_API:-0}" == "1" ]]; then
 else
     # The real proof: credentials plus network egress together. A rendered TUI
     # would demonstrate neither.
-    reply=$(echo 'claude -p "Reply with exactly: NEMR_E2E_OK"' | in_container | tr -d '\r' | grep -c NEMR_E2E_OK || true)
-    assert "Claude Code API round-trip succeeded" bash -c "[[ '$reply' -ge 1 ]]"
+    #
+    # F-73: this used to pipe straight into `grep -c ... || true` and assert on
+    # the count. Every distinct cause — no credential, expired credential, no
+    # network egress, Claude Code missing — produced the same single line,
+    # "FAIL Claude Code API round-trip succeeded", and the actual message was
+    # thrown away. Running the command by hand said
+    # "Failed to authenticate: OAuth session expired and could not be refreshed"
+    # immediately. Third instance of this class after F-65 and F-67, so the
+    # output is kept and shown.
+    reply=$(echo 'claude -p "Reply with exactly: NEMR_E2E_OK"' | in_container 2>&1 | tr -d '\r' || true)
+    if grep -q NEMR_E2E_OK <<<"$reply"; then
+        ok "Claude Code API round-trip succeeded"
+    else
+        fail "Claude Code API round-trip"
+        printf '       what Claude Code actually said:\n'
+        printf '%s\n' "$reply" | head -20 | sed 's/^/         /'
+        # Name the likely cause where the output makes it unambiguous. Where it
+        # does not, say so rather than guess — an error that invents a cause is
+        # worse than one that hands over the text.
+        case "$reply" in
+            *"OAuth session expired"*|*"could not be refreshed"*)
+                printf '       likely: the host credential has expired. Re-authenticate with `claude`,\n'
+                printf '               then note F-12: a running container keeps the OLD credential\n'
+                printf '               because the bind mount pins an inode. Recreate the project.\n' ;;
+            *"Invalid API key"*|*"authentication_error"*)
+                printf '       likely: the credential is present but not valid.\n' ;;
+            *"getaddrinfo"*|*"ENOTFOUND"*|*"ECONNREFUSED"*|*"network"*)
+                printf '       likely: no network egress from inside the container.\n' ;;
+            "")
+                printf '       Claude Code produced no output at all.\n' ;;
+            *)
+                printf '       cause not recognised from the output above — read it rather than\n'
+                printf '               assuming; this check does not know what happened.\n' ;;
+        esac
+    fi
 fi
 
 # ---------------------------------------------------------------------------
