@@ -49,6 +49,87 @@ impl HostRequirements {
     };
 }
 
+/// Reclaim volumes left by a previous run that was killed (F-77).
+///
+/// `TestProject`'s `Drop` cleans up however a test ends — **except** when the
+/// process is killed outright, and an interrupted arm of a reproduction
+/// experiment is exactly that. Each survivor is a fully-allocated 500 MB image
+/// plus an attached loop device, and once the image is unlinked the kernel
+/// keeps the inode alive, so the space cannot be reclaimed by deleting files.
+/// About 140 accumulated on the reference host and filled the disk — which then
+/// took out the ability to diagnose the disk filling.
+///
+/// So the suite bounds its own residue to one run's worth: before any
+/// host-backed test, release what an earlier run left.
+///
+/// **Precision matters more than thoroughness here.** Test projects are named
+/// `<prefix>-<pid>-<n>`. This only touches names of that shape whose pid is no
+/// longer running — so a developer's real project (`htmltest`, `myproject`)
+/// cannot match, and neither can a live parallel run's volumes.
+fn sweep_dead_test_volumes() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let Ok(paths) = VolumePaths::from_env() else {
+            return;
+        };
+        let mut names = std::collections::BTreeSet::new();
+        for dir in [paths.image_dir(), paths.mount_dir()] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let raw = entry.file_name().to_string_lossy().into_owned();
+                names.insert(raw.strip_suffix(".img").unwrap_or(&raw).to_string());
+            }
+        }
+
+        let helper = HelperOps::new();
+        let mut reclaimed = 0;
+        for name in names {
+            let Some(pid) = dead_test_project_pid(&name) else {
+                continue;
+            };
+            let _ = pid;
+            match helper.unmount_and_detach(&name) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(paths.image_file(&name));
+                    let _ = std::fs::remove_dir(paths.mount_point(&name));
+                    reclaimed += 1;
+                }
+                Err(error) => eprintln!("[nemr:test-sweep] could not release {name:?}: {error:#}"),
+            }
+        }
+        if reclaimed > 0 {
+            eprintln!(
+                "[nemr:test-sweep] reclaimed {reclaimed} volume(s) left by a killed run. \
+                 TestProject::drop does not run under SIGKILL, so this bounds residue to \
+                 one run's worth instead of letting it accumulate until the disk fills."
+            );
+        }
+    });
+}
+
+/// The pid embedded in a `<prefix>-<pid>-<n>` test project name, if that pid is
+/// no longer running.
+///
+/// Returns `None` for any name that is not of that shape — which is what keeps
+/// a real project out of the sweep — and for a pid that is still alive, which
+/// keeps a concurrently running suite's volumes out of it.
+pub fn dead_test_project_pid(name: &str) -> Option<u32> {
+    let mut parts = name.rsplitn(3, '-');
+    let _counter: u32 = parts.next()?.parse().ok()?;
+    let pid: u32 = parts.next()?.parse().ok()?;
+    let prefix = parts.next()?;
+    if prefix.is_empty() {
+        return None;
+    }
+    if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        return None;
+    }
+    Some(pid)
+}
+
 /// Refuse to run host-backed tests concurrently (F-71).
 ///
 /// This module's own documentation has always said `--test-threads=1` is
@@ -127,6 +208,7 @@ pub fn require_host(requirements: HostRequirements) -> bool {
     // because these tests share global host state, and a unit-only run touches
     // none of it. CI's unit job runs without the flag and is right to.
     require_serial_execution();
+    sweep_dead_test_volumes();
 
     let mut missing = Vec::new();
 

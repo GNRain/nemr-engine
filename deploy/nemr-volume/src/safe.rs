@@ -313,6 +313,54 @@ pub fn is_mounted_in_table(table: &str, mount_point: &Path) -> bool {
     found
 }
 
+/// The source device (major, minor) of `mount_point`, from a mountinfo table.
+///
+/// # Why this exists (F-77)
+///
+/// `unmount` located the loop device by the backing file's inode. When the
+/// backing file has been **deleted** — which is the normal state after a
+/// `delete`, and the state every interrupted test run leaves behind — there is
+/// no inode to look up, so the helper unmounted and reported
+/// "nothing to detach by inode" while leaving the loop device attached.
+///
+/// The code claimed "a detached-and-deleted device auto-clears once its mount
+/// is released". Measured on a real host: it does not. Seven loop devices were
+/// still attached to deleted images after their mounts were released, each
+/// pinning a fully-allocated 500 MB file that `rm` could not reclaim because
+/// the kernel still held the inode open. That is why deleting the `.img` files
+/// freed no space.
+///
+/// mountinfo field 3 is the source device as `major:minor`, and for a loop
+/// device major is 7 and minor is the device number — so the mount table itself
+/// says which loop to detach, with no dependence on the backing file existing.
+pub fn mount_source_device(table: &str, mount_point: &Path) -> Option<(u32, u32)> {
+    let wanted = mount_point.as_os_str().as_bytes();
+    for line in table.lines() {
+        let mut fields = line.split(' ');
+        let device = fields.nth(2)?;
+        let target = fields.nth(1)?;
+        if unescape_octal(target) != wanted {
+            continue;
+        }
+        let (major, minor) = device.split_once(':')?;
+        return Some((major.parse().ok()?, minor.parse().ok()?));
+    }
+    None
+}
+
+/// The loop device number backing `mount_point`, if it is a loop mount.
+///
+/// Major 7 is the loop block-device major; anything else is not a loop mount
+/// and must not be detached, so this returns `None` rather than guessing.
+pub fn loop_number_for_mount(mount_point: &Path) -> Option<u32> {
+    const LOOP_MAJOR: u32 = 7;
+    let table = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    match mount_source_device(&table, mount_point) {
+        Some((LOOP_MAJOR, minor)) => Some(minor),
+        _ => None,
+    }
+}
+
 /// Iterator over the (unescaped) mount-point targets in a mountinfo table.
 ///
 /// Field 5 (1-indexed) is the mount point. Optional fields follow it until a
@@ -507,6 +555,56 @@ mod tests {
         assert_eq!(
             unescape_octal(r"/home/John\040Doe/x"),
             b"/home/John Doe/x".to_vec()
+        );
+    }
+
+    /// F-77 — the mount table names the loop device, so a deleted backing file
+    /// does not strand it.
+    ///
+    /// Real mountinfo lines from a host that had leaked seven loop devices this
+    /// way. Field 3 is `major:minor`; major 7 is the loop major.
+    #[test]
+    fn the_loop_device_is_recovered_from_the_mount_table() {
+        let table = "\
+1259 29 7:20 / /home/nemr/.local/share/nemr/mounts/enospc-207576-19 rw,relatime shared:1 - ext4 /dev/loop20 rw
+1260 29 7:23 / /home/nemr/.local/share/nemr/mounts/htmltest rw,relatime - ext4 /dev/loop23 rw
+";
+        assert_eq!(
+            mount_source_device(
+                table,
+                Path::new("/home/nemr/.local/share/nemr/mounts/enospc-207576-19")
+            ),
+            Some((7, 20))
+        );
+        assert_eq!(
+            mount_source_device(
+                table,
+                Path::new("/home/nemr/.local/share/nemr/mounts/htmltest")
+            ),
+            Some((7, 23))
+        );
+        // CONTROL: a path that is not in the table must not resolve to a device.
+        // Detaching a loop device on a mistaken match would destroy an unrelated
+        // filesystem, so a miss has to be a miss.
+        assert_eq!(
+            mount_source_device(
+                table,
+                Path::new("/home/nemr/.local/share/nemr/mounts/absent")
+            ),
+            None
+        );
+    }
+
+    /// A mount point containing a space must still resolve.
+    ///
+    /// Same escaping trap as `is_mounted`: the kernel writes `\040` for a space,
+    /// so a raw comparison silently fails to find the device and the loop leaks.
+    #[test]
+    fn the_loop_lookup_unescapes_the_mount_point() {
+        let table = "49 29 7:19 / /home/john\\040doe/mnt rw shared:277 - ext4 /dev/loop19 rw\n";
+        assert_eq!(
+            mount_source_device(table, Path::new("/home/john doe/mnt")),
+            Some((7, 19))
         );
     }
 

@@ -160,6 +160,24 @@ async fn main() -> Result<()> {
                     p.name, status, used, p.quota, p.volume_path
                 );
             }
+
+            // F-77: a listing that shows only container-backed projects is true
+            // and misleading when orphaned images are filling the disk.
+            let untracked = project::untracked_volumes(&client).await?;
+            if !untracked.is_empty() {
+                println!();
+                println!(
+                    "{} volume image(s) belong to no project and are using disk:",
+                    untracked.len()
+                );
+                for name in untracked.iter().take(10) {
+                    println!("  {name}");
+                }
+                if untracked.len() > 10 {
+                    println!("  ... and {} more", untracked.len() - 10);
+                }
+                println!("Reclaim them with: nemr reconcile");
+            }
         }
 
         Command::Delete { name, yes } => {
@@ -218,6 +236,14 @@ async fn main() -> Result<()> {
             } else {
                 for name in &report.released {
                     println!("released orphan volume {name:?} (mount + loop device)");
+                }
+                for name in &report.not_released {
+                    println!(
+                        "FAILED to fully release {name:?}: the helper reported success but the \
+                         host still shows it mounted or loop-attached. An attached loop device \
+                         holds its image open, so that disk space is NOT reclaimed.\n  \
+                         Check: losetup -a | grep {name}"
+                    );
                 }
                 for key in &report.snapshots_removed {
                     println!("removed orphan snapshot {key:?}");

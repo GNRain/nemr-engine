@@ -433,11 +433,30 @@ fn m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted() {
             code, 0,
             "the history file must be readable again after remount"
         );
-        assert_eq!(
-            out.trim(),
-            token,
-            "the session state must come back from the volume, byte-identical"
-        );
+        // F-77: the observable is `out`, which is the *exec capture*, not the
+        // file. An empty capture and an empty file are different defects —
+        // losing a conversation versus losing a read of it — and the assertion
+        // alone cannot tell them apart. Read the volume directly at the moment
+        // of failure so the next occurrence is a diagnosis rather than a guess.
+        if out.trim() != token {
+            let on_volume = std::fs::read_to_string(&host_path);
+            let size = std::fs::metadata(&host_path).map(|m| m.len());
+            panic!(
+                "the session state did not come back byte-identical.\n     \
+                 exec capture: {out:?}\n     \
+                 token:        {token:?}\n     \
+                 --- read directly from the volume, bypassing the container ---\n     \
+                 host path:    {}\n     \
+                 file size:    {size:?}\n     \
+                 file content: {on_volume:?}\n     \
+                 {}\n     \
+                 If the file holds the token, the DATA is fine and the exec\n     \
+                 capture lost it. If the file is empty, the volume lost the\n     \
+                 write. Those are different bugs with different fixes.",
+                host_path.display(),
+                common::volume_state_report(&project.name)
+            );
+        }
 
         project::stop(&client, &project.name).await.ok();
     });
@@ -1577,4 +1596,45 @@ fn proc_06_a_container_ignoring_sigterm_is_escalated_to_sigkill() {
              honoured, so well-behaved containers are being killed without a chance to flush"
         );
     });
+}
+
+/// F-77 — the sweep must reclaim a killed run's volumes and nothing else.
+///
+/// The name filter is the whole safety argument: a real project like
+/// `htmltest` must never match, and a concurrently running suite's volumes must
+/// not either. Asserted directly against the classifier rather than by running
+/// the sweep, so the test cannot destroy anything while proving it is safe.
+#[test]
+fn f77_the_test_sweep_only_claims_dead_test_projects() {
+    let live = std::process::id();
+
+    // Reclaimable: test-shaped, and the pid is gone. PID 1 always exists, so
+    // use an implausible one and assert it really is absent first.
+    let dead_pid = 4_000_000u32;
+    assert!(
+        !std::path::Path::new(&format!("/proc/{dead_pid}")).exists(),
+        "control: pid {dead_pid} must not exist, or this test proves nothing"
+    );
+    assert_eq!(
+        common::dead_test_project_pid(&format!("m8-{dead_pid}-3")),
+        Some(dead_pid),
+        "a test project from a dead pid is reclaimable"
+    );
+
+    // NOT reclaimable: a live pid — a parallel run's volumes are in use.
+    assert_eq!(
+        common::dead_test_project_pid(&format!("m8-{live}-0")),
+        None,
+        "a live pid's volumes must never be swept"
+    );
+
+    // NOT reclaimable: real project names. This is the assertion that stops the
+    // sweep eating a developer's work.
+    for real in ["htmltest", "myproject", "demo", "my-project", "a-b-c"] {
+        assert_eq!(
+            common::dead_test_project_pid(real),
+            None,
+            "{real:?} is not a test project and must never be swept"
+        );
+    }
 }

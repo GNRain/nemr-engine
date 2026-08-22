@@ -337,6 +337,28 @@ impl Usage {
 /// already-mounted volume and stack a second loop device and ext4 mount over
 /// the same backing bytes — the exact silent-corruption shape VOL-06 exists to
 /// prevent. Same defect, same fix, as the privileged helper's parser.
+/// The loop device still attached to `image_path`, if any — including when the
+/// file has been deleted (F-77).
+///
+/// Readable without privilege, so a *report* about whether a release actually
+/// happened does not depend on the thing that does the releasing.
+pub fn attached_loop_device(image_path: &Path) -> Option<u32> {
+    let expected = image_path.to_string_lossy();
+    let deleted = format!("{expected} (deleted)");
+    for entry in std::fs::read_dir("/sys/block").ok()?.flatten() {
+        let Ok(backing) = std::fs::read_to_string(entry.path().join("loop/backing_file")) else {
+            continue;
+        };
+        let backing = backing.trim_end();
+        if backing == expected || backing == deleted {
+            let name = entry.file_name();
+            let digits = name.to_str()?.strip_prefix("loop")?;
+            return digits.parse().ok();
+        }
+    }
+    None
+}
+
 pub fn is_mounted(mount_point: &Path) -> bool {
     let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return false;
