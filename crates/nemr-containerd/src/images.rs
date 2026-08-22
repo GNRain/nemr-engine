@@ -4,7 +4,10 @@
 //! arrives in Milestone 2 and extends this module rather than duplicating it.
 
 use anyhow::{bail, Context, Result};
-use containerd_client::services::v1::{GetImageRequest, ListImagesRequest, ReadContentRequest};
+use containerd_client::services::v1::{
+    CreateImageRequest, DeleteImageRequest, GetImageRequest, Image, ListImagesRequest,
+    ReadContentRequest,
+};
 use containerd_client::tonic::Request;
 use containerd_client::with_namespace;
 use sha2::{Digest, Sha256};
@@ -70,6 +73,84 @@ impl ContainerdClient {
 }
 
 impl ContainerdClient {
+    /// Record an additional reference for an image that is already present.
+    ///
+    /// Only the name changes: the target descriptor is reused, so no blobs move
+    /// and both references resolve to the same digest. Exists so the D-08
+    /// by-digest resolution can be tested against real containerd — proving that
+    /// an image filed under a different name is still found requires a second
+    /// name to file it under.
+    pub async fn tag_image(&self, existing: &str, new_name: &str) -> Result<()> {
+        let request = GetImageRequest {
+            name: existing.to_string(),
+        };
+        let image = self
+            .raw()
+            .images()
+            .get(with_namespace!(request, self.namespace()))
+            .await
+            .with_context(|| format!("image {existing:?} not found"))?
+            .into_inner()
+            .image
+            .with_context(|| format!("image {existing:?} has no record"))?;
+
+        let request = CreateImageRequest {
+            image: Some(Image {
+                name: new_name.to_string(),
+                target: image.target,
+                labels: image.labels,
+                ..Default::default()
+            }),
+            source_date_epoch: None,
+        };
+        self.raw()
+            .images()
+            .create(with_namespace!(request, self.namespace()))
+            .await
+            .with_context(|| format!("failed to record image reference {new_name:?}"))?;
+        Ok(())
+    }
+
+    /// Remove an image *reference*. Blobs referenced elsewhere are untouched.
+    pub async fn untag_image(&self, name: &str) -> Result<()> {
+        let request = DeleteImageRequest {
+            name: name.to_string(),
+            sync: true,
+            target: None,
+        };
+        self.raw()
+            .images()
+            .delete(with_namespace!(request, self.namespace()))
+            .await
+            .with_context(|| format!("failed to remove image reference {name:?}"))?;
+        Ok(())
+    }
+
+    /// Find a locally-stored image whose target digest is `digest`.
+    ///
+    /// D-08 part 2: the digest is what identifies a base image, not the name it
+    /// happens to be filed under. An image pulled by digest, imported under a
+    /// different tag, or carried in a bundle is the *same image* if the digest
+    /// matches — so resolution must ask "are these bytes here?", not "is
+    /// something called `X` here?".
+    ///
+    /// Looking up by name only, as the import path did, meant a host holding
+    /// exactly the right image under any other reference would be told to go to
+    /// the registry. That is a needless network dependency on a machine that
+    /// already has the bytes, and D-08's whole point is that the product must
+    /// not need the registry when it does not have to.
+    ///
+    /// Returns every match, because more than one reference can point at the
+    /// same digest and reporting only the first would hide that.
+    pub async fn images_with_digest(&self, digest: &str) -> Result<Vec<ImageSummary>> {
+        Ok(self
+            .list_images()
+            .await?
+            .into_iter()
+            .filter(|image| image.digest == digest)
+            .collect())
+    }
+
     /// Fetch an image record and return its target descriptor digest.
     ///
     /// Fails with a message naming the image if it is absent, since "image not

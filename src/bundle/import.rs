@@ -34,10 +34,32 @@ pub struct Bundle {
 }
 
 /// What the destination must satisfy for an import to be allowed.
+/// The outcome of looking for the base image a bundle needs.
+///
+/// D-08: the digest identifies the image, not the name it happens to be filed
+/// under. An image pulled by digest, imported under a different tag, or carried
+/// in a bundle is the *same image* if the digest matches, so resolution asks
+/// "are these bytes here?" rather than "is something called X here?".
+///
+/// Carrying the failed attempts rather than a bare `None` is deliberate: the
+/// user needs to know whether the registry was unreachable or answered and did
+/// not have it, because those have different fixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaseImageResolution {
+    /// Found, digest verified. `reference` is where it was found, which may
+    /// differ from the reference the bundle names.
+    Present { reference: String },
+    /// Not found. `where_looked` lists each attempt in order.
+    Unresolved {
+        where_looked: Vec<String>,
+        advice: String,
+    },
+}
+
 pub struct ImportChecks<'a> {
-    /// Digest of the base image present on this host, if any. `None` means the
-    /// image is absent entirely.
-    pub local_base_image_digest: Option<&'a str>,
+    /// How the bundle's base image was resolved, and if it was not, where the
+    /// caller looked. Built by [`resolve_base_image`].
+    pub base_image: BaseImageResolution,
     /// Usable capacity of the destination volume, in bytes.
     pub destination_capacity: u64,
     /// The destination's quota preset, for the error message.
@@ -155,17 +177,31 @@ impl Bundle {
     ///
     /// All checks happen before extraction, so a refusal leaves the destination
     /// untouched.
+    /// The digest of the base image this bundle was created from.
+    pub fn base_image_digest(&self) -> &str {
+        &self.manifest.base_image.digest
+    }
+
     pub fn check(&self, checks: &ImportChecks<'_>) -> Result<()> {
         // Base image: the digest is authoritative, the reference is a hint.
         // Substituting a different image would restore a session onto a rootfs
         // it was not created against — a silent wrong result rather than an
         // error, which is the failure class this project keeps hitting.
-        match checks.local_base_image_digest {
-            Some(local) if local == self.manifest.base_image.digest => {}
-            _ => {
-                return Err(Error::BaseImageMissing {
+        match checks.base_image {
+            BaseImageResolution::Present { .. } => {}
+            BaseImageResolution::Unresolved {
+                ref where_looked,
+                ref advice,
+            } => {
+                return Err(Error::BaseImageUnresolved {
                     reference: self.manifest.base_image.reference.clone(),
                     digest: self.manifest.base_image.digest.clone(),
+                    where_looked: where_looked
+                        .iter()
+                        .map(|line| format!("  - {line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    advice: advice.clone(),
                 })
             }
         }
@@ -413,7 +449,9 @@ mod tests {
 
     fn checks<'a>() -> ImportChecks<'a> {
         ImportChecks {
-            local_base_image_digest: Some(DIGEST),
+            base_image: BaseImageResolution::Present {
+                reference: "docker.io/nemr/base:0.1.0".into(),
+            },
             destination_capacity: 1 << 30,
             destination_quota: "2GB",
         }
@@ -551,10 +589,13 @@ mod tests {
         let (_, bundle_path) = make_bundle("base-image", &[("a.txt", "x")]);
         let bundle = open(&bundle_path).unwrap();
 
-        for local in [None, Some("sha256:a-different-image")] {
+        for label in ["absent", "digest mismatch"] {
             let error = bundle
                 .check(&ImportChecks {
-                    local_base_image_digest: local,
+                    base_image: BaseImageResolution::Unresolved {
+                        where_looked: vec![format!("local containerd: {label}")],
+                        advice: "Build and import the base image.".into(),
+                    },
                     ..checks()
                 })
                 .expect_err("a mismatched base image must refuse");
@@ -564,6 +605,48 @@ mod tests {
                 "the error names the image the bundle needs"
             );
         }
+    }
+
+    /// D-08: the refusal must say **where** resolution was tried.
+    ///
+    /// "not present on this host" was true and useless — it did not say whether
+    /// a registry had been consulted, so a user could not tell a missing image
+    /// from a broken network. The distinction is the whole requirement.
+    #[test]
+    fn an_unresolved_base_image_says_where_it_looked() {
+        let (_, bundle_path) = make_bundle("where-looked", &[("a.txt", "x")]);
+        let bundle = open(&bundle_path).unwrap();
+
+        let error = bundle
+            .check(&ImportChecks {
+                base_image: BaseImageResolution::Unresolved {
+                    where_looked: vec![
+                        "local containerd, by name docker.io/nemr/base:0.1.0: not present".into(),
+                        "local containerd, by digest across all images: no match".into(),
+                        "no registry was contacted: this build resolves locally only".into(),
+                    ],
+                    advice: "Build and import the base image.".into(),
+                },
+                ..checks()
+            })
+            .expect_err("an unresolved base image must refuse");
+
+        let text = error.to_string();
+        assert!(text.contains(DIGEST), "must name the digest: {text}");
+        for attempt in [
+            "by name",
+            "by digest across all images",
+            "no registry was contacted",
+        ] {
+            assert!(
+                text.contains(attempt),
+                "the error must report the {attempt:?} attempt: {text}"
+            );
+        }
+        assert!(
+            text.contains("Build and import"),
+            "must say what to do next: {text}"
+        );
     }
 
     #[test]
@@ -713,13 +796,13 @@ mod tests {
         let (_, bundle_path) = make_bundle("drift", &[("a.txt", "x")]);
         let bundle = open(&bundle_path).unwrap();
 
-        for (local, label) in [
-            (None, "absent"),
-            (Some("sha256:a-different-image"), "drifted"),
-        ] {
+        for label in ["absent", "drifted"] {
             let error = bundle
                 .check(&ImportChecks {
-                    local_base_image_digest: local,
+                    base_image: BaseImageResolution::Unresolved {
+                        where_looked: vec![format!("local containerd, by name: {label}")],
+                        advice: "Build and import the base image.".into(),
+                    },
                     ..checks()
                 })
                 .unwrap_err();

@@ -166,13 +166,27 @@ pub enum Error {
         advice: String,
     },
 
-    /// The base image the bundle references is not present locally, and the
+    /// The base image the bundle references could not be resolved, and the
     /// bundle deliberately does not carry it (D-06).
+    ///
+    /// D-08 requires this error to name the digest, say **where** resolution was
+    /// attempted, and distinguish *the registry could not be reached* from *the
+    /// registry answered and does not have it*. Those need different fixes —
+    /// check your network versus this image was never published — and an error
+    /// that conflates them sends people to the wrong one. `where_looked` carries
+    /// the attempts in order.
     #[error(
-        "the bundle was created from base image {reference} (digest {digest}), which is not \
-         present on this host\nBuild or pull it, then retry the import."
+        "the bundle was created from base image {reference}\n\
+         digest: {digest}\n\
+         Resolution failed. Where I looked:\n{where_looked}\n\
+         {advice}"
     )]
-    BaseImageMissing { reference: String, digest: String },
+    BaseImageUnresolved {
+        reference: String,
+        digest: String,
+        where_looked: String,
+        advice: String,
+    },
 
     /// The destination cannot hold the bundle's contents.
     #[error(
@@ -209,7 +223,7 @@ impl Error {
             Self::BundleCorrupt { .. } => ErrorKind::DataIntegrity,
             Self::ChecksumMismatch { .. } => ErrorKind::DataIntegrity,
             Self::BundleVersionUnsupported { .. } => ErrorKind::Incompatible,
-            Self::BaseImageMissing { .. } => ErrorKind::HostPrerequisite,
+            Self::BaseImageUnresolved { .. } => ErrorKind::HostPrerequisite,
             Self::QuotaMismatch { .. } => ErrorKind::CapacityExceeded,
             Self::Transient { .. } => ErrorKind::Transient,
             Self::Internal(_) => ErrorKind::Internal,
@@ -263,9 +277,11 @@ mod tests {
                 ErrorKind::Incompatible,
             ),
             (
-                Error::BaseImageMissing {
+                Error::BaseImageUnresolved {
                     reference: "docker.io/nemr/base:0.1.0".into(),
                     digest: "sha256:abc".into(),
+                    where_looked: "  - local containerd: not present".into(),
+                    advice: "Build and import the base image.".into(),
                 },
                 ErrorKind::HostPrerequisite,
             ),
