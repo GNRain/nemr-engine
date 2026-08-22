@@ -1203,11 +1203,10 @@ fn d08_the_base_image_resolves_by_digest_under_any_reference() {
 /// containerd does not validate that `snapshot_key` resolves. The user saw
 /// `nemr create` succeed and `nemr start` fail forever.
 ///
-/// This drives metadata churn past containerd's default `mutation_threshold`
-/// (100) with two snapshots outstanding: one leased, one not. The unleased one
-/// is the **control** — without it, "the leased snapshot survived" could simply
-/// mean the collector never ran, and the test would pass with the lease
-/// removed.
+/// This triggers a collection with two snapshots outstanding: one leased, one
+/// not. The unleased one is the **control** — without it, "the leased snapshot
+/// survived" could simply mean the collector never ran, and the test would pass
+/// with the lease removed.
 #[test]
 fn f63_a_leased_snapshot_survives_the_collector_and_an_unleased_one_does_not() {
     if !require_host(HostRequirements {
@@ -1251,12 +1250,13 @@ fn f63_a_leased_snapshot_survives_the_collector_and_an_unleased_one_does_not() {
             "both snapshots must exist before the churn, or this test proves nothing"
         );
 
-        // Past containerd's default mutation_threshold of 100.
-        for i in 0..130 {
-            let key = format!("f63-churn-{pid}-{i}");
-            let _ = client.prepare_snapshot(&key, &chain_id, None).await;
-            let _ = client.remove_snapshot(&key).await;
-        }
+        // A collection on demand, not churn hoping to trip containerd's mutation
+        // counter. The churn version failed intermittently on its own control —
+        // "the unleased snapshot survived, so the collector never ran" — because
+        // that counter is process-global and an earlier test may just have reset
+        // it. A test whose control fires at random is a test that gets re-run
+        // rather than read.
+        client.collect_garbage_now().await;
 
         let keys = client.list_snapshot_keys().await.expect("list");
         let leased_survived = keys.contains(&leased_key);
