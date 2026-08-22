@@ -111,10 +111,7 @@ fn require_arg<'a>(args: &'a [String], index: usize, what: &str) -> Result<&'a s
 /// Refuse unexpected trailing arguments rather than ignoring them.
 fn reject_extra_args(args: &[String], expected: usize) -> Result<(), String> {
     if args.len() > expected {
-        return Err(format!(
-            "unexpected extra argument {:?}",
-            args[expected]
-        ));
+        return Err(format!("unexpected extra argument {:?}", args[expected]));
     }
     Ok(())
 }
@@ -164,7 +161,9 @@ impl Invoker {
     }
 
     fn image_file(&self, name: &str) -> PathBuf {
-        self.managed_root().join("volumes").join(format!("{name}.img"))
+        self.managed_root()
+            .join("volumes")
+            .join(format!("{name}.img"))
     }
 
     fn mount_point(&self, name: &str) -> PathBuf {
@@ -174,9 +173,19 @@ impl Invoker {
 
 /// Look up a uid's home directory in `/etc/passwd`.
 fn home_dir_of(uid: u32) -> Result<PathBuf, String> {
-    let passwd = fs::read_to_string("/etc/passwd")
-        .map_err(|e| format!("cannot read /etc/passwd: {e}"))?;
+    let passwd =
+        fs::read_to_string("/etc/passwd").map_err(|e| format!("cannot read /etc/passwd: {e}"))?;
+    home_dir_from_passwd(&passwd, uid)
+}
 
+/// Parse a passwd table for `uid`'s home directory.
+///
+/// Split out so the security property — the home comes from passwd, never from
+/// a caller-controlled `HOME`/`XDG_DATA_HOME`, and must be absolute — is
+/// testable. Previously the only test hand-built an `Invoker` and never reached
+/// this function, so the derivation could have been rewritten to read the
+/// environment with the suite staying green (F-58).
+fn home_dir_from_passwd(passwd: &str, uid: u32) -> Result<PathBuf, String> {
     for line in passwd.lines() {
         // name:passwd:uid:gid:gecos:home:shell
         let fields: Vec<&str> = line.split(':').collect();
@@ -444,8 +453,8 @@ mod tests {
     #[test]
     fn rejects_traversal_and_injection_names() {
         for name in [
-            "../etc", "..", ".", "a/b", "/abs", "a b", "a;b", "a$b", "a\\b", "a\nb", "UPPER", "-lead",
-            "a.img", "",
+            "../etc", "..", ".", "a/b", "/abs", "a b", "a;b", "a$b", "a\\b", "a\nb", "UPPER",
+            "-lead", "a.img", "",
         ] {
             assert!(validate_name(name).is_err(), "{name:?} must be rejected");
         }
@@ -492,9 +501,52 @@ mod tests {
         );
     }
 
+    /// The home directory must come from passwd, never from the environment,
+    /// and must be absolute.
+    ///
+    /// Exercises `home_dir_from_passwd` itself. The pre-existing
+    /// `paths_derive_from_invoker_home` hand-builds an `Invoker`, so it never
+    /// reaches the derivation and would stay green if this were rewritten to
+    /// read `HOME` (F-58).
+    #[test]
+    fn home_is_derived_from_passwd_not_the_environment() {
+        const PASSWD: &str = "root:x:0:0:root:/root:/bin/bash\n\
+                              nemr:x:1000:1000:Nemr:/home/nemr:/bin/bash\n";
+        // Poison the environment: the derivation must ignore it entirely.
+        std::env::set_var("HOME", "/tmp/attacker-controlled");
+        std::env::set_var("XDG_DATA_HOME", "/tmp/attacker-controlled");
+
+        assert_eq!(
+            home_dir_from_passwd(PASSWD, 1000).unwrap(),
+            PathBuf::from("/home/nemr"),
+            "the home must come from passwd, not from HOME"
+        );
+        assert_eq!(
+            home_dir_from_passwd(PASSWD, 0).unwrap(),
+            PathBuf::from("/root")
+        );
+        assert!(
+            home_dir_from_passwd(PASSWD, 4242).is_err(),
+            "an unknown uid must be refused, not defaulted"
+        );
+    }
+
+    /// A relative home in passwd must be refused: joining onto it would resolve
+    /// against the helper's working directory, which the caller can influence.
+    #[test]
+    fn a_relative_home_is_refused() {
+        const PASSWD: &str = "bad:x:1001:1001:Bad:relative/path:/bin/sh\n";
+        let error =
+            home_dir_from_passwd(PASSWD, 1001).expect_err("a non-absolute home must be refused");
+        assert!(error.contains("absolute"), "error should say why: {error}");
+    }
+
     #[test]
     fn extra_arguments_are_refused() {
-        let args: Vec<String> = ["mount", "a", "2GB", "extra"].iter().map(|s| s.to_string()).collect();
+        let args: Vec<String> = ["mount", "a", "2GB", "extra"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert!(reject_extra_args(&args, 3).is_err());
     }
 }

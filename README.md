@@ -573,11 +573,23 @@ returns by checking a marker file written beforehand.
 ## Installing the CLI
 
 ```bash
-cargo install --path . --bin nemr --root ~/.local --force
+./scripts/install_engine.sh
 ```
 
-Installs a release binary to `~/.local/bin/nemr`. It is a snapshot, not a
-symlink into `target/`, so rerun it after changing engine code.
+Builds `target/release/nemr` and copies it to `~/.local/bin/nemr`
+(override with `NEMR_INSTALLED_BIN`). It is a snapshot, not a symlink into
+`target/`, so rerun it after changing engine code.
+
+**Not `cargo install --path .`** (F-62). `cargo install` rebuilds in its own
+target directory and produces a binary that differs byte-for-byte from
+`target/release/nemr` built from identical source — about 40 bytes here, from
+an embedded path. That difference is indistinguishable from "you installed a
+stale build", so the hash gate over the installed binary could only ever be
+red. Building once and copying the artifact makes the installed binary provably
+the one this working tree produced, which is what
+`the_installed_engine_matches_its_source` asserts and what milestone closure
+("reinstalled from that commit, verified against the installed artifacts")
+requires.
 
 ## Current blockers
 

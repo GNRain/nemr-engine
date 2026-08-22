@@ -20,8 +20,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use containerd_client::services::v1::{ListContainersRequest, ListImagesRequest};
-use containerd_client::{with_namespace, Client};
 use containerd_client::tonic::Request;
+use containerd_client::{with_namespace, Client};
 
 const NAMESPACE: &str = "default";
 
@@ -115,13 +115,7 @@ async fn main() -> Result<()> {
         .into_inner()
         .containers
         .into_iter()
-        .map(|c| {
-            (
-                c.id,
-                c.image,
-                c.runtime.map(|r| r.name).unwrap_or_default(),
-            )
-        })
+        .map(|c| (c.id, c.image, c.runtime.map(|r| r.name).unwrap_or_default()))
         .collect();
     containers.sort_by(|a, b| a.0.cmp(&b.0));
 

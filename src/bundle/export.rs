@@ -18,10 +18,10 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 
 use super::manifest::{
-    BaseImageRef, ChunkEntry, ExcludedEntry, Manifest, MemberEntry, ProjectInfo, Span, CHUNK_PREFIX,
-    CHUNK_SIZE, MANIFEST_MEMBER,
+    BaseImageRef, ChunkEntry, ExcludedEntry, Manifest, MemberEntry, ProjectInfo, Span,
+    CHUNK_PREFIX, CHUNK_SIZE, MANIFEST_MEMBER,
 };
-use super::policy::{filter_claude_json, Class, Decision, ExcludeReason, Policy};
+use super::policy::{Class, Decision, Policy};
 use super::SCHEMA_VERSION;
 
 /// Everything the exporter needs that it cannot discover from the volume.
@@ -62,12 +62,10 @@ pub fn export(request: &ExportRequest<'_>, destination: &Path) -> Result<ExportS
     let mut members: Vec<MemberEntry> = Vec::new();
 
     for item in &mut plan.included {
-        let bytes = match &item.content {
-            Content::File(path) => std::fs::read(path).map_err(|e| {
-                Error::Internal(anyhow::Error::from(e).context(format!("reading {}", path.display())))
-            })?,
-            Content::Inline(bytes) => bytes.clone(),
-        };
+        let Content::File(path) = &item.content;
+        let bytes = std::fs::read(path).map_err(|e| {
+            Error::Internal(anyhow::Error::from(e).context(format!("reading {}", path.display())))
+        })?;
 
         let offset = stream.len() as u64;
         stream.extend_from_slice(&bytes);
@@ -146,7 +144,11 @@ fn write_archive(destination: &Path, manifest: &Manifest, chunks: &[Vec<u8>]) ->
     append(&mut archive, MANIFEST_MEMBER, &manifest_json)?;
 
     for (index, chunk) in chunks.iter().enumerate() {
-        append(&mut archive, &format!("{CHUNK_PREFIX}{index:04}.zst"), chunk)?;
+        append(
+            &mut archive,
+            &format!("{CHUNK_PREFIX}{index:04}.zst"),
+            chunk,
+        )?;
     }
 
     archive
@@ -173,10 +175,12 @@ fn append<W: Write>(archive: &mut tar::Builder<W>, name: &str, bytes: &[u8]) -> 
 // Planning: what goes in, what stays out
 // ---------------------------------------------------------------------------
 
+/// Where a planned member's bytes come from.
+///
+/// Only real files today. A synthesised variant existed for the filtered
+/// `.claude.json`, which was dead code (F-58) and has been removed with it.
 enum Content {
     File(PathBuf),
-    /// Synthesised content — currently the filtered `.claude.json` (F-54).
-    Inline(Vec<u8>),
 }
 
 struct PlannedMember {
@@ -257,11 +261,6 @@ fn plan_members(request: &ExportRequest<'_>, destination: &Path) -> Result<Plan>
 
             match request.policy.decide(&relative) {
                 Decision::Exclude { reason } => {
-                    // `.claude.json` is excluded as a whole file, then a
-                    // filtered copy is re-added (F-54).
-                    if relative == CLAUDE_JSON {
-                        add_filtered_claude_json(&path, &mut plan)?;
-                    }
                     plan.excluded.push(ExcludedEntry::new(relative, reason));
                 }
                 Decision::Include { class } => {
@@ -283,56 +282,20 @@ fn plan_members(request: &ExportRequest<'_>, destination: &Path) -> Result<Plan>
     Ok(plan)
 }
 
-const CLAUDE_JSON: &str = "root/.claude.json";
-/// Where the filtered, portable subset of `.claude.json` is written in the
-/// bundle. A distinct name so it can never be mistaken for the original.
-const CLAUDE_JSON_PORTABLE: &str = "root/.claude.portable.json";
-
-/// Re-add the portable subset of `.claude.json` under a distinct name (F-54).
-fn add_filtered_claude_json(path: &Path, plan: &mut Plan) -> Result<()> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return Ok(());
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        // Unparseable config is not a reason to fail an export; it simply does
-        // not travel, and the exclusion entry already records that.
-        return Ok(());
-    };
-
-    let filter = filter_claude_json(&value);
-    for field in &filter.dropped_unrecognised {
-        // The F-54 signal: visible drift, not a silent drop.
-        tracing::warn!(
-            field = %field,
-            "unrecognised field in .claude.json was NOT included in the bundle; \
-             if it should travel, add it to the portable allowlist"
-        );
-    }
-    plan.unrecognised_fields
-        .extend(filter.dropped_unrecognised.iter().cloned());
-
-    for field in &filter.dropped_unrecognised {
-        plan.excluded.push(ExcludedEntry::new(
-            format!("{CLAUDE_JSON}#{field}"),
-            ExcludeReason::UnrecognisedField,
-        ));
-    }
-
-    if filter.kept.is_empty() {
-        return Ok(());
-    }
-    let portable = serde_json::Value::Object(filter.kept.into_iter().collect());
-    let bytes = serde_json::to_vec_pretty(&portable).map_err(|e| {
-        Error::Internal(anyhow::Error::from(e).context("serialising the portable config subset"))
-    })?;
-    plan.included.push(PlannedMember {
-        path: CLAUDE_JSON_PORTABLE.to_string(),
-        class: Class::SessionCritical,
-        mode: 0o100644,
-        content: Content::Inline(bytes),
-    });
-    Ok(())
-}
+// NOTE: `.claude.json` is deliberately NOT staged into a bundle.
+//
+// F-54 requires MCP configuration to travel and machine identity not to. That is
+// satisfied structurally rather than by filtering: Claude Code reads
+// project-scoped MCP configuration from `.mcp.json` at the project root, which
+// IS the volume, so it travels as an ordinary member — while `.claude.json`
+// (holding `machineID`/`oauthAccount`) stays on the rootfs and never reaches the
+// exportable layer (F-55).
+//
+// A filtering path used to exist here, gated on the container-view path
+// `root/.claude.json`, which an export walking the volume never encounters. It
+// was dead code whose unit tests passed while the property they described was
+// false in production (F-58), so it has been removed rather than left to look
+// like a working defence.
 
 /// Canonical identity of a path that may not exist yet.
 fn canonical_destination(path: &Path) -> Option<PathBuf> {
@@ -393,6 +356,39 @@ mod tests {
         }
     }
 
+    /// Extract a bundle and return all file contents, for content assertions.
+    ///
+    /// F-57: never assert on the compressed `.nemr` bytes. A raw grep finds a
+    /// plaintext marker only while the content is small enough that zstd stores
+    /// it near-verbatim — measured, a marker visible in a 34-byte bundle is
+    /// invisible in a 241 KiB one. A "the secret must not appear" test written
+    /// that way passes on fixtures and guards nothing at real sizes.
+    fn extracted_text(bundle: &Path) -> String {
+        let opened = crate::bundle::import::open(bundle).expect("open bundle");
+        let dir = std::env::temp_dir().join(format!(
+            "nemr-xt-{}-{}",
+            std::process::id(),
+            bundle.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        opened.extract(&dir).expect("extract");
+        let mut combined = String::new();
+        let mut stack = vec![dir.clone()];
+        while let Some(current) = stack.pop() {
+            for entry in std::fs::read_dir(&current).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(text) = std::fs::read_to_string(&path) {
+                    combined.push_str(&text);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        combined
+    }
+
     #[test]
     fn the_manifest_is_the_first_archive_member() {
         let root = scratch("first-member");
@@ -431,10 +427,9 @@ mod tests {
                 .any(|m| m.path.contains("credentials")),
             "no member may reference the credential"
         );
-        let raw = std::fs::read(&out).unwrap();
         assert!(
-            !String::from_utf8_lossy(&raw).contains("SUPER-SECRET-VALUE"),
-            "the secret's bytes must not appear anywhere in the bundle (D-02)"
+            !extracted_text(&out).contains("SUPER-SECRET-VALUE"),
+            "the secret must not appear in the bundle's extracted content (D-02)"
         );
         assert!(
             summary
@@ -454,49 +449,22 @@ mod tests {
         let out = root.join("b.nemr");
         let summary = export(&request("demo", &root), &out).unwrap();
 
-        let paths: Vec<&str> = summary.manifest.members.iter().map(|m| m.path.as_str()).collect();
+        let paths: Vec<&str> = summary
+            .manifest
+            .members
+            .iter()
+            .map(|m| m.path.as_str())
+            .collect();
         assert!(paths.contains(&"workspace/src/main.rs"));
         assert!(
             !paths.iter().any(|p| p.contains("target/")),
             "build output must not travel: {paths:?}"
         );
-        assert!(summary.manifest.excluded.iter().any(|e| e.path.contains("target")));
-    }
-
-    /// F-54 end to end: MCP config travels under a distinct name, identity does
-    /// not, and an unrecognised field is reported rather than silently dropped.
-    #[test]
-    fn claude_json_is_filtered_by_field_and_drift_is_surfaced() {
-        let root = scratch("claude-json");
-        write(
-            &root,
-            "root/.claude.json",
-            r#"{"mcpServers":{"gh":{"command":"gh-mcp"}},
-                "machineID":"MACHINE-ID-VALUE",
-                "brandNewFieldFromNextRelease":"whatever"}"#,
-        );
-        let out = root.join("b.nemr");
-        let summary = export(&request("demo", &root), &out).unwrap();
-
-        let portable = summary
+        assert!(summary
             .manifest
-            .members
+            .excluded
             .iter()
-            .find(|m| m.path == CLAUDE_JSON_PORTABLE)
-            .expect("the portable subset travels");
-        assert!(portable.is_session_critical());
-
-        let raw = String::from_utf8_lossy(&std::fs::read(&out).unwrap()).to_string();
-        assert!(raw.contains("gh-mcp"), "MCP config travels");
-        assert!(
-            !raw.contains("MACHINE-ID-VALUE"),
-            "machine identity must not travel"
-        );
-        assert_eq!(
-            summary.unrecognised_fields,
-            vec!["brandNewFieldFromNextRelease".to_string()],
-            "drift must be reported to the caller"
-        );
+            .any(|e| e.path.contains("target")));
     }
 
     /// Chunk digests are over plaintext, so chunk identity does not depend on
@@ -548,7 +516,10 @@ mod tests {
         // created_at is a wall-clock stamp and is expected to differ.
         a.manifest.created_at = String::new();
         b.manifest.created_at = String::new();
-        assert_eq!(a.manifest, b.manifest, "manifests must match but for the timestamp");
+        assert_eq!(
+            a.manifest, b.manifest,
+            "manifests must match but for the timestamp"
+        );
     }
 
     /// Exporting into the project's own workspace must not swallow the bundle
@@ -566,13 +537,26 @@ mod tests {
         let inside = root.join("workspace/backup.nemr");
         let first = export(&request("demo", &root), &inside).unwrap();
         assert!(
-            !first.manifest.members.iter().any(|m| m.path.ends_with(".nemr")),
+            !first
+                .manifest
+                .members
+                .iter()
+                .any(|m| m.path.ends_with(".nemr")),
             "the bundle must not contain itself: {:?}",
-            first.manifest.members.iter().map(|m| &m.path).collect::<Vec<_>>()
+            first
+                .manifest
+                .members
+                .iter()
+                .map(|m| &m.path)
+                .collect::<Vec<_>>()
         );
 
         // And a second export must not pick up the first one either.
-        let second = export(&request("demo", &root), &root.join("workspace/backup2.nemr")).unwrap();
+        let second = export(
+            &request("demo", &root),
+            &root.join("workspace/backup2.nemr"),
+        )
+        .unwrap();
         let swallowed: Vec<&String> = second
             .manifest
             .members

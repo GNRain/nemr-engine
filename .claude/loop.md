@@ -50,6 +50,94 @@ control.** Before trusting a negative:
 Absence-because-correct and absence-because-you-looked-in-the-wrong-place are
 indistinguishable without the control. This recurs on every negative assertion.
 
+## The guard-test rule (a green signal over the *wrong* thing)
+
+The negative-assertion rule is about a green signal over *nothing*. This one is
+subtler: a green signal over the *wrong thing* — a test that exists, runs, and
+passes, while guarding a property it does not actually enforce.
+
+The reference case is F-56 (M9). `credentials_never_travel_under_any_policy`
+passed on every run, but it asserted against `root/.claude/.credentials.json` —
+the container's path — while a real export walks the *volume*, whose layout is
+`.nemr-state/…`. The path it checked cannot occur, so the test guarded nothing.
+D-02 was still true, but held **structurally** (the credential is a host
+bind-mount that never reaches the volume), not because the test enforced it. The
+test was false assurance sitting on top of a property that happened to be true
+for unrelated reasons — invisible precisely because it was green.
+
+**Standing rule: a guard test must be proven to fail when the guarded property
+is violated.** If you can delete the code the test guards — the filter, the
+check, the validation — and the test still passes, the test guards nothing.
+
+- For any test whose name or intent is "X never happens" / "Y is always
+  refused" / "Z cannot escape", confirm it goes red when X is made to happen.
+  Write the violation, watch the test fail, then restore. This is test-before-fix
+  applied to the *guard*, not just to the bug.
+- Prefer asserting against **real, measured** inputs over synthetic ones at a
+  boundary. F-56 and the `.claude.json` drift warning both passed every synthetic
+  test and failed only against the layout/keys that actually occur.
+- A guard whose property holds structurally (by construction elsewhere) is fine —
+  but the test must still enforce it, so a future refactor that removes the
+  structural guarantee turns the test red rather than leaving it falsely green.
+
+Expect siblings: a defect of this shape is rarely alone. When one is found, audit
+the other guard tests in the same pass.
+
+## The count rule (a green suite that ran nothing)
+
+`cargo test` exits **0 when it runs zero tests**. A mistyped name filter prints
+`running 0 tests / test result: ok` and passes. A test that returns early is
+counted as *passed*, so a suite can report "16 passed" while 14 of them did
+nothing — which is exactly what CI's unit job did on every PR (F-60).
+
+**Standing rule: a test run is evidence only if you know how many tests ran.**
+
+- Any script or CI job that gates on a suite must assert the number that **ran**
+  against the number that **exists** (`cargo test -- --list`), and that none
+  skipped. Exit status alone is not evidence.
+- Never gate on a name-filtered selection. If a filter is unavoidable, assert the
+  expected count explicitly, because a renamed test silently selects nothing.
+- An opt-out that makes tests return early (`NEMR_TEST_UNIT_ONLY`) must report
+  how many it skipped. A job using one may claim only what it actually ran.
+
+This is the same family as the negative-assertion and guard-test rules: the
+signal is green, and the thing it is supposedly about never happened.
+
+## The evidence rule (a failure that erased its own evidence)
+
+The three rules above are about green signals. This one is about **red** ones,
+and it came from three findings in a row that were the same defect wearing
+different clothes:
+
+- **F-61** — the bucket acceptance deleted the object it wrote on every exit
+  path, so the only evidence of a run was the run's own summary.
+- **F-65** — `output=$(cargo test ...)` under `bash -e` aborts at the
+  *assignment*, so `status=$?` and every diagnostic below it were unreachable in
+  all three places that run the suite, `verify_wp_a.sh` included. A red suite
+  printed an exit code and nothing else.
+- **F-66** — the offline test refused with "namespaces are unavailable" and did
+  not say why, so the cause had to be inferred from outside CI.
+
+In each case the *check* was correct and the *report* was worthless. That is
+worse than a missing check, because a failure that says nothing gets attributed
+to the last thing anyone touched.
+
+**Standing rule: a failure must leave behind something a person can inspect
+without re-running it, and the failure path must be executed at least once
+before it is trusted.**
+
+In practice:
+
+- Print the underlying error, not a category. `unshare` says
+  `write_setgroups failed: Permission denied`; "namespaces unavailable" does not.
+- If a check consumes or deletes its evidence, give it an opt-out that keeps it
+  (`--keep`) and print where the artifact went.
+- Diagnostics are code. Run them — with a stand-in that fails on purpose — and
+  assert the detail survives. `the_namespace_probe_reports_why_it_failed` is the
+  shape.
+- Under `set -e`, an assignment from a failing command aborts *there*. Put it in
+  an `if` condition, or the handler beneath it is dead code.
+
 ## Fix autonomously
 
 - A newly `#[ignore]`d or skipped test — de-skip it and make it run.
@@ -68,4 +156,6 @@ indistinguishable without the control. This recurs on every negative assertion.
   widening the privileged helper's scope (PRIV-05). Escalate per Section 9.
 - Any new instance of a silent-success/wrong-result defect (VOL-05 class) —
   fix it, but flag it, because a second one means the class is not contained.
+- Any new instance of a failure that erased its own evidence (F-65 class) —
+  same reasoning, and it hides the VOL-05 ones.
 - A regression whose only fix trades off against a Section-7 gate (E-01…E-11).

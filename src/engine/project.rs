@@ -73,6 +73,20 @@ pub const LABEL_PROJECT: &str = "nemr.project";
 pub const LABEL_VOLUME: &str = "nemr.volume";
 pub const LABEL_SIZE: &str = "nemr.size";
 
+/// Labels written onto a project's container record.
+///
+/// Factored out of `create` so the round trip `list` and `reconcile_orphans`
+/// depend on is testable without containerd: both key on these exact keys, so a
+/// silent change here makes projects invisible to `list` and makes every volume
+/// look like an orphan to reconciliation.
+pub fn project_labels(name: &str, volume_path: &str, size: VolumeSize) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    labels.insert(LABEL_PROJECT.to_string(), name.to_string());
+    labels.insert(LABEL_VOLUME.to_string(), volume_path.to_string());
+    labels.insert(LABEL_SIZE.to_string(), size.to_string());
+    labels
+}
+
 /// Create a project: a quota-bounded volume plus a ready-to-start container.
 ///
 /// # Ordering
@@ -138,10 +152,7 @@ pub async fn create(
             .with_context(|| format!("failed to create session-state dir {}", dir.display()))?;
     }
 
-    let mut labels = HashMap::new();
-    labels.insert(LABEL_PROJECT.to_string(), name.to_string());
-    labels.insert(LABEL_VOLUME.to_string(), mount_point.to_string_lossy().to_string());
-    labels.insert(LABEL_SIZE.to_string(), size.to_string());
+    let labels = project_labels(name, &mount_point.to_string_lossy(), size);
 
     let mut mounts = vec![
         // The project volume becomes the container's working directory.
@@ -161,7 +172,12 @@ pub async fn create(
         mounts,
         working_dir: Some(config::CONTAINER_WORKDIR.to_string()),
         extra_env: vec![],
-        args: Some(config::SUPERVISOR_ARGS.iter().map(|s| s.to_string()).collect()),
+        args: Some(
+            config::SUPERVISOR_ARGS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
         // Bare project name: the scope is `nemr-<name>.scope`, and passing the
         // container id (already `nemr-` prefixed) would double it.
         cgroup_name: Some(name.to_string()),
@@ -225,9 +241,25 @@ pub struct ProjectSummary {
 mod tests {
     use super::*;
 
+    /// The labels `list` and `reconcile_orphans` key on must actually be written.
+    ///
+    /// The previous version asserted a prefix on three string constants declared
+    /// in the same file — true by construction, and the entire label-writing
+    /// block in `create` could be deleted with it green, while `list` would show
+    /// no projects and `reconcile_orphans` would treat every volume as an orphan
+    /// and release its mount (F-58). Proven to fail when the labels are dropped.
     #[test]
-    fn label_keys_are_namespaced() {
-        for key in [LABEL_PROJECT, LABEL_VOLUME, LABEL_SIZE] {
+    fn create_writes_the_labels_list_and_reconcile_depend_on() {
+        let labels = project_labels("demo", "/mnt/demo", VolumeSize::Medium);
+
+        assert_eq!(labels.get(LABEL_PROJECT).map(String::as_str), Some("demo"));
+        assert_eq!(
+            labels.get(LABEL_VOLUME).map(String::as_str),
+            Some("/mnt/demo")
+        );
+        assert_eq!(labels.get(LABEL_SIZE).map(String::as_str), Some("2GB"));
+
+        for key in labels.keys() {
             assert!(key.starts_with("nemr."), "{key} should be namespaced");
         }
     }
@@ -298,9 +330,7 @@ pub async fn stop(client: &ContainerdClient, name: &str) -> Result<StopOutcome> 
 
     // AC-5.3: stopping an already-stopped project must fail clearly rather
     // than report success for work it did not do.
-    if client.task_state(&container_id).await?
-        == crate::containerd::containers::TaskState::None
-    {
+    if client.task_state(&container_id).await? == crate::containerd::containers::TaskState::None {
         bail!(
             "project {name:?} is not running.\n\
              Start it with: nemr start {name}"
@@ -513,7 +543,9 @@ pub async fn exec_capture(
         "noNewPrivileges": true
     });
 
-    client.exec_process(&container_id, &exec_id, process, &io).await?;
+    client
+        .exec_process(&container_id, &exec_id, process, &io)
+        .await?;
 
     let stdin_fifo = tty::open_fifo(&io.stdin)?;
     let stdout_fifo = tty::open_fifo(&io.stdout)?;
@@ -531,8 +563,9 @@ pub async fn exec_capture(
     let stop = Arc::new(AtomicBool::new(false));
     let out_writer = SharedWriter(collected.clone());
     let out_stop = stop.clone();
-    let out_thread =
-        std::thread::spawn(move || tty::pump_until_stopped(stdout_fifo, out_writer, out_stop, None));
+    let out_thread = std::thread::spawn(move || {
+        tty::pump_until_stopped(stdout_fifo, out_writer, out_stop, None)
+    });
     let err_thread = stderr_fifo.map(|fifo| {
         let stop = stop.clone();
         std::thread::spawn(move || tty::pump_until_stopped(fifo, std::io::sink(), stop, None))
@@ -678,7 +711,9 @@ pub async fn attach(client: &ContainerdClient, name: &str) -> Result<u32> {
     client.start_exec(&container_id, &exec_id).await?;
 
     if let Some((width, height)) = tty::window_size() {
-        let _ = client.resize_pty(&container_id, &exec_id, width, height).await;
+        let _ = client
+            .resize_pty(&container_id, &exec_id, width, height)
+            .await;
     }
 
     // Blocking IO off the async runtime. The gRPC side stays async; mixing is
@@ -924,7 +959,9 @@ pub async fn reconcile_orphans(client: &ContainerdClient) -> Result<ReconcileRep
                 match helper.unmount_and_detach(&name) {
                     Ok(()) => report.released.push(name),
                     Err(error) => {
-                        eprintln!("[nemr:reconcile] could not release orphan mount {name:?}: {error:#}")
+                        eprintln!(
+                            "[nemr:reconcile] could not release orphan mount {name:?}: {error:#}"
+                        )
                     }
                 }
             }
@@ -953,7 +990,9 @@ pub async fn reconcile_orphans(client: &ContainerdClient) -> Result<ReconcileRep
             match client.remove_snapshot(&key).await {
                 Ok(()) => report.snapshots_removed.push(key),
                 Err(error) => {
-                    eprintln!("[nemr:reconcile] could not remove orphan snapshot {key:?}: {error:#}")
+                    eprintln!(
+                        "[nemr:reconcile] could not remove orphan snapshot {key:?}: {error:#}"
+                    )
                 }
             }
         }

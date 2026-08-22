@@ -39,7 +39,44 @@ cargo test --lib --quiet
 (cd deploy/nemr-volume && cargo test --quiet)
 
 echo "==> Regression suite (host-backed, serial)"
-cargo test --test regression --quiet -- --test-threads=1
+# Count assertion, not just an exit status.
+#
+# `cargo test` exits 0 when it runs ZERO tests — a mistyped name filter prints
+# "running 0 tests / test result: ok" and passes. And a host-backed test that
+# returns early under NEMR_TEST_UNIT_ONLY is counted as *passed*, so a suite can
+# report "16 passed" while 14 of them did nothing. Both are green-over-nothing in
+# the harness rather than the code, so this gate asserts on counts: every test
+# that exists must run, and none may skip.
+regression_total=$(cargo test --test regression -- --list 2>/dev/null | grep -c ': test$')
+# F-65: under `set -euo pipefail`, `x=$(failing-cmd)` aborts the script at the
+# assignment — so `regression_status=$?` never ran and the tail -40 below it was
+# unreachable. This verification script would die printing nothing on exactly
+# the failure it exists to report. An assignment in an `if` condition is exempt
+# from -e, so the output survives.
+if ! regression_output=$(cargo test --test regression -- --test-threads=1 --nocapture 2>&1); then
+    printf '%s\n' "$regression_output" | grep -E '^test result:' || true
+    printf '%s\n' "$regression_output" | tail -40
+    echo "    regression suite FAILED" >&2
+    exit 1
+fi
+printf '%s\n' "$regression_output" | grep -E '^test result:' || true
+
+regression_passed=$(printf '%s\n' "$regression_output" \
+    | sed -n 's/.*test result: ok\. \([0-9]*\) passed.*/\1/p' | head -1)
+regression_skipped=$(printf '%s\n' "$regression_output" \
+    | grep -c 'skipping a host-backed regression test' || true)
+
+if [[ "${regression_passed:-0}" -ne "${regression_total:-0}" ]]; then
+    echo "    only ${regression_passed:-0} of ${regression_total:-0} regression tests ran." >&2
+    echo "    A partial run is not a pass — check for a name filter or a build error." >&2
+    exit 1
+fi
+if [[ "${regression_skipped:-0}" -ne 0 ]]; then
+    echo "    ${regression_skipped} regression test(s) returned early (NEMR_TEST_UNIT_ONLY)." >&2
+    echo "    This gate verifies the HOST-backed guarantees; a skipped run is not a pass." >&2
+    exit 1
+fi
+echo "    ok — all ${regression_total} regression tests ran, none skipped"
 
 echo "==> E2E smoke test (unprivileged)"
 ./scripts/e2e_smoke_test.sh

@@ -180,8 +180,7 @@ impl ContainerdClient {
             })
             .with_context(|| format!("image {name:?} config has no rootfs.diff_ids"))?;
 
-        chain_id(&diff_ids)
-            .with_context(|| format!("cannot compute chain ID for image {name:?}"))
+        chain_id(&diff_ids).with_context(|| format!("cannot compute chain ID for image {name:?}"))
     }
 }
 
@@ -199,10 +198,7 @@ impl ContainerdClient {
 /// unusable ID, since the snapshot parent simply will not exist.
 fn chain_id(diff_ids: &[String]) -> Result<String> {
     let mut iter = diff_ids.iter();
-    let mut chain = iter
-        .next()
-        .context("image has no layers")?
-        .clone();
+    let mut chain = iter.next().context("image has no layers")?.clone();
 
     for diff_id in iter {
         let mut hasher = Sha256::new();
@@ -219,10 +215,12 @@ fn chain_id(diff_ids: &[String]) -> Result<String> {
 /// keeps the code working across that API change either way.
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
-        let _ = write!(out, "{byte:02x}");
-        out
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 #[cfg(test)]
@@ -300,7 +298,11 @@ impl ContainerdClient {
             config
                 .pointer(pointer)
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
 

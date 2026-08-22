@@ -4,18 +4,17 @@
 //! stop and delete arrive in Milestones 4–5 and extend this module.
 
 use std::collections::HashMap;
-use std::time::Duration;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use containerd_client::services::v1::snapshots::{
     ListSnapshotsRequest, MountsRequest, PrepareSnapshotRequest, RemoveSnapshotRequest,
 };
 use containerd_client::services::v1::{
-    container::Runtime, Container, CreateContainerRequest, CreateTaskRequest,
-    CloseIoRequest, DeleteContainerRequest, DeleteProcessRequest, DeleteTaskRequest,
-    ExecProcessRequest, GetRequest, KillRequest, ListContainersRequest, ResizePtyRequest,
-    StartRequest, WaitRequest,
+    container::Runtime, CloseIoRequest, Container, CreateContainerRequest, CreateTaskRequest,
+    DeleteContainerRequest, DeleteProcessRequest, DeleteTaskRequest, ExecProcessRequest,
+    GetRequest, KillRequest, ListContainersRequest, ResizePtyRequest, StartRequest, WaitRequest,
 };
 use containerd_client::tonic::{Code, Request};
 use containerd_client::with_namespace;
@@ -93,16 +92,28 @@ pub struct BindMount {
 
 impl BindMount {
     pub fn read_write(source: impl Into<PathBuf>, destination: impl Into<String>) -> Self {
-        Self { source: source.into(), destination: destination.into(), read_only: false }
+        Self {
+            source: source.into(),
+            destination: destination.into(),
+            read_only: false,
+        }
     }
 
     pub fn read_only(source: impl Into<PathBuf>, destination: impl Into<String>) -> Self {
-        Self { source: source.into(), destination: destination.into(), read_only: true }
+        Self {
+            source: source.into(),
+            destination: destination.into(),
+            read_only: true,
+        }
     }
 
     fn options(&self) -> Vec<String> {
         let mut options = vec!["rbind".to_string()];
-        options.push(if self.read_only { "ro".into() } else { "rw".into() });
+        options.push(if self.read_only {
+            "ro".into()
+        } else {
+            "rw".into()
+        });
         options
     }
 }
@@ -403,9 +414,20 @@ fn oci_spec(spec: &ContainerSpec, image_config: &ImageConfig) -> serde_json::Val
 
 /// containerd's default capability set (14 capabilities).
 const DEFAULT_CAPABILITIES: [&str; 14] = [
-    "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FSETID", "CAP_FOWNER", "CAP_MKNOD",
-    "CAP_NET_RAW", "CAP_SETGID", "CAP_SETUID", "CAP_SETFCAP", "CAP_SETPCAP",
-    "CAP_NET_BIND_SERVICE", "CAP_SYS_CHROOT", "CAP_KILL", "CAP_AUDIT_WRITE",
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_FSETID",
+    "CAP_FOWNER",
+    "CAP_MKNOD",
+    "CAP_NET_RAW",
+    "CAP_SETGID",
+    "CAP_SETUID",
+    "CAP_SETFCAP",
+    "CAP_SETPCAP",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_SYS_CHROOT",
+    "CAP_KILL",
+    "CAP_AUDIT_WRITE",
 ];
 
 /// The standard filesystem mounts every container gets.
@@ -729,8 +751,8 @@ impl ContainerdClient {
         process: serde_json::Value,
         io: &ExecIo,
     ) -> Result<()> {
-        let spec_bytes = serde_json::to_vec(&process)
-            .context("failed to serialise the exec process spec")?;
+        let spec_bytes =
+            serde_json::to_vec(&process).context("failed to serialise the exec process spec")?;
 
         let request = ExecProcessRequest {
             container_id: container_id.to_string(),

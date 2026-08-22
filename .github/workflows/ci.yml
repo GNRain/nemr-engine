@@ -22,7 +22,7 @@ jobs:
   # Constraint gates — fast, no host provisioning needed.
   # ---------------------------------------------------------------------------
   docker-free:
-    name: NFR-01 — no Docker at any layer
+    name: constraints — NFR-01 Docker-freeness and the E-11 seam
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -31,6 +31,9 @@ jobs:
       # cargo tree resolves the graph, so the check sees transitive deps.
       - name: Docker-freeness check
         run: ./scripts/check_docker_free.sh
+
+      - name: E-11 seam — the open half must not depend on the commercial half
+        run: ./scripts/check_seam.sh
 
   lint:
     name: clippy (warnings denied) + fmt
@@ -47,6 +50,15 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: clippy — privileged helper (separate workspace)
         run: cd deploy/nemr-volume && cargo clippy --all-targets -- -D warnings
+      # F-64: this job has been named "clippy + fmt" and has installed rustfmt
+      # since it was written, and never ran it. Twenty-six files were
+      # unformatted as a result. A job whose name asserts a check it does not
+      # perform is the same defect class as F-60 (a green suite that ran
+      # nothing) — the signal is real, what it signals is not.
+      - name: fmt — engine workspace
+        run: cargo fmt --all -- --check
+      - name: fmt — privileged helper (separate workspace)
+        run: cd deploy/nemr-volume && cargo fmt --all -- --check
 
   unit-tests:
     name: unit tests (no host required)
@@ -64,10 +76,34 @@ jobs:
         # backing file) and the ioctl struct-layout ABI pins.
         run: cd deploy/nemr-volume && cargo test
       - name: Regression tests that need no host
-        # require_host() refuses rather than skips; NEMR_TEST_UNIT_ONLY is the
-        # explicit, narrow opt-out for a machine with no rootless containerd.
-        # The host-backed tests run in the `host-tests` job below.
-        run: NEMR_TEST_UNIT_ONLY=1 cargo test --test regression
+        # NEMR_TEST_UNIT_ONLY is the explicit, narrow opt-out for a machine with
+        # no rootless containerd. Host-backed tests return early under it — and
+        # a test that returns early is counted as PASSED, so this job would
+        # otherwise report "16 passed" while 14 of them did nothing.
+        #
+        # So the skip count is printed and asserted to be non-zero-but-expected:
+        # this job's green means "the host-free tests pass", never "the suite
+        # passes". The real coverage claim is the host-tests job below.
+        run: |
+          set -o pipefail
+          total=$(cargo test --test regression -- --list 2>/dev/null | grep -c ': test$')
+          # F-65: `output=$(failing-cmd)` under `bash -e` (GitHub's default
+          # shell) aborts the step at the assignment, so `status=$?` and every
+          # diagnostic below it were unreachable — a failure printed nothing but
+          # cargo's exit code. An assignment inside an `if` condition is exempt
+          # from -e, so the output survives to be shown.
+          if ! output=$(NEMR_TEST_UNIT_ONLY=1 cargo test --test regression -- --nocapture 2>&1); then
+            printf '%s\n' "$output" | tail -40
+            exit 1
+          fi
+          printf '%s\n' "$output" | tail -20
+          skipped=$(printf '%s\n' "$output" | grep -c 'skipping a host-backed regression test' || true)
+          ran=$(( total - skipped ))
+          echo "::notice::host-free coverage: $ran of $total regression tests actually executed; $skipped skipped (host required)"
+          if [ "$ran" -le 0 ]; then
+            echo "no regression test actually executed — this job proves nothing" >&2
+            exit 1
+          fi
 
   supply-chain:
     name: licenses + security advisories
@@ -107,11 +143,35 @@ jobs:
       - name: Install the privileged helper
         run: sudo ./scripts/setup_test_host.sh
       - name: Install the engine
-        run: cargo install --path . --bin nemr --root "$HOME/.local" --force
+        # NOT `cargo install --path .` (F-62): it rebuilds in its own target
+        # directory and emits a binary that cannot equal target/release/nemr, so
+        # the installed-matches-source gate could never pass here. This builds
+        # once and copies the artifact, which is what makes "verified against the
+        # installed artifacts" a checkable claim rather than a hope.
+        run: ./scripts/install_engine.sh
       - name: Regression suite (serial; hash-gated against the installed helper)
+        # Count assertion: every test that exists must run, and none may skip.
+        # `cargo test` exits 0 having run ZERO tests, so exit status alone is not
+        # evidence that anything was verified.
         run: |
+          set -o pipefail
           export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
-          cargo test --test regression -- --test-threads=1
+          total=$(cargo test --test regression -- --list 2>/dev/null | grep -c ': test$')
+          # F-65: see the unit job — the assignment must sit inside an `if`
+          # condition or `bash -e` kills the step before the diagnostic runs.
+          if ! output=$(cargo test --test regression -- --test-threads=1 --nocapture 2>&1); then
+            printf '%s\n' "$output" | grep -E '^test result:' || true
+            printf '%s\n' "$output" | tail -40
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -E '^test result:' || true
+          passed=$(printf '%s\n' "$output" | sed -n 's/.*test result: ok\. \([0-9]*\) passed.*/\1/p' | head -1)
+          skipped=$(printf '%s\n' "$output" | grep -c 'skipping a host-backed regression test' || true)
+          if [ "${passed:-0}" -ne "${total:-0}" ] || [ "${skipped:-0}" -ne 0 ]; then
+            echo "partial run: ${passed:-0}/${total:-0} ran, ${skipped:-0} skipped — not a pass" >&2
+            exit 1
+          fi
+          echo "all ${total} regression tests ran, none skipped"
       - name: E2E smoke test
         # NEMR_SKIP_API: CI has no Anthropic credentials, so the API round-trip
         # is skipped here. It is NOT skipped in the developer run, and the smoke

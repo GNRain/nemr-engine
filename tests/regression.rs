@@ -17,11 +17,16 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{installed_helper_matches_built, require_host, unit_only, HostRequirements, TestProject};
+use common::{
+    extracted_plaintext, installed_helper_matches_built, require_host, run_offline, unit_only,
+    write_hostile_bundle, HostRequirements, TestProject,
+};
 use nemr_engine::containerd::client::ContainerdClient;
 use nemr_engine::containerd::containers::StopOutcome;
 use nemr_engine::engine::project;
-use nemr_engine::engine::volume::{self, is_mounted, HelperOps, PrivilegedOps, Volume, VolumePaths, VolumeSize};
+use nemr_engine::engine::volume::{
+    self, is_mounted, HelperOps, PrivilegedOps, Volume, VolumePaths, VolumeSize,
+};
 
 /// TEST-01 — the installed helper must be the one this suite is testing.
 ///
@@ -174,8 +179,10 @@ fn vol_provision_mount_and_ownership_success_path() {
     common::purge(&name);
 
     let paths = VolumePaths::from_env().expect("HOME set");
-    let volume = Volume::create(&name, VolumeSize::Small, paths, HelperOps::new())
-        .unwrap_or_else(|e| panic!("provisioning must succeed against the installed helper: {e:#}"));
+    let volume =
+        Volume::create(&name, VolumeSize::Small, paths, HelperOps::new()).unwrap_or_else(|e| {
+            panic!("provisioning must succeed against the installed helper: {e:#}")
+        });
     let mount_point = volume.mount_point();
 
     // 1. The volume is genuinely mounted (loop attach + mount both worked).
@@ -190,9 +197,13 @@ fn vol_provision_mount_and_ownership_success_path() {
     //    PRIV-06 chown this write fails with EACCES — and the container (which
     //    maps to this uid) could not use its own volume.
     let marker = mount_point.join("provision-marker");
-    std::fs::write(&marker, b"written by the invoking user")
-        .unwrap_or_else(|e| panic!("the volume must be writable by the invoking user (PRIV-06 chown): {e}"));
-    assert_eq!(std::fs::read(&marker).unwrap(), b"written by the invoking user");
+    std::fs::write(&marker, b"written by the invoking user").unwrap_or_else(|e| {
+        panic!("the volume must be writable by the invoking user (PRIV-06 chown): {e}")
+    });
+    assert_eq!(
+        std::fs::read(&marker).unwrap(),
+        b"written by the invoking user"
+    );
 
     // 3. The quota is real: the filesystem's total does not exceed the request.
     let usage = volume::usage(&mount_point).expect("a mounted volume reports usage");
@@ -248,7 +259,10 @@ fn vol_06_start_remounts_a_volume_lost_to_reboot() {
     HelperOps::new()
         .unmount_and_detach(&name)
         .expect("simulated reboot teardown");
-    assert!(!is_mounted(&mount_point), "precondition: unmounted after simulated reboot");
+    assert!(
+        !is_mounted(&mount_point),
+        "precondition: unmounted after simulated reboot"
+    );
     assert!(!marker.exists(), "data is invisible while unmounted");
     assert!(
         paths.image_file(&name).exists(),
@@ -260,7 +274,10 @@ fn vol_06_start_remounts_a_volume_lost_to_reboot() {
     project::ensure_volume_mounted(&name)
         .unwrap_or_else(|e| panic!("VOL-06: start must remount, not proceed unmounted: {e:#}"));
 
-    assert!(is_mounted(&mount_point), "VOL-06: the volume must be mounted again");
+    assert!(
+        is_mounted(&mount_point),
+        "VOL-06: the volume must be mounted again"
+    );
     assert_eq!(
         std::fs::read(&marker).expect("marker must be back"),
         b"before the simulated reboot",
@@ -342,7 +359,11 @@ fn m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted() {
         let (code, _) = project::exec_capture(
             &client,
             &project.name,
-            &["/bin/sh", "-c", &format!("printf '%s' '{token}' > {container_path}")],
+            &[
+                "/bin/sh",
+                "-c",
+                &format!("printf '%s' '{token}' > {container_path}"),
+            ],
         )
         .await
         .expect("write inside container");
@@ -378,15 +399,17 @@ fn m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted() {
 
         // 5. Remount (start) and read it back inside the container — sourced
         //    from the volume, intact.
-        project::start(&client, &project.name).await.expect("restart");
-        let (code, out) = project::exec_capture(
-            &client,
-            &project.name,
-            &["/bin/cat", container_path],
-        )
-        .await
-        .expect("read back inside container");
-        assert_eq!(code, 0, "the history file must be readable again after remount");
+        project::start(&client, &project.name)
+            .await
+            .expect("restart");
+        let (code, out) =
+            project::exec_capture(&client, &project.name, &["/bin/cat", container_path])
+                .await
+                .expect("read back inside container");
+        assert_eq!(
+            code, 0,
+            "the history file must be readable again after remount"
+        );
         assert_eq!(
             out.trim(),
             token,
@@ -435,7 +458,10 @@ fn vol_write_past_quota_fails_with_enospc() {
         Some(28),
         "expected ENOSPC (28) at the quota, got {error:?}"
     );
-    assert!(written < VolumeSize::Small.bytes(), "must not exceed the volume size");
+    assert!(
+        written < VolumeSize::Small.bytes(),
+        "must not exceed the volume size"
+    );
     drop(volume);
     common::purge(&name);
 }
@@ -468,11 +494,33 @@ fn vol_fault_injection_leaves_no_orphans() {
     common::purge(&name);
     let paths = VolumePaths::from_env().unwrap();
 
-    let result = Volume::create(&name, VS::Small, paths.clone(), FailAfterMount { inner: HelperOps::new() });
-    assert!(result.is_err(), "the injected fault must fail creation");
+    let result = Volume::create(
+        &name,
+        VS::Small,
+        paths.clone(),
+        FailAfterMount {
+            inner: HelperOps::new(),
+        },
+    );
+    // CONTROL: assert the failure is the INJECTED one, not an earlier failure in
+    // create (name validation, sparse allocation, mkfs). Without this, an early
+    // failure would leave nothing mounted and the no-orphan assertions below
+    // would pass vacuously — the suite's only RAII-cleanup coverage silently
+    // ceasing to exercise cleanup while staying green (F-56 class).
+    let error = match result {
+        Ok(_) => panic!("the injected fault must fail creation"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{error:#}").contains("injected fault"),
+        "the failure must be the injected one, or this test proves nothing: {error:#}"
+    );
 
     // No residue: the mount genuinely happened, then failed — Drop must release it.
-    assert!(!is_mounted(&paths.mount_point(&name)), "no orphaned mount after the fault");
+    assert!(
+        !is_mounted(&paths.mount_point(&name)),
+        "no orphaned mount after the fault"
+    );
     let loop_attached = std::process::Command::new("losetup")
         .arg("-a")
         .output()
@@ -511,7 +559,10 @@ fn vol_remount_is_idempotent() {
     let after = device_of();
 
     assert!(is_mounted(&mount_point), "still mounted");
-    assert_eq!(before, after, "repeated remount must not attach a second loop device");
+    assert_eq!(
+        before, after,
+        "repeated remount must not attach a second loop device"
+    );
     assert_eq!(after, 1, "exactly one loop device backs the image");
     common::purge(&name);
 }
@@ -584,7 +635,12 @@ fn m10_bundle_round_trip_carries_the_session_to_another_project() {
                 .iter()
                 .any(|m| m.path.ends_with("session.jsonl") && m.is_session_critical()),
             "the transcript must be a session-critical member: {:?}",
-            opened.manifest.members.iter().map(|m| &m.path).collect::<Vec<_>>()
+            opened
+                .manifest
+                .members
+                .iter()
+                .map(|m| &m.path)
+                .collect::<Vec<_>>()
         );
 
         project::import(&client, &destination.name, &bundle)
@@ -592,7 +648,8 @@ fn m10_bundle_round_trip_carries_the_session_to_another_project() {
             .expect("import");
 
         assert_eq!(
-            std::fs::read_to_string(&restored).expect("the transcript must exist on the destination"),
+            std::fs::read_to_string(&restored)
+                .expect("the transcript must exist on the destination"),
             token,
             "the session must arrive byte-identical at the path Claude Code reads"
         );
@@ -628,20 +685,26 @@ fn m9_a_real_bundle_contains_no_credential() {
         .await
         .expect("export");
 
-        let raw = std::fs::read(&bundle).expect("read bundle");
-        let text = String::from_utf8_lossy(&raw);
+        // Assert on EXTRACTED plaintext, never the compressed bundle bytes
+        // (F-57: a raw grep degrades to a no-op once zstd actually compresses).
+        let opened = nemr_engine::bundle::import::open(&bundle).expect("open");
         assert!(
-            !text.contains(".credentials.json"),
+            !opened
+                .manifest
+                .members
+                .iter()
+                .any(|m| m.path.contains(".credentials.json")),
             "no bundle member may reference the credential file (D-02)"
         );
 
+        let plaintext = extracted_plaintext(&bundle);
         // And the host's real credential contents must not appear either.
         if let Ok(host_credential) = std::fs::read_to_string(
             nemr_engine::auth::host_credentials_path().expect("credential path"),
         ) {
             for line in host_credential.lines().filter(|l| l.len() > 24) {
                 assert!(
-                    !text.contains(line.trim()),
+                    !plaintext.contains(line.trim()),
                     "a line of the host credential appeared in the bundle (D-02)"
                 );
             }
@@ -649,4 +712,401 @@ fn m9_a_real_bundle_contains_no_credential() {
 
         let _ = std::fs::remove_file(&bundle);
     });
+}
+
+/// F-55 — MCP configuration travels, and identity does not.
+///
+/// # Why there is no bind-mount here
+///
+/// F-54 rules that MCP configuration must travel while machine and account
+/// identity must not. The obvious implementation was to bind-mount a filtered
+/// `.claude.json` from the volume, which would have put identity fields *on*
+/// the exportable layer and defended them with an export-time filter.
+///
+/// Claude Code makes that unnecessary. It natively supports project-scoped MCP
+/// configuration in `.mcp.json` at the project root — verified by
+/// `claude mcp list` discovering a server declared there — and the project root
+/// *is* the volume. So MCP configuration travels as an ordinary project file,
+/// while `machineID` and `oauthAccount` stay in `/root/.claude.json` on the
+/// rootfs and never reach the volume at all.
+///
+/// That is the difference between D-02 held by policy and D-02 held by
+/// structure: no filter can fail open on a field that was never there. It is
+/// also why this needed no M8 bind-mount change and therefore did not
+/// invalidate D-06.
+///
+/// This test carries a **control**: it asserts a known-present string IS found
+/// by the same search that reports identity absent, so a pass cannot come from
+/// the search being broken (the F-56 lesson).
+#[test]
+fn f55_mcp_config_travels_and_identity_does_not() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "f55", VolumeSize::Small).await;
+
+        let mount = VolumePaths::from_env().unwrap().mount_point(&project.name);
+        // Project-scoped MCP configuration, exactly where Claude Code reads it.
+        let marker = "mcp-marker-travels";
+        std::fs::write(
+            mount.join(".mcp.json"),
+            format!(r#"{{"mcpServers":{{"{marker}":{{"command":"echo"}}}}}}"#),
+        )
+        .expect("write .mcp.json");
+
+        let bundle = std::env::temp_dir().join(format!("f55-{}.nemr", std::process::id()));
+        let _ = std::fs::remove_file(&bundle);
+        project::export(
+            &client,
+            &project.name,
+            &bundle,
+            nemr_engine::bundle::policy::Policy::default(),
+        )
+        .await
+        .expect("export");
+
+        let opened = nemr_engine::bundle::import::open(&bundle).expect("open");
+
+        // MCP configuration must be a session-critical member.
+        assert!(
+            opened
+                .manifest
+                .members
+                .iter()
+                .any(|m| m.path == ".mcp.json" && m.is_session_critical()),
+            "MCP configuration must travel (F-54): {:?}",
+            opened
+                .manifest
+                .members
+                .iter()
+                .map(|m| &m.path)
+                .collect::<Vec<_>>()
+        );
+
+        // Search the EXTRACTED plaintext, not the compressed bundle (F-57).
+        let plaintext = extracted_plaintext(&bundle);
+
+        // CONTROL: the same search must find something known to be present, or
+        // the identity assertions below prove nothing.
+        assert!(
+            plaintext.contains(marker),
+            "control: the marker must be findable in the extracted plaintext, or \
+             the absence assertions below are vacuous"
+        );
+
+        // And identity must be absent — held structurally, since these fields
+        // live on the rootfs and never reach the volume.
+        for identity in ["machineID", "oauthAccount"] {
+            assert!(
+                !plaintext.contains(identity),
+                "{identity} must never appear in a bundle (F-54)"
+            );
+        }
+
+        let _ = std::fs::remove_file(&bundle);
+    });
+}
+
+/// M11 — a hostile bundle cannot write outside the destination.
+///
+/// The `extract()` traversal guard is unit-tested, but the defect F-58 found was
+/// that nothing asserted the extract path *used* it: swapping `safe_join` for a
+/// plain `join` left every test green while a crafted member path escaped. This
+/// is the same class as the original privileged-helper mount escalation, in new
+/// code, and reached by untrusted input — a bundle may arrive from another
+/// machine or another user.
+///
+/// So it gets a permanent, host-level regression test with a **real hostile
+/// bundle on disk**, driven through the real import path, asserting both that
+/// the import is refused and that nothing was written outside.
+#[test]
+fn m11_a_hostile_bundle_cannot_escape_the_destination() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "m11esc", VolumeSize::Small).await;
+
+        // A canary outside the destination volume. If traversal succeeds it is
+        // overwritten; the assertion is on its contents, not merely its absence,
+        // so a pass cannot come from the write landing somewhere unexpected.
+        let outside = std::env::temp_dir().join(format!("m11-canary-{}", std::process::id()));
+        std::fs::write(&outside, b"UNTOUCHED").expect("write canary");
+
+        // Build a hostile bundle by hand: export() cannot produce a traversing
+        // member path, which is exactly why this needs a crafted fixture.
+        let bundle_path =
+            std::env::temp_dir().join(format!("m11-hostile-{}.nemr", std::process::id()));
+        let payload = b"PWNED".to_vec();
+        let mount = VolumePaths::from_env().unwrap().mount_point(&project.name);
+        let escape = format!("../../../../../../..{}", outside.to_string_lossy());
+        write_hostile_bundle(&bundle_path, &escape, &payload);
+
+        let error = project::import(&client, &project.name, &bundle_path)
+            .await
+            .expect_err("a traversing member path must be refused");
+        assert_eq!(
+            error.kind(),
+            nemr_engine::error::ErrorKind::DataIntegrity,
+            "traversal must be a data-integrity refusal: {error}"
+        );
+
+        assert_eq!(
+            std::fs::read(&outside).expect("canary must still exist"),
+            b"UNTOUCHED",
+            "the hostile member must NOT have been written outside the destination"
+        );
+        assert!(
+            !mount.join("PWNED").exists(),
+            "and nothing stray inside it either"
+        );
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_file(&bundle_path);
+    });
+}
+
+/// M9 — exporting into the project's own workspace must not swallow a bundle.
+///
+/// Found by the determinism test: a second export included the first bundle as a
+/// member, so a repeatedly-exported project grows by its predecessor's size every
+/// time while every command reports success. Permanent regression test at host
+/// level, against real projects.
+#[test]
+fn m9_export_does_not_swallow_bundles_in_the_workspace() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "m9swal", VolumeSize::Small).await;
+        let mount = VolumePaths::from_env().unwrap().mount_point(&project.name);
+        std::fs::write(mount.join("notes.md"), "content").expect("seed a project file");
+
+        let policy = nemr_engine::bundle::policy::Policy::default();
+
+        // First export, written INTO the workspace.
+        let first = mount.join("backup.nemr");
+        project::export(&client, &project.name, &first, policy.clone())
+            .await
+            .expect("first export");
+        let opened = nemr_engine::bundle::import::open(&first).expect("open first");
+        assert!(
+            !opened
+                .manifest
+                .members
+                .iter()
+                .any(|m| m.path.ends_with(".nemr")),
+            "a bundle must not contain itself: {:?}",
+            opened
+                .manifest
+                .members
+                .iter()
+                .map(|m| &m.path)
+                .collect::<Vec<_>>()
+        );
+
+        // CONTROL: the first bundle really is sitting in the workspace, so the
+        // second export genuinely had the chance to swallow it.
+        assert!(
+            first.exists(),
+            "control: the first bundle is in the workspace"
+        );
+
+        let second = mount.join("backup2.nemr");
+        project::export(&client, &project.name, &second, policy)
+            .await
+            .expect("second export");
+        let opened = nemr_engine::bundle::import::open(&second).expect("open second");
+        let swallowed: Vec<&String> = opened
+            .manifest
+            .members
+            .iter()
+            .map(|m| &m.path)
+            .filter(|p| p.ends_with(".nemr"))
+            .collect();
+        assert!(
+            swallowed.is_empty(),
+            "a previous bundle must not be swallowed by the next export: {swallowed:?}"
+        );
+    });
+}
+
+/// E-11 — `nemr export` and `nemr import` work with no network and no
+/// credentials configured, against a local file.
+///
+/// # Why this is a test and not a comment
+///
+/// The open/commercial boundary rests on it: if the open engine ever needs the
+/// sync layer, an account, or an outbound request to move a bundle, the seam has
+/// leaked and the open half stops being useful on its own. That was true by
+/// construction and asserted nowhere, so nothing would have caught M12's storage
+/// trait accidentally becoming a dependency of the CLI surface.
+///
+/// # Method
+///
+/// The CLI runs inside a **network namespace with only loopback**, so any
+/// outbound request fails, and inside a **mount namespace with a tmpfs over
+/// `~/.claude`**, so no credential is visible. The mount namespace is what makes
+/// this safe: the real credential is hidden only inside the test's namespace and
+/// is never moved or modified.
+///
+/// containerd remains reachable because its socket is a local Unix socket, which
+/// is the point — "no network" means no internet and no sync service, not no IPC.
+#[test]
+fn e11_export_and_import_work_with_no_network_and_no_credentials() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    if let Err(reason) = common::namespace_probe() {
+        panic!(
+            "unprivileged user/mount/network namespaces are unavailable, so E-11's \
+             offline guarantee cannot be tested on this host. This is a gap in \
+             coverage, not a pass.\n     {reason}\n     \
+             fix (CI runners and Ubuntu 24.04 hosts): \
+             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+        );
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let (source, destination) = runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let source = TestProject::create(&client, "e11src", VolumeSize::Small).await;
+        let destination = TestProject::create(&client, "e11dst", VolumeSize::Small).await;
+        (source, destination)
+    });
+
+    let paths = VolumePaths::from_env().unwrap();
+    let marker = format!("offline-marker-{}", std::process::id());
+    std::fs::write(paths.mount_point(&source.name).join("notes.md"), &marker)
+        .expect("seed the source project");
+
+    let bundle = std::env::temp_dir().join(format!("e11-{}.nemr", std::process::id()));
+    let _ = std::fs::remove_file(&bundle);
+
+    // CONTROL: the credential really is present outside the namespace, so
+    // "it worked without one" is a meaningful claim rather than a vacuous one.
+    let credential = nemr_engine::auth::host_credentials_path().expect("credential path");
+    assert!(
+        credential.exists(),
+        "control: the host credential must exist outside the namespace, or hiding \
+         it inside proves nothing"
+    );
+
+    let export = run_offline(&["export", &source.name, "-o", &bundle.to_string_lossy()]);
+    assert!(
+        export.status.success(),
+        "export must work offline with no credential.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&export.stdout),
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(bundle.exists(), "the bundle must have been written");
+
+    let import = run_offline(&["import", &destination.name, &bundle.to_string_lossy()]);
+    assert!(
+        import.status.success(),
+        "import must work offline with no credential.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&import.stdout),
+        String::from_utf8_lossy(&import.stderr)
+    );
+
+    // The session must actually have arrived, not merely "the command exited 0".
+    assert_eq!(
+        std::fs::read_to_string(paths.mount_point(&destination.name).join("notes.md"))
+            .expect("the imported file must exist on the destination"),
+        marker,
+        "the content must round-trip offline, byte-identical"
+    );
+
+    // And the real credential is untouched by all of this.
+    assert!(
+        credential.exists(),
+        "the real credential must survive: the tmpfs hides it inside the namespace only"
+    );
+
+    let _ = std::fs::remove_file(&bundle);
+}
+
+/// The installed `nemr` must be the binary this working tree builds (F-62).
+///
+/// Milestone closure is "merged **and** reinstalled from that commit **and**
+/// verified against the installed artifacts". The privileged helper has been
+/// gated on that since F-58; the engine — the binary a user actually runs, and
+/// the one `scripts/e2e_smoke_test.sh` invokes off PATH — was not. Nothing
+/// stopped a smoke test from passing against a `nemr` built from a commit that
+/// no longer exists and reporting the milestone closed.
+///
+/// Not `require_host`-gated: this needs no containerd, no helper and no base
+/// image. It needs only that the working tree's claim about what is installed
+/// is true, which is exactly the thing that must hold before any other result
+/// here means anything.
+#[test]
+fn the_installed_engine_matches_its_source() {
+    if common::unit_only() {
+        eprintln!(
+            "NEMR_TEST_UNIT_ONLY is set: not checking the installed engine. \
+             A green run with it set says nothing about what is deployed."
+        );
+        return;
+    }
+    if let Err(reason) = common::installed_engine_matches_built() {
+        panic!(
+            "\n\nThe installed engine is not this source:\n\n  - {reason}\n\n\
+             A verification run against a stale binary proves something about a commit \n\
+             nobody is looking at. Reinstall, then re-run.\n"
+        );
+    }
+}
+
+/// The namespace probe must report *why* it failed, not just that it did.
+///
+/// The bare boolean it replaced cost a CI round-trip: the E-11 offline test
+/// refused with "namespaces are unavailable" and left the cause to be guessed
+/// at. This asserts the diagnostic actually carries the underlying reason —
+/// F-65 was a diagnostic that could never print, and the lesson generalises: a
+/// message nothing ever executes is not a message.
+///
+/// Needs no host: it runs a stand-in that fails the way `unshare` fails.
+#[test]
+fn the_namespace_probe_reports_why_it_failed() {
+    let dir = std::env::temp_dir().join(format!("nemr-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let shim = dir.join("unshare-stub");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\necho 'unshare: write_setgroups failed: Permission denied' >&2\nexit 1\n",
+    )
+    .expect("write the stand-in");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let reason = common::namespace_probe_with(&shim.to_string_lossy())
+        .expect_err("a failing probe must be an error");
+
+    // The specific stderr must survive into the message: a probe that reported
+    // only "it failed" is what made the last CI failure a guess.
+    assert!(
+        reason.contains("write_setgroups failed: Permission denied"),
+        "the probe must carry the underlying reason, got: {reason}"
+    );
+    // And the AppArmor knob must be named, because on Ubuntu 24.04 it is the
+    // usual cause and it is not visible in unshare's own message.
+    assert!(
+        reason.contains("apparmor_restrict_unprivileged_userns"),
+        "the probe must report the restriction sysctl, got: {reason}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -76,7 +76,8 @@ pub fn open_beneath(path: &Path, final_flags: libc::c_int) -> Result<OwnedFd, St
                     "refusing to follow a symlink at {:?} in {} — a component of a \
                      managed path is a symlink, which is how a privileged mount would \
                      be redirected off the managed directory",
-                    name, path.display()
+                    name,
+                    path.display()
                 )
             } else {
                 format!(
@@ -231,7 +232,10 @@ pub fn fstat(fd: &impl AsRawFd) -> Result<libc::stat, String> {
 pub fn fchown(fd: &impl AsRawFd, uid: u32, gid: u32) -> Result<(), String> {
     let rc = unsafe { libc::fchown(fd.as_raw_fd(), uid, gid) };
     if rc != 0 {
-        return Err(format!("fchown failed: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "fchown failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }
@@ -288,9 +292,19 @@ pub fn is_mounted(mount_point: &Path) -> bool {
     let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return false;
     };
+    is_mounted_in_table(&table, mount_point)
+}
+
+/// Whether `table` (mountinfo contents) lists `mount_point` as a mount target.
+///
+/// Split out so the production comparison and its test are the *same* code.
+/// Previously the test reimplemented the comparison in a local helper, so this
+/// loop — which decides the remount and detach paths — was covered by nothing
+/// and could have been inverted with the suite staying green (F-58).
+pub fn is_mounted_in_table(table: &str, mount_point: &Path) -> bool {
     let wanted = mount_point.as_os_str().as_bytes();
     let mut found = false;
-    for target in mountinfo_targets(&table) {
+    for target in mountinfo_targets(table) {
         if target == wanted {
             found = true;
             break;
@@ -348,7 +362,10 @@ fn open_root() -> Result<OwnedFd, String> {
         )
     };
     if raw < 0 {
-        return Err(format!("cannot open /: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "cannot open /: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
@@ -496,14 +513,15 @@ mod tests {
     #[test]
     fn mountinfo_field_five_is_read_past_optional_fields() {
         // A line with two optional fields (shared:277 master:2) before " - ".
-        let table = "49 29 7:19 / /home/john\\040doe/mnt rw shared:277 master:2 - ext4 /dev/loop0 rw\n";
+        let table =
+            "49 29 7:19 / /home/john\\040doe/mnt rw shared:277 master:2 - ext4 /dev/loop0 rw\n";
         let targets: Vec<Vec<u8>> = mountinfo_targets(table).collect();
         assert_eq!(targets, vec![b"/home/john doe/mnt".to_vec()]);
-        assert!(is_mounted_in(table, Path::new("/home/john doe/mnt")));
-        assert!(!is_mounted_in(table, Path::new("/home/john doe/other")));
-    }
-
-    fn is_mounted_in(table: &str, mount_point: &Path) -> bool {
-        mountinfo_targets(table).any(|t| t == mount_point.as_os_str().as_bytes())
+        // Calls the PRODUCTION comparison, not a local reimplementation.
+        assert!(is_mounted_in_table(table, Path::new("/home/john doe/mnt")));
+        assert!(!is_mounted_in_table(
+            table,
+            Path::new("/home/john doe/other")
+        ));
     }
 }

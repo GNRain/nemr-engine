@@ -192,12 +192,11 @@ impl Bundle {
                 .chunks
                 .get(&entry.index)
                 .expect("presence checked in open()");
-            let plain = zstd::decode_all(compressed.as_slice()).map_err(|e| {
-                Error::BundleCorrupt {
+            let plain =
+                zstd::decode_all(compressed.as_slice()).map_err(|e| Error::BundleCorrupt {
                     path: Path::new("<bundle>").to_path_buf(),
                     detail: format!("chunk {} does not decompress: {e}", entry.index),
-                }
-            })?;
+                })?;
 
             let actual = hex(&Sha256::digest(&plain));
             if actual != entry.sha256 {
@@ -323,6 +322,70 @@ mod tests {
 
     const DIGEST: &str = "sha256:deadbeef";
 
+    /// Write an arbitrary bundle: any manifest, any chunk payloads.
+    ///
+    /// M11 hardening cases are about bundles a *hostile or broken* producer
+    /// creates, which `export()` cannot make by construction. Building them as
+    /// real archive files means the cases go through the real
+    /// `open()` -> `check()` -> `extract()` path rather than a hand-mutated
+    /// struct, so a guard that exists but is never *called* still fails the test
+    /// (the F-58 lesson).
+    fn write_hostile_bundle(
+        tag: &str,
+        manifest: &Manifest,
+        chunks: &[Vec<u8>],
+        manifest_first: bool,
+    ) -> PathBuf {
+        let path = scratch(tag).join("hostile.nemr");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut builder = tar::Builder::new(file);
+
+        let append = |builder: &mut tar::Builder<std::fs::File>, name: &str, bytes: &[u8]| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            builder.append_data(&mut header, name, bytes).unwrap();
+        };
+
+        let json = serde_json::to_vec(manifest).unwrap();
+        if !manifest_first {
+            append(&mut builder, "chunks/0000.zst", b"decoy");
+        }
+        append(&mut builder, MANIFEST_MEMBER, &json);
+        for (index, chunk) in chunks.iter().enumerate() {
+            append(&mut builder, &format!("chunks/{index:04}.zst"), chunk);
+        }
+        builder.finish().unwrap();
+        path
+    }
+
+    /// A minimal well-formed manifest, for hardening cases to bend.
+    fn base_manifest(
+        members: Vec<MemberEntry>,
+        chunks: Vec<crate::bundle::manifest::ChunkEntry>,
+        content_bytes: u64,
+    ) -> Manifest {
+        Manifest {
+            schema_version: crate::bundle::SCHEMA_VERSION,
+            engine_version: "0.1.0".into(),
+            created_at: "0".into(),
+            project: crate::bundle::manifest::ProjectInfo {
+                name: "demo".into(),
+                quota: "2GB".into(),
+                content_bytes,
+            },
+            base_image: BaseImageRef {
+                reference: "docker.io/nemr/base:0.1.0".into(),
+                digest: DIGEST.into(),
+            },
+            chunks,
+            members,
+            excluded: vec![],
+        }
+    }
+
     fn make_bundle(tag: &str, files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
         let root = scratch(tag);
         for (path, contents) in files {
@@ -362,7 +425,10 @@ mod tests {
         let (_, bundle_path) = make_bundle(
             "roundtrip",
             &[
-                (".nemr-state/projects/-workspace/a.jsonl", "conversation history"),
+                (
+                    ".nemr-state/projects/-workspace/a.jsonl",
+                    "conversation history",
+                ),
                 ("notes.md", "project file"),
             ],
         );
@@ -382,6 +448,52 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(destination.join("notes.md")).unwrap(),
             "project file"
+        );
+    }
+
+    /// A future-schema bundle must be refused by `open()`, not merely by the
+    /// helper the manifest test calls directly.
+    ///
+    /// `a_newer_schema_is_refused_with_advice` exercises `Manifest::compatibility`
+    /// on a hand-built struct; deleting the `manifest.compatibility()?` call from
+    /// `open()` left it green while a future-version bundle would be extracted
+    /// under assumptions this build cannot know (F-56 class, guard-test audit).
+    /// This one rewrites a real bundle's manifest and goes through `open()`.
+    #[test]
+    fn a_future_schema_bundle_is_refused_by_open() {
+        let (_, bundle_path) = make_bundle("future-schema", &[("a.txt", "x")]);
+
+        // Rebuild the archive with the schema version bumped beyond this build.
+        let mut manifest: crate::bundle::manifest::Manifest = {
+            let file = std::fs::File::open(&bundle_path).unwrap();
+            let mut archive = tar::Archive::new(file);
+            let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        manifest.schema_version = crate::bundle::SCHEMA_VERSION + 1;
+
+        let future = bundle_path.with_extension("future");
+        {
+            let out = std::fs::File::create(&future).unwrap();
+            let mut builder = tar::Builder::new(out);
+            let json = serde_json::to_vec(&manifest).unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(json.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, MANIFEST_MEMBER, json.as_slice())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let error = open(&future).expect_err("a future-schema bundle must be refused");
+        assert_eq!(error.kind(), crate::error::ErrorKind::Incompatible);
+        assert!(
+            error.to_string().contains("Upgrade nemr"),
+            "the refusal must say what to do: {error}"
         );
     }
 
@@ -420,6 +532,14 @@ mod tests {
             .extract(&destination)
             .expect_err("a chunk digest mismatch must be caught");
         assert_eq!(error.kind(), crate::error::ErrorKind::DataIntegrity);
+        // Assert WHICH layer caught it. Without this, deleting the chunk-digest
+        // check in plaintext() left the test green — the tampered bytes flowed on
+        // and the per-member check rejected them with the same kind, so the
+        // chunk-level guard could vanish unnoticed (F-58).
+        assert!(
+            error.to_string().contains("chunk 0"),
+            "corruption must be caught at the CHUNK layer: {error}"
+        );
         assert!(
             !destination.join("a.txt").exists(),
             "nothing may be written when verification fails"
@@ -460,6 +580,284 @@ mod tests {
         assert_eq!(error.kind(), crate::error::ErrorKind::CapacityExceeded);
     }
 
+    /// `extract()` must *use* the traversal guard, not merely have one.
+    ///
+    /// The unit test below exercises `safe_join` directly; replacing the call
+    /// site with a plain `destination_root.join(&member.path)` left every test
+    /// green while a hostile bundle wrote outside the destination (F-58). A
+    /// bundle is untrusted input, so this drives a malicious member path through
+    /// the real extract path. Proven to fail when the call site is bypassed.
+    #[test]
+    fn extract_refuses_a_member_path_that_escapes_the_destination() {
+        let (_, bundle_path) = make_bundle("escape", &[("a.txt", "content")]);
+        let mut bundle = open(&bundle_path).unwrap();
+
+        let plain = b"PWNED".to_vec();
+        bundle.chunks.clear();
+        bundle
+            .chunks
+            .insert(0, zstd::encode_all(plain.as_slice(), 3).unwrap());
+        bundle.manifest.chunks = vec![crate::bundle::manifest::ChunkEntry {
+            index: 0,
+            sha256: hex(&Sha256::digest(&plain)),
+            compressed_bytes: 0,
+            plain_bytes: plain.len() as u64,
+        }];
+        bundle.manifest.members = vec![MemberEntry {
+            path: "../escaped.txt".into(),
+            class: crate::bundle::policy::Class::SessionCritical
+                .as_str()
+                .into(),
+            mode: 0o100644,
+            size: plain.len() as u64,
+            sha256: hex(&Sha256::digest(&plain)),
+            span: crate::bundle::manifest::Span {
+                offset: 0,
+                length: plain.len() as u64,
+            },
+        }];
+
+        let destination = scratch("escape-dest").join("inner");
+        std::fs::create_dir_all(&destination).unwrap();
+        let error = bundle
+            .extract(&destination)
+            .expect_err("a member path escaping the destination must be refused");
+        assert_eq!(error.kind(), crate::error::ErrorKind::DataIntegrity);
+
+        let escaped = destination.parent().unwrap().join("escaped.txt");
+        assert!(
+            !escaped.exists(),
+            "nothing may be written outside the destination: {} exists",
+            escaped.display()
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // M11 — hardening. Each case is a real archive a hostile or broken producer
+    // could write, driven through open() -> check() -> extract().
+    // ---------------------------------------------------------------------
+
+    /// M11: a bundle whose manifest is not the first member is refused.
+    ///
+    /// The whole "decide before reading content" guarantee rests on the manifest
+    /// being first; a reader that scanned for it would silently accept an
+    /// archive that buries it behind arbitrary content.
+    #[test]
+    fn m11_a_bundle_with_a_buried_manifest_is_refused() {
+        let manifest = base_manifest(vec![], vec![], 0);
+        let path = write_hostile_bundle("buried", &manifest, &[], false);
+
+        let error = open(&path).expect_err("a buried manifest must be refused");
+        assert_eq!(error.kind(), crate::error::ErrorKind::DataIntegrity);
+        // Assert on the SPECIFIC refusal, naming the member actually found.
+        //
+        // A first attempt asserted `contains("expected")`, which passed with the
+        // check disabled: serde's parse error for the decoy member is "expected
+        // value at line 1 column 1", so the assertion matched by coincidence.
+        // Proven vacuous by the disable-and-watch-it-fail probe — the rule
+        // catching a mistake made while applying the rule.
+        let text = error.to_string();
+        assert!(
+            text.contains("chunks/0000.zst") && text.contains(MANIFEST_MEMBER),
+            "the error must name what was found and what was expected: {text}"
+        );
+    }
+
+    /// M11: a manifest promising more chunks than the archive carries is
+    /// refused at open, before anything is written.
+    #[test]
+    fn m11_a_bundle_missing_a_promised_chunk_is_refused() {
+        let plain = b"content".to_vec();
+        let manifest = base_manifest(
+            vec![],
+            vec![
+                crate::bundle::manifest::ChunkEntry {
+                    index: 0,
+                    sha256: hex(&Sha256::digest(&plain)),
+                    compressed_bytes: 0,
+                    plain_bytes: plain.len() as u64,
+                },
+                // Promised but never written.
+                crate::bundle::manifest::ChunkEntry {
+                    index: 1,
+                    sha256: hex(&Sha256::digest(b"missing")),
+                    compressed_bytes: 0,
+                    plain_bytes: 7,
+                },
+            ],
+            plain.len() as u64,
+        );
+        let path = write_hostile_bundle(
+            "missing-chunk",
+            &manifest,
+            &[zstd::encode_all(plain.as_slice(), 3).unwrap()],
+            true,
+        );
+
+        let error = open(&path).expect_err("a missing chunk must be refused");
+        assert_eq!(error.kind(), crate::error::ErrorKind::DataIntegrity);
+        assert!(
+            error.to_string().contains("chunk 1"),
+            "the error must name the missing chunk: {error}"
+        );
+    }
+
+    /// M11: base image drift between source and destination refuses rather than
+    /// substituting a different rootfs.
+    ///
+    /// Driven through `check()` with three destination states: absent, a
+    /// different digest, and the matching digest as a control — so a pass cannot
+    /// come from `check()` refusing everything.
+    #[test]
+    fn m11_base_image_drift_refuses_and_the_matching_digest_is_accepted() {
+        let (_, bundle_path) = make_bundle("drift", &[("a.txt", "x")]);
+        let bundle = open(&bundle_path).unwrap();
+
+        for (local, label) in [
+            (None, "absent"),
+            (Some("sha256:a-different-image"), "drifted"),
+        ] {
+            let error = bundle
+                .check(&ImportChecks {
+                    local_base_image_digest: local,
+                    ..checks()
+                })
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::error::ErrorKind::HostPrerequisite,
+                "{label} base image must refuse"
+            );
+            assert!(
+                error.to_string().contains(DIGEST),
+                "{label}: the error must name the digest the bundle needs: {error}"
+            );
+        }
+
+        // CONTROL: the matching digest must be accepted, or the two refusals
+        // above prove only that check() always fails.
+        bundle
+            .check(&checks())
+            .expect("control: a matching base image must be accepted");
+    }
+
+    /// M11: quota mismatch refuses before extraction, and a sufficient
+    /// destination is accepted.
+    #[test]
+    fn m11_quota_mismatch_refuses_before_extraction() {
+        let (_, bundle_path) = make_bundle("quota-m11", &[("a.txt", &"x".repeat(10_000))]);
+        let bundle = open(&bundle_path).unwrap();
+        let needed = bundle.manifest.project.content_bytes;
+
+        let error = bundle
+            .check(&ImportChecks {
+                destination_capacity: needed - 1,
+                destination_quota: "500MB",
+                ..checks()
+            })
+            .expect_err("a destination one byte too small must refuse");
+        assert_eq!(error.kind(), crate::error::ErrorKind::CapacityExceeded);
+
+        // CONTROL: exactly enough capacity must be accepted.
+        bundle
+            .check(&ImportChecks {
+                destination_capacity: needed,
+                ..checks()
+            })
+            .expect("control: exactly-sufficient capacity must be accepted");
+    }
+
+    /// M11: a member digest mismatch is caught, names the member, and leaves
+    /// nothing of that member on disk.
+    #[test]
+    fn m11_member_digest_mismatch_names_the_member_and_writes_nothing() {
+        let plain = b"the real content".to_vec();
+        let manifest = base_manifest(
+            vec![MemberEntry {
+                path: "session/history.jsonl".into(),
+                class: crate::bundle::policy::Class::SessionCritical
+                    .as_str()
+                    .into(),
+                mode: 0o100644,
+                size: plain.len() as u64,
+                sha256: "0".repeat(64), // wrong on purpose
+                span: crate::bundle::manifest::Span {
+                    offset: 0,
+                    length: plain.len() as u64,
+                },
+            }],
+            vec![crate::bundle::manifest::ChunkEntry {
+                index: 0,
+                sha256: hex(&Sha256::digest(&plain)),
+                compressed_bytes: 0,
+                plain_bytes: plain.len() as u64,
+            }],
+            plain.len() as u64,
+        );
+        let path = write_hostile_bundle(
+            "member-digest",
+            &manifest,
+            &[zstd::encode_all(plain.as_slice(), 3).unwrap()],
+            true,
+        );
+
+        let bundle = open(&path).expect("structurally valid");
+        let destination = scratch("member-digest-dest");
+        let error = bundle
+            .extract(&destination)
+            .expect_err("a member digest mismatch must be caught");
+        assert_eq!(error.kind(), crate::error::ErrorKind::DataIntegrity);
+        assert!(
+            error.to_string().contains("session/history.jsonl"),
+            "the error must name the member: {error}"
+        );
+        assert!(
+            !destination.join("session/history.jsonl").exists(),
+            "a member failing verification must not be written"
+        );
+    }
+
+    /// M11: a member span pointing past the end of the stream is refused rather
+    /// than panicking on a slice out of range.
+    #[test]
+    fn m11_a_member_span_past_the_stream_end_is_refused() {
+        let plain = b"short".to_vec();
+        let manifest = base_manifest(
+            vec![MemberEntry {
+                path: "a.txt".into(),
+                class: crate::bundle::policy::Class::SessionCritical
+                    .as_str()
+                    .into(),
+                mode: 0o100644,
+                size: 9_999,
+                sha256: "0".repeat(64),
+                span: crate::bundle::manifest::Span {
+                    offset: 0,
+                    length: 9_999,
+                },
+            }],
+            vec![crate::bundle::manifest::ChunkEntry {
+                index: 0,
+                sha256: hex(&Sha256::digest(&plain)),
+                compressed_bytes: 0,
+                plain_bytes: plain.len() as u64,
+            }],
+            plain.len() as u64,
+        );
+        let path = write_hostile_bundle(
+            "span-overrun",
+            &manifest,
+            &[zstd::encode_all(plain.as_slice(), 3).unwrap()],
+            true,
+        );
+
+        let bundle = open(&path).unwrap();
+        let error = bundle
+            .extract(&scratch("span-dest"))
+            .expect_err("an out-of-range span must be refused, not panic");
+        assert_eq!(error.kind(), crate::error::ErrorKind::DataIntegrity);
+    }
+
     /// A bundle is untrusted input. A member path that escapes the destination
     /// must be refused — the same defect class as the helper's mount-point
     /// escape, in a different place.
@@ -475,23 +873,75 @@ mod tests {
         assert!(safe_join(&root, "nested/ok.txt").is_ok());
     }
 
-    /// Session-critical members are written first, so a failure part-way leaves
-    /// the session usable rather than the caches restored and history missing.
+    /// Session-critical members are written before reconstructible ones, so a
+    /// failure part-way leaves the session usable rather than the caches
+    /// restored and the history missing.
+    ///
+    /// Observes the order `extract()` actually writes in: the reconstructible
+    /// member is listed first but carries a deliberately wrong digest, so
+    /// extraction aborts on it — and the session-critical file must already be
+    /// on disk. The previous version re-implemented the same sort inside the
+    /// test and asserted on its own output, which was tautological: the
+    /// production sort could be deleted with the test staying green (F-56
+    /// class, found by the guard-test audit).
     #[test]
-    fn session_critical_members_are_written_first() {
-        let (_, bundle_path) = make_bundle(
-            "ordering",
-            &[
-                (".nemr-state/backups/old.json", "reconstructible"),
-                (".nemr-state/projects/-workspace/a.jsonl", "critical"),
-            ],
-        );
-        let bundle = open(&bundle_path).unwrap();
-        let mut ordered: Vec<&MemberEntry> = bundle.manifest.members.iter().collect();
-        ordered.sort_by_key(|m| !m.is_session_critical());
+    fn session_critical_members_are_written_before_reconstructible_ones() {
+        let (_, bundle_path) = make_bundle("ordering", &[("a.txt", "content")]);
+        let mut bundle = open(&bundle_path).unwrap();
+
+        // Hand-built manifest mixing classes: the policy cannot produce a
+        // Reconstructible member from the real volume layout, so a fixture built
+        // through export() could not discriminate ordering at all.
+        let plain = b"CRITICAL-BYTESRECONSTRUCTIBLE".to_vec();
+        bundle.chunks.clear();
+        bundle
+            .chunks
+            .insert(0, zstd::encode_all(plain.as_slice(), 3).unwrap());
+        bundle.manifest.chunks = vec![crate::bundle::manifest::ChunkEntry {
+            index: 0,
+            sha256: hex(&Sha256::digest(&plain)),
+            compressed_bytes: 0,
+            plain_bytes: plain.len() as u64,
+        }];
+        bundle.manifest.members = vec![
+            MemberEntry {
+                path: "cache/regenerable.bin".into(),
+                class: crate::bundle::policy::Class::Reconstructible
+                    .as_str()
+                    .into(),
+                mode: 0o100644,
+                size: 15,
+                sha256: "0".repeat(64),
+                span: crate::bundle::manifest::Span {
+                    offset: 14,
+                    length: 15,
+                },
+            },
+            MemberEntry {
+                path: "session/history.jsonl".into(),
+                class: crate::bundle::policy::Class::SessionCritical
+                    .as_str()
+                    .into(),
+                mode: 0o100644,
+                size: 14,
+                sha256: hex(&Sha256::digest(b"CRITICAL-BYTES")),
+                span: crate::bundle::manifest::Span {
+                    offset: 0,
+                    length: 14,
+                },
+            },
+        ];
+
+        let destination = scratch("ordering-dest");
+        let error = bundle
+            .extract(&destination)
+            .expect_err("the corrupt reconstructible member must abort extraction");
+        assert_eq!(error.kind(), crate::error::ErrorKind::DataIntegrity);
+
         assert!(
-            ordered[0].is_session_critical(),
-            "the session-critical member must be restored first"
+            destination.join("session/history.jsonl").exists(),
+            "session-critical members must be written FIRST; without the production \
+             sort this file would not exist when extraction aborts"
         );
     }
 }

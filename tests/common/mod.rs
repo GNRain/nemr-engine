@@ -164,8 +164,38 @@ pub fn installed_helper_matches_built() -> Result<(), String> {
         ));
     }
 
-    let installed_hash = sha256_of(&installed)
-        .map_err(|e| format!("cannot hash the installed helper {}: {e}", installed.display()))?;
+    // F-58: hashing installed-vs-built is not enough. Neither hash is tied to
+    // the *source*, so "helper edited but never rebuilt" leaves both binaries
+    // identically stale and the gate green — contradicting this gate's own
+    // promise that a source change which was not reinstalled fails loudly.
+    // Nothing else rebuilds the helper: only scripts/setup_test_host.sh does,
+    // and the suite never runs it.
+    //
+    // So compare the built artifact against the source that produced it. A
+    // source file newer than the binary means the binary is stale, whatever its
+    // hash agrees with.
+    if let Some((newest, mtime)) = newest_helper_source()? {
+        let built_mtime = std::fs::metadata(&built)
+            .and_then(|m| m.modified())
+            .map_err(|e| format!("cannot stat {}: {e}", built.display()))?;
+        if mtime > built_mtime {
+            return Err(format!(
+                "the helper's source is newer than its built binary:\n     \
+                 {} is newer than {}\n     \
+                 The installed helper cannot be the source under test.\n     \
+                 fix: sudo ./scripts/setup_test_host.sh",
+                newest.display(),
+                built.display()
+            ));
+        }
+    }
+
+    let installed_hash = sha256_of(&installed).map_err(|e| {
+        format!(
+            "cannot hash the installed helper {}: {e}",
+            installed.display()
+        )
+    })?;
     let built_hash = sha256_of(&built)
         .map_err(|e| format!("cannot hash the built helper {}: {e}", built.display()))?;
 
@@ -182,10 +212,165 @@ pub fn installed_helper_matches_built() -> Result<(), String> {
     Ok(())
 }
 
+/// Newest source file of the helper crate, with its mtime.
+///
+/// `deploy/nemr-volume` is its **own** workspace with its own lockfile, so the
+/// outer workspace's manifests are deliberately not included: they do not
+/// determine this binary, and counting them made every ordinary edit to the
+/// engine report the helper as stale.
+fn newest_helper_source() -> Result<Option<(PathBuf, std::time::SystemTime)>, String> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("deploy/nemr-volume");
+    Ok(newest_under(&[
+        root.join("src"),
+        root.join("Cargo.toml"),
+        root.join("Cargo.lock"),
+    ]))
+}
+
+/// Newest source file of the engine and everything it is built from.
+///
+/// `crates/` is included because the engine links them: a change in
+/// `crates/nemr-containerd` changes the `nemr` binary just as surely as a change
+/// in `src/`, and a gate watching only `src/` would call a stale install
+/// current. The workspace manifests are included here because here they do
+/// determine the binary.
+fn newest_engine_source() -> Result<Option<(PathBuf, std::time::SystemTime)>, String> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    Ok(newest_under(&[
+        root.join("src"),
+        root.join("crates"),
+        root.join("Cargo.toml"),
+        root.join("Cargo.lock"),
+    ]))
+}
+
+/// Newest file among `paths`, recursing into directories.
+///
+/// Takes an explicit list rather than inferring a crate layout: each gate must
+/// state exactly what determines its binary, because a gate that guesses too
+/// widely goes red on unrelated edits and a gate that guesses too narrowly goes
+/// green on a stale one. `target/` directories are skipped — build output is
+/// newer than its own source by construction.
+fn newest_under(paths: &[PathBuf]) -> Option<(PathBuf, std::time::SystemTime)> {
+    let mut stack: Vec<PathBuf> = paths.iter().filter(|p| p.exists()).cloned().collect();
+    let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
+    while let Some(path) = stack.pop() {
+        if path.is_dir() {
+            if path.file_name().is_some_and(|name| name == "target") {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            stack.extend(entries.flatten().map(|entry| entry.path()));
+            continue;
+        }
+        let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(_, best)| mtime > *best) {
+            newest = Some((path, mtime));
+        }
+    }
+    newest
+}
+
+/// Where `nemr` is installed. Overridable so a developer with a different
+/// prefix can still be gated rather than silently exempt.
+pub fn installed_engine_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("NEMR_INSTALLED_BIN") {
+        return PathBuf::from(path);
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    home.join(".local/bin/nemr")
+}
+
+/// Path to the engine's release binary.
+pub fn built_engine_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/nemr")
+}
+
+/// Is the installed `nemr` the binary this working tree builds? (F-62)
+///
+/// The helper has had this gate since F-58; the engine has not, and the engine
+/// is the binary a user actually runs. Milestone closure here means "merged
+/// **and** reinstalled from that commit **and** verified against the installed
+/// artifacts" — a rule nothing enforced. `scripts/e2e_smoke_test.sh` invokes
+/// whatever `nemr` is on PATH, so a smoke test could pass against a binary
+/// built from a commit that no longer exists and report the milestone closed.
+///
+/// Two checks, for the two ways staleness happens:
+///
+///   1. installed hash != built hash — built but never installed;
+///   2. a source file newer than the installed binary — edited and never built,
+///      which leaves both binaries identically stale and hash-equal (the exact
+///      hole F-58 found in the helper's gate).
+///
+/// The hash comparison requires the install to be a **copy of
+/// `target/release/nemr`**, not a `cargo install` — `cargo install` rebuilds in
+/// its own target directory and produces a different (larger) binary from
+/// identical source, so hashes would never agree. See README.
+pub fn installed_engine_matches_built() -> Result<(), String> {
+    let installed = installed_engine_path();
+    let built = built_engine_path();
+
+    if !installed.exists() {
+        return Err(format!(
+            "nemr is not installed at {}\n     \
+             fix: ./scripts/install_engine.sh",
+            installed.display()
+        ));
+    }
+    if !built.exists() {
+        return Err(format!(
+            "the engine's release binary is not built at {}\n     \
+             fix: ./scripts/install_engine.sh",
+            built.display()
+        ));
+    }
+
+    if let Some((newest, mtime)) = newest_engine_source()? {
+        let installed_mtime = std::fs::metadata(&installed)
+            .and_then(|m| m.modified())
+            .map_err(|e| format!("cannot stat {}: {e}", installed.display()))?;
+        if mtime > installed_mtime {
+            return Err(format!(
+                "the engine's source is newer than the installed binary:\n     \
+                 {} is newer than {}\n     \
+                 The installed nemr cannot be the source under test.\n     \
+                 fix: ./scripts/install_engine.sh",
+                newest.display(),
+                installed.display()
+            ));
+        }
+    }
+
+    let installed_hash = sha256_of(&installed).map_err(|e| {
+        format!(
+            "cannot hash the installed engine {}: {e}",
+            installed.display()
+        )
+    })?;
+    let built_hash = sha256_of(&built)
+        .map_err(|e| format!("cannot hash the built engine {}: {e}", built.display()))?;
+    if installed_hash != built_hash {
+        return Err(format!(
+            "the installed nemr does not match the built source:\n     \
+             installed {} = {installed_hash}\n     \
+             built     {} = {built_hash}\n     \
+             fix: ./scripts/install_engine.sh",
+            installed.display(),
+            built.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Path to the helper crate's release binary, relative to this crate's root.
 pub fn built_helper_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("deploy/nemr-volume/target/release/nemr-volume")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("deploy/nemr-volume/target/release/nemr-volume")
 }
 
 fn sha256_of(path: &Path) -> std::io::Result<String> {
@@ -290,4 +475,210 @@ pub fn purge(name: &str) {
         let _ = std::fs::remove_file(paths.image_file(name));
         let _ = std::fs::remove_dir(paths.mount_point(name));
     }
+}
+
+/// Extract a bundle to a scratch directory and return every file's contents
+/// concatenated, for content assertions.
+///
+/// # Why not grep the bundle file
+///
+/// F-57: a bundle's chunks are zstd-compressed, so searching the `.nemr` bytes
+/// finds a plaintext string only when the content was small enough that zstd
+/// stored it near-verbatim. Measured: a marker in a 34-byte bundle is findable
+/// in the raw file; the same marker in a 241 KiB bundle is not. Every
+/// "the secret must not appear in the bundle" test written that way therefore
+/// passes on small fixtures and stops guarding anything at realistic sizes —
+/// it degrades precisely when it matters.
+///
+/// Assertions about what a bundle does or does not contain must run against the
+/// extracted plaintext, which is also what an importer or an attacker actually
+/// sees.
+pub fn extracted_plaintext(bundle_path: &Path) -> String {
+    let bundle = nemr_engine::bundle::import::open(bundle_path)
+        .unwrap_or_else(|e| panic!("open bundle {}: {e}", bundle_path.display()));
+    let dir = std::env::temp_dir().join(format!(
+        "nemr-extract-{}-{}",
+        std::process::id(),
+        unique_name("x")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    bundle.extract(&dir).expect("extract bundle");
+
+    let mut combined = String::new();
+    let mut stack = vec![dir.clone()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                combined.push_str(&text);
+                combined.push('\n');
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    combined
+}
+
+/// Write a bundle whose single member has an arbitrary (possibly hostile) path.
+///
+/// `export()` cannot produce a traversing member path — which is precisely why a
+/// traversal regression test needs a crafted fixture rather than a unit test on
+/// the path-joining helper alone (F-58).
+pub fn write_hostile_bundle(destination: &Path, member_path: &str, payload: &[u8]) {
+    use sha2::{Digest, Sha256};
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "engine_version": "0.1.0",
+        "created_at": "0",
+        "project": { "name": "hostile", "quota": "500MB", "content_bytes": payload.len() },
+        "base_image": {
+            "reference": nemr_engine::config::BASE_IMAGE,
+            "digest": local_base_image_digest().unwrap_or_default(),
+        },
+        "chunks": [{
+            "index": 0,
+            "sha256": hex(&Sha256::digest(payload)),
+            "compressed_bytes": 0,
+            "plain_bytes": payload.len(),
+        }],
+        "members": [{
+            "path": member_path,
+            "class": "session-critical",
+            "mode": 33188,
+            "size": payload.len(),
+            "sha256": hex(&Sha256::digest(payload)),
+            "span": { "offset": 0, "length": payload.len() },
+        }],
+        "excluded": [],
+    });
+
+    let file = std::fs::File::create(destination).expect("create hostile bundle");
+    let mut builder = tar::Builder::new(file);
+    let append = |builder: &mut tar::Builder<std::fs::File>, name: &str, bytes: &[u8]| {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder.append_data(&mut header, name, bytes).unwrap();
+    };
+    append(
+        &mut builder,
+        "manifest.json",
+        &serde_json::to_vec(&manifest).unwrap(),
+    );
+    append(
+        &mut builder,
+        "chunks/0000.zst",
+        &zstd::encode_all(payload, 3).unwrap(),
+    );
+    builder.finish().expect("finish hostile bundle");
+}
+
+/// The base image digest on this host, so a hostile bundle passes the base-image
+/// check and reaches the extraction path under test.
+pub fn local_base_image_digest() -> Option<String> {
+    // On a dedicated thread: callers are already inside a runtime, and nesting
+    // `Runtime::new().block_on` inside one panics.
+    std::thread::spawn(|| {
+        let runtime = tokio::runtime::Runtime::new().ok()?;
+        runtime.block_on(async {
+            let client = ContainerdClient::connect().await.ok()?;
+            client
+                .image_target_digest(nemr_engine::config::BASE_IMAGE)
+                .await
+                .ok()
+        })
+    })
+    .join()
+    .ok()
+    .flatten()
+}
+
+/// Whether unprivileged user, mount and network namespaces are usable here,
+/// and if not, **why**.
+///
+/// Reported rather than silently skipped: a host without them cannot verify
+/// E-11's offline guarantee, and that is a coverage gap to surface.
+///
+/// The bare boolean this replaced cost a CI round-trip: the offline test
+/// refused, said only "namespaces are unavailable", and left the actual cause
+/// to be guessed at. `unshare` writes a specific reason to stderr — on Ubuntu 24.04 it is
+/// normally `kernel.apparmor_restrict_unprivileged_userns`, but "normally" is
+/// not a diagnosis. Surfacing the real message means the next failure is read
+/// rather than inferred.
+pub fn namespace_probe() -> Result<(), String> {
+    namespace_probe_with("unshare")
+}
+
+/// The probe, parameterised on the binary so its failure path is testable.
+///
+/// Taking the command as an argument rather than mutating `PATH` keeps the test
+/// free of process-global state — and the point of the parameter is that the
+/// *diagnostic* gets exercised, not just the happy path. F-65 was a diagnostic
+/// that could never print; a diagnostic nothing ever runs is the same bug
+/// waiting to happen.
+pub fn namespace_probe_with(command: &str) -> Result<(), String> {
+    match Command::new(command).args(["-rmn", "true"]).output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.trim();
+            let restriction =
+                std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+                    .map(|value| format!("apparmor_restrict_unprivileged_userns={}", value.trim()))
+                    .unwrap_or_else(|_| "apparmor_restrict_unprivileged_userns=<absent>".into());
+            Err(format!(
+                "`unshare -rmn true` failed ({}): {}\n     {restriction}",
+                output.status,
+                if detail.is_empty() {
+                    "no stderr"
+                } else {
+                    detail
+                }
+            ))
+        }
+        Err(e) => Err(format!("cannot run `unshare`: {e}")),
+    }
+}
+
+/// Run the installed `nemr` CLI with **no network** and **no credential**.
+///
+/// A network namespace with only loopback makes any outbound request fail; a
+/// mount namespace with a tmpfs over `~/.claude` hides the credential *inside
+/// the namespace only*, so the real one is never moved or modified. containerd
+/// stays reachable through its local Unix socket, which is the intended
+/// reading of "no network": no internet and no sync service, not no IPC.
+pub fn run_offline(args: &[&str]) -> std::process::Output {
+    let home = std::env::var("HOME").expect("HOME");
+    let socket = ContainerdClient::default_socket_path()
+        .expect("containerd socket path")
+        .to_string_lossy()
+        .into_owned();
+    // CARGO_BIN_EXE_ rather than a hardcoded target/debug path: cargo guarantees
+    // this points at the binary built for *this* test run. The hardcoded path
+    // was correct only by coincidence — under `cargo test --release` the fresh
+    // binary lands in target/release and the debug one goes stale, so the
+    // offline tests would have gone green against a binary from an older commit.
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_nemr"));
+    let quoted: Vec<String> = args.iter().map(|a| format!("'{a}'")).collect();
+
+    Command::new("unshare")
+        .args(["-rmn", "bash", "-c"])
+        .arg(format!(
+            "mount -t tmpfs none '{home}/.claude' && \
+             CONTAINERD_ADDRESS='{socket}' '{}' {}",
+            binary.display(),
+            quoted.join(" ")
+        ))
+        .output()
+        .expect("run nemr offline")
 }

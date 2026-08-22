@@ -145,7 +145,10 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            println!("{:<18} {:<9} {:<18} {:<8} VOLUME", "NAME", "STATUS", "USED", "QUOTA");
+            println!(
+                "{:<18} {:<9} {:<18} {:<8} VOLUME",
+                "NAME", "STATUS", "USED", "QUOTA"
+            );
             for p in &projects {
                 let status = if p.running { "running" } else { "stopped" };
                 let used = match p.usage {
@@ -175,8 +178,18 @@ async fn main() -> Result<()> {
                             .unwrap_or_else(|| "unknown".into());
                         eprintln!("About to delete project {name:?}:");
                         eprintln!("  container: {}", p.container_id);
-                        eprintln!("  volume:    {} ({} used of {})", p.volume_path, used, p.quota);
-                        eprintln!("  status:    {}", if p.running { "running (will be stopped)" } else { "stopped" });
+                        eprintln!(
+                            "  volume:    {} ({} used of {})",
+                            p.volume_path, used, p.quota
+                        );
+                        eprintln!(
+                            "  status:    {}",
+                            if p.running {
+                                "running (will be stopped)"
+                            } else {
+                                "stopped"
+                            }
+                        );
                         eprintln!();
                         eprintln!("This permanently destroys the volume and everything in it.");
                     }
@@ -237,7 +250,8 @@ async fn main() -> Result<()> {
             include_build_artifacts,
         } => {
             let client = ContainerdClient::connect().await?;
-            let destination = output.unwrap_or_else(|| std::path::PathBuf::from(format!("{name}.nemr")));
+            let destination =
+                output.unwrap_or_else(|| std::path::PathBuf::from(format!("{name}.nemr")));
             let policy = nemr_engine::bundle::policy::Policy {
                 include_build_artifacts,
             };
@@ -271,7 +285,9 @@ async fn main() -> Result<()> {
                 for field in &summary.unrecognised_fields {
                     eprintln!("         {field}");
                 }
-                eprintln!("       If any of these should travel, add them to the portable allowlist.");
+                eprintln!(
+                    "       If any of these should travel, add them to the portable allowlist."
+                );
             }
 
             // The credential exclusion is a security property (D-02), so state

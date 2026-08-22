@@ -411,7 +411,10 @@ mod mode_tracker_tests {
     #[test]
     fn alt_screen_left_on_is_restored() {
         let r = restore_after(&[b"\x1b[?1049h drawing..."]);
-        assert!(r.contains("\x1b[?1049l"), "must leave the alternate screen: {r:?}");
+        assert!(
+            r.contains("\x1b[?1049l"),
+            "must leave the alternate screen: {r:?}"
+        );
         assert!(r.ends_with("\x1b[0m"), "must reset attributes after: {r:?}");
     }
 
@@ -441,7 +444,10 @@ mod mode_tracker_tests {
     #[test]
     fn sequence_split_across_reads_is_recognised() {
         let r = restore_after(&[b"\x1b[?10", b"49h rest"]);
-        assert!(r.contains("\x1b[?1049l"), "split sequence must be parsed: {r:?}");
+        assert!(
+            r.contains("\x1b[?1049l"),
+            "split sequence must be parsed: {r:?}"
+        );
     }
 
     /// Modes the tracker does not manage are left alone — guessing at a mode a
@@ -455,7 +461,10 @@ mod mode_tracker_tests {
     #[test]
     fn mouse_modes_left_on_are_disabled() {
         let r = restore_after(&[b"\x1b[?1000h\x1b[?1006h"]);
-        assert!(r.contains("\x1b[?1000l") && r.contains("\x1b[?1006l"), "mouse off: {r:?}");
+        assert!(
+            r.contains("\x1b[?1000l") && r.contains("\x1b[?1006l"),
+            "mouse off: {r:?}"
+        );
     }
 
     /// Alternate-screen restore must come first: leaving the buffer repositions
