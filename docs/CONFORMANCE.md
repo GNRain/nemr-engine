@@ -80,6 +80,30 @@ unless `sha256(installed) == sha256(built)` (finding F-11 / TEST-01).
 | STATE-01 (C1) | Determine empirically where session state lives | `docs/state-locality.md` (measured both layers) | experiment (evidence in doc) | ✅ history on rootfs, project files on volume; credential is a host bind-mount |
 | M8 (C2) | Relocate session-critical state onto the portable volume | `project.rs::session_state_mounts`, `create`; `config.rs` state paths | `m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted` + real-API `--continue` recall | ✅ surgical (history subtrees only; credential + `.claude.json` identity stay off the volume, D-02) |
 
+### Bundle portability and the storage seam (WP-D — M9–M12)
+
+| ID | Requirement | Implementation | Test | Status |
+|---|---|---|---|---|
+| M9 | Versioned bundle format: manifest, checksums, zstd, exclusion policy | `bundle/{manifest,export,policy}.rs`; `docs/bundle-format.md` v1 | 34 bundle unit tests; `m9_a_real_bundle_contains_no_credential`, `m9_export_does_not_swallow_bundles_in_the_workspace` | ✅ |
+| M10 | Import restores a session on another host | `bundle/import.rs`, `project::import` | `m10_bundle_round_trip_carries_the_session_to_another_project`; **live-API acceptance**: `claude --continue` recalled CARDAMOM-77 on a destination proven empty first | ✅ |
+| M11 | Hardening: old versions, base-image drift, corrupt/truncated, digest and quota mismatch | `import.rs` decide→verify→extract | 6 `m11_*` tests via a hostile-bundle fixture, **each proven red with its guarded code disabled**; `m11_a_hostile_bundle_cannot_escape_the_destination` | ✅ |
+| M12 | S3-compatible trait, R2 first, B2 viable behind it | `crates/nemr-storage` (**commercial side**, E-11): `ObjectStore`, `local`, `s3`, `conformance` | 16 storage tests; conformance suite run against `LocalStore` **and proven to reject a corrupting backend** | 🟡 **live bucket round-trip outstanding** — needs a credential this session does not hold; run `bucket_roundtrip` (see below) |
+| E-11 seam | The open half must not depend on the commercial half | dependency direction; `scripts/check_seam.sh` in CI | proven red when `nemr-engine` depends on `nemr-storage`; carries a control so a crate rename cannot make it pass vacuously | ✅ |
+| D-05 | Egress-conscious storage interface | `head` (no transfer) and `get_range` (manifest prefix) on the trait | `get_range_returns_a_prefix_and_clamps_past_the_end`; S3 `get_range` clamps rather than letting the service 416 | ✅ |
+| D-02 (M12) | A storage credential must not reach a log | `S3Config` `Debug` redacts both halves; error text truncated and stripped at `?` | `debug_redacts_the_credential_but_keeps_diagnostics` (with a control that the bucket *does* appear) | ✅ |
+
+**M12's remaining gap, stated precisely.** Everything except the live bucket is
+tested. The outstanding step is one command, run by whoever holds the credential:
+
+```
+NEMR_S3_PROVIDER=r2 NEMR_S3_BUCKET=… NEMR_S3_ENDPOINT=… NEMR_S3_ACCESS_KEY_ID=… NEMR_S3_SECRET_ACCESS_KEY=… cargo run -p nemr-storage --bin bucket_roundtrip -- <bundle.nemr>
+```
+
+It uses a PID-unique key under `nemr-roundtrip/`, deletes on every exit path
+including assertion failure, and prints no credential. Until it has run, "one
+cloud backend works end to end" is **unverified** — the local conformance pass is
+evidence the suite is correct, not evidence R2 is.
+
 ### Process model (PROC, Section 3.8)
 
 | ID | Requirement | Implementation | Test | Status |
