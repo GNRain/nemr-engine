@@ -1253,7 +1253,11 @@ pub async fn import(
     bundle.extract(&mount_point)
 }
 
-/// Find the base image a bundle needs, **locally first** (D-08 part 2).
+/// Find the base image a bundle needs, **locally only** (D-08 parts 1 and 2).
+///
+/// Public so the message a user actually sees can be asserted in a test rather
+/// than a reconstruction of it — the error text is the deliverable here, and a
+/// test that builds its own input would only be checking `format!`.
 ///
 /// Two attempts, in this order:
 ///
@@ -1265,7 +1269,7 @@ pub async fn import(
 /// Only after both miss does the registry become relevant. Each attempt is
 /// recorded so the error can say where it looked rather than just that it
 /// failed; see `Error::BaseImageUnresolved`.
-async fn resolve_base_image(
+pub async fn resolve_base_image(
     client: &ContainerdClient,
     wanted_digest: &str,
 ) -> crate::bundle::import::BaseImageResolution {
@@ -1302,17 +1306,26 @@ async fn resolve_base_image(
         )),
     }
 
-    // No registry is consulted yet — see D-08 part 1. Saying so is the point:
-    // an error that implied a network attempt it never made would send someone
-    // to debug their connection.
-    where_looked.push(
-        "no registry was contacted: this build resolves the base image locally only".to_string(),
-    );
+    // D-08 part 1, as ruled: nemr does not pull. Saying so explicitly is the
+    // point — an error that implied a network attempt it never made would send
+    // someone to debug their connection, and an error claiming to know whether a
+    // registry was reachable would be inventing a fact.
+    where_looked.push("no registry: nemr does not fetch images itself (D-08 part 1)".to_string());
 
     BaseImageResolution::Unresolved {
         where_looked,
-        advice: "Build and import the base image on this host (README, \"Base image\"), \n\
-                 or import the bundle on a machine that already has it."
-            .to_string(),
+        advice: format!(
+            "nemr does not fetch images. Pull it into the same rootless containerd \
+             this engine uses:\n\n    \
+             CONTAINERD_ADDRESS={socket} \\\n      \
+             ctr --namespace {namespace} images pull {reference}\n\n\
+             Then retry the import. If the image is not published anywhere, build it \
+             locally: ./scripts/build_base_image.sh",
+            socket = ContainerdClient::default_socket_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "$XDG_RUNTIME_DIR/containerd/containerd.sock".to_string()),
+            namespace = client.namespace(),
+            reference = config::BASE_IMAGE,
+        ),
     }
 }

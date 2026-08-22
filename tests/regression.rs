@@ -17,6 +17,10 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+/// The engine's own grace period, not a copy of it. A test asserting against a
+/// duplicated literal stops testing production the moment production changes.
+const GRACE_PERIOD: Duration = nemr_engine::containerd::config::SIGTERM_GRACE;
+
 use common::{
     extracted_plaintext, installed_helper_matches_built, require_host, run_offline, unit_only,
     write_hostile_bundle, HostRequirements, TestProject,
@@ -113,10 +117,20 @@ fn proc_06_stop_terminates_gracefully_without_escalating_to_sigkill() {
              that can only be killed is a container that never gets to flush anything."
         );
 
+        // F-68: this was `< 3s`, which fired at 3.47s on a machine that happened
+        // to be compiling — a false red on a healthy engine.
+        //
+        // The property that matters is already asserted above: `Graceful` means
+        // the supervisor exited on SIGTERM and was never escalated to SIGKILL.
+        // What remains for a duration check is the narrower case of "handled,
+        // but so slowly it nearly escalated", and only a threshold close to the
+        // grace period expresses that. Three seconds expressed "the machine is
+        // busy", which is not a defect in anything under test.
         assert!(
-            elapsed < Duration::from_secs(3),
-            "stop took {elapsed:?}. A graceful stop should be near-instant; anything \
-             approaching the five-second grace period means the signal is not being handled."
+            elapsed < GRACE_PERIOD - Duration::from_millis(500),
+            "stop took {elapsed:?} of a {GRACE_PERIOD:?} grace period. It did not escalate, \
+             but it came close enough that a slower machine would have been SIGKILLed — the \
+             supervisor is handling SIGTERM sluggishly rather than promptly."
         );
 
         assert!(
@@ -1176,6 +1190,391 @@ fn d08_the_base_image_resolves_by_digest_under_any_reference() {
             matched,
             "an image filed under {alias:?} carries digest {digest} and must be found by it; \
              resolving by name only would send this host to a registry for bytes it already has"
+        );
+    });
+}
+
+/// F-63 — a snapshot under a lease survives containerd's collector.
+///
+/// The defect: `create_container` prepared the rootfs snapshot and only then
+/// wrote the container record naming it. In between, the snapshot was
+/// unreferenced — containerd's definition of garbage — and if the collector ran
+/// there it was deleted, while the record write still returned `Ok` because
+/// containerd does not validate that `snapshot_key` resolves.
+///
+/// # Why both snapshots start leased (F-72)
+///
+/// The obvious shape — create one leased snapshot and one unleased one, then
+/// collect — is unsound, and failed in **both directions** before this:
+///
+///   * locally, in a full serial run: the unleased snapshot *survived*, because
+///     nothing had pushed containerd past its mutation threshold;
+///   * on CI: a snapshot was *already gone* at the baseline check, because 23
+///     preceding tests had, and the collector fired before the test looked.
+///
+/// Both are the same root cause. An unleased snapshot is unreferenced from the
+/// instant it is created, so it can be collected at any moment — including
+/// before the test has established it ever existed. The baseline observation was
+/// racing the very collector the test is trying to reason about.
+///
+/// So both snapshots are created **under leases**, which makes the baseline
+/// deterministic, and the control snapshot is then made collectable by releasing
+/// its lease at a moment this test chooses. Every state transition is
+/// test-controlled; none of it depends on when the collector happens to run.
+#[test]
+fn f63_a_leased_snapshot_survives_the_collector_and_an_unleased_one_does_not() {
+    if !require_host(HostRequirements {
+        containerd: true,
+        helper: false,
+        base_image: true,
+    }) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let chain_id = client
+            .image_chain_id(nemr_engine::config::BASE_IMAGE)
+            .await
+            .expect("the base image must be present");
+
+        let pid = std::process::id();
+        let kept_key = format!("f63-kept-{pid}");
+        let dropped_key = format!("f63-dropped-{pid}");
+
+        let lease_kept = client
+            .create_lease(&format!("f63-kept-lease-{pid}"))
+            .await
+            .expect("take the lease under test");
+        let lease_dropped = client
+            .create_lease(&format!("f63-dropped-lease-{pid}"))
+            .await
+            .expect("take the control's lease");
+
+        client
+            .prepare_snapshot(&kept_key, &chain_id, Some(&lease_kept))
+            .await
+            .expect("prepare under the lease under test");
+        client
+            .prepare_snapshot(&dropped_key, &chain_id, Some(&lease_dropped))
+            .await
+            .expect("prepare under the control's lease");
+
+        // BASELINE: both are lease-protected, so this cannot race the collector.
+        // Naming which one is missing matters: "a snapshot is gone" is
+        // ambiguous between "the harness raced" and "the lease is not working",
+        // and those are opposite conclusions.
+        let keys = client.list_snapshot_keys().await.expect("list");
+        assert!(
+            keys.contains(&kept_key),
+            "{kept_key} is missing at the baseline, while still under a live lease. \
+             That is the lease failing to protect, not a timing artifact."
+        );
+        assert!(
+            keys.contains(&dropped_key),
+            "{dropped_key} is missing at the baseline, while still under a live lease. \
+             That is the lease failing to protect, not a timing artifact."
+        );
+
+        // The control becomes collectable HERE, by this test's choice — not at
+        // some earlier moment outside its control.
+        client
+            .delete_lease(&lease_dropped)
+            .await
+            .expect("release the control's lease");
+
+        // A collection on demand: containerd answers a synchronous lease delete
+        // only once a collection has completed.
+        client.collect_garbage_now().await;
+
+        let keys = client.list_snapshot_keys().await.expect("list");
+        let kept_survived = keys.contains(&kept_key);
+        let dropped_survived = keys.contains(&dropped_key);
+
+        // Clean up before asserting, so a failure leaves no residue.
+        let _ = client.delete_lease(&lease_kept).await;
+        let _ = client.remove_snapshot(&kept_key).await;
+        let _ = client.remove_snapshot(&dropped_key).await;
+
+        // CONTROL first: if the collection did not actually remove the
+        // unreferenced snapshot, then "the leased one survived" says nothing.
+        assert!(
+            !dropped_survived,
+            "{dropped_key} survived after its lease was released and a collection ran, so \
+             the collection did not do anything and this test cannot speak to the lease"
+        );
+        assert!(
+            kept_survived,
+            "{kept_key} was collected while its lease was still held: the lease is not \
+             protecting the window between prepare and the container record write (F-63)"
+        );
+    });
+}
+
+/// F-63 — a completed create leaves no lease behind.
+///
+/// The lease pins its snapshot. Held past the point the container record
+/// references it, it would keep collecting nothing forever — the opposite leak,
+/// and quieter, because nothing fails and the disk just never comes back. The
+/// expiry label bounds that to an hour; this asserts the normal path does not
+/// rely on it.
+#[test]
+fn f63_a_create_releases_its_lease() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let before = client.list_lease_ids().await.expect("list leases");
+
+        let project = TestProject::create(&client, "f63lease", VolumeSize::DEFAULT).await;
+
+        let after = client.list_lease_ids().await.expect("list leases");
+        let leaked: Vec<&String> = after
+            .iter()
+            .filter(|id| !before.contains(id) && id.contains(&project.name))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "create left {leaked:?} behind; a lease outliving its create pins the snapshot \
+             it was protecting and nothing reports it"
+        );
+    });
+}
+
+/// F-63 — `create_container` itself must survive a collector running during it.
+///
+/// The sibling test proves the lease *mechanism* protects a snapshot. This one
+/// proves `create_container` actually **uses** it, which is a different claim: a
+/// working mechanism the production path never reaches protects nothing.
+///
+/// # Why this uses a hook rather than racing
+///
+/// The window is two consecutive gRPC calls wide. The first version of this
+/// test ran creates under heavy concurrent churn and hoped to catch the
+/// collector in it — and **passed with the lease removed**, twice. Measuring it
+/// properly: 79 of 80 creates survived unleased, a ~1.25% per-create failure
+/// rate. A guard that misses the defect 98.75% of the time is a guard that
+/// reports green over a real bug, so the probabilistic version was deleted
+/// rather than tuned.
+///
+/// The hook makes it deterministic: a synchronous lease deletion — which
+/// containerd answers only after a collection has run — fires *inside* the
+/// window. Leased survives every time; unleased is collected every time.
+#[test]
+fn f63_create_container_holds_its_snapshot_against_a_collection_inside_the_window() {
+    if !require_host(HostRequirements {
+        containerd: true,
+        helper: false,
+        base_image: true,
+    }) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let pid = std::process::id();
+
+        // The hook: create a lease and delete it with sync=true, which
+        // containerd answers only once a garbage collection has completed. That
+        // is a collection running inside the create window, on demand.
+        let hook_client = std::sync::Arc::new(ContainerdClient::connect().await.expect("connect"));
+        let hook: nemr_engine::containerd::client::CreateWindowHook =
+            std::sync::Arc::new(move || {
+                let client = hook_client.clone();
+                Box::pin(async move {
+                    client.collect_garbage_now().await;
+                })
+            });
+
+        let client = ContainerdClient::connect()
+            .await
+            .expect("connect")
+            .with_create_window_hook(hook);
+
+        let id = format!("nemr-f63-window-{pid}");
+        let spec = nemr_engine::containerd::containers::ContainerSpec {
+            id: id.clone(),
+            image: nemr_engine::config::BASE_IMAGE.to_string(),
+            mounts: vec![],
+            working_dir: None,
+            extra_env: vec![],
+            args: Some(vec!["/bin/sh".to_string()]),
+            cgroup_name: None,
+            cgroup_prefix: nemr_engine::config::CGROUP_PREFIX.to_string(),
+            labels: Default::default(),
+        };
+
+        client
+            .create_container(&spec)
+            .await
+            .expect("create_container must succeed");
+
+        let survived = client
+            .list_snapshot_keys()
+            .await
+            .expect("list")
+            .contains(&id);
+
+        let _ = client.delete_container(&id).await;
+        let _ = client.remove_snapshot(&id).await;
+
+        assert!(
+            survived,
+            "the rootfs snapshot for {id} was collected during create. create_container is \
+             not holding a lease across prepare→record (F-63): it returns Ok with a \
+             snapshot_key that no longer resolves, and `nemr start` fails later, forever."
+        );
+    });
+}
+
+/// D-08 part 1 — the unresolved-base-image error must not imply a fetch it never attempts.
+///
+/// The ruling scoped registry pull out: `nemr` does not fetch images. The
+/// earlier draft of this error promised to distinguish "registry unreachable"
+/// from "digest not found there" — a distinction nothing can make without
+/// attempting the fetch. Claiming it would have been a fabrication in the one
+/// place a user is already stuck.
+///
+/// Asserts the real message from the real resolver, not a reconstruction.
+#[test]
+fn d08_the_unresolved_base_image_error_is_honest_about_not_fetching() {
+    if !require_host(HostRequirements {
+        containerd: true,
+        helper: false,
+        base_image: false,
+    }) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let absent = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+        let resolution = project::resolve_base_image(&client, absent).await;
+        let (where_looked, advice) = match resolution {
+            nemr_engine::bundle::import::BaseImageResolution::Unresolved {
+                where_looked,
+                advice,
+            } => (where_looked.join("\n"), advice),
+            other => panic!("a digest of all zeroes must not resolve, got {other:?}"),
+        };
+
+        assert!(
+            where_looked.contains("by digest across all images"),
+            "must report the by-digest attempt: {where_looked}"
+        );
+        assert!(
+            where_looked.contains("does not fetch images itself"),
+            "must say plainly that nemr does not pull: {where_looked}"
+        );
+        // The honest-limit requirement, stated as a negative: no claim about a
+        // registry's reachability, because none was contacted.
+        for invented in ["unreachable", "not found there", "timed out", "connection"] {
+            assert!(
+                !where_looked.to_lowercase().contains(invented),
+                "must not claim {invented:?} about a registry it never contacted: {where_looked}"
+            );
+        }
+        assert!(
+            advice.contains("ctr") && advice.contains("images pull"),
+            "must give the exact fetch command: {advice}"
+        );
+        assert!(
+            advice.contains("--namespace"),
+            "the command must target the same containerd namespace the engine uses, or it \
+             pulls into a namespace nemr never reads: {advice}"
+        );
+        assert!(
+            advice.contains("CONTAINERD_ADDRESS"),
+            "the command must target the rootless socket, or it pulls into the system \
+             daemon (PRIV-01): {advice}"
+        );
+    });
+}
+
+/// PROC-06 — the SIGKILL escalation path must actually work.
+///
+/// # The gap this closes (F-69)
+///
+/// `proc_06_stop_terminates_gracefully_without_escalating_to_sigkill` asserts
+/// that stopping a well-behaved container does **not** escalate. Nothing
+/// asserted that escalation happens when it should, so
+/// `StopOutcome::Killed` was never produced anywhere in the tree — not by a
+/// test, not by any other code path. If the timeout branch in `stop_task` were
+/// dead, every existing test would still pass: a container ignoring SIGTERM
+/// would hang forever and no guard would notice.
+///
+/// The message a user sees in that case (`nemr.rs`, "had to be killed") had
+/// likewise never been produced. Same shape as F-65 and F-67 — machinery for a
+/// failure, never run on one.
+///
+/// Runs a PID 1 that explicitly traps and ignores SIGTERM, so escalation is the
+/// only way the task can end.
+#[test]
+fn proc_06_a_container_ignoring_sigterm_is_escalated_to_sigkill() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let name = common::unique_name("proc06kill");
+        common::purge(&name);
+
+        // A supervisor that refuses to die on SIGTERM. `trap '' TERM` sets the
+        // disposition to ignore, which survives into the shell's wait loop.
+        let spec = nemr_engine::containerd::containers::ContainerSpec {
+            id: format!("nemr-{name}"),
+            image: nemr_engine::config::BASE_IMAGE.to_string(),
+            mounts: vec![],
+            working_dir: None,
+            extra_env: vec![],
+            args: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "trap '' TERM; while :; do sleep 1; done".to_string(),
+            ]),
+            cgroup_name: Some(name.clone()),
+            cgroup_prefix: nemr_engine::config::CGROUP_PREFIX.to_string(),
+            labels: Default::default(),
+        };
+        let id = spec.id.clone();
+
+        client.create_container(&spec).await.expect("create");
+        client.start_task(&id).await.expect("start the task");
+
+        let started = Instant::now();
+        let outcome = client.stop_task(&id).await.expect("stop must not error");
+        let elapsed = started.elapsed();
+
+        let _ = client.delete_container(&id).await;
+        let _ = client.remove_snapshot(&id).await;
+        common::purge(&name);
+
+        assert_eq!(
+            outcome,
+            StopOutcome::Killed,
+            "a PID 1 that ignores SIGTERM must be escalated to SIGKILL and reported as \
+             Killed, not silently reported as a graceful stop"
+        );
+        // It must have actually waited for the grace period rather than
+        // escalating immediately — killing straight away would defeat the point
+        // of a graceful stop for every well-behaved container.
+        assert!(
+            elapsed >= GRACE_PERIOD,
+            "escalated after only {elapsed:?}; the {GRACE_PERIOD:?} grace period was not \
+             honoured, so well-behaved containers are being killed without a chance to flush"
         );
     });
 }

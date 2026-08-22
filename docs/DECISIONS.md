@@ -542,6 +542,56 @@ motivated it; the audit found the rest.
 
 ---
 
+### D-10 — Registry pull: out of scope now, a hard dependency the moment there is a GUI
+
+**Status:** Open — **tracked dependency, deliberately not built.**
+**Raised by:** Claude Code · **Ruled out of D-08 scope by:** Rain
+**Relates to:** D-08, E-10, E-11
+
+D-08 part 1 was scoped down: `nemr` does not fetch images. The base image is
+resolved locally or the user is told the exact command to fetch it. That is
+correct today and the error says so plainly rather than implying a capability
+that does not exist.
+
+**Why it is recorded separately rather than left implicit in D-08.** The
+scope-down rests on one assumption: that the user is at a terminal and can run
+`ctr images pull`. A GUI promising one-click attach cannot tell anyone to run
+`ctr`. So registry pull is not a nice-to-have that might arrive — it is a
+prerequisite of the GUI, and it should be visible as a tracked dependency now
+rather than discovered during GUI work when it blocks a release.
+
+Note the interaction with E-10: the GUI is also what makes non-Linux hosts
+urgent. Both deferred items come due at the same moment, and neither is small.
+
+**Likely approach.** containerd's **Transfer service**, exposed by
+`containerd-client` 0.9 (`TransferClient`, `containerd.services.transfer.v1`) and
+already vendored in the dependency we have. It moves an OCI registry source into
+an image-store destination server-side, which means containerd handles the
+manifest walk, layer download and content ingest — no HTTP client, no manifest
+parsing and no blob handling in our code. It also composes with F-63's leases:
+a transfer is exactly the kind of multi-step resource creation that needs one.
+
+**Cost estimate — my own, and it is an estimate.** Roughly **3–5 days** of
+focused work:
+
+| Piece | Notes |
+|---|---|
+| Transfer plumbing | The smallest part. Wire `OCIRegistry` source → `ImageStore` destination, stream progress. ~½ day |
+| Registry auth | Anonymous pull for a public GHCR image is easy; token flow for private ones is not, and the credential then falls under D-02, which forbids syncing it. Design work, not just code |
+| Lease correctness | A transfer creates content and image records; the F-63 class applies directly |
+| Failure taxonomy | The distinction dropped from D-08's error — unreachable vs absent vs unauthorised — becomes real and must be mapped into D-07 |
+| Verification | Needs a registry to test against. A local registry in CI, or GHCR with a scoped token, which is a credential this project deliberately keeps out of the harness (see D-02 and the R2 precedent) |
+
+The last row is the one that usually surprises: the code is days, the *evidence*
+that it works is where the time actually goes, exactly as it did for M12.
+
+**Consequence of leaving it open:** the honest description of the product today
+is "brings your own base image". Any roadmap or GUI mock that shows attaching on
+a fresh machine with no terminal step is describing something that does not
+exist yet.
+
+---
+
 ### D-09 — B2 is implemented but has never touched a live bucket
 
 **Status:** Open (tracking item; no ruling required, but the gap should not
@@ -596,4 +646,6 @@ is overstating what has been demonstrated.
 | 2026-08-22 | D-08 | Opened — base-image hosting; four options, recommendation (c)-then-(b), **not decided** (Claude Code) |
 | 2026-08-22 | D-09 | Opened — B2 implemented but never run against a live bucket; tracking item (Claude Code) |
 | 2026-08-22 | D-08 | **Resolved** — GHCR by digest + local-cache fallback + `export --with-base-image`; recommendation (c)-then-(b) superseded (Rain) |
+| 2026-08-22 | D-10 | Opened — registry pull out of D-08 scope; tracked as a GUI prerequisite, Transfer service, 3–5 day estimate (Claude Code) |
+| 2026-08-22 | D-08 | Part 1 scoped down (Rain): nemr does not pull; error states the limit and gives the exact `ctr` command |
 | 2026-08-22 | E-10 | **Deferred with direction** — Linux first, then WSL2, then a bundled VM on macOS; remote-engine fallback rejected. Moved out of Open (Rain) |

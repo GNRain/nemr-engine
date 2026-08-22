@@ -30,6 +30,47 @@ pub struct ContainerdClient {
     inner: Client,
     socket_path: PathBuf,
     namespace: String,
+    /// Test-only seam: awaited between `PrepareSnapshot` and the container
+    /// record write inside [`ContainerdClient::create_container`].
+    ///
+    /// # Why a hook instead of a probabilistic test (F-63)
+    ///
+    /// The window this guards is two consecutive gRPC calls wide. Measured
+    /// against the unfixed code under heavy concurrent churn, a create loses its
+    /// snapshot about **1.25% of the time** (79 of 80 survived), so a test that
+    /// races the collector would miss the defect far more often than it caught
+    /// it — a guard that passes when the property is violated, which this
+    /// project treats as worse than no guard.
+    ///
+    /// With the hook, a test triggers a synchronous collection *inside* the
+    /// window and the outcome is deterministic: leased survives, unleased does
+    /// not, every run.
+    ///
+    /// It is `None` on every constructor. Nothing reads an environment variable
+    /// to enable it and there is no production path that sets it, so it cannot
+    /// fire outside a test that deliberately installs it.
+    #[doc(hidden)]
+    pub(crate) inside_create_window: Option<CreateWindowHook>,
+}
+
+/// See [`ContainerdClient::inside_create_window`].
+#[doc(hidden)]
+pub type CreateWindowHook = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
+impl ContainerdClient {
+    /// Install the test seam described on [`Self::inside_create_window`].
+    ///
+    /// Hidden from the docs and used only by the F-63 regression test. Kept on
+    /// the client rather than behind `cfg(test)` because the test lives in a
+    /// different crate, and behind a constructor rather than an environment
+    /// variable so nothing outside this call can turn it on.
+    #[doc(hidden)]
+    pub fn with_create_window_hook(mut self, hook: CreateWindowHook) -> Self {
+        self.inside_create_window = Some(hook);
+        self
+    }
 }
 
 impl ContainerdClient {
@@ -96,6 +137,7 @@ impl ContainerdClient {
             inner,
             socket_path,
             namespace: namespace.into(),
+            inside_create_window: None,
         })
     }
 

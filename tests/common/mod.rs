@@ -49,6 +49,60 @@ impl HostRequirements {
     };
 }
 
+/// Refuse to run host-backed tests concurrently (F-71).
+///
+/// This module's own documentation has always said `--test-threads=1` is
+/// **required**: these tests attach loop devices, mount filesystems, start
+/// containers and drive containerd's garbage collector, all of which are global
+/// host state. Nothing enforced it. `cargo test --test regression` — the obvious
+/// invocation — runs them across `nproc` threads and produces failures that
+/// belong to the harness rather than the engine.
+///
+/// That cost real time: F-63 was first observed in a parallel run, and "you ran
+/// it in an unsupported mode" was a live explanation for it until a serial arm
+/// ruled it out. A requirement stated only in prose is the same defect class as
+/// a CI job named for a check it never runs (F-64) or a suite that reports ok
+/// having run nothing (F-60): the rule exists, and nothing applies it.
+///
+/// `NEMR_TEST_ALLOW_PARALLEL=1` is a deliberate opt-out for concurrency
+/// experiments — the loaded-parallel arms used to characterise F-63 need it. It
+/// prints what it means, because a failure in that mode is not a defect unless
+/// it also reproduces serially.
+fn require_serial_execution() {
+    if std::env::var_os("NEMR_TEST_ALLOW_PARALLEL").is_some() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            eprintln!(
+                "NEMR_TEST_ALLOW_PARALLEL is set: host-backed tests may run concurrently. \
+                 These tests share global host state, so a failure here is NOT a defect \
+                 unless it also reproduces under --test-threads=1."
+            );
+        });
+        return;
+    }
+
+    // libtest passes its own arguments through to the test binary, so the
+    // binary's argv is an exact record of how it was invoked — no guessing.
+    let serial_flag = std::env::args().any(|arg| arg == "--test-threads=1")
+        || std::env::args()
+            .zip(std::env::args().skip(1))
+            .any(|(flag, value)| flag == "--test-threads" && value == "1");
+    let serial_env = std::env::var("RUST_TEST_THREADS").is_ok_and(|value| value == "1");
+
+    assert!(
+        serial_flag || serial_env,
+        "\n\nThis suite must run serially, and nothing was asserting it until F-71.\n\n\
+         These tests attach loop devices, mount filesystems, start containers and drive \n\
+         containerd's garbage collector — all global host state. Run in parallel they \n\
+         produce failures that belong to the harness rather than the engine, which is \n\
+         exactly how F-63 nearly got dismissed as a threading artifact.\n\n  \
+         fix: cargo test --test regression -- --test-threads=1\n\n  \
+         For a deliberate concurrency experiment, set NEMR_TEST_ALLOW_PARALLEL=1 and read \n  \
+         its warning: a failure in that mode is not a defect unless it also reproduces \n  \
+         serially.\n"
+    );
+}
+
 /// Whether the developer explicitly opted out of host-backed tests.
 pub fn unit_only() -> bool {
     std::env::var_os("NEMR_TEST_UNIT_ONLY").is_some()
@@ -68,6 +122,11 @@ pub fn require_host(requirements: HostRequirements) -> bool {
         );
         return false;
     }
+
+    // After the unit-only return, deliberately: the serial requirement exists
+    // because these tests share global host state, and a unit-only run touches
+    // none of it. CI's unit job runs without the flag and is right to.
+    require_serial_execution();
 
     let mut missing = Vec::new();
 
