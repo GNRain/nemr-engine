@@ -32,6 +32,8 @@ jobs:
       - name: Docker-freeness check
         run: ./scripts/check_docker_free.sh
 
+      - name: Base image inputs are pinned (F-74)
+        run: ./scripts/check_base_image_pins.sh
       - name: E-11 seam — the open half must not depend on the commercial half
         run: ./scripts/check_seam.sh
 

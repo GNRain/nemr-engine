@@ -12,7 +12,14 @@
 # measured size is recorded in README per AC-2.2.
 #
 # Node 22 matches the LTS line and the host's own Node (v22.23.2).
-FROM node:22-slim
+#
+# Pinned by digest, not by tag (F-74). `node:22-slim` is a moving target: two
+# hosts building the same Dockerfile a week apart get different bytes, which is
+# how Clawd ended up on sha256:2c4127a5… and Work on sha256:4074f744… from
+# identical source. The tag is kept in the reference for readability; the digest
+# is what actually selects.
+ARG NODE_DIGEST=sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436
+FROM node:22-slim@${NODE_DIGEST}
 
 # Runtime dependencies, kept deliberately small:
 #   ca-certificates — TLS trust for the Anthropic API; without it Claude Code
@@ -25,6 +32,13 @@ FROM node:22-slim
 #   less            — pager used for long output.
 # --no-install-recommends keeps the layer minimal; the apt lists are removed
 # in the same layer so they do not persist in the image.
+#
+# NOT pinned, and this is the honest limit of F-74's fix: `apt-get update` takes
+# whatever the Debian mirror currently serves. Pinning it means snapshot.debian.org
+# and a snapshot date, which is a further change with its own cost (a frozen
+# snapshot stops receiving security updates until someone moves the date). The
+# base image and Claude Code were the two inputs that actually drifted here; apt
+# is recorded as remaining variance rather than quietly implied to be fixed.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -33,11 +47,19 @@ RUN apt-get update \
         less \
     && rm -rf /var/lib/apt/lists/*
 
-# Claude Code itself. Pinned to no specific version at Phase 1: the engine is
-# what is under test, and pinning here would mean rebuilding the base image to
-# pick up Claude Code updates. Revisit if reproducibility of the image becomes
-# a requirement.
-RUN npm install -g @anthropic-ai/claude-code \
+# Claude Code itself, pinned (F-74).
+#
+# It was deliberately unpinned at Phase 1, on the reasoning that the engine is
+# what is under test and pinning means rebuilding to pick up updates. That
+# reasoning was overtaken by evidence: two hosts built the same Dockerfile and
+# got Claude Code 2.1.227 and 2.1.240, which is a different image and therefore
+# a base-image drift that M11 correctly refuses to import across. Rebuilding to
+# take an update is the cheaper problem.
+#
+# Overridable, so taking an update is a build-arg away rather than an edit:
+#   buildctl build --opt build-arg:CLAUDE_CODE_VERSION=2.1.241 ...
+ARG CLAUDE_CODE_VERSION=2.1.240
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force
 
 # Use the distro ripgrep rather than the vendored one (see above).
