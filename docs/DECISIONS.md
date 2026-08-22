@@ -383,6 +383,130 @@ motivated it; the audit found the rest.
 
 ---
 
+### D-08 — Where the base image lives, and what happens when it does not
+
+**Status:** Open — **raised, not decided.** Needs a Product Owner ruling.
+**Raised by:** Claude Code · **Relates to:** D-06 (base image by digest), E-11
+
+`nemr` pins its base image as `docker.io/nemr/base:0.1.0`. Three facts about
+that string, established rather than assumed:
+
+**Is it published anywhere?** **No — measured, not assumed.** An anonymous
+manifest request to `registry-1.docker.io` for `nemr/base` returns **HTTP 401**
+for both `0.1.0` and `latest`, while the same probe returns **HTTP 200** for
+`library/alpine` and `library/busybox` — the control that proves the probe finds
+a repository that does exist. Docker Hub answers 401 rather than 404 for
+absent-or-private repositories, so the precise finding is *not anonymously
+pullable*; whether it is missing or private cannot be distinguished from
+outside. Either way a pull would fail for a new user.
+
+The name was written into `config.rs` as a placeholder and never registered.
+Every working install today has the image because it was built locally and
+imported into containerd by hand, per README §"Base image (Milestone 2)". The
+reference is therefore a *label for a local artifact*, not a location — and
+nothing in the code or the docs says so.
+
+**What happens on registry outage?** Today, nothing — because nothing pulls.
+That is not a resilience property, it is the absence of a code path. The moment
+a pull is implemented against this name, an outage (or a Docker Hub rate limit,
+which is far likelier: anonymous pulls are throttled per-IP) becomes a hard
+failure at `nemr start` on any machine that has not already cached the image.
+Note the shape: the failure would arrive on a machine that has run fine for
+months, at the moment its cache is evicted.
+
+**Does E-11 constrain where base images live?** No — and this is worth stating
+plainly because it is the one part that is genuinely unconstrained. E-11 puts
+the engine, the containerd wrapper, the volume layer, the helper and the bundle
+*format* on the open side, and the sync layer, lease service, cloud storage
+backends and identity on the commercial side. A base image is none of those. It
+is an input the open engine consumes, like `runc`. The E-11 test — *can someone
+use the open half productively without ever paying?* — is satisfied as long as
+the image is obtainable without an account. It is **not** satisfied if the image
+moves behind a registry that requires a paid identity, which is the one option
+below that should be treated as foreclosed.
+
+There is a fourth fact that matters more than the hosting question: `docker.io`
+is a **Docker-branded registry**, and the project's hard constraint is *no Docker
+at any layer, including transitively*. Pulling from Docker Hub does not link
+Docker code — containerd speaks the OCI distribution protocol and the registry
+is just an HTTPS host — so this is a naming and dependency-posture question, not
+a literal breach. But shipping a product that forbids Docker while its default
+image reference begins `docker.io/` is the kind of detail that will be read as
+one, and I would rather raise it than let it be discovered.
+
+**Options.**
+
+| # | Option | Cost | What it buys | What it costs |
+|---|---|---|---|---|
+| a | **Keep the name, publish the image** to Docker Hub under a real `nemr` org | low | The reference becomes true; `nemr start` can pull | Registry dependency on `docker.io` at first run; rate limits; the branding problem above |
+| b | **Rename to a vendor-neutral registry** (GHCR, `ghcr.io/<org>/nemr-base`) and publish | low | Same as (a), without `docker.io` in the string; GHCR has no anonymous pull limit for public images | Still a single hosted dependency and a single point of outage |
+| c | **Keep it local-only and say so**: rename to a non-registry reference (e.g. `nemr.local/base:0.1.0`), keep the build-and-import step, add a check that fails with a build instruction rather than attempting a pull | low | Honest today; no network dependency at all; no registry to go down | Every user must build the image; slower first run; no upgrade path without one |
+| d | **Content-addressed with a mirror list**: pin by digest (D-06 already does this for bundles), fetch from any of N hosts, fall back to local build | high | Outage-tolerant, verifiable, vendor-neutral | Real work — mirror infrastructure, digest pinning for images, fallback logic — for a problem nobody has hit yet |
+
+**Recommendation: (c) now, (b) when there is something to ship.**
+
+The reasoning is that (c) is the only option that makes the code *stop lying*
+today, at near-zero cost. The current string asserts a registry location that
+does not exist; renaming it to something obviously local converts a latent
+404-on-first-pull into an accurate description of what the system actually does.
+That is a strictly better position to be in while pre-release, and it forecloses
+nothing. (b) is where this should land once there is a published artifact worth
+pulling, and it avoids both the `docker.io` branding problem and Docker Hub's
+anonymous rate limits. (d) is correct engineering for a mature product and
+premature now — it buys resilience against an outage of infrastructure that has
+not been chosen yet.
+
+**Consequences of each, since the ruling is yours:**
+
+- **(a)** commits the project to `docker.io` in its most visible default string,
+  and to Docker Hub's rate limits on every uncached first run. Reversing it
+  later means changing a reference users have already pinned.
+- **(b)** commits to GHCR as the distribution point and to maintaining a
+  published image (tagging, retention, a signing story). Cheapest correct
+  long-term answer; still one host that can go down.
+- **(c)** commits every user to a local build step, which is a real onboarding
+  cost and will be the first thing a new user complains about. It also means
+  there is no mechanism to ship a base-image security fix — users must rebuild,
+  and nothing tells them to.
+- **(d)** commits to running mirror infrastructure, which is an ongoing
+  operational cost and a commercial-side obligation E-11 has not accounted for.
+
+**Not decided here.** I have not changed `BASE_IMAGE`; the string still reads
+`docker.io/nemr/base:0.1.0` and the README still says build-and-import.
+
+---
+
+### D-09 — B2 is implemented but has never touched a live bucket
+
+**Status:** Open (tracking item; no ruling required, but the gap should not
+close silently)
+**Raised by:** Claude Code · **Relates to:** D-05, F-61
+
+M12's acceptance ran against a real R2 bucket and passed. The same `S3Store`
+code path serves B2 — `Provider` supplies configuration only and is never
+branched on at request time, which is exactly the property that makes "it works
+for R2" *suggestive* for B2 rather than *evidence* for it.
+
+What is actually established: B2 passes the conformance suite against
+`LocalStore`, and its configuration is constructed by the same code that R2's
+is. What is not established: that B2's endpoint accepts these requests, that its
+`head` returns the size field this code reads, that its ETag shape does not
+break anything, that range requests clamp rather than 416, and that its
+delete-idempotence matches the trait contract. Every one of those is a place
+where S3-compatible implementations are known to differ.
+
+D-05 records B2 as *viable behind the same trait*. That claim is currently
+untested against the thing it is a claim about. It should stay open until
+someone runs `bucket_roundtrip` against a live B2 bucket — the same one-command
+step the R2 acceptance was, now with `--keep` so the result can be checked
+independently (F-61).
+
+**Consequence of leaving it open:** the honest description of the storage layer
+is "R2-verified, B2-plausible", and any roadmap or README claiming B2 support
+is overstating what has been demonstrated.
+
+---
+
 ## Log
 
 | Date | Entry | Change |
@@ -403,3 +527,5 @@ motivated it; the audit found the rest.
 | 2026-08-21 | F-XX | Opened — `.claude.json` MCP-vs-identity split |
 | 2026-08-21 | F-XX | Implementation note appended — ledger number is F-54; resolved via project-scoped `.mcp.json`, structurally, no bind-mount change, D-06 intact (Claude Code) |
 | 2026-08-21 | F-58 | Opened — guard-test rule produced 17 findings incl. an `extract()` path traversal; all closed (Claude Code) |
+| 2026-08-22 | D-08 | Opened — base-image hosting; four options, recommendation (c)-then-(b), **not decided** (Claude Code) |
+| 2026-08-22 | D-09 | Opened — B2 implemented but never run against a live bucket; tracking item (Claude Code) |
