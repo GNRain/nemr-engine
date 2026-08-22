@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
     let _ = client.remove_snapshot(PROBE).await;
 
     println!("1. preparing an UNREFERENCED snapshot (exactly what create_container does)");
-    client.prepare_snapshot(PROBE, &chain_id).await?;
+    client.prepare_snapshot(PROBE, &chain_id, None).await?;
     let present = client
         .list_snapshot_keys()
         .await?
@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     println!("2. driving metadata mutations past containerd's default threshold (100)");
     for i in 0..130 {
         let key = format!("f63-churn-{i}");
-        let _ = client.prepare_snapshot(&key, &chain_id).await;
+        let _ = client.prepare_snapshot(&key, &chain_id, None).await;
         let _ = client.remove_snapshot(&key).await;
     }
 

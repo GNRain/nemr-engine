@@ -1179,3 +1179,210 @@ fn d08_the_base_image_resolves_by_digest_under_any_reference() {
         );
     });
 }
+
+/// F-63 — a snapshot under a lease survives containerd's collector.
+///
+/// The defect: `create_container` prepared the rootfs snapshot and only then
+/// wrote the container record naming it. In between, the snapshot was
+/// unreferenced — containerd's definition of garbage — and if the collector ran
+/// there it was deleted, while the record write still returned `Ok` because
+/// containerd does not validate that `snapshot_key` resolves. The user saw
+/// `nemr create` succeed and `nemr start` fail forever.
+///
+/// This drives metadata churn past containerd's default `mutation_threshold`
+/// (100) with two snapshots outstanding: one leased, one not. The unleased one
+/// is the **control** — without it, "the leased snapshot survived" could simply
+/// mean the collector never ran, and the test would pass with the lease
+/// removed.
+#[test]
+fn f63_a_leased_snapshot_survives_the_collector_and_an_unleased_one_does_not() {
+    if !require_host(HostRequirements {
+        containerd: true,
+        helper: false,
+        base_image: true,
+    }) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let chain_id = client
+            .image_chain_id(nemr_engine::config::BASE_IMAGE)
+            .await
+            .expect("the base image must be present");
+
+        let pid = std::process::id();
+        let leased_key = format!("f63-leased-{pid}");
+        let unleased_key = format!("f63-unleased-{pid}");
+        let lease = client
+            .create_lease(&format!("f63-test-{pid}"))
+            .await
+            .expect("take a lease");
+
+        client
+            .prepare_snapshot(&leased_key, &chain_id, Some(&lease))
+            .await
+            .expect("prepare under a lease");
+        client
+            .prepare_snapshot(&unleased_key, &chain_id, None)
+            .await
+            .expect("prepare without a lease");
+
+        // CONTROL: both exist now, so "gone later" cannot mean "never created".
+        let keys = client.list_snapshot_keys().await.expect("list");
+        assert!(
+            keys.contains(&leased_key) && keys.contains(&unleased_key),
+            "both snapshots must exist before the churn, or this test proves nothing"
+        );
+
+        // Past containerd's default mutation_threshold of 100.
+        for i in 0..130 {
+            let key = format!("f63-churn-{pid}-{i}");
+            let _ = client.prepare_snapshot(&key, &chain_id, None).await;
+            let _ = client.remove_snapshot(&key).await;
+        }
+
+        let keys = client.list_snapshot_keys().await.expect("list");
+        let leased_survived = keys.contains(&leased_key);
+        let unleased_survived = keys.contains(&unleased_key);
+
+        // Clean up before asserting, so a failure leaves no residue.
+        let _ = client.delete_lease(&lease).await;
+        let _ = client.remove_snapshot(&leased_key).await;
+        let _ = client.remove_snapshot(&unleased_key).await;
+
+        assert!(
+            !unleased_survived,
+            "the unleased snapshot survived the churn, so the collector never ran and this \
+             test cannot say anything about the lease"
+        );
+        assert!(
+            leased_survived,
+            "the leased snapshot was collected: the lease is not protecting the window \
+             between prepare and the container record write (F-63)"
+        );
+    });
+}
+
+/// F-63 — a completed create leaves no lease behind.
+///
+/// The lease pins its snapshot. Held past the point the container record
+/// references it, it would keep collecting nothing forever — the opposite leak,
+/// and quieter, because nothing fails and the disk just never comes back. The
+/// expiry label bounds that to an hour; this asserts the normal path does not
+/// rely on it.
+#[test]
+fn f63_a_create_releases_its_lease() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let before = client.list_lease_ids().await.expect("list leases");
+
+        let project = TestProject::create(&client, "f63lease", VolumeSize::DEFAULT).await;
+
+        let after = client.list_lease_ids().await.expect("list leases");
+        let leaked: Vec<&String> = after
+            .iter()
+            .filter(|id| !before.contains(id) && id.contains(&project.name))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "create left {leaked:?} behind; a lease outliving its create pins the snapshot \
+             it was protecting and nothing reports it"
+        );
+    });
+}
+
+/// F-63 — `create_container` itself must survive a collector running during it.
+///
+/// The sibling test proves the lease *mechanism* protects a snapshot. This one
+/// proves `create_container` actually **uses** it, which is a different claim: a
+/// working mechanism the production path never reaches protects nothing.
+///
+/// # Why this uses a hook rather than racing
+///
+/// The window is two consecutive gRPC calls wide. The first version of this
+/// test ran creates under heavy concurrent churn and hoped to catch the
+/// collector in it — and **passed with the lease removed**, twice. Measuring it
+/// properly: 79 of 80 creates survived unleased, a ~1.25% per-create failure
+/// rate. A guard that misses the defect 98.75% of the time is a guard that
+/// reports green over a real bug, so the probabilistic version was deleted
+/// rather than tuned.
+///
+/// The hook makes it deterministic: a synchronous lease deletion — which
+/// containerd answers only after a collection has run — fires *inside* the
+/// window. Leased survives every time; unleased is collected every time.
+#[test]
+fn f63_create_container_holds_its_snapshot_against_a_collection_inside_the_window() {
+    if !require_host(HostRequirements {
+        containerd: true,
+        helper: false,
+        base_image: true,
+    }) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let pid = std::process::id();
+
+        // The hook: create a lease and delete it with sync=true, which
+        // containerd answers only once a garbage collection has completed. That
+        // is a collection running inside the create window, on demand.
+        let hook_client = std::sync::Arc::new(ContainerdClient::connect().await.expect("connect"));
+        let hook: nemr_engine::containerd::client::CreateWindowHook =
+            std::sync::Arc::new(move || {
+                let client = hook_client.clone();
+                Box::pin(async move {
+                    client.collect_garbage_now().await;
+                })
+            });
+
+        let client = ContainerdClient::connect()
+            .await
+            .expect("connect")
+            .with_create_window_hook(hook);
+
+        let id = format!("nemr-f63-window-{pid}");
+        let spec = nemr_engine::containerd::containers::ContainerSpec {
+            id: id.clone(),
+            image: nemr_engine::config::BASE_IMAGE.to_string(),
+            mounts: vec![],
+            working_dir: None,
+            extra_env: vec![],
+            args: Some(vec!["/bin/sh".to_string()]),
+            cgroup_name: None,
+            cgroup_prefix: nemr_engine::config::CGROUP_PREFIX.to_string(),
+            labels: Default::default(),
+        };
+
+        client
+            .create_container(&spec)
+            .await
+            .expect("create_container must succeed");
+
+        let survived = client
+            .list_snapshot_keys()
+            .await
+            .expect("list")
+            .contains(&id);
+
+        let _ = client.delete_container(&id).await;
+        let _ = client.remove_snapshot(&id).await;
+
+        assert!(
+            survived,
+            "the rootfs snapshot for {id} was collected during create. create_container is \
+             not holding a lease across prepare→record (F-63): it returns Ok with a \
+             snapshot_key that no longer resolves, and `nemr start` fails later, forever."
+        );
+    });
+}

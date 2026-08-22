@@ -178,7 +178,18 @@ impl ContainerdClient {
     /// `parent` is the image's rootfs chain ID. containerd performs the
     /// snapshot work server-side and returns the mounts the runtime will later
     /// apply — this crate never mounts anything itself here.
-    pub async fn prepare_snapshot(&self, key: &str, parent: &str) -> Result<()> {
+    /// `lease` is **not** optional by accident. A snapshot prepared without one
+    /// is unreferenced until a container record names it, and containerd's
+    /// collector deletes unreferenced resources — that window is F-63. Making
+    /// the parameter explicit forces every call site to state which it wants
+    /// rather than inheriting the unsafe default; `gc_probe` passes `None`
+    /// deliberately, to demonstrate the failure it exists to demonstrate.
+    pub async fn prepare_snapshot(
+        &self,
+        key: &str,
+        parent: &str,
+        lease: Option<&crate::leases::Lease>,
+    ) -> Result<()> {
         let request = PrepareSnapshotRequest {
             snapshotter: self.snapshotter().to_string(),
             key: key.to_string(),
@@ -188,7 +199,12 @@ impl ContainerdClient {
 
         self.raw()
             .snapshots()
-            .prepare(with_namespace!(request, self.namespace()))
+            .prepare(match lease {
+                Some(lease) => {
+                    crate::with_lease!(request, self.namespace(), lease.id())
+                }
+                None => with_namespace!(request, self.namespace()),
+            })
             .await
             .with_context(|| {
                 format!(
@@ -263,14 +279,53 @@ impl ContainerdClient {
         let chain_id = self.image_chain_id(&spec.image).await?;
         let image_config = self.image_config(&spec.image).await?;
 
-        self.prepare_snapshot(&spec.id, &chain_id).await?;
+        // F-63: the lease is acquired BEFORE the snapshot exists and released
+        // only after the record that references it has been written. Inside that
+        // window the snapshot is attributed to the lease, so containerd's
+        // collector leaves it alone; outside it, the container record is the
+        // reference and the lease is no longer needed.
+        //
+        // Without this, the collector could delete the snapshot between the two
+        // calls and `create_container_record` would still return Ok — containerd
+        // does not validate that `snapshot_key` resolves — producing a container
+        // that reports created and can never start.
+        let lease = self
+            .create_lease(&format!("nemr-create-{}", spec.id))
+            .await?;
 
-        let result = self.create_container_record(spec, &image_config).await;
+        let result = async {
+            self.prepare_snapshot(&spec.id, &chain_id, Some(&lease))
+                .await?;
+            // Test seam: lets the F-63 guard run a collection *inside* this
+            // window deterministically. `None` everywhere but that test.
+            if let Some(hook) = &self.inside_create_window {
+                hook().await;
+            }
+            self.create_container_record(spec, &image_config).await
+        }
+        .await;
+
+        // Released on BOTH paths. A lease left behind pins its snapshot past the
+        // point anything refers to it, which is the opposite leak and a quieter
+        // one — nothing fails, the disk just never comes back.
+        let released = self.delete_lease(&lease).await;
+
         if let Err(error) = result {
             // Roll the snapshot back rather than leaving an orphan for a
             // create that did not complete.
             let _ = self.remove_snapshot(&spec.id).await;
             return Err(error);
+        }
+
+        // The create succeeded, so a failed release is not fatal — but it is not
+        // nothing either: the lease's expiry label bounds the leak to an hour,
+        // and saying so beats discovering it from disk usage later.
+        if let Err(error) = released {
+            tracing::warn!(
+                container = %spec.id,
+                %error,
+                "created the container but could not release its lease; it expires within the hour"
+            );
         }
         Ok(())
     }

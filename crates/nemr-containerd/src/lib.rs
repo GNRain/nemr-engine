@@ -21,3 +21,10 @@ pub mod client;
 pub mod config;
 pub mod containers;
 pub mod images;
+pub mod leases;
+
+/// Re-exports the `with_lease!` macro needs at its expansion site.
+#[doc(hidden)]
+pub mod __reexport {
+    pub use containerd_client::tonic::Request;
+}

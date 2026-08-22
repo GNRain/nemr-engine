@@ -29,6 +29,10 @@ path = "src/bin/wrapper_connectivity.rs"
 # tonic types must come from containerd_client::tonic (the crate re-exports it);
 # a direct tonic dep resolves a second, incompatible version. See SPEC M1 note.
 containerd-client = "0.9"
+# RFC3339 formatting for the lease expiry label (F-63). One tiny, dependency-free
+# crate rather than hand-rolled calendar arithmetic: a leap-year bug here would
+# set an expiry in the past and silently return the F-63 window.
+humantime = "2"
 # The library itself needs only `time` (the stop-task timeout). `macros` and
 # `rt-multi-thread` are here for the two connectivity binaries below, which need
 # an #[tokio::main]; a consumer linking only the library still pays for them, but
