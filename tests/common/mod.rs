@@ -91,14 +91,34 @@ fn sweep_dead_test_volumes() {
                 continue;
             };
             let _ = pid;
-            match helper.unmount_and_detach(&name) {
-                Ok(()) => {
-                    let _ = std::fs::remove_file(paths.image_file(&name));
-                    let _ = std::fs::remove_dir(paths.mount_point(&name));
-                    reclaimed += 1;
-                }
-                Err(error) => eprintln!("[nemr:test-sweep] could not release {name:?}: {error:#}"),
+            if let Err(error) = helper.unmount_and_detach(&name) {
+                eprintln!("[nemr:test-sweep] could not release {name:?}: {error:#}");
+                continue;
             }
+            // F-79: verify the release BEFORE deleting the evidence of it.
+            //
+            // This previously deleted the image and the mount point on the
+            // strength of the call returning Ok. When the helper could not
+            // detach a loop device whose backing file was gone (F-77), that
+            // removed the only two things `reconcile` enumerates — the image
+            // file and the mount-point directory — leaving the device attached
+            // and unfindable. 57 accumulated that way, holding 24 GB, with
+            // `nemr reconcile` reporting "nothing to reconcile".
+            //
+            // The cleanup hid the mess it failed to clean. Assume-success in a
+            // sweep is worse than assume-success anywhere else, because the
+            // assumption destroys the trail.
+            if let Some(device) = volume::attached_loop_device(&paths.image_file(&name)) {
+                eprintln!(
+                    "[nemr:test-sweep] {name:?} is still attached to /dev/loop{device} after \
+                     release; leaving its image and mount point in place so `nemr reconcile` \
+                     can still find it"
+                );
+                continue;
+            }
+            let _ = std::fs::remove_file(paths.image_file(&name));
+            let _ = std::fs::remove_dir(paths.mount_point(&name));
+            reclaimed += 1;
         }
         if reclaimed > 0 {
             eprintln!(
