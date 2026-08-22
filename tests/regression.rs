@@ -982,3 +982,34 @@ fn e11_export_and_import_work_with_no_network_and_no_credentials() {
 
     let _ = std::fs::remove_file(&bundle);
 }
+
+/// The installed `nemr` must be the binary this working tree builds (F-62).
+///
+/// Milestone closure is "merged **and** reinstalled from that commit **and**
+/// verified against the installed artifacts". The privileged helper has been
+/// gated on that since F-58; the engine — the binary a user actually runs, and
+/// the one `scripts/e2e_smoke_test.sh` invokes off PATH — was not. Nothing
+/// stopped a smoke test from passing against a `nemr` built from a commit that
+/// no longer exists and reporting the milestone closed.
+///
+/// Not `require_host`-gated: this needs no containerd, no helper and no base
+/// image. It needs only that the working tree's claim about what is installed
+/// is true, which is exactly the thing that must hold before any other result
+/// here means anything.
+#[test]
+fn the_installed_engine_matches_its_source() {
+    if common::unit_only() {
+        eprintln!(
+            "NEMR_TEST_UNIT_ONLY is set: not checking the installed engine. \
+             A green run with it set says nothing about what is deployed."
+        );
+        return;
+    }
+    if let Err(reason) = common::installed_engine_matches_built() {
+        panic!(
+            "\n\nThe installed engine is not this source:\n\n  - {reason}\n\n\
+             A verification run against a stale binary proves something about a commit \n\
+             nobody is looking at. Reinstall, then re-run.\n"
+        );
+    }
+}

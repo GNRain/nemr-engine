@@ -103,7 +103,21 @@ missing=0
 for binary in containerd runc ctr losetup mkfs.ext4; do
     command -v "$binary" >/dev/null || { fail "$binary not found"; missing=1; }
 done
-command -v "$NEMR" >/dev/null || { fail "$NEMR not found — cargo install --path . --bin nemr --root ~/.local"; missing=1; }
+command -v "$NEMR" >/dev/null || { fail "$NEMR not found — run ./scripts/install_engine.sh"; missing=1; }
+
+# F-62: this script exercises whatever `nemr` is on PATH. Without a freshness
+# check it can pass against a binary built from a commit that no longer exists
+# and be reported as a milestone closing. The gate lives in the Rust harness so
+# there is one implementation, not two that can drift.
+if command -v "$NEMR" >/dev/null; then
+    if ! cargo test --test regression the_installed_engine_matches_its_source \
+         --quiet >/dev/null 2>&1; then
+        fail "the installed nemr is not this source — run ./scripts/install_engine.sh"
+        cargo test --test regression the_installed_engine_matches_its_source 2>&1 \
+            | sed -n '/is not this source/,/^$/p' >&2
+        missing=1
+    fi
+fi
 [[ -x "$HELPER" ]] || { fail "privileged helper missing at $HELPER — see PREREQUISITES.md"; missing=1; }
 
 if ! systemctl --user is-active --quiet containerd-rootless.service; then

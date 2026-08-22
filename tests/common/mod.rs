@@ -210,23 +210,55 @@ pub fn installed_helper_matches_built() -> Result<(), String> {
 
 /// Newest source file of the helper crate, with its mtime.
 ///
-/// Covers `src/**` plus the manifests, which together determine the binary.
+/// `deploy/nemr-volume` is its **own** workspace with its own lockfile, so the
+/// outer workspace's manifests are deliberately not included: they do not
+/// determine this binary, and counting them made every ordinary edit to the
+/// engine report the helper as stale.
 fn newest_helper_source() -> Result<Option<(PathBuf, std::time::SystemTime)>, String> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("deploy/nemr-volume");
+    Ok(newest_under(&[
+        root.join("src"),
+        root.join("Cargo.toml"),
+        root.join("Cargo.lock"),
+    ]))
+}
+
+/// Newest source file of the engine and everything it is built from.
+///
+/// `crates/` is included because the engine links them: a change in
+/// `crates/nemr-containerd` changes the `nemr` binary just as surely as a change
+/// in `src/`, and a gate watching only `src/` would call a stale install
+/// current. The workspace manifests are included here because here they do
+/// determine the binary.
+fn newest_engine_source() -> Result<Option<(PathBuf, std::time::SystemTime)>, String> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    Ok(newest_under(&[
+        root.join("src"),
+        root.join("crates"),
+        root.join("Cargo.toml"),
+        root.join("Cargo.lock"),
+    ]))
+}
+
+/// Newest file among `paths`, recursing into directories.
+///
+/// Takes an explicit list rather than inferring a crate layout: each gate must
+/// state exactly what determines its binary, because a gate that guesses too
+/// widely goes red on unrelated edits and a gate that guesses too narrowly goes
+/// green on a stale one. `target/` directories are skipped — build output is
+/// newer than its own source by construction.
+fn newest_under(paths: &[PathBuf]) -> Option<(PathBuf, std::time::SystemTime)> {
+    let mut stack: Vec<PathBuf> = paths.iter().filter(|p| p.exists()).cloned().collect();
     let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
-    let mut stack = vec![root.join("src")];
-    for manifest in ["Cargo.toml", "Cargo.lock"] {
-        let path = root.join(manifest);
-        if path.exists() {
-            stack.push(path);
-        }
-    }
     while let Some(path) = stack.pop() {
         if path.is_dir() {
+            if path.file_name().is_some_and(|name| name == "target") {
+                continue;
+            }
             let Ok(entries) = std::fs::read_dir(&path) else {
                 continue;
             };
-            stack.extend(entries.flatten().map(|e| e.path()));
+            stack.extend(entries.flatten().map(|entry| entry.path()));
             continue;
         }
         let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
@@ -236,7 +268,94 @@ fn newest_helper_source() -> Result<Option<(PathBuf, std::time::SystemTime)>, St
             newest = Some((path, mtime));
         }
     }
-    Ok(newest)
+    newest
+}
+
+/// Where `nemr` is installed. Overridable so a developer with a different
+/// prefix can still be gated rather than silently exempt.
+pub fn installed_engine_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("NEMR_INSTALLED_BIN") {
+        return PathBuf::from(path);
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    home.join(".local/bin/nemr")
+}
+
+/// Path to the engine's release binary.
+pub fn built_engine_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/nemr")
+}
+
+/// Is the installed `nemr` the binary this working tree builds? (F-62)
+///
+/// The helper has had this gate since F-58; the engine has not, and the engine
+/// is the binary a user actually runs. Milestone closure here means "merged
+/// **and** reinstalled from that commit **and** verified against the installed
+/// artifacts" — a rule nothing enforced. `scripts/e2e_smoke_test.sh` invokes
+/// whatever `nemr` is on PATH, so a smoke test could pass against a binary
+/// built from a commit that no longer exists and report the milestone closed.
+///
+/// Two checks, for the two ways staleness happens:
+///
+///   1. installed hash != built hash — built but never installed;
+///   2. a source file newer than the installed binary — edited and never built,
+///      which leaves both binaries identically stale and hash-equal (the exact
+///      hole F-58 found in the helper's gate).
+///
+/// The hash comparison requires the install to be a **copy of
+/// `target/release/nemr`**, not a `cargo install` — `cargo install` rebuilds in
+/// its own target directory and produces a different (larger) binary from
+/// identical source, so hashes would never agree. See README.
+pub fn installed_engine_matches_built() -> Result<(), String> {
+    let installed = installed_engine_path();
+    let built = built_engine_path();
+
+    if !installed.exists() {
+        return Err(format!(
+            "nemr is not installed at {}\n     \
+             fix: ./scripts/install_engine.sh",
+            installed.display()
+        ));
+    }
+    if !built.exists() {
+        return Err(format!(
+            "the engine's release binary is not built at {}\n     \
+             fix: ./scripts/install_engine.sh",
+            built.display()
+        ));
+    }
+
+    if let Some((newest, mtime)) = newest_engine_source()? {
+        let installed_mtime = std::fs::metadata(&installed)
+            .and_then(|m| m.modified())
+            .map_err(|e| format!("cannot stat {}: {e}", installed.display()))?;
+        if mtime > installed_mtime {
+            return Err(format!(
+                "the engine's source is newer than the installed binary:\n     \
+                 {} is newer than {}\n     \
+                 The installed nemr cannot be the source under test.\n     \
+                 fix: ./scripts/install_engine.sh",
+                newest.display(),
+                installed.display()
+            ));
+        }
+    }
+
+    let installed_hash = sha256_of(&installed)
+        .map_err(|e| format!("cannot hash the installed engine {}: {e}", installed.display()))?;
+    let built_hash = sha256_of(&built)
+        .map_err(|e| format!("cannot hash the built engine {}: {e}", built.display()))?;
+    if installed_hash != built_hash {
+        return Err(format!(
+            "the installed nemr does not match the built source:\n     \
+             installed {} = {installed_hash}\n     \
+             built     {} = {built_hash}\n     \
+             fix: ./scripts/install_engine.sh",
+            installed.display(),
+            built.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Path to the helper crate's release binary, relative to this crate's root.
@@ -492,7 +611,12 @@ pub fn run_offline(args: &[&str]) -> std::process::Output {
         .expect("containerd socket path")
         .to_string_lossy()
         .into_owned();
-    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/nemr");
+    // CARGO_BIN_EXE_ rather than a hardcoded target/debug path: cargo guarantees
+    // this points at the binary built for *this* test run. The hardcoded path
+    // was correct only by coincidence — under `cargo test --release` the fresh
+    // binary lands in target/release and the debug one goes stale, so the
+    // offline tests would have gone green against a binary from an older commit.
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_nemr"));
     let quoted: Vec<String> = args.iter().map(|a| format!("'{a}'")).collect();
 
     Command::new("unshare")
