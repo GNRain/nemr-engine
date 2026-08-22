@@ -460,13 +460,37 @@ rewrites it. **Do the enum now; defer the status codes.**
 
 ### F-12 — Credential bind-mount pins an inode
 
-**Status:** Open · verified, tracked, not fixed
+**Status:** **Scheduled** (2026-08-22, Rain) — promoted from tracked after
+hitting it in production during the cross-machine validation.
 **Feeds:** M9 · **Interacts with:** D-02
 
 The credential bind-mount pins an inode, so host-side rotation is invisible
 inside a running container. Per-device credentials injected at attach only hold
 if rotation propagates; otherwise D-02 is true at create time and drifts
 thereafter.
+
+**Confirmed in the wild, and worse than tracked (2026-08-22).** On the second
+host the credential had expired. Re-authenticating on the host did not help:
+the running container kept the old inode and continued to fail. Recovery
+required `nemr delete` and recreating the project — losing the container, not
+just the session.
+
+What the user experiences: a working credential on the host, a broken one in
+the container, and **nothing that connects the two**. The engine reports no
+error because from its point of view nothing is wrong; Claude Code reports an
+authentication failure that the obvious remedy does not fix. That is the
+VOL-05 shape applied to credentials — the system is confidently serving stale
+state — and it sits directly on D-02's enforcement path, which is the whole
+basis of the per-device credential model.
+
+**Why "recreate the project" is not an acceptable remedy:** it destroys the
+container to refresh a file, and on a machine where the session is the thing of
+value that is a data-loss-shaped workaround for a mount bug.
+
+**Not fixed in this pass.** Recorded as scheduled with the live evidence
+attached; the fix has options (mount the directory rather than the file, or
+re-resolve at attach) whose trade-offs against D-02 need stating before one is
+chosen.
 
 ---
 
@@ -542,6 +566,57 @@ motivated it; the audit found the rest.
 
 ---
 
+### D-11 — No user-facing path moves a bundle through storage
+
+**Status:** Open — **scope statement, not a build request.**
+**Raised by:** Rain (cross-machine validation) · **Relates to:** E-11, D-05, M12
+
+There is no `nemr push` and no `nemr pull`, which is **correct** under E-11: the
+sync layer is the commercial half, and putting it in the open CLI would breach
+the seam the whole architecture is arranged around.
+
+But the gap is currently total. `bucket_roundtrip` has no "fetch this key to a
+path" mode either, so even internal tooling cannot complete a transfer. The
+cross-machine validation was done with `rclone` — a third-party tool doing the
+job the product is supposed to do.
+
+**The distinction worth writing down:** M12 proved *the storage backend works*.
+It did not prove *a user can move a session*, and those are different claims.
+Everything between them — a command, credentials for it, key naming, progress,
+resumption, failure recovery — is the sync layer, and it is commercial-side
+scope. Stating it here means the roadmap says so rather than someone inferring
+from a green M12 that the transport story is done.
+
+**Consequence:** the honest description today is "the engine can export and
+import a bundle; moving that bundle between machines is your problem." That is
+a defensible Phase 1 position and an indefensible product one.
+
+---
+
+### D-12 — Import requires a project that does not exist yet, and a quota to invent
+
+**Status:** Open — **scope statement; the shape is obvious, the ruling is not.**
+**Raised by:** Rain (cross-machine validation) · **Relates to:** M10, D-06
+
+`nemr import <name> <bundle>` requires the project to already exist, so
+restoring onto a fresh host is three commands — `create` (with a size the user
+has to invent), `import`, `start`.
+
+The size is the part that is actually wrong rather than merely verbose: the
+bundle records the source project's quota, so the user is being asked to supply
+a number the file already contains. Guess low and the import refuses; guess high
+and the volume is oversized forever.
+
+The obvious shapes are `nemr import --create`, or importing into a non-existent
+project by default. Which one is a product decision, not an engineering one —
+hence recorded rather than built.
+
+Worth noting what *is* working: the errors guide a user around this correctly at
+every step. They are good errors. They are also guiding people around a gap,
+and a well-signposted detour is still a detour.
+
+---
+
 ### D-10 — Registry pull: out of scope now, a hard dependency the moment there is a GUI
 
 **Status:** Open — **tracked dependency, deliberately not built.**
@@ -584,6 +659,27 @@ focused work:
 
 The last row is the one that usually surprises: the code is days, the *evidence*
 that it works is where the time actually goes, exactly as it did for M12.
+
+**COST NOW MEASURED, NOT ESTIMATED (2026-08-22, Rain).** The ruling scoped pull
+out because it was expensive work with no users. Provisioning a second host
+showed the alternative's price, and it is higher than estimated:
+
+- every new host installs a **build toolchain** — BuildKit fetched from a GitHub
+  release, a second rootless systemd unit, a daemon to run — to produce an image
+  that should be a download;
+- the build is **not reproducible** (F-74), so two hosts following the same
+  instructions get different images and M11 correctly refuses to import between
+  them. That is not a bug in M11; it is the drift check working, on a drift that
+  only exists because the image is built rather than distributed;
+- the failure lands on a new user at the worst moment — after a two-hour setup,
+  on their first import.
+
+Publishing to GHCR turns roughly two hundred lines of build orchestration into
+one `ctr images pull`, and makes F-74 moot rather than partly mitigated: an
+image distributed by digest is byte-identical everywhere by construction.
+
+**The ruling is not reversed** — recorded so the decision is re-taken against
+measured cost rather than the original estimate.
 
 **Consequence of leaving it open:** the honest description of the product today
 is "brings your own base image". Any roadmap or GUI mock that shows attaching on
@@ -646,6 +742,9 @@ is overstating what has been demonstrated.
 | 2026-08-22 | D-08 | Opened — base-image hosting; four options, recommendation (c)-then-(b), **not decided** (Claude Code) |
 | 2026-08-22 | D-09 | Opened — B2 implemented but never run against a live bucket; tracking item (Claude Code) |
 | 2026-08-22 | D-08 | **Resolved** — GHCR by digest + local-cache fallback + `export --with-base-image`; recommendation (c)-then-(b) superseded (Rain) |
+| 2026-08-22 | F-12 | **Scheduled** — confirmed in production during the cross-machine validation; recovery required delete+recreate (Rain) |
+| 2026-08-22 | D-11 | Opened — no user-facing path moves a bundle through storage; sync layer is commercial scope (Claude Code) |
+| 2026-08-22 | D-12 | Opened — import needs a pre-existing project and an invented quota the bundle already records (Claude Code) |
 | 2026-08-22 | D-10 | Opened — registry pull out of D-08 scope; tracked as a GUI prerequisite, Transfer service, 3–5 day estimate (Claude Code) |
 | 2026-08-22 | D-08 | Part 1 scoped down (Rain): nemr does not pull; error states the limit and gives the exact `ctr` command |
 | 2026-08-22 | E-10 | **Deferred with direction** — Linux first, then WSL2, then a bundled VM on macOS; remote-engine fallback rejected. Moved out of Open (Rain) |

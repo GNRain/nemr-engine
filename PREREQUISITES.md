@@ -14,6 +14,29 @@ reference host; the outputs shown are real, not illustrative.
 > Section 3.3 designates this document as the place a clean host is
 > provisioned from.
 
+## Do this first
+
+```bash
+./scripts/setup_host.sh
+```
+
+That script performs every step in this document, in order, idempotently, and
+refuses early with a named check, the value it found and the fix when the host
+cannot support the stack.
+
+**Read the rest of this file when a preflight check refuses**, or when you want
+to know why a step exists. It is the reference; the script is the procedure.
+Following it by hand takes about two hours and is how the systemd units below
+came to be transcribed by hand into a second host.
+
+The systemd units are **files in the repository**, not text in this document:
+
+| File | Installed to |
+|---|---|
+| `deploy/systemd/user/containerd-rootless.service` | `~/.config/systemd/user/` |
+| `deploy/systemd/user/buildkitd-rootless.service` | `~/.config/systemd/user/` |
+| `deploy/systemd/delegate.conf` | `/etc/systemd/system/user@.service.d/` |
+
 ## Target host
 
 | Item | Required | Verified on reference host |

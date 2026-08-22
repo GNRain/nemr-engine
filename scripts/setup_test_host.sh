@@ -80,7 +80,12 @@ sudo -u "$ACCOUNT" env HOME="$ACCOUNT_HOME" "$CARGO_BIN" build \
     --release --manifest-path "$HELPER_SRC_DIR/Cargo.toml"
 
 echo "==> Installing $HELPER_DEST (root:root, 0755)"
-install -o root -g root -m 0755 "$HELPER_SRC_DIR/target/release/nemr-volume" "$HELPER_DEST"
+# -D creates the parent directory. /usr/local/libexec does not exist on a clean
+# Ubuntu — only on hosts that have accumulated it — so without this every
+# first-time install fails with "cannot create regular file: No such file or
+# directory". The reference host had the directory already, which is why this
+# survived until someone provisioned a genuinely clean machine.
+install -D -o root -g root -m 0755 "$HELPER_SRC_DIR/target/release/nemr-volume" "$HELPER_DEST"
 
 echo "==> Installing $SUDOERS_DEST (root:root, 0440)"
 # Substitute the account into the grant's first field, then validate BEFORE
@@ -92,7 +97,7 @@ if ! visudo -c -f "$tmp" >/dev/null; then
     rm -f "$tmp"
     exit 1
 fi
-install -o root -g root -m 0440 "$tmp" "$SUDOERS_DEST"
+install -D -o root -g root -m 0440 "$tmp" "$SUDOERS_DEST"
 rm -f "$tmp"
 
 echo "==> Verifying"

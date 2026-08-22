@@ -1,0 +1,27 @@
+[Unit]
+Description=BuildKit (rootless) — Nemr base image builder, NFR-01 (no Docker)
+Documentation=https://github.com/moby/buildkit/blob/master/docs/rootless.md
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/rootlesskit \
+    --state-dir=%t/buildkitd-rootless \
+    --net=slirp4netns \
+    --mtu=65520 \
+    --disable-host-loopback \
+    --copy-up=/etc \
+    --copy-up=/run \
+    --propagation=rslave \
+    %h/.local/bin/buildkitd \
+        --oci-worker-no-process-sandbox \
+        --root %h/.local/share/buildkit \
+        --addr unix://%t/buildkit/buildkitd.sock
+
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=default.target

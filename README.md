@@ -129,6 +129,33 @@ is introduced, so that AC-1.2 can compare wrapper output against a known-good
 pre-abstraction baseline. If the wrapper's output ever diverges from this
 program's, the wrapper is wrong.
 
+## Setting up a host
+
+```bash
+./scripts/setup_host.sh
+```
+
+One command, idempotent, safe to re-run against a half-configured host. It
+runs preflight checks and **refuses before changing anything** if the host
+cannot support the stack; installs packages, cgroup delegation and the
+rootless systemd units (which ship as files under `deploy/systemd/`, not as
+prose to transcribe); installs the engine, the privileged helper and the base
+image; and finishes by running `./scripts/verify_wp_a.sh`, because setup is
+not done when commands exit zero, it is done when the host passes acceptance.
+
+It will stop once and ask you to reboot — cgroup delegation only takes effect
+when `user@<uid>.service` restarts, and restarting that kills the session doing
+the asking. Exit code 3 means "reboot and run me again"; it resumes from where
+it stopped.
+
+Provisioning a second host by following the documentation by hand took about
+two hours. That is the problem this script exists to answer, and it is also the
+executable spec for the product installer that has to replace it: under D-01
+and E-09, a user installs a package, a daemon starts, and they log in.
+
+`PREREQUISITES.md` remains the reference for *what* the script does and why,
+and is what to read when a preflight check refuses.
+
 ## Build
 
 Requires the host setup in `PREREQUISITES.md`.
@@ -191,6 +218,21 @@ overlay mount. The engine will have to account for this when it gains
 as a surprise then.
 
 ## Base image (Milestone 2)
+
+```bash
+./scripts/build_base_image.sh
+```
+
+Starts a rootless `buildkitd` if one is not already answering, builds the image
+with BuildKit, exports an OCI archive and imports it into containerd. The
+prose below explains *why* it works this way; the script is what to run.
+`scripts/setup_host.sh` calls it for you.
+
+> This section used to describe the procedure without mentioning that a script
+> existed, so a host was provisioned by following the prose: downloading
+> BuildKit from a GitHub release, hand-writing a systemd unit, and driving
+> `buildctl` by hand. The unit now ships at
+> `deploy/systemd/user/buildkitd-rootless.service`.
 
 ### Build tool: BuildKit via `buildctl`
 

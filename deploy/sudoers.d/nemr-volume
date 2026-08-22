@@ -10,7 +10,11 @@
 #
 # The obvious formulation would enumerate the underlying commands, e.g.
 #
-#     nemr ALL=(root) NOPASSWD: /usr/sbin/losetup --find --show /home/nemr/.local/share/nemr/volumes/*.img
+#     <user> ALL=(root) NOPASSWD: /usr/sbin/losetup --find --show <home>/.local/share/nemr/volumes/*.img
+#
+# (written with placeholders deliberately: this is a rejected formulation, and
+#  spelling it with a real account and home directory has been mistaken for a
+#  live grant on hosts where the account is not `nemr`)
 #
 # That does not do what it appears to do. Per sudoers(5):
 #
