@@ -17,6 +17,10 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+/// The engine's own grace period, not a copy of it. A test asserting against a
+/// duplicated literal stops testing production the moment production changes.
+const GRACE_PERIOD: Duration = nemr_engine::containerd::config::SIGTERM_GRACE;
+
 use common::{
     extracted_plaintext, installed_helper_matches_built, require_host, run_offline, unit_only,
     write_hostile_bundle, HostRequirements, TestProject,
@@ -113,10 +117,20 @@ fn proc_06_stop_terminates_gracefully_without_escalating_to_sigkill() {
              that can only be killed is a container that never gets to flush anything."
         );
 
+        // F-68: this was `< 3s`, which fired at 3.47s on a machine that happened
+        // to be compiling — a false red on a healthy engine.
+        //
+        // The property that matters is already asserted above: `Graceful` means
+        // the supervisor exited on SIGTERM and was never escalated to SIGKILL.
+        // What remains for a duration check is the narrower case of "handled,
+        // but so slowly it nearly escalated", and only a threshold close to the
+        // grace period expresses that. Three seconds expressed "the machine is
+        // busy", which is not a defect in anything under test.
         assert!(
-            elapsed < Duration::from_secs(3),
-            "stop took {elapsed:?}. A graceful stop should be near-instant; anything \
-             approaching the five-second grace period means the signal is not being handled."
+            elapsed < GRACE_PERIOD - Duration::from_millis(500),
+            "stop took {elapsed:?} of a {GRACE_PERIOD:?} grace period. It did not escalate, \
+             but it came close enough that a slower machine would have been SIGKILLed — the \
+             supervisor is handling SIGTERM sluggishly rather than promptly."
         );
 
         assert!(

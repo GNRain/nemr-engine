@@ -691,7 +691,7 @@ impl ContainerdClient {
     /// that survived precisely because nothing distinguished the two paths. So
     /// the path taken is returned rather than dropped, and callers surface it.
     pub async fn stop_task(&self, id: &str) -> Result<StopOutcome> {
-        const GRACE: Duration = Duration::from_secs(5);
+        const GRACE: Duration = crate::config::SIGTERM_GRACE;
         const KILL_TIMEOUT: Duration = Duration::from_secs(10);
 
         // Nothing to stop. Reported distinctly so a caller can tell "already
