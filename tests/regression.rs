@@ -1200,13 +1200,27 @@ fn d08_the_base_image_resolves_by_digest_under_any_reference() {
 /// wrote the container record naming it. In between, the snapshot was
 /// unreferenced — containerd's definition of garbage — and if the collector ran
 /// there it was deleted, while the record write still returned `Ok` because
-/// containerd does not validate that `snapshot_key` resolves. The user saw
-/// `nemr create` succeed and `nemr start` fail forever.
+/// containerd does not validate that `snapshot_key` resolves.
 ///
-/// This triggers a collection with two snapshots outstanding: one leased, one
-/// not. The unleased one is the **control** — without it, "the leased snapshot
-/// survived" could simply mean the collector never ran, and the test would pass
-/// with the lease removed.
+/// # Why both snapshots start leased (F-72)
+///
+/// The obvious shape — create one leased snapshot and one unleased one, then
+/// collect — is unsound, and failed in **both directions** before this:
+///
+///   * locally, in a full serial run: the unleased snapshot *survived*, because
+///     nothing had pushed containerd past its mutation threshold;
+///   * on CI: a snapshot was *already gone* at the baseline check, because 23
+///     preceding tests had, and the collector fired before the test looked.
+///
+/// Both are the same root cause. An unleased snapshot is unreferenced from the
+/// instant it is created, so it can be collected at any moment — including
+/// before the test has established it ever existed. The baseline observation was
+/// racing the very collector the test is trying to reason about.
+///
+/// So both snapshots are created **under leases**, which makes the baseline
+/// deterministic, and the control snapshot is then made collectable by releasing
+/// its lease at a moment this test chooses. Every state transition is
+/// test-controlled; none of it depends on when the collector happens to run.
 #[test]
 fn f63_a_leased_snapshot_survives_the_collector_and_an_unleased_one_does_not() {
     if !require_host(HostRequirements {
@@ -1227,55 +1241,74 @@ fn f63_a_leased_snapshot_survives_the_collector_and_an_unleased_one_does_not() {
             .expect("the base image must be present");
 
         let pid = std::process::id();
-        let leased_key = format!("f63-leased-{pid}");
-        let unleased_key = format!("f63-unleased-{pid}");
-        let lease = client
-            .create_lease(&format!("f63-test-{pid}"))
+        let kept_key = format!("f63-kept-{pid}");
+        let dropped_key = format!("f63-dropped-{pid}");
+
+        let lease_kept = client
+            .create_lease(&format!("f63-kept-lease-{pid}"))
             .await
-            .expect("take a lease");
+            .expect("take the lease under test");
+        let lease_dropped = client
+            .create_lease(&format!("f63-dropped-lease-{pid}"))
+            .await
+            .expect("take the control's lease");
 
         client
-            .prepare_snapshot(&leased_key, &chain_id, Some(&lease))
+            .prepare_snapshot(&kept_key, &chain_id, Some(&lease_kept))
             .await
-            .expect("prepare under a lease");
+            .expect("prepare under the lease under test");
         client
-            .prepare_snapshot(&unleased_key, &chain_id, None)
+            .prepare_snapshot(&dropped_key, &chain_id, Some(&lease_dropped))
             .await
-            .expect("prepare without a lease");
+            .expect("prepare under the control's lease");
 
-        // CONTROL: both exist now, so "gone later" cannot mean "never created".
+        // BASELINE: both are lease-protected, so this cannot race the collector.
+        // Naming which one is missing matters: "a snapshot is gone" is
+        // ambiguous between "the harness raced" and "the lease is not working",
+        // and those are opposite conclusions.
         let keys = client.list_snapshot_keys().await.expect("list");
         assert!(
-            keys.contains(&leased_key) && keys.contains(&unleased_key),
-            "both snapshots must exist before the churn, or this test proves nothing"
+            keys.contains(&kept_key),
+            "{kept_key} is missing at the baseline, while still under a live lease. \
+             That is the lease failing to protect, not a timing artifact."
+        );
+        assert!(
+            keys.contains(&dropped_key),
+            "{dropped_key} is missing at the baseline, while still under a live lease. \
+             That is the lease failing to protect, not a timing artifact."
         );
 
-        // A collection on demand, not churn hoping to trip containerd's mutation
-        // counter. The churn version failed intermittently on its own control —
-        // "the unleased snapshot survived, so the collector never ran" — because
-        // that counter is process-global and an earlier test may just have reset
-        // it. A test whose control fires at random is a test that gets re-run
-        // rather than read.
+        // The control becomes collectable HERE, by this test's choice — not at
+        // some earlier moment outside its control.
+        client
+            .delete_lease(&lease_dropped)
+            .await
+            .expect("release the control's lease");
+
+        // A collection on demand: containerd answers a synchronous lease delete
+        // only once a collection has completed.
         client.collect_garbage_now().await;
 
         let keys = client.list_snapshot_keys().await.expect("list");
-        let leased_survived = keys.contains(&leased_key);
-        let unleased_survived = keys.contains(&unleased_key);
+        let kept_survived = keys.contains(&kept_key);
+        let dropped_survived = keys.contains(&dropped_key);
 
         // Clean up before asserting, so a failure leaves no residue.
-        let _ = client.delete_lease(&lease).await;
-        let _ = client.remove_snapshot(&leased_key).await;
-        let _ = client.remove_snapshot(&unleased_key).await;
+        let _ = client.delete_lease(&lease_kept).await;
+        let _ = client.remove_snapshot(&kept_key).await;
+        let _ = client.remove_snapshot(&dropped_key).await;
 
+        // CONTROL first: if the collection did not actually remove the
+        // unreferenced snapshot, then "the leased one survived" says nothing.
         assert!(
-            !unleased_survived,
-            "the unleased snapshot survived the churn, so the collector never ran and this \
-             test cannot say anything about the lease"
+            !dropped_survived,
+            "{dropped_key} survived after its lease was released and a collection ran, so \
+             the collection did not do anything and this test cannot speak to the lease"
         );
         assert!(
-            leased_survived,
-            "the leased snapshot was collected: the lease is not protecting the window \
-             between prepare and the container record write (F-63)"
+            kept_survived,
+            "{kept_key} was collected while its lease was still held: the lease is not \
+             protecting the window between prepare and the container record write (F-63)"
         );
     });
 }
