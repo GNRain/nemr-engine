@@ -1386,3 +1386,70 @@ fn f63_create_container_holds_its_snapshot_against_a_collection_inside_the_windo
         );
     });
 }
+
+/// D-08 part 1 — the unresolved-base-image error must not imply a fetch it never attempts.
+///
+/// The ruling scoped registry pull out: `nemr` does not fetch images. The
+/// earlier draft of this error promised to distinguish "registry unreachable"
+/// from "digest not found there" — a distinction nothing can make without
+/// attempting the fetch. Claiming it would have been a fabrication in the one
+/// place a user is already stuck.
+///
+/// Asserts the real message from the real resolver, not a reconstruction.
+#[test]
+fn d08_the_unresolved_base_image_error_is_honest_about_not_fetching() {
+    if !require_host(HostRequirements {
+        containerd: true,
+        helper: false,
+        base_image: false,
+    }) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let absent = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+        let resolution = project::resolve_base_image(&client, absent).await;
+        let (where_looked, advice) = match resolution {
+            nemr_engine::bundle::import::BaseImageResolution::Unresolved {
+                where_looked,
+                advice,
+            } => (where_looked.join("\n"), advice),
+            other => panic!("a digest of all zeroes must not resolve, got {other:?}"),
+        };
+
+        assert!(
+            where_looked.contains("by digest across all images"),
+            "must report the by-digest attempt: {where_looked}"
+        );
+        assert!(
+            where_looked.contains("does not fetch images itself"),
+            "must say plainly that nemr does not pull: {where_looked}"
+        );
+        // The honest-limit requirement, stated as a negative: no claim about a
+        // registry's reachability, because none was contacted.
+        for invented in ["unreachable", "not found there", "timed out", "connection"] {
+            assert!(
+                !where_looked.to_lowercase().contains(invented),
+                "must not claim {invented:?} about a registry it never contacted: {where_looked}"
+            );
+        }
+        assert!(
+            advice.contains("ctr") && advice.contains("images pull"),
+            "must give the exact fetch command: {advice}"
+        );
+        assert!(
+            advice.contains("--namespace"),
+            "the command must target the same containerd namespace the engine uses, or it \
+             pulls into a namespace nemr never reads: {advice}"
+        );
+        assert!(
+            advice.contains("CONTAINERD_ADDRESS"),
+            "the command must target the rootless socket, or it pulls into the system \
+             daemon (PRIV-01): {advice}"
+        );
+    });
+}

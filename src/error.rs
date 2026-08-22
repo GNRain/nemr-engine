@@ -169,12 +169,17 @@ pub enum Error {
     /// The base image the bundle references could not be resolved, and the
     /// bundle deliberately does not carry it (D-06).
     ///
-    /// D-08 requires this error to name the digest, say **where** resolution was
-    /// attempted, and distinguish *the registry could not be reached* from *the
-    /// registry answered and does not have it*. Those need different fixes —
-    /// check your network versus this image was never published — and an error
-    /// that conflates them sends people to the wrong one. `where_looked` carries
-    /// the attempts in order.
+    /// D-08 part 1 was scoped down deliberately: `nemr` does **not** pull from a
+    /// registry, so this error must not imply it tried. The earlier draft
+    /// promised to distinguish *registry unreachable* from *digest not found
+    /// there* — a distinction nothing can make without attempting the fetch, and
+    /// claiming it would have been a lie in the one place a user is already
+    /// stuck.
+    ///
+    /// What it does instead: name the digest, state plainly that the image is
+    /// not present locally and that nemr does not fetch images itself, and give
+    /// the exact command to fetch it. An honest limit beats a message implying
+    /// capability that does not exist.
     #[error(
         "the bundle was created from base image {reference}\n\
          digest: {digest}\n\
