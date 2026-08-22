@@ -1243,12 +1243,76 @@ pub async fn import(
         .map(|size| size.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let local_digest = client.image_target_digest(config::BASE_IMAGE).await.ok();
+    let base_image = resolve_base_image(client, bundle.base_image_digest()).await;
     bundle.check(&ImportChecks {
-        local_base_image_digest: local_digest.as_deref(),
+        base_image,
         destination_capacity: usage.available,
         destination_quota: &quota,
     })?;
 
     bundle.extract(&mount_point)
+}
+
+/// Find the base image a bundle needs, **locally first** (D-08 part 2).
+///
+/// Two attempts, in this order:
+///
+///   1. the configured reference, by name — the fast path, one gRPC call;
+///   2. every local image, by digest — because the same bytes filed under a
+///      different tag are still the right image, and a host that already has
+///      them must not be sent to a registry.
+///
+/// Only after both miss does the registry become relevant. Each attempt is
+/// recorded so the error can say where it looked rather than just that it
+/// failed; see `Error::BaseImageUnresolved`.
+async fn resolve_base_image(
+    client: &ContainerdClient,
+    wanted_digest: &str,
+) -> crate::bundle::import::BaseImageResolution {
+    use crate::bundle::import::BaseImageResolution;
+    let mut where_looked = Vec::new();
+
+    match client.image_target_digest(config::BASE_IMAGE).await {
+        Ok(digest) if digest == wanted_digest => {
+            return BaseImageResolution::Present {
+                reference: config::BASE_IMAGE.to_string(),
+            }
+        }
+        Ok(digest) => where_looked.push(format!(
+            "local containerd, by name {}: present, but its digest is {digest}",
+            config::BASE_IMAGE
+        )),
+        Err(_) => where_looked.push(format!(
+            "local containerd, by name {}: not present",
+            config::BASE_IMAGE
+        )),
+    }
+
+    match client.images_with_digest(wanted_digest).await {
+        Ok(matches) if !matches.is_empty() => {
+            return BaseImageResolution::Present {
+                reference: matches[0].name.clone(),
+            }
+        }
+        Ok(_) => {
+            where_looked.push("local containerd, by digest across all images: no match".to_string())
+        }
+        Err(error) => where_looked.push(format!(
+            "local containerd, by digest across all images: the query failed ({error})"
+        )),
+    }
+
+    // No registry is consulted yet — see D-08 part 1. Saying so is the point:
+    // an error that implied a network attempt it never made would send someone
+    // to debug their connection.
+    where_looked.push(
+        "no registry was contacted: this build resolves the base image locally only".to_string(),
+    );
+
+    BaseImageResolution::Unresolved {
+        where_looked,
+        advice: "Build and import the base image on this host (README, \"Base image\"), \n\
+                 or import the bundle on a machine that already has it."
+            .to_string(),
+    }
 }

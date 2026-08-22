@@ -1119,3 +1119,63 @@ fn the_namespace_probe_reports_why_it_failed() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// D-08 — the base image is identified by its digest, not by its name.
+///
+/// The import path used to ask containerd "do you have `docker.io/nemr/base`?".
+/// A host holding exactly the right bytes under any other reference — pulled by
+/// digest, imported under a local tag, carried in from another machine — would
+/// be told to go to the registry for an image it already had. D-08's whole
+/// argument is that the product must not need a third party when it does not
+/// have to, so resolution asks whether the *bytes* are here.
+///
+/// Files the base image under a second reference, then resolves by digest and
+/// requires that reference to come back.
+#[test]
+fn d08_the_base_image_resolves_by_digest_under_any_reference() {
+    if !require_host(HostRequirements {
+        containerd: true,
+        helper: false,
+        base_image: true,
+    }) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let alias = format!("nemr.test/d08-alias:{}", std::process::id());
+
+        let canonical = nemr_engine::config::BASE_IMAGE;
+        let digest = client
+            .image_target_digest(canonical)
+            .await
+            .expect("the base image must be present");
+
+        // CONTROL: before the alias exists, resolution by digest must not
+        // already report it — otherwise the assertion below proves nothing.
+        let before = client.images_with_digest(&digest).await.expect("query");
+        assert!(
+            !before.iter().any(|image| image.name == alias),
+            "the alias must not exist before the test creates it"
+        );
+
+        client
+            .tag_image(canonical, &alias)
+            .await
+            .expect("record a second reference for the same image");
+
+        let found = client.images_with_digest(&digest).await.expect("query");
+        let matched = found.iter().any(|image| image.name == alias);
+
+        // Clean up before asserting, so a failure does not leave the alias behind.
+        let _ = client.untag_image(&alias).await;
+
+        assert!(
+            matched,
+            "an image filed under {alias:?} carries digest {digest} and must be found by it; \
+             resolving by name only would send this host to a registry for bytes it already has"
+        );
+    });
+}
