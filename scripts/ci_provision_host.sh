@@ -169,6 +169,31 @@ CRED
     echo "    created a placeholder at ~/.claude/.credentials.json (mode 600)"
 fi
 
+echo "==> Allow unprivileged user namespaces (E-11 offline test)"
+# Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1, which blocks
+# `unshare -r` for unconfined programs. The E-11 offline test needs a user +
+# mount + network namespace to prove that `nemr export` and `nemr import` work
+# with no network and no credential, and it REFUSES rather than skips when that
+# is unavailable — correctly, since a skipped guarantee is not a verified one.
+#
+# Scope: this relaxes a hardening knob on a disposable CI runner so a test can
+# create its own namespaces. It is NOT a change to how nemr runs anywhere else,
+# and it does not touch the privileged helper's scope. A developer host that
+# already permits unprivileged userns (the common case) needs nothing.
+if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+    current=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)
+    echo "    kernel.apparmor_restrict_unprivileged_userns = $current"
+    if [[ "$current" != "0" ]]; then
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+    fi
+fi
+if unshare -rmn true 2>/dev/null; then
+    echo "    unshare -rmn: available"
+else
+    echo "    unshare -rmn: UNAVAILABLE — the E-11 offline test will refuse to run" >&2
+    unshare -rmn true || true
+fi
+
 echo "==> Build and import the base image (BuildKit, daemonless — no Docker)"
 ./scripts/build_base_image.sh
 

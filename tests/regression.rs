@@ -18,8 +18,8 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{
-    extracted_plaintext, installed_helper_matches_built, namespaces_available, require_host,
-    run_offline, unit_only, write_hostile_bundle, HostRequirements, TestProject,
+    extracted_plaintext, installed_helper_matches_built, require_host, run_offline, unit_only,
+    write_hostile_bundle, HostRequirements, TestProject,
 };
 use nemr_engine::containerd::client::ContainerdClient;
 use nemr_engine::containerd::containers::StopOutcome;
@@ -967,11 +967,13 @@ fn e11_export_and_import_work_with_no_network_and_no_credentials() {
     if !require_host(HostRequirements::FULL) {
         return;
     }
-    if !namespaces_available() {
+    if let Err(reason) = common::namespace_probe() {
         panic!(
             "unprivileged user/mount/network namespaces are unavailable, so E-11's \
              offline guarantee cannot be tested on this host. This is a gap in \
-             coverage, not a pass."
+             coverage, not a pass.\n     {reason}\n     \
+             fix (CI runners and Ubuntu 24.04 hosts): \
+             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
         );
     }
 
@@ -1063,4 +1065,48 @@ fn the_installed_engine_matches_its_source() {
              nobody is looking at. Reinstall, then re-run.\n"
         );
     }
+}
+
+/// The namespace probe must report *why* it failed, not just that it did.
+///
+/// The bare boolean it replaced cost a CI round-trip: the E-11 offline test
+/// refused with "namespaces are unavailable" and left the cause to be guessed
+/// at. This asserts the diagnostic actually carries the underlying reason —
+/// F-65 was a diagnostic that could never print, and the lesson generalises: a
+/// message nothing ever executes is not a message.
+///
+/// Needs no host: it runs a stand-in that fails the way `unshare` fails.
+#[test]
+fn the_namespace_probe_reports_why_it_failed() {
+    let dir = std::env::temp_dir().join(format!("nemr-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let shim = dir.join("unshare-stub");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\necho 'unshare: write_setgroups failed: Permission denied' >&2\nexit 1\n",
+    )
+    .expect("write the stand-in");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let reason = common::namespace_probe_with(&shim.to_string_lossy())
+        .expect_err("a failing probe must be an error");
+
+    // The specific stderr must survive into the message: a probe that reported
+    // only "it failed" is what made the last CI failure a guess.
+    assert!(
+        reason.contains("write_setgroups failed: Permission denied"),
+        "the probe must carry the underlying reason, got: {reason}"
+    );
+    // And the AppArmor knob must be named, because on Ubuntu 24.04 it is the
+    // usual cause and it is not visible in unshare's own message.
+    assert!(
+        reason.contains("apparmor_restrict_unprivileged_userns"),
+        "the probe must report the restriction sysctl, got: {reason}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

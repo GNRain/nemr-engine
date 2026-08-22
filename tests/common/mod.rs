@@ -603,16 +603,51 @@ pub fn local_base_image_digest() -> Option<String> {
     .flatten()
 }
 
-/// Whether unprivileged user, mount and network namespaces are usable here.
+/// Whether unprivileged user, mount and network namespaces are usable here,
+/// and if not, **why**.
 ///
 /// Reported rather than silently skipped: a host without them cannot verify
 /// E-11's offline guarantee, and that is a coverage gap to surface.
-pub fn namespaces_available() -> bool {
-    Command::new("unshare")
-        .args(["-rmn", "true"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+///
+/// The bare boolean this replaced cost a CI round-trip: the offline test
+/// refused, said only "namespaces are unavailable", and left the actual cause
+/// to be guessed at. `unshare` writes a specific reason to stderr — on Ubuntu 24.04 it is
+/// normally `kernel.apparmor_restrict_unprivileged_userns`, but "normally" is
+/// not a diagnosis. Surfacing the real message means the next failure is read
+/// rather than inferred.
+pub fn namespace_probe() -> Result<(), String> {
+    namespace_probe_with("unshare")
+}
+
+/// The probe, parameterised on the binary so its failure path is testable.
+///
+/// Taking the command as an argument rather than mutating `PATH` keeps the test
+/// free of process-global state — and the point of the parameter is that the
+/// *diagnostic* gets exercised, not just the happy path. F-65 was a diagnostic
+/// that could never print; a diagnostic nothing ever runs is the same bug
+/// waiting to happen.
+pub fn namespace_probe_with(command: &str) -> Result<(), String> {
+    match Command::new(command).args(["-rmn", "true"]).output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.trim();
+            let restriction =
+                std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+                    .map(|value| format!("apparmor_restrict_unprivileged_userns={}", value.trim()))
+                    .unwrap_or_else(|_| "apparmor_restrict_unprivileged_userns=<absent>".into());
+            Err(format!(
+                "`unshare -rmn true` failed ({}): {}\n     {restriction}",
+                output.status,
+                if detail.is_empty() {
+                    "no stderr"
+                } else {
+                    detail
+                }
+            ))
+        }
+        Err(e) => Err(format!("cannot run `unshare`: {e}")),
+    }
 }
 
 /// Run the installed `nemr` CLI with **no network** and **no credential**.
