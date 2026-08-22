@@ -118,18 +118,21 @@ pub async fn create(
     // half-owned pair. Check both halves — either one existing means the name
     // is taken, and a project with only one half is a broken state we should
     // report rather than silently complete.
+    // F-70: typed, so a daemon mapping ErrorKind to a gRPC status returns
+    // Conflict rather than Internal. These conditions were reported as untyped
+    // anyhow strings while `Error::ProjectExists` sat in the enum, reachable by
+    // nothing — the taxonomy declared and never applied.
     if client.container_exists(&container_id).await? {
-        bail!(
-            "project {name:?} already exists (container {container_id:?}).\n\
-             Choose a different name, or delete the existing project first."
-        );
+        return Err(crate::error::Error::ProjectExists {
+            name: name.to_string(),
+        }
+        .into());
     }
     if paths.image_file(name).exists() {
-        bail!(
-            "project {name:?} already has a volume at {}, but no container.\n\
-             This is a partially-created project; remove the volume file before retrying.",
-            paths.image_file(name).display()
-        );
+        return Err(crate::error::Error::ProjectExists {
+            name: name.to_string(),
+        }
+        .into());
     }
 
     // AUTH-01/02/03: credentials come from the host, read-only, and their

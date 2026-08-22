@@ -107,31 +107,34 @@ const MAX_NAME_LEN: usize = 32;
 ///
 /// Rejects anything containing `/`, `.`, whitespace, or shell metacharacters,
 /// so a name can never traverse or escape the managed directory.
-pub fn validate_name(name: &str) -> Result<()> {
+pub fn validate_name(name: &str) -> std::result::Result<(), crate::error::Error> {
+    let invalid = |reason: &str| crate::error::Error::InvalidName {
+        name: name.to_string(),
+        reason: reason.to_string(),
+    };
     if name.is_empty() {
-        bail!("volume name must not be empty");
+        return Err(invalid("must not be empty"));
     }
     if name.len() > MAX_NAME_LEN {
-        bail!(
-            "volume name {name:?} is {} characters; maximum is {MAX_NAME_LEN}",
+        return Err(invalid(&format!(
+            "{} characters; maximum is {MAX_NAME_LEN}",
             name.len()
-        );
+        )));
     }
     if !name
         .chars()
         .next()
         .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     {
-        bail!("volume name {name:?} must start with a lowercase letter or digit");
+        return Err(invalid("must start with a lowercase letter or digit"));
     }
     if let Some(bad) = name
         .chars()
         .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-'))
     {
-        bail!(
-            "volume name {name:?} contains {bad:?}; only lowercase letters, \
-             digits and '-' are allowed"
-        );
+        return Err(invalid(&format!(
+            "contains {bad:?}; only lowercase letters, digits and '-' are allowed"
+        )));
     }
     Ok(())
 }
