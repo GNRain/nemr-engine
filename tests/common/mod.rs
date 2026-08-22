@@ -21,7 +21,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use nemr_engine::containerd::client::ContainerdClient;
-use nemr_engine::engine::volume::{HelperOps, PrivilegedOps, VolumePaths};
+use nemr_engine::engine::volume::{self, HelperOps, PrivilegedOps, VolumePaths};
 
 /// Host facilities a regression test needs.
 pub struct HostRequirements {
@@ -601,6 +601,74 @@ pub fn local_base_image_digest() -> Option<String> {
     .join()
     .ok()
     .flatten()
+}
+
+/// Install a tracing subscriber for the regression suite, once per process.
+///
+/// WP B added structured lifecycle logging, but nothing in `tests/` ever
+/// initialised a subscriber — that happens in `nemr`'s `main`. So every
+/// `tracing::debug!` the engine emits was discarded in exactly the place
+/// failures get diagnosed: `NEMR_LOG=... cargo test` produced no engine logs at
+/// all. Found while diagnosing F-63, where `ensure_volume_mounted`'s
+/// decision-point log was the fact needed and was not there.
+///
+/// Off unless `NEMR_LOG` is set, so ordinary runs are unchanged.
+pub fn init_tracing() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let Ok(filter) = std::env::var("NEMR_LOG") else {
+            return;
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_test_writer()
+            .with_target(true)
+            .try_init();
+    });
+}
+
+/// Everything needed to tell "the volume was not mounted" apart from "the
+/// volume was mounted but the directory was missing".
+///
+/// F-63 turned on exactly that distinction and the failure carried neither
+/// fact: the panic said `.nemr-state/projects: no such file or directory` and
+/// left open whether the mount had silently not happened (a VOL-05 violation,
+/// severe) or the volume was mounted and genuinely lacked the directory (a test
+/// artifact). Captured at the moment of failure, not reconstructed afterwards.
+pub fn volume_state_report(name: &str) -> String {
+    let Ok(paths) = VolumePaths::from_env() else {
+        return "  <cannot resolve VolumePaths>".into();
+    };
+    let mount_point = paths.mount_point(name);
+    let image = paths.image_file(name);
+
+    let listing = match std::fs::read_dir(&mount_point) {
+        Ok(entries) => {
+            let mut names: Vec<String> = entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            if names.is_empty() {
+                "<empty>".to_string()
+            } else {
+                names.join(", ")
+            }
+        }
+        Err(e) => format!("<unreadable: {e}>"),
+    };
+
+    format!(
+        "  mount point:   {}\n                is_mounted:    {}\n                backing dev:   {}\n                image file:    {} ({})\n                dir contents:  {}\n                .nemr-state/projects exists: {}",
+        mount_point.display(),
+        volume::is_mounted(&mount_point),
+        volume::backing_device(&mount_point).unwrap_or_else(|| "<none>".into()),
+        image.display(),
+        if image.exists() { "present" } else { "MISSING" },
+        listing,
+        mount_point.join(".nemr-state/projects").exists(),
+    )
 }
 
 /// Whether unprivileged user, mount and network namespaces are usable here,

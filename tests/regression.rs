@@ -337,6 +337,7 @@ fn vol_06_missing_backing_file_fails_loudly() {
 /// remove it.
 #[test]
 fn m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted() {
+    common::init_tracing();
     if !require_host(HostRequirements::FULL) {
         return;
     }
@@ -399,9 +400,17 @@ fn m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted() {
 
         // 5. Remount (start) and read it back inside the container — sourced
         //    from the volume, intact.
-        project::start(&client, &project.name)
-            .await
-            .expect("restart");
+        if let Err(error) = project::start(&client, &project.name).await {
+            // F-63: the bare `.expect("restart")` reported the error and nothing
+            // about the state that produced it, which left the two candidate
+            // causes indistinguishable — a mount that silently did not happen
+            // (VOL-05, severe) versus a volume mounted without the directory.
+            // Capture the discriminating facts here, while they are still true.
+            panic!(
+                "restart failed: {error:#}\n     {}",
+                common::volume_state_report(&project.name)
+            );
+        }
         let (code, out) =
             project::exec_capture(&client, &project.name, &["/bin/cat", container_path])
                 .await
