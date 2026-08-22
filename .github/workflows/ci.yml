@@ -50,6 +50,15 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: clippy — privileged helper (separate workspace)
         run: cd deploy/nemr-volume && cargo clippy --all-targets -- -D warnings
+      # F-64: this job has been named "clippy + fmt" and has installed rustfmt
+      # since it was written, and never ran it. Twenty-six files were
+      # unformatted as a result. A job whose name asserts a check it does not
+      # perform is the same defect class as F-60 (a green suite that ran
+      # nothing) — the signal is real, what it signals is not.
+      - name: fmt — engine workspace
+        run: cargo fmt --all -- --check
+      - name: fmt — privileged helper (separate workspace)
+        run: cd deploy/nemr-volume && cargo fmt --all -- --check
 
   unit-tests:
     name: unit tests (no host required)
