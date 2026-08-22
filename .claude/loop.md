@@ -103,6 +103,41 @@ nothing — which is exactly what CI's unit job did on every PR (F-60).
 This is the same family as the negative-assertion and guard-test rules: the
 signal is green, and the thing it is supposedly about never happened.
 
+## The evidence rule (a failure that erased its own evidence)
+
+The three rules above are about green signals. This one is about **red** ones,
+and it came from three findings in a row that were the same defect wearing
+different clothes:
+
+- **F-61** — the bucket acceptance deleted the object it wrote on every exit
+  path, so the only evidence of a run was the run's own summary.
+- **F-65** — `output=$(cargo test ...)` under `bash -e` aborts at the
+  *assignment*, so `status=$?` and every diagnostic below it were unreachable in
+  all three places that run the suite, `verify_wp_a.sh` included. A red suite
+  printed an exit code and nothing else.
+- **F-66** — the offline test refused with "namespaces are unavailable" and did
+  not say why, so the cause had to be inferred from outside CI.
+
+In each case the *check* was correct and the *report* was worthless. That is
+worse than a missing check, because a failure that says nothing gets attributed
+to the last thing anyone touched.
+
+**Standing rule: a failure must leave behind something a person can inspect
+without re-running it, and the failure path must be executed at least once
+before it is trusted.**
+
+In practice:
+
+- Print the underlying error, not a category. `unshare` says
+  `write_setgroups failed: Permission denied`; "namespaces unavailable" does not.
+- If a check consumes or deletes its evidence, give it an opt-out that keeps it
+  (`--keep`) and print where the artifact went.
+- Diagnostics are code. Run them — with a stand-in that fails on purpose — and
+  assert the detail survives. `the_namespace_probe_reports_why_it_failed` is the
+  shape.
+- Under `set -e`, an assignment from a failing command aborts *there*. Put it in
+  an `if` condition, or the handler beneath it is dead code.
+
 ## Fix autonomously
 
 - A newly `#[ignore]`d or skipped test — de-skip it and make it run.
@@ -121,4 +156,6 @@ signal is green, and the thing it is supposedly about never happened.
   widening the privileged helper's scope (PRIV-05). Escalate per Section 9.
 - Any new instance of a silent-success/wrong-result defect (VOL-05 class) —
   fix it, but flag it, because a second one means the class is not contained.
+- Any new instance of a failure that erased its own evidence (F-65 class) —
+  same reasoning, and it hides the VOL-05 ones.
 - A regression whose only fix trades off against a Section-7 gate (E-01…E-11).
