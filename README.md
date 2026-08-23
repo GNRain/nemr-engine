@@ -129,6 +129,20 @@ is introduced, so that AC-1.2 can compare wrapper output against a known-good
 pre-abstraction baseline. If the wrapper's output ever diverges from this
 program's, the wrapper is wrong.
 
+## Base image publishing
+
+[![publish base image](https://github.com/GNRain/nemr-engine/actions/workflows/publish-base-image.yml/badge.svg)](https://github.com/GNRain/nemr-engine/actions/workflows/publish-base-image.yml)
+
+The base image is published to `ghcr.io/gnrain/nemr-base:0.1.0` from CI, and
+`image/PUBLISHED_DIGEST` records the digest that was pushed. The publish
+workflow fails if the two diverge, or if the package is not pullable without an
+account.
+
+**That workflow is deliberately not a required check** — it runs only on pushes
+to `main`, so a pull request showing all-green says nothing about it. The badge
+above and an auto-filed `publish-failure` issue are what make a failure
+visible; without them the first silent failure would be found months later.
+
 ## Setting up a host
 
 ```bash
