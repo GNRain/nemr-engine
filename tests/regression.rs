@@ -2273,9 +2273,15 @@ fn user_facing_errors_name_the_subject_and_a_next_step() {
 /// imported afterwards with the old name removed from containerd entirely — and
 /// pinned here so the property cannot regress into name-based resolution.
 ///
-/// Exercised without touching the base image: asking for a digest that the
-/// configured reference does *not* have forces the by-digest path, which is the
-/// one that saved those bundles.
+/// # This reproduces the rename rather than standing in for it
+///
+/// The first version looked for any *other* image on the host to act as a
+/// renamed one. That passed here, where `alpine` happened to be lying around,
+/// and failed on a clean CI runner where the base image is the only one — a
+/// test depending on incidental host state, which is the class this project
+/// keeps finding. It now performs the rename itself: file the image under an
+/// alias, remove the canonical name, resolve, then put it back. At every step
+/// at least one reference holds the blobs, so the image is never orphaned.
 #[test]
 fn a_bundle_survives_a_rename_of_the_base_image() {
     if !require_host(HostRequirements {
@@ -2290,46 +2296,62 @@ fn a_bundle_survives_a_rename_of_the_base_image() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
+        let canonical = nemr_engine::config::BASE_IMAGE;
+        let alias = format!("nemr.test/renamed-base:{}", std::process::id());
 
-        // Some other image that is present but is NOT what BASE_IMAGE names.
-        let others: Vec<_> = client
-            .list_images()
-            .await
-            .expect("list images")
-            .into_iter()
-            .filter(|i| i.name != nemr_engine::config::BASE_IMAGE && !i.digest.is_empty())
-            .collect();
-        let Some(other) = others.first() else {
-            panic!("this host has no second image to stand in for a renamed one");
-        };
-
-        // CONTROL: the configured reference does not carry this digest, so
-        // attempt 1 (by name) must miss and attempt 2 (by digest) is what
-        // answers. Without this the test could pass via the name path.
-        let by_name = client
-            .image_target_digest(nemr_engine::config::BASE_IMAGE)
+        let digest = client
+            .image_target_digest(canonical)
             .await
             .expect("the base image must be present");
-        assert_ne!(
-            by_name, other.digest,
-            "control: the stand-in must differ from the configured reference, or the \
-             by-digest path is never reached"
-        );
 
-        // A bundle referencing a name that does not resolve, by a digest that
-        // does — exactly the post-rename situation.
-        let resolution = project::resolve_base_image(&client, &other.digest).await;
-        match resolution {
+        // 1. File it under the new name. Both references now point at the same
+        //    target, which is exactly what `ctr images tag` did for the real
+        //    rename.
+        client
+            .tag_image(canonical, &alias)
+            .await
+            .expect("file the image under a second reference");
+
+        // 2. Remove the old name. A bundle referencing it can now only resolve
+        //    by digest — the situation every pre-rename bundle is in.
+        let removed = client.untag_image(canonical).await;
+
+        // 3. Resolve. Everything after this must run even on failure, or the
+        //    host is left without its base image.
+        let resolution = if removed.is_ok() {
+            Some(project::resolve_base_image(&client, &digest).await)
+        } else {
+            None
+        };
+
+        // 4. Put the canonical name back, then drop the alias.
+        let restored = client.tag_image(&alias, canonical).await;
+        let _ = client.untag_image(&alias).await;
+
+        removed.expect("removing the canonical reference must succeed");
+        restored.expect("the canonical reference must be restored");
+
+        match resolution.expect("resolution must have run") {
             nemr_engine::bundle::import::BaseImageResolution::Present { reference } => {
                 assert_eq!(
-                    reference, other.name,
-                    "resolution must report where it actually found the image"
+                    reference, alias,
+                    "resolution must report where it actually found the image, which is the                      renamed reference — not the one the bundle asked for"
                 );
             }
-            other_outcome => panic!(
-                "an image present under a different name must resolve by digest — this is \
-                 what keeps pre-rename bundles importable: {other_outcome:?}"
+            other => panic!(
+                "with the old name gone, the image must still resolve by digest under its new                  name — this is what keeps pre-rename bundles importable: {other:?}"
             ),
         }
+
+        // CONTROL: the base image is back under its canonical name, so this
+        // test has not broken the host for everything that follows.
+        assert_eq!(
+            client
+                .image_target_digest(canonical)
+                .await
+                .expect("the canonical reference must resolve again"),
+            digest,
+            "the base image must be restored exactly as it was"
+        );
     });
 }
