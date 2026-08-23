@@ -1166,7 +1166,7 @@ fn the_namespace_probe_reports_why_it_failed() {
 
 /// D-08 — the base image is identified by its digest, not by its name.
 ///
-/// The import path used to ask containerd "do you have `docker.io/nemr/base`?".
+/// The import path used to ask containerd "do you have `ghcr.io/gnrain/nemr-base`?".
 /// A host holding exactly the right bytes under any other reference — pulled by
 /// digest, imported under a local tag, carried in from another machine — would
 /// be told to go to the registry for an image it already had. D-08's whole
@@ -2259,4 +2259,77 @@ fn user_facing_errors_name_the_subject_and_a_next_step() {
             "{args:?}: a single-clause error with no next step: {message:?}"
         );
     }
+}
+
+/// A bundle survives a rename of the base image (D-08).
+///
+/// When `docker.io/nemr/base:0.1.0` became `ghcr.io/gnrain/nemr-base:0.1.0`,
+/// every bundle already exported referenced the old name. They still import,
+/// and this is why: the manifest identifies the base image by **digest**, the
+/// reference is documented as a hint, and `resolve_base_image`'s second attempt
+/// scans every local image by digest rather than trusting the name.
+///
+/// Verified empirically at the time — a bundle exported before the rename
+/// imported afterwards with the old name removed from containerd entirely — and
+/// pinned here so the property cannot regress into name-based resolution.
+///
+/// Exercised without touching the base image: asking for a digest that the
+/// configured reference does *not* have forces the by-digest path, which is the
+/// one that saved those bundles.
+#[test]
+fn a_bundle_survives_a_rename_of_the_base_image() {
+    if !require_host(HostRequirements {
+        containerd: true,
+        helper: false,
+        base_image: true,
+    }) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+
+        // Some other image that is present but is NOT what BASE_IMAGE names.
+        let others: Vec<_> = client
+            .list_images()
+            .await
+            .expect("list images")
+            .into_iter()
+            .filter(|i| i.name != nemr_engine::config::BASE_IMAGE && !i.digest.is_empty())
+            .collect();
+        let Some(other) = others.first() else {
+            panic!("this host has no second image to stand in for a renamed one");
+        };
+
+        // CONTROL: the configured reference does not carry this digest, so
+        // attempt 1 (by name) must miss and attempt 2 (by digest) is what
+        // answers. Without this the test could pass via the name path.
+        let by_name = client
+            .image_target_digest(nemr_engine::config::BASE_IMAGE)
+            .await
+            .expect("the base image must be present");
+        assert_ne!(
+            by_name, other.digest,
+            "control: the stand-in must differ from the configured reference, or the \
+             by-digest path is never reached"
+        );
+
+        // A bundle referencing a name that does not resolve, by a digest that
+        // does — exactly the post-rename situation.
+        let resolution = project::resolve_base_image(&client, &other.digest).await;
+        match resolution {
+            nemr_engine::bundle::import::BaseImageResolution::Present { reference } => {
+                assert_eq!(
+                    reference, other.name,
+                    "resolution must report where it actually found the image"
+                );
+            }
+            other_outcome => panic!(
+                "an image present under a different name must resolve by digest — this is \
+                 what keeps pre-rename bundles importable: {other_outcome:?}"
+            ),
+        }
+    });
 }

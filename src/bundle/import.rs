@@ -413,7 +413,7 @@ mod tests {
                 content_bytes,
             },
             base_image: BaseImageRef {
-                reference: "docker.io/nemr/base:0.1.0".into(),
+                reference: "ghcr.io/gnrain/nemr-base:0.1.0".into(),
                 digest: DIGEST.into(),
             },
             chunks,
@@ -436,7 +436,7 @@ mod tests {
                 quota: "2GB",
                 source_root: &root,
                 base_image: BaseImageRef {
-                    reference: "docker.io/nemr/base:0.1.0".into(),
+                    reference: "ghcr.io/gnrain/nemr-base:0.1.0".into(),
                     digest: DIGEST.into(),
                 },
                 policy: Policy::default(),
@@ -450,7 +450,7 @@ mod tests {
     fn checks<'a>() -> ImportChecks<'a> {
         ImportChecks {
             base_image: BaseImageResolution::Present {
-                reference: "docker.io/nemr/base:0.1.0".into(),
+                reference: "ghcr.io/gnrain/nemr-base:0.1.0".into(),
             },
             destination_capacity: 1 << 30,
             destination_quota: "2GB",
@@ -601,7 +601,7 @@ mod tests {
                 .expect_err("a mismatched base image must refuse");
             assert_eq!(error.kind(), crate::error::ErrorKind::HostPrerequisite);
             assert!(
-                error.to_string().contains("docker.io/nemr/base"),
+                error.to_string().contains("ghcr.io/gnrain/nemr-base"),
                 "the error names the image the bundle needs"
             );
         }
@@ -621,7 +621,8 @@ mod tests {
             .check(&ImportChecks {
                 base_image: BaseImageResolution::Unresolved {
                     where_looked: vec![
-                        "local containerd, by name docker.io/nemr/base:0.1.0: not present".into(),
+                        "local containerd, by name ghcr.io/gnrain/nemr-base:0.1.0: not present"
+                            .into(),
                         "local containerd, by digest across all images: no match".into(),
                         "no registry was contacted: this build resolves locally only".into(),
                     ],

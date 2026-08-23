@@ -14,7 +14,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-IMAGE="${NEMR_BASE_IMAGE:-docker.io/nemr/base:0.1.0}"
+IMAGE="${NEMR_BASE_IMAGE:-ghcr.io/gnrain/nemr-base:0.1.0}"
 
 # Reproducibility (F-74). Both halves are load-bearing, measured rather than
 # assumed: three cold builds with these flags produced one digest, and two cold
