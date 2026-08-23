@@ -10,7 +10,19 @@
 // product. Only product-level constants remain here.
 
 /// Base image produced by Milestone 2.
-pub const BASE_IMAGE: &str = "docker.io/nemr/base:0.1.0";
+///
+/// # Why not `docker.io/...` (D-08)
+///
+/// It used to read `docker.io/nemr/base:0.1.0`. Nothing about the image is
+/// Docker — `docker.io/` is simply the registry containerd fills in for a name
+/// with no host, and nothing was ever pushed there. But on a project whose
+/// NFR-01 forbids Docker at every layer, with a CI gate enforcing it, having
+/// Docker's registry in the name of the primary artifact was misleading every
+/// time anyone read it, and cost real reasoning twice.
+///
+/// GHCR per D-08: the org exists, CI already builds the image, and packages are
+/// free for public repos — no new vendor and no Docker Hub rate limits.
+pub const BASE_IMAGE: &str = "ghcr.io/gnrain/nemr-base:0.1.0";
 
 /// Prefix for engine-created container IDs.
 ///

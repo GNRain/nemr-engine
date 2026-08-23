@@ -165,7 +165,7 @@ mod tests {
                 content_bytes: 0,
             },
             base_image: BaseImageRef {
-                reference: "docker.io/nemr/base:0.1.0".into(),
+                reference: "ghcr.io/gnrain/nemr-base:0.1.0".into(),
                 digest: "sha256:abc".into(),
             },
             chunks: vec![],

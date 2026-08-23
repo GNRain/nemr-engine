@@ -167,6 +167,11 @@ jobs:
           # condition or `bash -e` kills the step before the diagnostic runs.
           if ! output=$(cargo test --test regression -- --test-threads=1 --nocapture 2>&1); then
             printf '%s\n' "$output" | grep -E '^test result:' || true
+            # Print the FAILURES section, not just the tail. `tail -40` was
+            # enough at 17 tests and silently truncated the panic at 36 — the
+            # F-65 class again: the diagnostic existed and did not reach anyone.
+            printf '%s\n' "$output" | sed -n '/^failures:/,$p' || true
+            printf '%s\n' "$output" | grep -B2 -A15 'panicked at' || true
             printf '%s\n' "$output" | tail -40
             exit 1
           fi

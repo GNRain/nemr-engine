@@ -1,0 +1,85 @@
+name: publish base image
+
+# Deliberately a SEPARATE workflow, not part of the required CI checks.
+#
+# Publishing is not something every pull request should do, and its first run
+# necessarily fails: there is no recorded digest yet, so the divergence check
+# has nothing to compare against and prints the value to record. A required
+# check that is designed to fail once would block merges for a reason unrelated
+# to the change under review.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'image/**'
+      - 'scripts/build_base_image.sh'
+      - 'scripts/publish_base_image.sh'
+      - '.github/workflows/publish-base-image.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: build and push ghcr.io/gnrain/nemr-base
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install rootless prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y uidmap rootlesskit slirp4netns
+
+      - name: Install BuildKit
+        # Same pinned version and checksum as ci_provision_host.sh: the builder
+        # is an input to the image, so it is pinned like every other input.
+        run: |
+          set -euo pipefail
+          version=0.32.2
+          sha=2975d0f651ad96ba8b80b9992ae1f9a964f4408569af5b6dc36544165c3926af
+          tarball="buildkit-v${version}.linux-amd64.tar.gz"
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            -o "/tmp/${tarball}" \
+            "https://github.com/moby/buildkit/releases/download/v${version}/${tarball}"
+          echo "${sha}  /tmp/${tarball}" | sha256sum -c -
+          tar -xzf "/tmp/${tarball}" -C /tmp
+          install -D -m 0755 /tmp/bin/buildctl "$HOME/.local/bin/buildctl"
+          install -D -m 0755 /tmp/bin/buildkitd "$HOME/.local/bin/buildkitd"
+
+      - name: Start rootless buildkitd
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+          mkdir -p "$XDG_RUNTIME_DIR/buildkit"
+          rootlesskit \
+            --state-dir="$XDG_RUNTIME_DIR/buildkitd-rootless" \
+            --net=slirp4netns --mtu=65520 --disable-host-loopback \
+            --copy-up=/etc --copy-up=/run --propagation=rslave \
+            buildkitd --oci-worker-no-process-sandbox \
+              --root "$HOME/.local/share/buildkit" \
+              --addr "unix://$XDG_RUNTIME_DIR/buildkit/buildkitd.sock" \
+            > "$XDG_RUNTIME_DIR/buildkitd.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            [ -S "$XDG_RUNTIME_DIR/buildkit/buildkitd.sock" ] && break
+            sleep 1
+          done
+          if [ ! -S "$XDG_RUNTIME_DIR/buildkit/buildkitd.sock" ]; then
+            echo "buildkitd did not come up; log:" >&2
+            tail -40 "$XDG_RUNTIME_DIR/buildkitd.log" >&2
+            exit 1
+          fi
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          echo "PATH=$HOME/.local/bin:$PATH" >> "$GITHUB_ENV"
+
+      - name: Publish and verify the digest
+        env:
+          # The workflow's own token — no secret anyone has to hand over, which
+          # is the same posture the R2 credential established: the engineer
+          # never holds the credential.
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: ./scripts/publish_base_image.sh

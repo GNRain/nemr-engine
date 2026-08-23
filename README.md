@@ -274,7 +274,7 @@ Node 22 matches the LTS line and the host's own Node (v22.23.2).
 | Artifact | Size |
 |---|---|
 | OCI archive (`/tmp/nemr-base.tar`) | 201 MB |
-| **Image in containerd** (`docker.io/nemr/base:0.1.0`) | **200.5 MiB** |
+| **Image in containerd** (`ghcr.io/gnrain/nemr-base:0.1.0`) | **200.5 MiB** |
 
 Recorded per AC-2.2. This is larger than an Alpine-based equivalent would be
 (~80–130 MiB); the trade is glibc compatibility against size, per E-01 above.
@@ -290,7 +290,7 @@ buildctl build \
   --frontend dockerfile.v0 \
   --local context=image \
   --local dockerfile=image \
-  --output type=oci,dest=/tmp/nemr-base.tar,name=docker.io/nemr/base:0.1.0
+  --output type=oci,dest=/tmp/nemr-base.tar,name=ghcr.io/gnrain/nemr-base:0.1.0
 
 export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
 ctr images import /tmp/nemr-base.tar
@@ -312,7 +312,7 @@ nsenter -U --preserve-credentials -m -n -t "$CHILD_PID" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus" \
         XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
     ctr run --rm --runc-systemd-cgroup --cgroup "user.slice:nemr:m2verify" \
-        docker.io/nemr/base:0.1.0 m2-verify \
+        ghcr.io/gnrain/nemr-base:0.1.0 m2-verify \
         /bin/bash -lc 'claude --version'
 ```
 
