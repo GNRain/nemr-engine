@@ -111,6 +111,28 @@ pub enum Error {
     #[error("project {name:?} already exists\nChoose a different name, or delete the existing project first.")]
     ProjectExists { name: String },
 
+    /// A restore whose destination name is taken.
+    ///
+    /// Separate from [`Error::ProjectExists`] because the remedies differ: for
+    /// `create` the answer is "pick another name", while for a restore the user
+    /// usually wants *this* name and needs to know they can supply a different
+    /// one for the same bundle, or replace what is there. Refusing without
+    /// saying which is how a good refusal still wastes someone's time.
+    #[error(
+        "cannot restore into {name:?}: a project of that name already exists\n\
+         Nothing was changed — a restore never merges into an existing project, \
+         because that would overwrite one session with another and the damage is \
+         invisible until someone opens it.\n\n\
+         Restore under a different name:\n    nemr import {other} {bundle}\n\n\
+         Or replace the existing project, destroying what is in it:\n    \
+         nemr delete {name} && nemr import {bundle}"
+    )]
+    RestoreTargetExists {
+        name: String,
+        other: String,
+        bundle: String,
+    },
+
     #[error("project {name:?} is {state}")]
     WrongState { name: String, state: &'static str },
 
@@ -224,6 +246,7 @@ impl Error {
             Self::InvalidName { .. } => ErrorKind::InvalidRequest,
             Self::NoSuchProject { .. } => ErrorKind::InvalidRequest,
             Self::ProjectExists { .. } => ErrorKind::Conflict,
+            Self::RestoreTargetExists { .. } => ErrorKind::Conflict,
             Self::WrongState { .. } => ErrorKind::Conflict,
             Self::HostPrerequisite { .. } => ErrorKind::HostPrerequisite,
             Self::HelperProtocolMismatch { .. } => ErrorKind::Incompatible,

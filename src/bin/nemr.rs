@@ -58,14 +58,22 @@ enum Command {
     /// Reclaim orphaned mounts, loop devices and snapshots left by a crash.
     Reconcile,
 
-    /// Import a bundle into an existing, stopped project.
+    /// Restore a bundle, creating the project if it does not exist.
     ///
     /// Works standalone against a local file: no account, no network (E-11).
+    ///
+    ///   nemr import session.nemr              name and quota from the bundle
+    ///   nemr import newname session.nemr      restore under a different name
+    ///   nemr import session.nemr --size 2GB   override the recorded quota
     Import {
-        /// Destination project. Create it first with the quota you want.
-        name: String,
-        /// Bundle to read.
-        bundle: std::path::PathBuf,
+        /// The bundle to read — or, when a second argument is given, the
+        /// destination project name.
+        bundle_or_name: String,
+        /// The bundle to read, when a destination name was given first.
+        bundle: Option<std::path::PathBuf>,
+        /// Quota for a project this creates. Defaults to the bundle's own.
+        #[arg(long)]
+        size: Option<volume::VolumeSize>,
     },
 
     /// Export a stopped project to a portable bundle.
@@ -257,12 +265,25 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Import { name, bundle } => {
+        Command::Import {
+            bundle_or_name,
+            bundle,
+            size,
+        } => {
+            // One argument is the bundle; two are name-then-bundle. Keeping the
+            // old two-argument form working matters more than a tidier grammar:
+            // it is in the README and in muscle memory.
+            let (explicit_name, bundle_path) = match bundle {
+                Some(path) => (Some(bundle_or_name), path),
+                None => (None, std::path::PathBuf::from(bundle_or_name)),
+            };
             let client = ContainerdClient::connect().await?;
-            let summary = project::import(&client, &name, &bundle).await?;
+            let (name, summary) =
+                project::import_creating(&client, &bundle_path, explicit_name.as_deref(), size)
+                    .await?;
             println!(
                 "imported {} into project {name:?} ({} members, {})",
-                bundle.display(),
+                bundle_path.display(),
                 summary.members,
                 volume::human_bytes(summary.bytes)
             );

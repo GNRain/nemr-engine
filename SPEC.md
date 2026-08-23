@@ -65,6 +65,7 @@
 | 1.47 | Revision | **A mount at a project's mount point must be verified to BE that project's volume** (F-28). `is_mounted` answers "is something mounted here?", which is not the question: a mount landing on the wrong path is indistinguishable from the right one by presence alone, and the container is handed a foreign filesystem with nothing reported. Diagnosed from a captured F-63a failure showing `mounted=true`, a live loop device, and a volume containing only `lost+found`. **Requirement: `start` resolves the backing image of the mounted filesystem and refuses unless it is the project's own; a mount that is not loop-backed is refused outright, since it cannot be a volume this engine provisioned.** The decision is a pure function so the production path and its guard are the same code. | Claude Code |
 | 1.48 | Revision | **The D-07 error taxonomy is applied, not merely declared** (F-70). Three variants were unreachable while the engine reported those conditions as untyped `anyhow` strings, so a daemon mapping `kind()` onto a status would have answered `Internal` for a user's typo. `validate_name` now returns `Error::InvalidName` and `create` returns `Error::ProjectExists`; the duplicate, unreachable `CapacityExceeded` variant is removed in favour of `QuotaMismatch`, which is produced — `ErrorKind::CapacityExceeded` is unchanged as its class. **Requirement: every `Error` variant must have a construction site; a variant nothing can produce is not a taxonomy entry.** | Claude Code |
 | 1.49 | Revision | **Commands that read host state must share an enumeration** (F-79). `nemr list` reported 57 untracked volumes holding 24 GB while `nemr reconcile` reported nothing to reconcile — both correct about the part of the host they looked at, and `list` looked at `/sys` while `reconcile` looked at directories and files. **Requirement: reconciliation enumerates volume artifacts from the same source `list` does, and must account for every artifact `list` reports — released, refused, or explicitly kept. Silence about a reported artifact is a defect.** A cleanup command's false all-clear is worse than a noisy one: it ends the investigation. Verified end to end on the affected host: 14 GB free → 38 GB, 58 loop devices → 1. | Claude Code |
+| 1.50 | Revision | **`nemr import <bundle>` restores without a pre-existing project.** The destination name and quota come from the manifest, which has carried both since schema v1 — **no bundle-format change was required**. `nemr import <name> <bundle>` still names the destination explicitly and `--size` overrides the recorded quota. A name already in use is **refused, never merged**: a merge would overwrite one session with another and the damage is invisible until someone opens it, so `Error::RestoreTargetExists` names both remedies (restore under another name, or delete and replace). Restoring used to be three commands, one of which demanded a quota the bundle already recorded. Raises **E-14**: the restore defers AUTH-03's credential requirement so E-11's offline guarantee holds, confined to one call site and asserted to stay there — a narrowing of a Section 3 requirement, raised rather than decided. | Claude Code |
 
 ---
 
@@ -907,6 +908,24 @@ resolved unilaterally, if encountered during implementation:
   CLI talks to the daemon and keeps no second, direct path into containerd. Not
   implemented yet: the ruling exists so WP B stops paying for library/daemon
   optionality and WP C's design can assume it.
+- E-14: **A restore cannot require a host credential — OPEN, needs a ruling.**
+  AUTH-03 makes a missing credential fatal *at creation time*. E-11 requires
+  `nemr import` to work with no network and no credential. These did not collide
+  while import needed a pre-existing project — the create had already happened,
+  with a credential — but a restore that creates its own project makes them
+  collide directly. Restoring a bundle on a fresh machine *before* logging in is
+  the normal case, and import's own output already ends "Authenticate on this
+  host, then: nemr start". **Interim position, applied:** `nemr create` keeps
+  AUTH-03 unchanged; the restore path defers the credential requirement, and the
+  deferral is confined to exactly one call site with a test asserting it stays
+  there. This narrows *where* AUTH-03 fires, not whether it does — a credential
+  is still required to run anything. Raised rather than decided because AUTH-03
+  is a Section 3 requirement and Section 3 is Product Owner territory (4A.5).
+  **Second consequence, recorded:** a restore provisions a volume, so it needs
+  the privileged helper, which cannot run inside the E-11 offline test's user
+  namespace. The end-to-end no-credential assertion for import is therefore
+  replaced by a policy-level one, which is weaker; the export half is unchanged.
+
 - E-10: **Non-Linux hosts — OPEN.** Loopback ext4 plus rootless namespaces is
   Linux-only; the product vision is a cross-platform GUI, and D-01 (local
   compute) makes this a direct contradiction rather than a deferred concern.

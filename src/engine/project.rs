@@ -103,10 +103,29 @@ pub fn project_labels(name: &str, volume_path: &str, size: VolumeSize) -> HashMa
 ///    the mount and loop device, and the backing file is removed.
 /// 5. Only once the container exists, `persist()` the volume so it outlives
 ///    the guard — the container now depends on it.
+/// Whether a missing host credential is fatal (AUTH-03) or deferred (E-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthPolicy {
+    /// `nemr create`: AUTH-03 applies unchanged.
+    Required,
+    /// `nemr import`: E-11 requires the restore to work with no credential.
+    DeferredForRestore,
+}
+
+/// Create a project. A missing host credential is fatal (AUTH-03).
 pub async fn create(
     client: &ContainerdClient,
     name: &str,
     size: VolumeSize,
+) -> Result<ProjectSummary> {
+    create_with_auth(client, name, size, AuthPolicy::Required).await
+}
+
+async fn create_with_auth(
+    client: &ContainerdClient,
+    name: &str,
+    size: VolumeSize,
+    auth_policy: AuthPolicy,
 ) -> Result<ProjectSummary> {
     crate::engine::volume::validate_name(name)
         .with_context(|| format!("invalid project name {name:?}"))?;
@@ -137,8 +156,34 @@ pub async fn create(
 
     // AUTH-01/02/03: credentials come from the host, read-only, and their
     // absence is a clear failure before anything is provisioned.
-    let credentials = auth::resolve_credentials()?;
-    auth::check_permissions(&credentials)?;
+    //
+    // E-14: exempt for a restore. AUTH-03 makes a missing credential fatal "at
+    // creation time"; E-11 requires `nemr import` to work with no credential
+    // and no network at all. Those did not collide while import needed a
+    // pre-existing project — the create had already happened, with a
+    // credential. Now that a restore creates its own project, they do.
+    //
+    // E-11's guarantee is the one that holds: a bundle restored on a fresh
+    // machine before the user has logged in is the *normal* case, and import's
+    // own output already ends with "Authenticate on this host, then: nemr
+    // start". A credential is still required to run anything — `create` is
+    // unchanged and `attach` still resolves one — so this narrows *where*
+    // AUTH-03 fires, not whether it does. Raised as E-14 because AUTH-03 is a
+    // Section 3 requirement and narrowing it is not mine to decide.
+    let credentials = match auth_policy {
+        AuthPolicy::Required => {
+            let credentials = auth::resolve_credentials()?;
+            auth::check_permissions(&credentials)?;
+            credentials
+        }
+        AuthPolicy::DeferredForRestore => match auth::resolve_credentials() {
+            Ok(credentials) => {
+                auth::check_permissions(&credentials)?;
+                credentials
+            }
+            Err(_) => auth::host_credentials_path()?,
+        },
+    };
 
     let volume = Volume::create(name, size, paths, HelperOps::new())
         .with_context(|| format!("failed to provision volume for project {name:?}"))?;
@@ -1370,6 +1415,88 @@ pub async fn export(
 /// Per D-02 the bundle carries no credential. The caller authenticates on the
 /// destination host before attaching; `import` states this rather than leaving
 /// it to be discovered at the first API call.
+/// Restore a bundle, creating the destination project if it does not exist.
+///
+/// # Why this exists
+///
+/// Restoring onto a fresh host used to be three commands, one of which required
+/// inventing a number:
+///
+/// ```text
+/// nemr create htmltest --size 500MB    # a quota the user had to guess
+/// nemr import htmltest bundle.nemr
+/// nemr start htmltest
+/// ```
+///
+/// The bundle already records the source project's name and quota, so the guess
+/// was being demanded for information the file carried. That is the restore
+/// flow — the point of the product — and it required knowing internals.
+///
+/// `name` and `size` override the manifest when the destination host needs
+/// different ones; both default to what the bundle says. **No bundle-format
+/// change was needed:** `ProjectInfo` has carried `name` and `quota` since v1.
+pub async fn import_creating(
+    client: &ContainerdClient,
+    bundle_path: &std::path::Path,
+    name: Option<&str>,
+    size: Option<VolumeSize>,
+) -> crate::error::Result<(String, crate::bundle::import::ExtractSummary)> {
+    use crate::bundle::import::open as open_bundle;
+    use crate::error::Error;
+
+    let bundle = open_bundle(bundle_path)?;
+    let manifest = &bundle.manifest;
+    let name = name.unwrap_or(&manifest.project.name).to_string();
+    crate::engine::volume::validate_name(&name)?;
+
+    let size = match size {
+        Some(size) => size,
+        None => manifest.project.quota.parse::<VolumeSize>().map_err(|e| {
+            Error::Internal(e.context(format!(
+                "the bundle records quota {:?}, which this build does not recognise. \
+                 Pass --size to choose one explicitly.",
+                manifest.project.quota
+            )))
+        })?,
+    };
+
+    // Refuse rather than clobber. An import that silently merged into an
+    // existing project would overwrite a session with another one, and the
+    // damage is not visible until someone opens it.
+    let container_id = config::container_id(&name);
+    let exists = client
+        .container_exists(&container_id)
+        .await
+        .map_err(Error::Internal)?;
+    if exists {
+        return Err(Error::RestoreTargetExists {
+            other: format!("{name}-restored"),
+            bundle: bundle_path.display().to_string(),
+            name,
+        });
+    }
+
+    create_with_auth(client, &name, size, AuthPolicy::DeferredForRestore)
+        .await
+        .map_err(Error::Internal)?;
+
+    // A failed restore must not leave a half-populated project behind: the user
+    // asked for a session, and an empty project wearing its name is worse than
+    // nothing, because the name is then taken.
+    match import(client, &name, bundle_path).await {
+        Ok(summary) => Ok((name, summary)),
+        Err(error) => {
+            if let Err(cleanup) = delete(client, &name).await {
+                eprintln!(
+                    "[nemr:import] restore failed AND the partially-created project {name:?} \
+                     could not be removed: {cleanup:#}. Remove it with `nemr delete {name}`."
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
 pub async fn import(
     client: &ContainerdClient,
     name: &str,

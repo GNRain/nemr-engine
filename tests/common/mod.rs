@@ -600,6 +600,18 @@ impl TestProject {
     }
 }
 
+impl TestProject {
+    /// Take ownership of a project this test did not create, so it is still
+    /// cleaned up when the test ends.
+    ///
+    /// Needed where the *engine* chooses the name — a restore takes it from the
+    /// bundle — and the test must still guarantee the volume is released
+    /// however the test exits.
+    pub fn adopt(name: String) -> Self {
+        Self { name }
+    }
+}
+
 impl Drop for TestProject {
     fn drop(&mut self) {
         purge(&self.name);
