@@ -753,6 +753,48 @@ image distributed by digest is byte-identical everywhere by construction.
 **The ruling is not reversed** — recorded so the decision is re-taken against
 measured cost rather than the original estimate.
 
+**RE-ESTIMATE AFTER PUBLISHING (2026-08-23).** Asked to revisit the number now
+that the image is actually published to GHCR. **It has moved, in both
+directions, and the net is roughly unchanged at 3–5 days.**
+
+What got cheaper:
+
+- The instruction in the unresolved-base-image error becomes a one-liner that
+  *works* — `ctr images pull ghcr.io/gnrain/nemr-base:0.1.0` — rather than a
+  pointer to a build toolchain. That removes most of the *pain* pull was going
+  to relieve, which lowers its priority even though it does not lower its cost.
+- Anonymous pull of a public GHCR package needs no credential, so the
+  **registry-auth row largely disappears** for the default case. That was the
+  row carrying the D-02 interaction, and it was the one I flagged as design
+  rather than code. Private packages would bring it back; nothing needs one.
+
+What got more expensive, or newly appeared:
+
+- **Digest verification becomes mandatory, not optional.** Now that a published
+  digest exists and is recorded, a pull that does not verify what it fetched
+  against it would be strictly worse than telling the user to run `ctr` — it
+  would silently accept a substituted image. That is a new requirement pull
+  did not previously carry.
+- **The local-first path (part 2) becomes load-bearing rather than an
+  optimisation.** Once pulling is possible, E-11's offline guarantee depends on
+  resolution genuinely preferring the local copy — a pull attempted before the
+  local check would break `nemr import` on a machine with no network. That is
+  already implemented and tested, but it moves from "nice" to "the thing that
+  must not regress", and pull work has to be built around it.
+- **Verification still dominates.** The transfer plumbing is still about half a
+  day; proving it works still needs a registry to test against, and now also
+  needs the offline path proven *not* to reach for one.
+
+**Net: no change to the estimate, and a clear drop in urgency.** The argument
+for building it was "every new host installs a build toolchain to produce an
+image that should be a download". That argument is now retired by publishing
+alone — the download exists, it is one documented command, and the error names
+it. What remains is the GUI case from the entry above, which is unchanged: a
+one-click attach cannot tell anyone to run `ctr`.
+
+**Recommendation: leave the ruling as it stands.** The cost did not fall enough
+to change the decision, and the reason to hurry did.
+
 **Consequence of leaving it open:** the honest description of the product today
 is "brings your own base image". Any roadmap or GUI mock that shows attaching on
 a fresh machine with no terminal step is describing something that does not
@@ -818,6 +860,9 @@ is overstating what has been demonstrated.
 | 2026-08-22 | F-12 | **Scheduled** — confirmed in production during the cross-machine validation; recovery required delete+recreate (Rain) |
 | 2026-08-22 | D-11 | Opened — no user-facing path moves a bundle through storage; sync layer is commercial scope (Claude Code) |
 | 2026-08-22 | D-12 | Opened — import needs a pre-existing project and an invented quota the bundle already records (Claude Code) |
+| 2026-08-23 | D-10 | Re-estimated after publishing: still 3–5 days; auth row mostly gone, digest verification newly mandatory, urgency dropped. Recommend leaving the ruling (Claude Code) |
+| 2026-08-23 | D-08 | Part 1 delivered — published to GHCR from CI with a digest-divergence check; base image renamed to ghcr.io/gnrain/nemr-base (Claude Code) |
+| 2026-08-23 | E-14 | **Resolved** — restore defers the credential check, `create` keeps AUTH-03; AUTH-03 reworded to state the distinction (Rain) |
 | 2026-08-22 | D-10 | Opened — registry pull out of D-08 scope; tracked as a GUI prerequisite, Transfer service, 3–5 day estimate (Claude Code) |
 | 2026-08-22 | D-08 | Part 1 scoped down (Rain): nemr does not pull; error states the limit and gives the exact `ctr` command |
 | 2026-08-22 | E-10 | **Deferred with direction** — Linux first, then WSL2, then a bundled VM on macOS; remote-engine fallback rejected. Moved out of Open (Rain) |
