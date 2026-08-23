@@ -1236,6 +1236,108 @@ pub struct ProjectStatus {
     pub usage: Option<crate::engine::volume::Usage>,
 }
 
+/// Everything about one project, in one place.
+///
+/// Answering "what state is this in?" meant reading `nemr list`, `df` and
+/// `losetup` separately and correlating them by hand. Worse, the two questions
+/// that actually cost time during the cross-machine work — is the mounted
+/// filesystem the right one (F-28), and is there a credential — were not
+/// answerable from any command at all.
+#[derive(Debug, Clone)]
+pub struct ProjectDetail {
+    pub name: String,
+    pub container_id: String,
+    pub running: bool,
+    pub quota: String,
+    pub mount_point: std::path::PathBuf,
+    pub image_file: std::path::PathBuf,
+    pub image_present: bool,
+    pub mounted: bool,
+    /// The loop device backing the mount, when it is loop-backed.
+    pub loop_device: Option<u32>,
+    /// The image the mounted filesystem is actually backed by (F-28). `Some`
+    /// and equal to `image_file` is healthy; anything else is not.
+    pub mounted_image: Option<std::path::PathBuf>,
+    pub usage: Option<crate::engine::volume::Usage>,
+    /// Base image reference and the digest present on this host, if any.
+    pub base_image: String,
+    pub base_image_digest: Option<String>,
+    /// Host credential (AUTH-02), and when it was last written.
+    pub credential: Option<std::path::PathBuf>,
+    pub credential_modified: Option<std::time::SystemTime>,
+}
+
+impl ProjectDetail {
+    /// Whether the mounted filesystem is this project's own volume (F-28).
+    ///
+    /// `None` when nothing is mounted — an absent volume is not a wrong one,
+    /// and reporting them the same way is how "not started yet" gets mistaken
+    /// for corruption.
+    pub fn mount_is_correct(&self) -> Option<bool> {
+        if !self.mounted {
+            return None;
+        }
+        Some(self.mounted_image.as_deref() == Some(self.image_file.as_path()))
+    }
+}
+
+/// Gather everything `nemr status` reports.
+pub async fn status(client: &ContainerdClient, name: &str) -> crate::error::Result<ProjectDetail> {
+    use crate::error::Error;
+
+    let container_id = config::container_id(name);
+    let container = client
+        .list_containers()
+        .await
+        .map_err(Error::Internal)?
+        .into_iter()
+        .find(|c| c.id == container_id)
+        .ok_or_else(|| Error::NoSuchProject {
+            name: name.to_string(),
+        })?;
+
+    let paths = VolumePaths::from_env().map_err(Error::Internal)?;
+    let mount_point = paths.mount_point(name);
+    let image_file = paths.image_file(name);
+    let mounted = crate::engine::volume::is_mounted(&mount_point);
+
+    let credential = auth::host_credentials_path().ok().filter(|p| p.exists());
+    let credential_modified = credential
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
+
+    Ok(ProjectDetail {
+        name: name.to_string(),
+        running: client
+            .task_state(&container_id)
+            .await
+            .map_err(Error::Internal)?
+            .is_running(),
+        container_id,
+        quota: container
+            .labels
+            .get(LABEL_SIZE)
+            .cloned()
+            .unwrap_or_else(|| "unknown".into()),
+        loop_device: crate::engine::volume::attached_loop_device(&image_file),
+        mounted_image: crate::engine::volume::mounted_image_path(&mount_point),
+        usage: if mounted {
+            crate::engine::volume::usage(&mount_point)
+        } else {
+            None
+        },
+        image_present: image_file.exists(),
+        base_image_digest: client.image_target_digest(config::BASE_IMAGE).await.ok(),
+        base_image: config::BASE_IMAGE.to_string(),
+        mount_point,
+        image_file,
+        mounted,
+        credential,
+        credential_modified,
+    })
+}
+
 /// List all projects (Milestone 6).
 ///
 /// State comes from containerd: the container records and their labels are the

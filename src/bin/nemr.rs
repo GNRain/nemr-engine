@@ -67,6 +67,12 @@ enum Command {
     /// Reclaim orphaned mounts, loop devices and snapshots left by a crash.
     Reconcile,
 
+    /// Everything about one project: state, volume, base image, credential.
+    Status {
+        /// Project to describe.
+        name: String,
+    },
+
     /// Restore a bundle, creating the project if it does not exist.
     ///
     /// Works standalone against a local file: no account, no network (E-11).
@@ -274,6 +280,83 @@ async fn main() -> Result<()> {
                          KEPT — it may hold data. Remove it deliberately if you are sure."
                     );
                 }
+            }
+        }
+
+        Command::Status { name } => {
+            let client = ContainerdClient::connect().await?;
+            let d = project::status(&client, &name).await?;
+
+            println!("{}", d.name);
+            println!(
+                "  state:        {}",
+                if d.running { "running" } else { "stopped" }
+            );
+            println!("  container:    {}", d.container_id);
+
+            let usage = match &d.usage {
+                Some(u) => format!(
+                    "{} of {} ({:.0}%)",
+                    volume::human_bytes(u.used),
+                    d.quota,
+                    u.percent()
+                ),
+                None => format!("unmounted (quota {})", d.quota),
+            };
+            println!("  volume:       {}", d.mount_point.display());
+            println!("  usage:        {usage}");
+            println!(
+                "  image file:   {} ({})",
+                d.image_file.display(),
+                if d.image_present {
+                    "present"
+                } else {
+                    "MISSING"
+                }
+            );
+            println!(
+                "  loop device:  {}",
+                d.loop_device
+                    .map(|n| format!("/dev/loop{n}"))
+                    .unwrap_or_else(|| "none".into())
+            );
+
+            // F-28: the question that cost the most time to answer by hand.
+            match d.mount_is_correct() {
+                None => println!("  mount check:  n/a (not mounted)"),
+                Some(true) => println!("  mount check:  ok (backed by this project's image)"),
+                Some(false) => println!(
+                    "  mount check:  WRONG VOLUME — mounted filesystem is backed by {}\n\
+                     \x20               Run `nemr reconcile`, then start again.",
+                    d.mounted_image
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "something that is not a loop device".into())
+                ),
+            }
+
+            println!("  base image:   {}", d.base_image);
+            println!(
+                "  base digest:  {}",
+                d.base_image_digest
+                    .as_deref()
+                    .unwrap_or("NOT PRESENT on this host")
+            );
+
+            // The expired-credential failure took three steps to identify; this
+            // is the line that would have made it one.
+            match (&d.credential, d.credential_modified) {
+                (Some(path), modified) => {
+                    let age = modified
+                        .and_then(|m| m.elapsed().ok())
+                        .map(|d| format!(", last written {} days ago", d.as_secs() / 86_400))
+                        .unwrap_or_default();
+                    println!("  credential:   present at {}{age}", path.display());
+                }
+                (None, _) => println!(
+                    "  credential:   ABSENT — `nemr start` will fail (AUTH-03).\n\
+                     \x20               Authenticate on this host by running `claude`."
+                ),
             }
         }
 

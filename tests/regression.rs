@@ -2080,3 +2080,118 @@ fn the_elevation_note_is_visible_without_a_flag() {
         "default output must not carry the full privileged command line: {stderr:?}"
     );
 }
+
+/// `nemr status` must answer the questions that previously took three commands.
+///
+/// During the cross-machine work, "what state is this in?" meant reading
+/// `nemr list`, `df` and `losetup` and correlating them by hand — and the two
+/// questions that actually cost time were answerable from no command at all:
+/// whether the mounted filesystem is the right one (F-28), and whether a
+/// credential is present.
+#[test]
+fn status_reports_the_facts_that_took_three_commands_to_gather() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "status", VolumeSize::Small).await;
+
+        let detail = project::status(&client, &project.name)
+            .await
+            .expect("status must work for an existing project");
+
+        assert_eq!(detail.name, project.name);
+        assert!(!detail.running, "a freshly created project is not running");
+        assert!(detail.image_present, "the backing image must exist");
+        assert!(detail.mounted, "a freshly created project is mounted");
+        assert!(
+            detail.loop_device.is_some(),
+            "a mounted volume must report the loop device backing it"
+        );
+        assert!(
+            detail.usage.is_some(),
+            "a mounted volume must report usage against its quota"
+        );
+        assert_eq!(detail.quota, VolumeSize::Small.to_string());
+
+        // The F-28 answer, which no command could give before.
+        assert_eq!(
+            detail.mount_is_correct(),
+            Some(true),
+            "a healthy project must report that its mount is its own volume"
+        );
+
+        // The credential answer, which turned a three-step diagnosis into a line.
+        assert!(
+            detail.credential.is_some(),
+            "the host credential exists on this host, so status must report it"
+        );
+
+        // A project that does not exist is a clear refusal, not an empty report.
+        let error = project::status(&client, "definitely-not-a-project")
+            .await
+            .expect_err("status on a missing project must fail");
+        assert_eq!(
+            error.kind(),
+            nemr_engine::error::ErrorKind::InvalidRequest,
+            "asking about a project that does not exist is a caller error: {error}"
+        );
+    });
+}
+
+/// `status` must report an unmounted volume as unmounted, not as wrong.
+///
+/// `mount_is_correct()` returns `None` when nothing is mounted. Collapsing that
+/// into `false` would report a perfectly healthy stopped project as corrupted,
+/// which is the kind of false alarm that trains people to ignore the field.
+#[test]
+fn status_distinguishes_unmounted_from_wrongly_mounted() {
+    if !require_host(HostRequirements::VOLUME) {
+        return;
+    }
+
+    let paths = VolumePaths::from_env().expect("paths");
+    let detail = project::ProjectDetail {
+        name: "demo".into(),
+        container_id: "nemr-demo".into(),
+        running: false,
+        quota: "500MB".into(),
+        mount_point: paths.mount_point("demo"),
+        image_file: paths.image_file("demo"),
+        image_present: true,
+        mounted: false,
+        loop_device: None,
+        mounted_image: None,
+        usage: None,
+        base_image: "x".into(),
+        base_image_digest: None,
+        credential: None,
+        credential_modified: None,
+    };
+    assert_eq!(
+        detail.mount_is_correct(),
+        None,
+        "an unmounted volume is not a wrongly-mounted one"
+    );
+
+    let wrong = project::ProjectDetail {
+        mounted: true,
+        mounted_image: Some(paths.image_file("someone-else")),
+        ..detail.clone()
+    };
+    assert_eq!(
+        wrong.mount_is_correct(),
+        Some(false),
+        "a foreign image backing the mount must report as wrong (F-28)"
+    );
+
+    let right = project::ProjectDetail {
+        mounted: true,
+        mounted_image: Some(paths.image_file("demo")),
+        ..detail
+    };
+    assert_eq!(right.mount_is_correct(), Some(true));
+}
