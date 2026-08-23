@@ -266,10 +266,29 @@ impl HelperOps {
         }
 
         if !output.status.success() {
+            // The helper's own stderr is the useful part — it names the exact
+            // syscall or path that failed — so it leads. The remedies below are
+            // the three things that are actually wrong when this fires, in the
+            // order they occur in practice.
             bail!(
-                "privileged helper failed ({}): {}",
+                "the privileged helper failed.\n\
+                 command:  {} {}\n\
+                 exit:     {}\n\
+                 it said:  {}\n\n\
+                 Most likely, in order:\n  \
+                 1. the helper is out of date — reinstall: sudo ./scripts/setup_test_host.sh\n  \
+                 2. the sudoers grant is missing — check: sudo -n {} version\n  \
+                 3. the host cannot provide what was asked (loop devices exhausted, \
+                 no space) — check: losetup -a | wc -l, df -h",
+                self.helper_path.display(),
+                args.join(" "),
                 output.status,
-                stderr.trim()
+                if stderr.trim().is_empty() {
+                    "<nothing>"
+                } else {
+                    stderr.trim()
+                },
+                self.helper_path.display(),
             );
         }
         Ok(())
@@ -618,7 +637,12 @@ impl<P: PrivilegedOps> Volume<P> {
         let image = paths.image_file(name);
         if image.exists() {
             bail!(
-                "volume {name:?} already exists at {}. Delete it first.",
+                "volume {name:?} already exists at {}\n\
+             A volume is never reformatted in place — that would destroy whatever \
+             is on it. Remove the project and its volume:\n    \
+             nemr delete {name}\n\
+             Or, if there is no project and only a stray image, remove the file \
+             deliberately.",
                 image.display()
             );
         }
@@ -801,10 +825,24 @@ fn format_ext4(path: &Path) -> Result<()> {
 
     if !output.status.success() {
         bail!(
-            "mkfs.ext4 failed on {} ({}): {}",
+            "could not format the volume as ext4.\n\
+             image:    {}\n\
+             exit:     {}\n\
+             it said:  {}\n\n\
+             The image file was allocated but is unusable, so it is left in place \
+             rather than silently removed. Remove it before retrying:\n    \
+             rm {}",
             path.display(),
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            {
+                let e = String::from_utf8_lossy(&output.stderr);
+                if e.trim().is_empty() {
+                    "<nothing>".to_string()
+                } else {
+                    e.trim().to_string()
+                }
+            },
+            path.display()
         );
     }
     Ok(())

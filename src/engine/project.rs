@@ -87,6 +87,15 @@ pub fn project_labels(name: &str, volume_path: &str, size: VolumeSize) -> HashMa
     labels
 }
 
+/// Whether a missing host credential is fatal (AUTH-03) or deferred (E-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthPolicy {
+    /// `nemr create`: AUTH-03 applies unchanged.
+    Required,
+    /// `nemr import`: E-11 requires the restore to work with no credential.
+    DeferredForRestore,
+}
+
 /// Create a project: a quota-bounded volume plus a ready-to-start container.
 ///
 /// # Ordering
@@ -103,16 +112,9 @@ pub fn project_labels(name: &str, volume_path: &str, size: VolumeSize) -> HashMa
 ///    the mount and loop device, and the backing file is removed.
 /// 5. Only once the container exists, `persist()` the volume so it outlives
 ///    the guard — the container now depends on it.
-/// Whether a missing host credential is fatal (AUTH-03) or deferred (E-14).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthPolicy {
-    /// `nemr create`: AUTH-03 applies unchanged.
-    Required,
-    /// `nemr import`: E-11 requires the restore to work with no credential.
-    DeferredForRestore,
-}
-
-/// Create a project. A missing host credential is fatal (AUTH-03).
+///
+/// Step 2 is unconditional here. A *restore* defers it — see [`AuthPolicy`] and
+/// E-14 — because E-11 requires `nemr import` to work with no credential at all.
 pub async fn create(
     client: &ContainerdClient,
     name: &str,
@@ -587,7 +589,11 @@ pub async fn exec_capture(
 
     let container_id = resolve(client, name).await?;
     if !client.task_state(&container_id).await?.is_running() {
-        bail!("project {name:?} is not running; start it first");
+        bail!(
+            "project {name:?} is not running, so there is nothing to run a command in.\n    \
+             nemr start {name}\n\
+             Check what state it is in with: nemr status {name}"
+        );
     }
 
     let exec_id = format!(

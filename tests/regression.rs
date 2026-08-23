@@ -2195,3 +2195,68 @@ fn status_distinguishes_unmounted_from_wrongly_mounted() {
     };
     assert_eq!(right.mount_is_correct(), Some(true));
 }
+
+/// User-facing errors must name what failed and what to do next.
+///
+/// The D-08 unresolved-base-image error set the bar: it named the digest,
+/// listed every place it looked and what it found there, stated its own limits,
+/// and gave two concrete fixes. Several errors were a single clause with no
+/// remedy — `"project X is not running; start it first"` tells you the state
+/// and makes you go and find the command.
+///
+/// This asserts the floor, not the ceiling: an error must name its subject and
+/// contain something the reader can act on. Not every error needs four
+/// sections; every error needs a next step.
+#[test]
+fn user_facing_errors_name_the_subject_and_a_next_step() {
+    if !require_host(HostRequirements {
+        containerd: true,
+        helper: false,
+        base_image: false,
+    }) {
+        return;
+    }
+
+    let nemr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nemr"));
+    let socket = ContainerdClient::default_socket_path().expect("socket");
+    let absent = format!("no-such-{}", std::process::id());
+
+    let run = |args: &[&str]| -> String {
+        let output = std::process::Command::new(&nemr)
+            .args(args)
+            .env("CONTAINERD_ADDRESS", &socket)
+            .output()
+            .expect("run nemr");
+        assert!(
+            !output.status.success(),
+            "expected {args:?} to fail so its error could be inspected"
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    // Each case: the command, and a command the error must suggest.
+    let cases: [(&[&str], &str); 4] = [
+        (&["start", &absent], "nemr create"),
+        (&["stop", &absent], "nemr create"),
+        (&["status", &absent], "nemr create"),
+        (&["export", &absent], "nemr create"),
+    ];
+
+    for (args, expected_remedy) in cases {
+        let message = run(args);
+        assert!(
+            message.contains(&absent),
+            "{args:?}: the error must name its subject: {message:?}"
+        );
+        assert!(
+            message.contains(expected_remedy),
+            "{args:?}: the error must offer a next step containing {expected_remedy:?}: \
+             {message:?}"
+        );
+        // A bare one-liner with no remedy is the shape this guards against.
+        assert!(
+            message.lines().filter(|l| !l.trim().is_empty()).count() >= 2,
+            "{args:?}: a single-clause error with no next step: {message:?}"
+        );
+    }
+}
