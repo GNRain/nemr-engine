@@ -138,6 +138,39 @@ In practice:
 - Under `set -e`, an assignment from a failing command aborts *there*. Put it in
   an `if` condition, or the handler beneath it is dead code.
 
+## The cleanup rule (a failure that destroyed its own evidence)
+
+The evidence rule says a failure must leave something inspectable. Cleanup paths
+are where that goes wrong worst, and F-79 is the case:
+
+- The test sweep called `unmount_and_detach`, got `Ok`, and deleted the image
+  and the mount point. The helper had silently failed to detach (F-77), so the
+  loop device stayed — and the two things `nemr reconcile` enumerates were now
+  gone. 57 devices holding 24 GB became invisible, and `reconcile` answered
+  *"nothing to reconcile"*.
+- It was committed in the same pass that fixed assume-success in `reconcile`'s
+  own reporting. Knowing the principle did not stop me applying its opposite one
+  function away.
+
+**Standing rule: a cleanup path must verify the release happened before deleting
+anything that records what needs releasing.**
+
+Assume-success is bad everywhere. In a cleanup path it is worse than elsewhere,
+because **the assumption deletes the evidence** — the failure and the trail to
+it are destroyed by the same call. Nothing is left to notice, and the next
+command that looks reports all-clear.
+
+In practice:
+
+- Observe, then destroy. Never destroy on the strength of a call returning `Ok`.
+- If the release did not happen, **leave the artifacts in place** and say so. A
+  visible mess is recoverable; an invisible one is not.
+- Two commands that read the same host state must share an enumeration. `list`
+  reading `/sys` while `reconcile` read directories is how one reported 57 and
+  the other reported none, both truthfully.
+- A cleanup command's false all-clear is worse than a noisy one: it ends the
+  investigation.
+
 ## Fix autonomously
 
 - A newly `#[ignore]`d or skipped test — de-skip it and make it run.
@@ -158,4 +191,5 @@ In practice:
   fix it, but flag it, because a second one means the class is not contained.
 - Any new instance of a failure that erased its own evidence (F-65 class) —
   same reasoning, and it hides the VOL-05 ones.
+- Any cleanup path that destroys before verifying (F-79 class) — it hides both.
 - A regression whose only fix trades off against a Section-7 gate (E-01…E-11).
