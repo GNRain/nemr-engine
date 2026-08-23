@@ -268,6 +268,20 @@ async fn main() -> Result<()> {
 
             println!("created project {:?}", project.name);
             println!("  agent:     {}", project.agent.label());
+            if !project.agent.portability_verified() {
+                // At the point of selection, not only in docs someone may not
+                // read: "implemented the same way" must not quietly become
+                // "works" (E-15/F-84).
+                eprintln!();
+                eprintln!(
+                    "  note: {} support is IMPLEMENTED BUT UNVERIFIED.",
+                    project.agent.label()
+                );
+                eprintln!("        Where it stores its conversation has not been measured, so a");
+                eprintln!(
+                    "        stop/restart or an export/import may silently lose it. See F-84."
+                );
+            }
             println!("  container: {}", project.container_id);
             println!("  volume:    {} ({})", project.volume_path, project.size);
             println!("  status:    stopped (ready to start)");
@@ -503,6 +517,14 @@ async fn main() -> Result<()> {
                 println!("project {name:?} already runs {}", now.label());
             } else {
                 println!("project {name:?}: {} -> {}", previous.label(), now.label());
+                if !now.portability_verified() {
+                    eprintln!();
+                    eprintln!(
+                        "note: {} is IMPLEMENTED BUT UNVERIFIED — its session state may not",
+                        now.label()
+                    );
+                    eprintln!("      survive a stop/restart or an export/import. See F-84.");
+                }
                 // Be blunt about what this does NOT do. Silence here would let
                 // someone switch agents expecting their history to follow.
                 println!();

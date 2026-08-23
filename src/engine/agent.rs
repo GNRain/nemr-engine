@@ -55,7 +55,28 @@ impl Agent {
     pub fn description(self) -> &'static str {
         match self {
             Agent::ClaudeCode => "Anthropic's Claude Code (default)",
-            Agent::Codex => "OpenAI's Codex CLI",
+            Agent::Codex => "OpenAI's Codex CLI (implemented but unverified — see F-84)",
+        }
+    }
+
+    /// Whether Nemr's session portability has been empirically verified for
+    /// this agent (E-15).
+    ///
+    /// Claude Code was verified by WP-C: its session-state layout was captured
+    /// from a real session, the session-critical parts were relocated onto the
+    /// portable volume (M8), and portability was proven end to end (M10). Codex
+    /// is IMPLEMENTED the same way but NOT verified — where it writes session
+    /// state has never been measured, so the relocation may point at the wrong
+    /// paths, and D-02 (the credential never travels) is asserted for it, not
+    /// enforced. Verifying it needs a real Codex session with API round-trips,
+    /// which needs Codex authenticated on the host (see F-84).
+    ///
+    /// This is a method, not a doc note, so the CLI can warn at the point of
+    /// selection rather than trusting the user to read the docs.
+    pub fn portability_verified(self) -> bool {
+        match self {
+            Agent::ClaudeCode => true,
+            Agent::Codex => false,
         }
     }
 
