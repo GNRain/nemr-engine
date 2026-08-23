@@ -592,10 +592,30 @@ impl TestProject {
         // Clear any residue from an earlier interrupted run before creating.
         purge(&name);
 
-        nemr_engine::engine::project::create(client, &name, size)
+        nemr_engine::engine::project::create(
+            client,
+            &name,
+            size,
+            nemr_engine::engine::agent::Agent::default_agent(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("failed to create test project {name:?}: {error:#}"));
+
+        Self { name }
+    }
+
+    /// Create a test project running a specific agent (E-15).
+    pub async fn create_with_agent(
+        client: &ContainerdClient,
+        prefix: &str,
+        size: nemr_engine::engine::volume::VolumeSize,
+        agent: nemr_engine::engine::agent::Agent,
+    ) -> Self {
+        let name = unique_name(prefix);
+        purge(&name);
+        nemr_engine::engine::project::create(client, &name, size, agent)
             .await
             .unwrap_or_else(|error| panic!("failed to create test project {name:?}: {error:#}"));
-
         Self { name }
     }
 }

@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use crate::engine::agent::Agent;
 use anyhow::{bail, Context, Result};
 
 use crate::auth;
@@ -72,6 +73,10 @@ const PROMPT_TIDY: &str = concat!(
 pub const LABEL_PROJECT: &str = "nemr.project";
 pub const LABEL_VOLUME: &str = "nemr.volume";
 pub const LABEL_SIZE: &str = "nemr.size";
+/// The agent a project runs (E-15). Absent on projects created before the
+/// field existed — those are Claude Code by construction, so a missing label
+/// reads back as the default.
+pub const LABEL_AGENT: &str = "nemr.agent";
 
 /// Labels written onto a project's container record.
 ///
@@ -79,11 +84,17 @@ pub const LABEL_SIZE: &str = "nemr.size";
 /// depend on is testable without containerd: both key on these exact keys, so a
 /// silent change here makes projects invisible to `list` and makes every volume
 /// look like an orphan to reconciliation.
-pub fn project_labels(name: &str, volume_path: &str, size: VolumeSize) -> HashMap<String, String> {
+pub fn project_labels(
+    name: &str,
+    volume_path: &str,
+    size: VolumeSize,
+    agent: Agent,
+) -> HashMap<String, String> {
     let mut labels = HashMap::new();
     labels.insert(LABEL_PROJECT.to_string(), name.to_string());
     labels.insert(LABEL_VOLUME.to_string(), volume_path.to_string());
     labels.insert(LABEL_SIZE.to_string(), size.to_string());
+    labels.insert(LABEL_AGENT.to_string(), agent.id().to_string());
     labels
 }
 
@@ -119,14 +130,16 @@ pub async fn create(
     client: &ContainerdClient,
     name: &str,
     size: VolumeSize,
+    agent: Agent,
 ) -> Result<ProjectSummary> {
-    create_with_auth(client, name, size, AuthPolicy::Required).await
+    create_with_auth(client, name, size, agent, AuthPolicy::Required).await
 }
 
 async fn create_with_auth(
     client: &ContainerdClient,
     name: &str,
     size: VolumeSize,
+    agent: Agent,
     auth_policy: AuthPolicy,
 ) -> Result<ProjectSummary> {
     crate::engine::volume::validate_name(name)
@@ -202,7 +215,7 @@ async fn create_with_auth(
             .with_context(|| format!("failed to create session-state dir {}", dir.display()))?;
     }
 
-    let labels = project_labels(name, &mount_point.to_string_lossy(), size);
+    let labels = project_labels(name, &mount_point.to_string_lossy(), size, agent);
 
     let mut mounts = vec![
         // The project volume becomes the container's working directory.
@@ -254,6 +267,7 @@ async fn create_with_auth(
         container_id,
         volume_path: mount_point.to_string_lossy().to_string(),
         size,
+        agent,
     })
 }
 
@@ -285,6 +299,7 @@ pub struct ProjectSummary {
     pub container_id: String,
     pub volume_path: String,
     pub size: VolumeSize,
+    pub agent: Agent,
 }
 
 #[cfg(test)]
@@ -300,7 +315,7 @@ mod tests {
     /// and release its mount (F-58). Proven to fail when the labels are dropped.
     #[test]
     fn create_writes_the_labels_list_and_reconcile_depend_on() {
-        let labels = project_labels("demo", "/mnt/demo", VolumeSize::Medium);
+        let labels = project_labels("demo", "/mnt/demo", VolumeSize::Medium, Agent::ClaudeCode);
 
         assert_eq!(labels.get(LABEL_PROJECT).map(String::as_str), Some("demo"));
         assert_eq!(
@@ -551,6 +566,17 @@ pub fn ensure_volume_mounted(name: &str) -> Result<()> {
 /// Derived from the backing file's apparent size, which is exactly the preset
 /// requested at creation — the file is sparse, so this costs nothing to read
 /// and does not depend on containerd being reachable.
+/// The agent recorded on a project's container labels, defaulting to Claude
+/// Code when the label is absent (a project created before the field existed)
+/// or holds an unknown value (a downgrade reading a newer project — better the
+/// default than a hard failure on a read path).
+pub fn agent_from_labels(labels: &std::collections::HashMap<String, String>) -> Agent {
+    labels
+        .get(LABEL_AGENT)
+        .and_then(|id| id.parse::<Agent>().ok())
+        .unwrap_or_else(Agent::default_agent)
+}
+
 fn read_recorded_size(paths: &VolumePaths, name: &str) -> Option<VolumeSize> {
     let length = std::fs::metadata(paths.image_file(name)).ok()?.len();
     VolumeSize::all().into_iter().find(|s| s.bytes() == length)
@@ -1253,6 +1279,7 @@ pub struct ProjectStatus {
 pub struct ProjectDetail {
     pub name: String,
     pub container_id: String,
+    pub agent: Agent,
     pub running: bool,
     pub quota: String,
     pub mount_point: std::path::PathBuf,
@@ -1287,6 +1314,60 @@ impl ProjectDetail {
     }
 }
 
+/// Change a project's agent after creation (E-15).
+///
+/// Updates the recorded label so `start`/`attach` launch the new agent's CLI,
+/// and returns the (previous, new) pair so the caller can be blunt about what
+/// this does NOT do: the old conversation stays on disk but the new agent will
+/// not see it, because each CLI stores history in its own format. One agent at
+/// a time per project is the honest model — this switches which one, it does
+/// not merge two histories, and it is the future home of cross-agent migration
+/// (a post-daemon epic) without the command changing.
+pub async fn set_agent(
+    client: &ContainerdClient,
+    name: &str,
+    agent: Agent,
+) -> crate::error::Result<(Agent, Agent)> {
+    use crate::error::Error;
+
+    let container_id = config::container_id(name);
+    let container = client
+        .list_containers()
+        .await
+        .map_err(Error::Internal)?
+        .into_iter()
+        .find(|c| c.id == container_id)
+        .ok_or_else(|| Error::NoSuchProject {
+            name: name.to_string(),
+        })?;
+
+    if client
+        .task_state(&container_id)
+        .await
+        .map_err(Error::Internal)?
+        .is_running()
+    {
+        return Err(Error::WrongState {
+            name: name.to_string(),
+            state: "running; stop it before switching agents so nothing is mid-session",
+        });
+    }
+
+    let previous = agent_from_labels(&container.labels);
+    if previous == agent {
+        return Ok((previous, agent));
+    }
+
+    let mut labels = container.labels.clone();
+    labels.insert(LABEL_AGENT.to_string(), agent.id().to_string());
+    client
+        .update_container_labels(&container_id, labels)
+        .await
+        .map_err(Error::Internal)?;
+
+    Ok((previous, agent))
+}
+
 /// Gather everything `nemr status` reports.
 pub async fn status(client: &ContainerdClient, name: &str) -> crate::error::Result<ProjectDetail> {
     use crate::error::Error;
@@ -1315,6 +1396,7 @@ pub async fn status(client: &ContainerdClient, name: &str) -> crate::error::Resu
 
     Ok(ProjectDetail {
         name: name.to_string(),
+        agent: agent_from_labels(&container.labels),
         running: client
             .task_state(&container_id)
             .await
@@ -1495,6 +1577,18 @@ pub async fn export(
         .map(|size| size.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
+    // The producing agent comes from the container's own label (E-15). A
+    // project predating the field reads back as the default, which is correct.
+    let labels = client
+        .list_containers()
+        .await
+        .map_err(Error::Internal)?
+        .into_iter()
+        .find(|c| c.id == container_id)
+        .map(|c| c.labels)
+        .unwrap_or_default();
+    let agent = agent_from_labels(&labels);
+
     // The base image is referenced by digest, never carried (D-06).
     let digest = client
         .image_target_digest(config::BASE_IMAGE)
@@ -1503,6 +1597,7 @@ pub async fn export(
 
     let request = ExportRequest {
         project: name,
+        agent: agent.id(),
         quota: &quota,
         source_root: &mount_point,
         base_image: BaseImageRef {
@@ -1555,6 +1650,22 @@ pub async fn import_creating(
     let bundle = open_bundle(bundle_path)?;
     let manifest = &bundle.manifest;
     let name = name.unwrap_or(&manifest.project.name).to_string();
+    // E-15: the imported project runs the agent that produced the bundle, so
+    // the right CLI launches on the far machine. An unrecognised agent (a
+    // bundle from a newer nemr) is refused rather than silently defaulted —
+    // launching the wrong CLI against a session is worse than a clear failure.
+    let agent = manifest
+        .project
+        .agent
+        .parse::<Agent>()
+        .map_err(|_| Error::UnknownAgent {
+            requested: manifest.project.agent.clone(),
+            known: Agent::all()
+                .iter()
+                .map(|a| a.id())
+                .collect::<Vec<_>>()
+                .join(", "),
+        })?;
     crate::engine::volume::validate_name(&name)?;
 
     let size = match size {
@@ -1584,7 +1695,7 @@ pub async fn import_creating(
         });
     }
 
-    create_with_auth(client, &name, size, AuthPolicy::DeferredForRestore)
+    create_with_auth(client, &name, size, agent, AuthPolicy::DeferredForRestore)
         .await
         .map_err(Error::Internal)?;
 

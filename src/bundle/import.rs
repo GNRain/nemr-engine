@@ -411,6 +411,7 @@ mod tests {
                 name: "demo".into(),
                 quota: "2GB".into(),
                 content_bytes,
+                agent: "claude-code".into(),
             },
             base_image: BaseImageRef {
                 reference: "ghcr.io/gnrain/nemr-base:0.1.0".into(),
@@ -434,6 +435,7 @@ mod tests {
             &ExportRequest {
                 project: "demo",
                 quota: "2GB",
+                agent: "claude-code",
                 source_root: &root,
                 base_image: BaseImageRef {
                     reference: "ghcr.io/gnrain/nemr-base:0.1.0".into(),

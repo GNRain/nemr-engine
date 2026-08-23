@@ -52,6 +52,28 @@ pub struct ProjectInfo {
     /// Present so import can check the destination quota **before** extracting
     /// anything, rather than failing half-way through (`Error::QuotaMismatch`).
     pub content_bytes: u64,
+
+    /// The agent that PRODUCED this session (E-15).
+    ///
+    /// Named for what it records, not "the project's agent": a session has one
+    /// author, and cross-agent migration (a future epic) will read another
+    /// agent's transcript and re-emit it, at which point "produced by" and "will
+    /// run under" diverge. Recording the producer now leaves room for that
+    /// without a schema change.
+    ///
+    /// `#[serde(default)]` makes this v1-compatible in BOTH directions,
+    /// established empirically (see the round-trip test): an old reader ignores
+    /// it, and this reader treats its absence as Claude Code — which is correct,
+    /// because every bundle written before this field existed was Claude Code.
+    #[serde(default = "default_agent_id")]
+    pub agent: String,
+}
+
+/// The agent id assumed when a manifest predates the `agent` field.
+fn default_agent_id() -> String {
+    crate::engine::agent::Agent::default_agent()
+        .id()
+        .to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -154,6 +176,51 @@ impl Manifest {
 mod tests {
     use super::*;
 
+    /// The `agent` field is v1-compatible in BOTH directions (E-15).
+    ///
+    /// Forward: a manifest written before the field existed (no `agent` key)
+    /// must read back as Claude Code, because every such bundle was Claude Code.
+    /// Backward: a manifest carrying the field must round-trip unchanged. This
+    /// is why no schema bump was needed — established here, not assumed.
+    #[test]
+    fn the_agent_field_is_v1_compatible_both_ways() {
+        // Forward: JSON with no `agent` key at all (a genuine pre-field bundle).
+        let without = r#"{"name":"old","quota":"2GB","content_bytes":10}"#;
+        let info: ProjectInfo =
+            serde_json::from_str(without).expect("old manifest must still parse");
+        assert_eq!(
+            info.agent, "claude-code",
+            "a manifest predating the agent field must read back as Claude Code"
+        );
+
+        // Backward: a manifest with the field round-trips.
+        let with = ProjectInfo {
+            name: "new".into(),
+            quota: "500MB".into(),
+            content_bytes: 20,
+            agent: "codex".into(),
+        };
+        let json = serde_json::to_string(&with).expect("serialize");
+        let back: ProjectInfo = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back, with,
+            "a manifest with the agent field must round-trip unchanged"
+        );
+
+        // And an OLD reader (one that does not know `agent`) ignores it rather
+        // than rejecting — modelled by a struct without the field, since serde
+        // ignores unknown fields by default (no deny_unknown_fields).
+        #[derive(serde::Deserialize)]
+        struct OldProjectInfo {
+            name: String,
+            #[allow(dead_code)]
+            quota: String,
+        }
+        let old: OldProjectInfo =
+            serde_json::from_str(&json).expect("an old reader must accept a manifest with agent");
+        assert_eq!(old.name, "new");
+    }
+
     fn manifest_with_version(schema_version: u32) -> Manifest {
         Manifest {
             schema_version,
@@ -163,6 +230,7 @@ mod tests {
                 name: "demo".into(),
                 quota: "2GB".into(),
                 content_bytes: 0,
+                agent: "claude-code".into(),
             },
             base_image: BaseImageRef {
                 reference: "ghcr.io/gnrain/nemr-base:0.1.0".into(),
