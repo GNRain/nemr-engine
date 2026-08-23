@@ -180,6 +180,22 @@ pub fn mount_ext4(source: &str, target: &str) -> Result<(), String> {
     let source = CString::new(source).map_err(|_| "source has an interior NUL".to_string())?;
     let target = CString::new(target).map_err(|_| "target has an interior NUL".to_string())?;
     let fstype = c"ext4";
+    // MS_NOSUID | MS_NODEV harden the mount against the backing image, which is
+    // the one thing here the caller fully controls (F-83).
+    //
+    // The image is allocated and formatted by the UNPRIVILEGED engine, owned by
+    // the invoking user, and this helper checks only that it is a regular file
+    // they own — never that its contents are trustworthy. Without these flags a
+    // user can craft an ext4 image containing a setuid-root binary (no root
+    // needed: `debugfs` sets inode uid/mode directly on an image file they own),
+    // hand it to this helper by project name, and get it mounted with setuid
+    // honoured — a local privilege escalation. `nosuid` makes setuid/setgid bits
+    // inert; `nodev` stops device nodes on the image being usable.
+    //
+    // Exec is deliberately NOT disabled: the mount is the container's /workspace
+    // and running project code from it is the whole point. Setuid binaries and
+    // device nodes in a project workspace are attack surface, not a feature.
+    let flags = libc::MS_NOSUID | libc::MS_NODEV;
     // SAFETY: all pointers are valid NUL-terminated strings for the call; data
     // is NULL, meaning ext4 defaults.
     let rc = unsafe {
@@ -187,7 +203,7 @@ pub fn mount_ext4(source: &str, target: &str) -> Result<(), String> {
             source.as_ptr(),
             target.as_ptr(),
             fstype.as_ptr(),
-            0,
+            flags,
             std::ptr::null(),
         )
     };

@@ -2355,3 +2355,65 @@ fn a_bundle_survives_a_rename_of_the_base_image() {
         );
     });
 }
+
+/// F-83 — a project's disk must be mounted `nosuid` and `nodev`.
+///
+/// The backing image is allocated and formatted by the unprivileged engine and
+/// owned by the invoking user; the privileged helper checks only that it is a
+/// regular file they own, never that its contents are safe. An unprivileged
+/// user can plant a setuid-root binary in an ext4 image they own — `debugfs`
+/// sets inode uid and mode directly on the image file, no root and no mount
+/// required — and, if the helper mounts it without `nosuid`, executing that
+/// binary yields root. `nodev` closes the same door for device nodes.
+///
+/// This asserts the kernel's own report of the mount, which is authoritative:
+/// if `nosuid`/`nodev` are absent from mountinfo, setuid and devices are
+/// honoured on a filesystem the user controls.
+#[test]
+fn f83_project_volumes_are_mounted_nosuid_and_nodev() {
+    if !require_host(HostRequirements::VOLUME) {
+        return;
+    }
+    common::init_tracing();
+
+    let name = common::unique_name("f83");
+    common::purge(&name);
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, &name, VolumeSize::Small).await;
+
+        let mount_point = VolumePaths::from_env()
+            .expect("paths")
+            .mount_point(&project.name);
+
+        // CONTROL: the mount is actually present and readable, so an absent
+        // option below means "not set" rather than "nothing mounted here".
+        assert!(
+            nemr_engine::engine::volume::is_mounted(&mount_point),
+            "control: the volume must be mounted for this test to mean anything"
+        );
+
+        // The kernel's per-mount option list is mountinfo field 6.
+        let table = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        let wanted = mount_point.to_string_lossy();
+        let options = table
+            .lines()
+            .find(|l| l.split(' ').nth(4) == Some(wanted.as_ref()))
+            .and_then(|l| l.split(' ').nth(5))
+            .unwrap_or("")
+            .to_string();
+
+        assert!(
+            options.split(',').any(|o| o == "nosuid"),
+            "the project volume must be mounted nosuid — without it a user-crafted setuid-root \
+             binary on the volume runs as root (F-83). mount options were: {options:?}"
+        );
+        assert!(
+            options.split(',').any(|o| o == "nodev"),
+            "the project volume must be mounted nodev — without it device nodes on the \
+             user-controlled image are usable (F-83). mount options were: {options:?}"
+        );
+    });
+}
