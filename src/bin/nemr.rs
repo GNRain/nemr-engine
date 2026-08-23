@@ -21,6 +21,15 @@ use nemr_engine::engine::volume::{self, VolumeSize};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Show the full provisioning trace: every privileged call with its
+    /// arguments, every mount, every loop device.
+    ///
+    /// The default prints a summary and a one-line note whenever the privileged
+    /// helper runs. This restores the detail — the same trail `NEMR_DEBUG` gives
+    /// — for when you need to reconstruct exactly what happened.
+    #[arg(long, short, global = true)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -58,14 +67,28 @@ enum Command {
     /// Reclaim orphaned mounts, loop devices and snapshots left by a crash.
     Reconcile,
 
-    /// Import a bundle into an existing, stopped project.
+    /// Everything about one project: state, volume, base image, credential.
+    Status {
+        /// Project to describe.
+        name: String,
+    },
+
+    /// Restore a bundle, creating the project if it does not exist.
     ///
     /// Works standalone against a local file: no account, no network (E-11).
+    ///
+    ///   nemr import session.nemr              name and quota from the bundle
+    ///   nemr import newname session.nemr      restore under a different name
+    ///   nemr import session.nemr --size 2GB   override the recorded quota
     Import {
-        /// Destination project. Create it first with the quota you want.
-        name: String,
-        /// Bundle to read.
-        bundle: std::path::PathBuf,
+        /// The bundle to read — or, when a second argument is given, the
+        /// destination project name.
+        bundle_or_name: String,
+        /// The bundle to read, when a destination name was given first.
+        bundle: Option<std::path::PathBuf>,
+        /// Quota for a project this creates. Defaults to the bundle's own.
+        #[arg(long)]
+        size: Option<volume::VolumeSize>,
     },
 
     /// Export a stopped project to a portable bundle.
@@ -90,11 +113,14 @@ fn parse_size(input: &str) -> Result<VolumeSize, String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Install the subscriber before anything can log. NEMR_DEBUG=1 turns on the
-    // decision-point detail; NEMR_LOG takes a full env-filter.
-    nemr_engine::observability::init();
-
+    // Parse first: the subscriber's verbosity is now a flag, so it cannot be
+    // installed before the flag is known. Nothing logs during parsing.
     let cli = Cli::parse();
+
+    // Install the subscriber before anything else can log. --verbose and
+    // NEMR_DEBUG=1 turn on the decision-point detail; NEMR_LOG takes a full
+    // env-filter and overrides both.
+    nemr_engine::observability::init(cli.verbose);
 
     match cli.command {
         Command::Create { name, size } => {
@@ -257,12 +283,102 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Import { name, bundle } => {
+        Command::Status { name } => {
             let client = ContainerdClient::connect().await?;
-            let summary = project::import(&client, &name, &bundle).await?;
+            let d = project::status(&client, &name).await?;
+
+            println!("{}", d.name);
+            println!(
+                "  state:        {}",
+                if d.running { "running" } else { "stopped" }
+            );
+            println!("  container:    {}", d.container_id);
+
+            let usage = match &d.usage {
+                Some(u) => format!(
+                    "{} of {} ({:.0}%)",
+                    volume::human_bytes(u.used),
+                    d.quota,
+                    u.percent()
+                ),
+                None => format!("unmounted (quota {})", d.quota),
+            };
+            println!("  volume:       {}", d.mount_point.display());
+            println!("  usage:        {usage}");
+            println!(
+                "  image file:   {} ({})",
+                d.image_file.display(),
+                if d.image_present {
+                    "present"
+                } else {
+                    "MISSING"
+                }
+            );
+            println!(
+                "  loop device:  {}",
+                d.loop_device
+                    .map(|n| format!("/dev/loop{n}"))
+                    .unwrap_or_else(|| "none".into())
+            );
+
+            // F-28: the question that cost the most time to answer by hand.
+            match d.mount_is_correct() {
+                None => println!("  mount check:  n/a (not mounted)"),
+                Some(true) => println!("  mount check:  ok (backed by this project's image)"),
+                Some(false) => println!(
+                    "  mount check:  WRONG VOLUME — mounted filesystem is backed by {}\n\
+                     \x20               Run `nemr reconcile`, then start again.",
+                    d.mounted_image
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "something that is not a loop device".into())
+                ),
+            }
+
+            println!("  base image:   {}", d.base_image);
+            println!(
+                "  base digest:  {}",
+                d.base_image_digest
+                    .as_deref()
+                    .unwrap_or("NOT PRESENT on this host")
+            );
+
+            // The expired-credential failure took three steps to identify; this
+            // is the line that would have made it one.
+            match (&d.credential, d.credential_modified) {
+                (Some(path), modified) => {
+                    let age = modified
+                        .and_then(|m| m.elapsed().ok())
+                        .map(|d| format!(", last written {} days ago", d.as_secs() / 86_400))
+                        .unwrap_or_default();
+                    println!("  credential:   present at {}{age}", path.display());
+                }
+                (None, _) => println!(
+                    "  credential:   ABSENT — `nemr start` will fail (AUTH-03).\n\
+                     \x20               Authenticate on this host by running `claude`."
+                ),
+            }
+        }
+
+        Command::Import {
+            bundle_or_name,
+            bundle,
+            size,
+        } => {
+            // One argument is the bundle; two are name-then-bundle. Keeping the
+            // old two-argument form working matters more than a tidier grammar:
+            // it is in the README and in muscle memory.
+            let (explicit_name, bundle_path) = match bundle {
+                Some(path) => (Some(bundle_or_name), path),
+                None => (None, std::path::PathBuf::from(bundle_or_name)),
+            };
+            let client = ContainerdClient::connect().await?;
+            let (name, summary) =
+                project::import_creating(&client, &bundle_path, explicit_name.as_deref(), size)
+                    .await?;
             println!(
                 "imported {} into project {name:?} ({} members, {})",
-                bundle.display(),
+                bundle_path.display(),
                 summary.members,
                 volume::human_bytes(summary.bytes)
             );

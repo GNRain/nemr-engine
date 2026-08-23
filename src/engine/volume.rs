@@ -242,11 +242,10 @@ impl HelperOps {
     fn run(&self, args: &[&str]) -> Result<()> {
         // VOL-03 / NFR-04: every privileged invocation is logged in full,
         // before it runs, with the fact of elevation stated explicitly.
-        audit(&format!(
-            "ELEVATED: sudo -n {} {}",
-            self.helper_path.display(),
-            args.join(" ")
-        ));
+        audit_elevated(
+            args.first().copied().unwrap_or("run"),
+            &format!("sudo -n {} {}", self.helper_path.display(), args.join(" ")),
+        );
 
         let output = Command::new("sudo")
             .arg("-n")
@@ -267,10 +266,29 @@ impl HelperOps {
         }
 
         if !output.status.success() {
+            // The helper's own stderr is the useful part — it names the exact
+            // syscall or path that failed — so it leads. The remedies below are
+            // the three things that are actually wrong when this fires, in the
+            // order they occur in practice.
             bail!(
-                "privileged helper failed ({}): {}",
+                "the privileged helper failed.\n\
+                 command:  {} {}\n\
+                 exit:     {}\n\
+                 it said:  {}\n\n\
+                 Most likely, in order:\n  \
+                 1. the helper is out of date — reinstall: sudo ./scripts/setup_test_host.sh\n  \
+                 2. the sudoers grant is missing — check: sudo -n {} version\n  \
+                 3. the host cannot provide what was asked (loop devices exhausted, \
+                 no space) — check: losetup -a | wc -l, df -h",
+                self.helper_path.display(),
+                args.join(" "),
                 output.status,
-                stderr.trim()
+                if stderr.trim().is_empty() {
+                    "<nothing>"
+                } else {
+                    stderr.trim()
+                },
+                self.helper_path.display(),
             );
         }
         Ok(())
@@ -567,11 +585,29 @@ pub fn human_bytes(bytes: u64) -> String {
 /// Written to stderr so it is visible without a log file and cannot be
 /// confused with a command's own stdout. Prefixed so an operator can
 /// reconstruct what happened without reading Rust source.
+/// The audit trail (VOL-03 / NFR-04), at `debug`.
+///
+/// It used to be `info`, so every command printed its full provisioning trace.
+/// That was right while WP A was auditing the privileged path and wrong as a
+/// default: a user running `nemr create` was shown ten lines of loop devices
+/// and mount points to say "your project is ready".
+///
+/// The trail is not lost — `--verbose`, `NEMR_DEBUG` and `NEMR_LOG` all show it
+/// in full, and the *fact* of elevation stays visible by default via
+/// [`audit_elevated`]. What changed is that reconstructing a run is now
+/// something you ask for rather than something you scroll past.
 fn audit(message: &str) {
-    // VOL-03 / NFR-04: the audit trail. Emitted at `info` so it is on by
-    // default without any flag — an operator must be able to reconstruct what
-    // happened without knowing to enable anything.
-    tracing::info!("[nemr:volume] {message}");
+    tracing::debug!("[nemr:volume] {message}");
+}
+
+/// The one thing that stays visible by default: something ran as root.
+///
+/// A user must be able to tell that privilege was used without having to enable
+/// anything, even though they do not see the arguments. The full command line —
+/// which is the audit record — is emitted alongside at `debug`.
+fn audit_elevated(operation: &str, full_command: &str) {
+    tracing::info!("[nemr] elevated: {operation} (via the privileged helper)");
+    tracing::debug!("[nemr:volume] ELEVATED: {full_command}");
 }
 
 /// A provisioned volume.
@@ -601,7 +637,12 @@ impl<P: PrivilegedOps> Volume<P> {
         let image = paths.image_file(name);
         if image.exists() {
             bail!(
-                "volume {name:?} already exists at {}. Delete it first.",
+                "volume {name:?} already exists at {}\n\
+             A volume is never reformatted in place — that would destroy whatever \
+             is on it. Remove the project and its volume:\n    \
+             nemr delete {name}\n\
+             Or, if there is no project and only a stray image, remove the file \
+             deliberately.",
                 image.display()
             );
         }
@@ -784,10 +825,24 @@ fn format_ext4(path: &Path) -> Result<()> {
 
     if !output.status.success() {
         bail!(
-            "mkfs.ext4 failed on {} ({}): {}",
+            "could not format the volume as ext4.\n\
+             image:    {}\n\
+             exit:     {}\n\
+             it said:  {}\n\n\
+             The image file was allocated but is unusable, so it is left in place \
+             rather than silently removed. Remove it before retrying:\n    \
+             rm {}",
             path.display(),
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            {
+                let e = String::from_utf8_lossy(&output.stderr);
+                if e.trim().is_empty() {
+                    "<nothing>".to_string()
+                } else {
+                    e.trim().to_string()
+                }
+            },
+            path.display()
         );
     }
     Ok(())

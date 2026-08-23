@@ -55,8 +55,21 @@ pub fn resolve_credentials() -> Result<PathBuf> {
 
     if !path.is_file() {
         bail!(
-            "{} exists but is not a regular file; expected the Claude Code credentials file",
-            path.display()
+            "the credential path exists but is not a regular file.\n\
+             path:     {}\n\
+             expected: the Claude Code credentials file\n\
+             found:    {}\n\n\
+             It is bind-mounted read-only into the container (AUTH-02), and only a \
+             regular file can be. Remove or rename whatever is there, then \
+             authenticate on the host by running `claude`.",
+            path.display(),
+            if path.is_dir() {
+                "a directory"
+            } else if path.is_symlink() {
+                "a symlink"
+            } else {
+                "something that is neither a regular file nor a directory"
+            }
         );
     }
 

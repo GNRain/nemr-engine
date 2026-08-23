@@ -1053,21 +1053,32 @@ fn e11_export_and_import_work_with_no_network_and_no_credentials() {
     );
     assert!(bundle.exists(), "the bundle must have been written");
 
-    let import = run_offline(&["import", &destination.name, &bundle.to_string_lossy()]);
-    assert!(
-        import.status.success(),
-        "import must work offline with no credential.\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&import.stdout),
-        String::from_utf8_lossy(&import.stderr)
-    );
+    // IMPORT, and what this can and cannot still assert (E-14).
+    //
+    // A restore now creates its own project, which means provisioning a volume,
+    // which means the privileged helper. The helper cannot run inside this
+    // test's user namespace — `sudo` refuses there, because /etc/sudo.conf maps
+    // to nobody — so the import half can no longer be driven through the CLI
+    // inside the namespace at all.
+    //
+    // That is not E-11 weakening: E-11's guarantee is no network and no
+    // credential, never "no privilege", and `create` has always needed the
+    // helper. But it does mean the *end-to-end* no-credential assertion for
+    // import is gone, replaced by the policy-level one in
+    // `import_defers_the_credential_requirement`. Recorded rather than papered
+    // over, and escalated as E-14 because resolving it properly touches
+    // AUTH-03, which is a gated Section 3 requirement.
+    //
+    // The export half above is unchanged and still proves the full guarantee.
+    drop(destination);
 
-    // The session must actually have arrived, not merely "the command exited 0".
-    assert_eq!(
-        std::fs::read_to_string(paths.mount_point(&destination.name).join("notes.md"))
-            .expect("the imported file must exist on the destination"),
-        marker,
-        "the content must round-trip offline, byte-identical"
-    );
+    // NOT asserted here any more, and no substitute is invented: there is no
+    // read-only CLI command to run offline, and adding one to make a test
+    // possible would be inventing product surface. The import guarantee is
+    // covered instead by `import_defers_the_credential_requirement` (policy
+    // level) and by scripts/check_seam.sh (the engine cannot depend on the
+    // storage crate at all). Both are weaker than an end-to-end run, and saying
+    // so is the point — see E-14.
 
     // And the real credential is untouched by all of this.
     assert!(
@@ -1771,4 +1782,481 @@ fn f79_reconcile_acts_on_everything_list_reports_as_untracked() {
             "still untracked after reconcile: {after:?}"
         );
     });
+}
+
+/// The restore flow: one command, no invented quota.
+///
+/// Restoring onto a fresh host used to be three commands, one of which demanded
+/// a `--size` the user had to guess — for information the bundle already
+/// carried. `ProjectInfo` has recorded the source project's name and quota
+/// since schema v1, so this needed no format change.
+#[test]
+fn import_creates_the_project_from_the_bundle_with_no_guessed_quota() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let source = TestProject::create(&client, "impsrc", VolumeSize::Small).await;
+        let paths = VolumePaths::from_env().unwrap();
+
+        let token = format!("restore-token-{}", std::process::id());
+        let transcript = paths
+            .mount_point(&source.name)
+            .join(nemr_engine::config::VOLUME_STATE_PROJECTS)
+            .join("-workspace/session.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).expect("mkdir");
+        std::fs::write(&transcript, &token).expect("write transcript");
+
+        let bundle = std::env::temp_dir().join(format!("restore-{}.nemr", std::process::id()));
+        project::export(
+            &client,
+            &source.name,
+            &bundle,
+            nemr_engine::bundle::policy::Policy::default(),
+        )
+        .await
+        .expect("export");
+
+        // Remove the source entirely: this is a restore onto a host that has
+        // never seen the project, which is the case that mattered.
+        project::delete(&client, &source.name)
+            .await
+            .expect("delete");
+
+        // CONTROL: nothing of that name exists now, so a success below is the
+        // import creating it rather than finding it.
+        assert!(
+            !client
+                .container_exists(&nemr_engine::config::container_id(&source.name))
+                .await
+                .expect("exists"),
+            "control: the project must be gone before the restore"
+        );
+
+        // One command. No name, no size.
+        let (restored_name, summary) = project::import_creating(&client, &bundle, None, None)
+            .await
+            .expect("import must create the project from the bundle");
+        let restored = TestProject::adopt(restored_name.clone());
+
+        assert_eq!(
+            restored_name, source.name,
+            "the project name must come from the bundle"
+        );
+        assert!(summary.members > 0, "the restore must have carried members");
+
+        // The session is actually there.
+        let landed = paths
+            .mount_point(&restored.name)
+            .join(nemr_engine::config::VOLUME_STATE_PROJECTS)
+            .join("-workspace/session.jsonl");
+        assert_eq!(
+            std::fs::read_to_string(&landed).expect("the transcript must have been restored"),
+            token,
+            "the restored session must be byte-identical"
+        );
+
+        // The quota came from the bundle, not from a default.
+        let listed = project::list(&client).await.expect("list");
+        let entry = listed
+            .iter()
+            .find(|p| p.name == restored.name)
+            .expect("the restored project must be listed");
+        assert_eq!(
+            entry.quota,
+            VolumeSize::Small.to_string(),
+            "the quota must come from the bundle's manifest, not a guess or a default"
+        );
+
+        let _ = std::fs::remove_file(&bundle);
+    });
+}
+
+/// Importing over an existing project must refuse, not merge.
+///
+/// A silent merge would overwrite one session with another, and the damage is
+/// invisible until someone opens it.
+#[test]
+fn import_refuses_to_clobber_an_existing_project() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let occupant = TestProject::create(&client, "impclob", VolumeSize::Small).await;
+        let paths = VolumePaths::from_env().unwrap();
+
+        let keep = format!("must-survive-{}", std::process::id());
+        let existing = paths
+            .mount_point(&occupant.name)
+            .join(nemr_engine::config::VOLUME_STATE_PROJECTS)
+            .join("-workspace/existing.jsonl");
+        std::fs::create_dir_all(existing.parent().unwrap()).expect("mkdir");
+        std::fs::write(&existing, &keep).expect("write");
+
+        let bundle = std::env::temp_dir().join(format!("clobber-{}.nemr", std::process::id()));
+        project::export(
+            &client,
+            &occupant.name,
+            &bundle,
+            nemr_engine::bundle::policy::Policy::default(),
+        )
+        .await
+        .expect("export");
+
+        let error = project::import_creating(&client, &bundle, Some(&occupant.name), None)
+            .await
+            .expect_err("importing onto an existing project must refuse");
+
+        assert_eq!(
+            error.kind(),
+            nemr_engine::error::ErrorKind::Conflict,
+            "a name collision is a conflict, not an internal error: {error}"
+        );
+        assert!(
+            error.to_string().contains(&occupant.name),
+            "the refusal must name the project: {error}"
+        );
+
+        // And it left the occupant alone.
+        assert_eq!(
+            std::fs::read_to_string(&existing).expect("the existing session must survive"),
+            keep,
+            "a refused import must not have touched the existing project"
+        );
+
+        let _ = std::fs::remove_file(&bundle);
+    });
+}
+
+/// E-14 — a restore must not require a host credential.
+///
+/// E-11 rules that `nemr import` works with no network and no credential.
+/// AUTH-03 rules that a missing credential is fatal "at creation time". Those
+/// did not collide while import needed a pre-existing project; now that a
+/// restore creates its own, they do.
+///
+/// This asserts the resolution at the policy level: `create` still refuses
+/// without a credential, and a restore does not. It is weaker than the
+/// end-to-end offline run it replaces — a restore provisions a volume and so
+/// needs the privileged helper, which cannot run inside the offline test's user
+/// namespace — and that gap is recorded rather than hidden.
+#[test]
+fn import_defers_the_credential_requirement() {
+    // No host needed: this is about which policy each path selects.
+    let source = std::fs::read_to_string("src/engine/project.rs").expect("read project.rs");
+
+    // `create` is the AUTH-03 path and must stay Required.
+    assert!(
+        source.contains("create_with_auth(client, name, size, AuthPolicy::Required)"),
+        "nemr create must keep AUTH-03: a missing credential is fatal at creation time"
+    );
+    // The restore path must defer.
+    assert!(
+        source.contains("AuthPolicy::DeferredForRestore"),
+        "a restore must not require a credential, or E-11's guarantee is broken"
+    );
+    // And the deferral must be confined to the restore: exactly one call site.
+    let deferred_call_sites = source.matches("AuthPolicy::DeferredForRestore)").count();
+    assert_eq!(
+        deferred_call_sites, 1,
+        "the credential deferral must apply to the restore path only; found {deferred_call_sites} \
+         call sites. Widening it would repeal AUTH-03 rather than narrow it."
+    );
+}
+
+/// Quieting the success path must not quieten the failure path.
+///
+/// The provisioning trace moved from `info` to `debug` so `nemr create` prints
+/// a summary instead of ten lines of loop devices. Everything F-65, F-67 and
+/// F-73 bought depends on failures still being loud, and a filter change is
+/// exactly the kind of edit that takes them out silently — WARN and ERROR sit
+/// above INFO, so lowering what INFO shows cannot touch them, but "cannot" is
+/// an argument and this is a test.
+#[test]
+fn quieting_the_success_path_does_not_quieten_failures() {
+    if !require_host(HostRequirements {
+        containerd: true,
+        helper: false,
+        base_image: false,
+    }) {
+        return;
+    }
+
+    let nemr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nemr"));
+    let socket = ContainerdClient::default_socket_path().expect("socket");
+    let absent = format!("no-such-project-{}", std::process::id());
+
+    let run = |args: &[&str]| {
+        std::process::Command::new(&nemr)
+            .args(args)
+            .env("CONTAINERD_ADDRESS", &socket)
+            .env_remove("NEMR_DEBUG")
+            .env_remove("NEMR_LOG")
+            .output()
+            .expect("run nemr")
+    };
+
+    // DEFAULT verbosity — the quiet one.
+    let quiet = run(&["start", &absent]);
+    let quiet_err = String::from_utf8_lossy(&quiet.stderr);
+    assert!(
+        !quiet.status.success(),
+        "starting a project that does not exist must fail"
+    );
+    assert!(
+        quiet_err.contains(&absent),
+        "the failure must name the project even at default verbosity: {quiet_err:?}"
+    );
+    assert!(
+        quiet_err.contains("nemr create"),
+        "the failure must still say what to do next at default verbosity: {quiet_err:?}"
+    );
+
+    // VERBOSE must not be required to see it, and must not lose it either.
+    let loud = run(&["--verbose", "start", &absent]);
+    let loud_err = String::from_utf8_lossy(&loud.stderr);
+    assert!(
+        loud_err.contains(&absent),
+        "the failure must survive --verbose too: {loud_err:?}"
+    );
+
+    // CONTROL: the quiet path really is quieter, or this test is asserting
+    // nothing about the change it exists to guard.
+    let quiet_lines = quiet_err.lines().count();
+    let loud_lines = loud_err.lines().count();
+    assert!(
+        loud_lines >= quiet_lines,
+        "verbose produced fewer lines ({loud_lines}) than default ({quiet_lines}); \
+         the verbosity switch is not doing what this test assumes"
+    );
+}
+
+/// The fact of elevation stays visible without any flag.
+///
+/// A user must be able to tell that something ran as root, even though the
+/// arguments moved behind `--verbose`. Silence about privilege would be a worse
+/// default than the firehose it replaced.
+#[test]
+fn the_elevation_note_is_visible_without_a_flag() {
+    if !require_host(HostRequirements::VOLUME) {
+        return;
+    }
+
+    let nemr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nemr"));
+    let socket = ContainerdClient::default_socket_path().expect("socket");
+    let name = common::unique_name("elev");
+    common::purge(&name);
+
+    let output = std::process::Command::new(&nemr)
+        .args(["create", &name, "--size", "500MB"])
+        .env("CONTAINERD_ADDRESS", &socket)
+        .env_remove("NEMR_DEBUG")
+        .env_remove("NEMR_LOG")
+        .output()
+        .expect("run nemr create");
+    let _cleanup = TestProject::adopt(name.clone());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "create must succeed: {stderr}\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("elevated:"),
+        "default output must say that the privileged helper ran: {stderr:?}"
+    );
+    // But NOT the arguments — that is what moved behind --verbose.
+    assert!(
+        !stderr.contains("sudo -n"),
+        "default output must not carry the full privileged command line: {stderr:?}"
+    );
+}
+
+/// `nemr status` must answer the questions that previously took three commands.
+///
+/// During the cross-machine work, "what state is this in?" meant reading
+/// `nemr list`, `df` and `losetup` and correlating them by hand — and the two
+/// questions that actually cost time were answerable from no command at all:
+/// whether the mounted filesystem is the right one (F-28), and whether a
+/// credential is present.
+#[test]
+fn status_reports_the_facts_that_took_three_commands_to_gather() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "status", VolumeSize::Small).await;
+
+        let detail = project::status(&client, &project.name)
+            .await
+            .expect("status must work for an existing project");
+
+        assert_eq!(detail.name, project.name);
+        assert!(!detail.running, "a freshly created project is not running");
+        assert!(detail.image_present, "the backing image must exist");
+        assert!(detail.mounted, "a freshly created project is mounted");
+        assert!(
+            detail.loop_device.is_some(),
+            "a mounted volume must report the loop device backing it"
+        );
+        assert!(
+            detail.usage.is_some(),
+            "a mounted volume must report usage against its quota"
+        );
+        assert_eq!(detail.quota, VolumeSize::Small.to_string());
+
+        // The F-28 answer, which no command could give before.
+        assert_eq!(
+            detail.mount_is_correct(),
+            Some(true),
+            "a healthy project must report that its mount is its own volume"
+        );
+
+        // The credential answer, which turned a three-step diagnosis into a line.
+        assert!(
+            detail.credential.is_some(),
+            "the host credential exists on this host, so status must report it"
+        );
+
+        // A project that does not exist is a clear refusal, not an empty report.
+        let error = project::status(&client, "definitely-not-a-project")
+            .await
+            .expect_err("status on a missing project must fail");
+        assert_eq!(
+            error.kind(),
+            nemr_engine::error::ErrorKind::InvalidRequest,
+            "asking about a project that does not exist is a caller error: {error}"
+        );
+    });
+}
+
+/// `status` must report an unmounted volume as unmounted, not as wrong.
+///
+/// `mount_is_correct()` returns `None` when nothing is mounted. Collapsing that
+/// into `false` would report a perfectly healthy stopped project as corrupted,
+/// which is the kind of false alarm that trains people to ignore the field.
+#[test]
+fn status_distinguishes_unmounted_from_wrongly_mounted() {
+    if !require_host(HostRequirements::VOLUME) {
+        return;
+    }
+
+    let paths = VolumePaths::from_env().expect("paths");
+    let detail = project::ProjectDetail {
+        name: "demo".into(),
+        container_id: "nemr-demo".into(),
+        running: false,
+        quota: "500MB".into(),
+        mount_point: paths.mount_point("demo"),
+        image_file: paths.image_file("demo"),
+        image_present: true,
+        mounted: false,
+        loop_device: None,
+        mounted_image: None,
+        usage: None,
+        base_image: "x".into(),
+        base_image_digest: None,
+        credential: None,
+        credential_modified: None,
+    };
+    assert_eq!(
+        detail.mount_is_correct(),
+        None,
+        "an unmounted volume is not a wrongly-mounted one"
+    );
+
+    let wrong = project::ProjectDetail {
+        mounted: true,
+        mounted_image: Some(paths.image_file("someone-else")),
+        ..detail.clone()
+    };
+    assert_eq!(
+        wrong.mount_is_correct(),
+        Some(false),
+        "a foreign image backing the mount must report as wrong (F-28)"
+    );
+
+    let right = project::ProjectDetail {
+        mounted: true,
+        mounted_image: Some(paths.image_file("demo")),
+        ..detail
+    };
+    assert_eq!(right.mount_is_correct(), Some(true));
+}
+
+/// User-facing errors must name what failed and what to do next.
+///
+/// The D-08 unresolved-base-image error set the bar: it named the digest,
+/// listed every place it looked and what it found there, stated its own limits,
+/// and gave two concrete fixes. Several errors were a single clause with no
+/// remedy — `"project X is not running; start it first"` tells you the state
+/// and makes you go and find the command.
+///
+/// This asserts the floor, not the ceiling: an error must name its subject and
+/// contain something the reader can act on. Not every error needs four
+/// sections; every error needs a next step.
+#[test]
+fn user_facing_errors_name_the_subject_and_a_next_step() {
+    if !require_host(HostRequirements {
+        containerd: true,
+        helper: false,
+        base_image: false,
+    }) {
+        return;
+    }
+
+    let nemr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nemr"));
+    let socket = ContainerdClient::default_socket_path().expect("socket");
+    let absent = format!("no-such-{}", std::process::id());
+
+    let run = |args: &[&str]| -> String {
+        let output = std::process::Command::new(&nemr)
+            .args(args)
+            .env("CONTAINERD_ADDRESS", &socket)
+            .output()
+            .expect("run nemr");
+        assert!(
+            !output.status.success(),
+            "expected {args:?} to fail so its error could be inspected"
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    // Each case: the command, and a command the error must suggest.
+    let cases: [(&[&str], &str); 4] = [
+        (&["start", &absent], "nemr create"),
+        (&["stop", &absent], "nemr create"),
+        (&["status", &absent], "nemr create"),
+        (&["export", &absent], "nemr create"),
+    ];
+
+    for (args, expected_remedy) in cases {
+        let message = run(args);
+        assert!(
+            message.contains(&absent),
+            "{args:?}: the error must name its subject: {message:?}"
+        );
+        assert!(
+            message.contains(expected_remedy),
+            "{args:?}: the error must offer a next step containing {expected_remedy:?}: \
+             {message:?}"
+        );
+        // A bare one-liner with no remedy is the shape this guards against.
+        assert!(
+            message.lines().filter(|l| !l.trim().is_empty()).count() >= 2,
+            "{args:?}: a single-clause error with no next step: {message:?}"
+        );
+    }
 }
