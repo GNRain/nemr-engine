@@ -566,6 +566,69 @@ motivated it; the audit found the rest.
 
 ---
 
+### E-15 — One agent per project; how many agents a project assumes
+
+**Status:** RESOLVED in code (2026-08-23) — **a project does not assume Claude
+Code, but it does assume one agent at a time.**
+**Feeds:** WP-H · **Relates to:** D-02, the cross-agent-migration epic below
+
+The ledger's open question was whether the design bakes in exactly one agent
+(Claude Code). Answer, now implemented: the agent is a recorded property
+(`nemr.agent` label, defaulting to Claude Code for anything predating the
+field), chosen at `create`, reported by `status`, switchable by `nemr
+switch-agent`, and carried in the bundle manifest so a restore launches the
+right CLI.
+
+**Why one at a time, not many side by side.** Each agent's CLI stores its
+conversation in its own undocumented, independently-versioned format. Two agents
+writing into one project would give it two disconnected pasts with no way to
+tell which is authoritative — and no agent can read another's transcript
+natively. So the honest model is exactly one active agent per project, and
+`switch-agent` is blunt that switching does not migrate the conversation: the
+old history stays on the volume but the new agent will not see it.
+
+**The manifest records the PRODUCING agent, not merely the project's agent** —
+deliberately, to leave room for the migration epic below without a schema
+change. Established empirically that the field is v1-compatible in both
+directions (an old reader ignores it; its absence reads as Claude Code), so no
+bump was needed.
+
+**Not finished this pass, and not faked:** where Codex keeps its session state
+(the WP-C-equivalent empirical capture) and the M8/M10 portability acceptance
+for a Codex project both need a real Codex session with API round-trips, which
+needs Codex authenticated on the host. That was unavailable. The scaffolding is
+in place; the empirical discovery is the real work and must be measured, not
+assumed — WP-C's lesson was that the layout contradicted everyone's guess.
+
+---
+
+### Epic (post-daemon) — Cross-agent session migration
+
+**Status:** Recorded, not scheduled. Do not design for it yet.
+
+The motivating case: someone cancels one agent's subscription, moves to another,
+and loses access to their sessions — the transcripts are still on disk
+(cancelling revokes the service, not the local files) but cannot be resumed
+anywhere.
+
+What the research establishes: **lossy handoff is feasible; lossless native
+resume is not.** A different model can read another's transcript as context and
+continue the work, but cannot faithfully replay the original tool calls or
+resume as the same conversation object. The proven pattern (the open-source
+`authsec-bridge` does this across Claude Code, Codex and Gemini) is parse →
+neutral intermediate representation → write in the target's native format,
+demoting tool calls to prose summaries because one-to-one mapping breaks.
+
+Nemr is well placed: it already bundles the working tree — the actual state — so
+only the conversation needs transplanting, which is the tractable half. Shape
+when we reach it: a neutral transcript IR in the bundle, a lossy `HANDOFF.md`
+mode first, then per-target writers. Main ongoing cost and risk: every agent's
+on-disk format is undocumented and changes without notice — which is also the
+standing risk for the Codex session-state work above. `nemr switch-agent` is the
+command that will host it; only what it can promise will change.
+
+---
+
 ### E-13 — Authenticating on a second machine revoked the first one's credential
 
 **Status:** Open — **escalation, raised for understanding before design.**
@@ -860,6 +923,7 @@ is overstating what has been demonstrated.
 | 2026-08-22 | F-12 | **Scheduled** — confirmed in production during the cross-machine validation; recovery required delete+recreate (Rain) |
 | 2026-08-22 | D-11 | Opened — no user-facing path moves a bundle through storage; sync layer is commercial scope (Claude Code) |
 | 2026-08-22 | D-12 | Opened — import needs a pre-existing project and an invented quota the bundle already records (Claude Code) |
+| 2026-08-23 | E-15 | Resolved in code — one agent per project, recorded and switchable; Codex added; session-state capture blocked on Codex auth (Claude Code) |
 | 2026-08-23 | D-10 | Re-estimated after publishing: still 3–5 days; auth row mostly gone, digest verification newly mandatory, urgency dropped. Recommend leaving the ruling (Claude Code) |
 | 2026-08-23 | D-08 | Part 1 delivered — published to GHCR from CI with a digest-divergence check; base image renamed to ghcr.io/gnrain/nemr-base (Claude Code) |
 | 2026-08-23 | E-14 | **Resolved** — restore defers the credential check, `create` keeps AUTH-03; AUTH-03 reworded to state the distinction (Rain) |
