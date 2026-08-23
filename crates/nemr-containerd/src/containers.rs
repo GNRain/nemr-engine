@@ -14,7 +14,8 @@ use containerd_client::services::v1::snapshots::{
 use containerd_client::services::v1::{
     container::Runtime, CloseIoRequest, Container, CreateContainerRequest, CreateTaskRequest,
     DeleteContainerRequest, DeleteProcessRequest, DeleteTaskRequest, ExecProcessRequest,
-    GetRequest, KillRequest, ListContainersRequest, ResizePtyRequest, StartRequest, WaitRequest,
+    GetRequest, KillRequest, ListContainersRequest, ResizePtyRequest, StartRequest,
+    UpdateContainerRequest, WaitRequest,
 };
 use containerd_client::tonic::{Code, Request};
 use containerd_client::with_namespace;
@@ -364,6 +365,36 @@ impl ContainerdClient {
             .create(with_namespace!(request, self.namespace()))
             .await
             .with_context(|| format!("failed to create container {:?}", spec.id))?;
+        Ok(())
+    }
+
+    /// Update the labels on an existing container record.
+    ///
+    /// Used to change a project's recorded agent (E-15). Sends an
+    /// `UpdateContainerRequest` with a `labels` field mask, so only the labels
+    /// are touched — the snapshot, runtime and OCI spec are left exactly as they
+    /// were. containerd requires the target container to carry the id.
+    pub async fn update_container_labels(
+        &self,
+        id: &str,
+        labels: std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        let request = UpdateContainerRequest {
+            container: Some(Container {
+                id: id.to_string(),
+                labels,
+                ..Default::default()
+            }),
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["labels".to_string()],
+            }),
+        };
+
+        self.raw()
+            .containers()
+            .update(with_namespace!(request, self.namespace()))
+            .await
+            .with_context(|| format!("failed to update labels on container {id:?}"))?;
         Ok(())
     }
 

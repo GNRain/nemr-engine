@@ -72,6 +72,22 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     # were the only files that differed between two cold builds of this layer.
     && rm -rf /root/.npm/_logs /tmp/node-compile-cache
 
+# OpenAI Codex CLI (E-15). A second agent Nemr can run.
+#
+# One image carries every agent rather than one image per agent: simpler to
+# build, publish and reason about, and the incremental cost is small (Codex is
+# an npm package on the same Node runtime). Pinned and residue-stripped exactly
+# like Claude Code above, so the reproducibility guarantee (F-74) and the
+# published-digest check survive the addition — the image is still built from
+# fully pinned inputs and is still byte-reproducible.
+#
+# Overridable the same way:
+#   buildctl build --opt build-arg:CODEX_VERSION=0.150.0 ...
+ARG CODEX_VERSION=0.149.0
+RUN npm install -g "@openai/codex@${CODEX_VERSION}" \
+    && npm cache clean --force \
+    && rm -rf /root/.npm/_logs /tmp/node-compile-cache
+
 # Use the distro ripgrep rather than the vendored one (see above).
 ENV USE_BUILTIN_RIPGREP=0
 

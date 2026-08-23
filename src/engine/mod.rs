@@ -2,6 +2,7 @@
 //!
 //! Scaffolded per Section 3.4; populated from Milestone 2 onward.
 
+pub mod agent;
 pub mod image;
 pub mod project;
 pub mod tty;

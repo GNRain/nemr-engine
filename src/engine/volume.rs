@@ -63,6 +63,13 @@ impl VolumeSize {
         }
     }
 
+    /// The default size for a new project — the old clap default (2GB), now
+    /// applied by the resolution layer so a missing `--size` and an explicit
+    /// `--size 2GB` are distinguishable (WP-H).
+    pub fn default_size() -> VolumeSize {
+        VolumeSize::Medium
+    }
+
     pub fn all() -> [Self; 3] {
         [Self::Small, Self::Medium, Self::Large]
     }

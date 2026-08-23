@@ -12,6 +12,7 @@ pub mod bundle;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod interactive;
 pub mod observability;
 
 pub use nemr_containerd as containerd;

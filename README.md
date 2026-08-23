@@ -80,10 +80,11 @@ haven't):
 claude
 ```
 
-**3. Make a project and open it:**
+**3. Make a project and open it.** Run `nemr create` on its own to be walked
+through the name, size and agent (Claude Code or Codex), or give them directly:
 
 ```bash
-nemr create myproject --size 2GB
+nemr create myproject --size 2GB --agent claude-code
 nemr start myproject
 nemr attach myproject
 ```
@@ -98,7 +99,8 @@ work normally. Press `Ctrl-D` to leave; the project keeps running until you
 
 | Command | What it does |
 |---|---|
-| `nemr create <name> --size 2GB` | Make a new project. Pick one of three sizes: `500MB`, `2GB`, `10GB`. The size is permanent — see [limitations](#known-limitations). |
+| `nemr create <name> --size 2GB` | Make a new project. Pick one of three sizes: `500MB`, `2GB`, `10GB` (permanent — see [limitations](#known-limitations)), and which coding agent it runs. |
+| `nemr switch-agent <name> <agent>` | Change which agent a stopped project runs. |
 | `nemr start <name>` | Start it up. |
 | `nemr attach <name>` | Open a terminal prompt inside it. |
 | `nemr stop <name>` | Shut it down. Your files stay. |

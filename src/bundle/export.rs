@@ -30,6 +30,8 @@ pub struct ExportRequest<'a> {
     pub project: &'a str,
     /// The size preset the project was created with.
     pub quota: &'a str,
+    /// The agent that produced this session (E-15).
+    pub agent: &'a str,
     /// Root to export from — the project's mounted volume.
     pub source_root: &'a Path,
     /// Base image reference and digest, referenced rather than carried (D-06).
@@ -111,6 +113,7 @@ pub fn export(request: &ExportRequest<'_>, destination: &Path) -> Result<ExportS
             name: request.project.to_string(),
             quota: request.quota.to_string(),
             content_bytes,
+            agent: request.agent.to_string(),
         },
         base_image: request.base_image.clone(),
         chunks: chunk_entries,
@@ -347,6 +350,7 @@ mod tests {
         ExportRequest {
             project,
             quota: "2GB",
+            agent: "claude-code",
             source_root: root,
             base_image: BaseImageRef {
                 reference: "ghcr.io/gnrain/nemr-base:0.1.0".into(),

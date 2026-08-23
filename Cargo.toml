@@ -54,3 +54,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tar = "0.4.46"
 zstd = "0.13.3"
+# Interactive prompts for `nemr create` (WP-H). Only ever runs when stdin is a
+# TTY and no flag supplied the value; the never-hang logic lives in
+# src/interactive.rs, not here. Minimal features: no fuzzy-search, no history.
+dialoguer = { version = "0.11", default-features = false }

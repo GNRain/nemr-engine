@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 
 use nemr_engine::containerd::client::ContainerdClient;
 use nemr_engine::containerd::containers::StopOutcome;
+use nemr_engine::engine::agent::Agent;
 use nemr_engine::engine::project;
 use nemr_engine::engine::volume::{self, VolumeSize};
 
@@ -36,12 +37,19 @@ struct Cli {
 enum Command {
     /// Create a project: a quota-bounded volume plus a ready-to-start container.
     Create {
-        /// Project name (lowercase letters, digits and '-').
-        name: String,
+        /// Project name (lowercase letters, digits and '-'). Omitted, you are
+        /// prompted (or a name is derived from the current directory).
+        name: Option<String>,
 
-        /// Storage quota, fixed at creation time.
-        #[arg(long, default_value = "2GB", value_parser = parse_size)]
-        size: VolumeSize,
+        /// Storage quota, fixed at creation time. Omitted, defaults to 2GB
+        /// (or you are prompted, in a terminal).
+        #[arg(long, value_parser = parse_size)]
+        size: Option<VolumeSize>,
+
+        /// Coding agent to run. Omitted, defaults to Claude Code (or you are
+        /// prompted, in a terminal).
+        #[arg(long, value_parser = parse_agent)]
+        agent: Option<Agent>,
     },
 
     /// Start a project's container.
@@ -71,6 +79,15 @@ enum Command {
     Status {
         /// Project to describe.
         name: String,
+    },
+
+    /// Change which coding agent a project runs (stop it first).
+    SwitchAgent {
+        /// Project to change.
+        name: String,
+        /// The agent to switch to.
+        #[arg(value_parser = parse_agent)]
+        agent: Agent,
     },
 
     /// Restore a bundle, creating the project if it does not exist.
@@ -107,8 +124,115 @@ enum Command {
 
 /// Parse `--size`, reusing the engine's own preset parsing so the CLI cannot
 /// drift from what the engine and the privileged helper accept.
+fn parse_agent(input: &str) -> Result<Agent, String> {
+    input.parse::<Agent>().map_err(|e| e.to_string())
+}
+
 fn parse_size(input: &str) -> Result<VolumeSize, String> {
     input.parse::<VolumeSize>().map_err(|e| e.to_string())
+}
+
+use nemr_engine::interactive::{decide, Resolution};
+
+/// A name suggested from the current directory — the common case is that the
+/// project you want is named after where you are.
+fn name_from_cwd() -> Option<String> {
+    let raw = std::env::current_dir().ok()?;
+    let base = raw.file_name()?.to_string_lossy().to_ascii_lowercase();
+    // Only offer it if it is already a valid project name; never silently
+    // mangle a directory name into something that only half resembles it.
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches('-').to_string();
+    (nemr_engine::engine::volume::validate_name(&cleaned).is_ok()).then_some(cleaned)
+}
+
+fn resolve_name(provided: Option<String>, interactive: bool) -> Result<String> {
+    // Name has no fixed default; a cwd-derived suggestion serves as the prompt
+    // pre-fill but NOT as a non-interactive default — guessing a project name
+    // for a script is worse than telling it to pass one.
+    match decide(
+        provided,
+        interactive,
+        None,
+        "a project name (nemr create <name>)",
+    ) {
+        Resolution::Provided(v) => Ok(v),
+        Resolution::UseDefault(v) => Ok(v),
+        Resolution::MustFail { required_flag } => {
+            anyhow::bail!(
+                "{required_flag} is required when stdin is not a terminal.\n\
+                 Run it in a terminal to be prompted, or pass the name directly."
+            )
+        }
+        Resolution::Prompt { .. } => {
+            let suggestion = name_from_cwd().unwrap_or_default();
+            let input = dialoguer::Input::<String>::new()
+                .with_prompt("Project name")
+                .with_initial_text(suggestion)
+                .interact_text()?;
+            Ok(input)
+        }
+    }
+}
+
+fn resolve_size(provided: Option<VolumeSize>, interactive: bool) -> Result<VolumeSize> {
+    let default = VolumeSize::default_size();
+    match decide(provided, interactive, Some(default), "--size") {
+        Resolution::Provided(v) | Resolution::UseDefault(v) => Ok(v),
+        Resolution::MustFail { required_flag } => {
+            anyhow::bail!("{required_flag} is required when stdin is not a terminal")
+        }
+        Resolution::Prompt { default } => {
+            let options = VolumeSize::all();
+            let start = options
+                .iter()
+                .position(|s| Some(*s) == default)
+                .unwrap_or(0);
+            let labels: Vec<String> = options.iter().map(|s| s.to_string()).collect();
+            let choice = dialoguer::Select::new()
+                .with_prompt("Storage size (fixed for the life of the project)")
+                .items(&labels)
+                .default(start)
+                .interact()?;
+            Ok(options[choice])
+        }
+    }
+}
+
+fn resolve_agent(provided: Option<Agent>, interactive: bool) -> Result<Agent> {
+    let default = Agent::default_agent();
+    match decide(provided, interactive, Some(default), "--agent") {
+        Resolution::Provided(v) | Resolution::UseDefault(v) => Ok(v),
+        Resolution::MustFail { required_flag } => {
+            anyhow::bail!("{required_flag} is required when stdin is not a terminal")
+        }
+        Resolution::Prompt { default } => {
+            let options = Agent::all();
+            let start = options
+                .iter()
+                .position(|a| Some(*a) == default)
+                .unwrap_or(0);
+            let labels: Vec<String> = options
+                .iter()
+                .map(|a| format!("{} — {}", a.label(), a.description()))
+                .collect();
+            let choice = dialoguer::Select::new()
+                .with_prompt("Coding agent")
+                .items(&labels)
+                .default(start)
+                .interact()?;
+            Ok(options[choice])
+        }
+    }
 }
 
 #[tokio::main]
@@ -123,7 +247,16 @@ async fn main() -> Result<()> {
     nemr_engine::observability::init(cli.verbose);
 
     match cli.command {
-        Command::Create { name, size } => {
+        Command::Create { name, size, agent } => {
+            // Resolve each field: a flag wins; otherwise prompt in a terminal,
+            // or fall back to a default / fail fast without one. The never-hang
+            // logic is in nemr_engine::interactive; this only renders prompts in
+            // the branch it blesses.
+            let interactive = nemr_engine::interactive::is_interactive();
+            let name = resolve_name(name, interactive)?;
+            let size = resolve_size(size, interactive)?;
+            let agent = resolve_agent(agent, interactive)?;
+
             let client = ContainerdClient::connect().await?;
             eprintln!(
                 "[nemr] containerd: {} (namespace {})",
@@ -131,12 +264,14 @@ async fn main() -> Result<()> {
                 client.namespace()
             );
 
-            let project = project::create(&client, &name, size).await?;
+            let project = project::create(&client, &name, size, agent).await?;
 
             println!("created project {:?}", project.name);
+            println!("  agent:     {}", project.agent.label());
             println!("  container: {}", project.container_id);
             println!("  volume:    {} ({})", project.volume_path, project.size);
             println!("  status:    stopped (ready to start)");
+            println!("  next:      nemr start {}", project.name);
         }
 
         Command::Start { name } => {
@@ -288,6 +423,7 @@ async fn main() -> Result<()> {
             let d = project::status(&client, &name).await?;
 
             println!("{}", d.name);
+            println!("  agent:        {}", d.agent.label());
             println!(
                 "  state:        {}",
                 if d.running { "running" } else { "stopped" }
@@ -357,6 +493,29 @@ async fn main() -> Result<()> {
                     "  credential:   ABSENT — `nemr start` will fail (AUTH-03).\n\
                      \x20               Authenticate on this host by running `claude`."
                 ),
+            }
+        }
+
+        Command::SwitchAgent { name, agent } => {
+            let client = ContainerdClient::connect().await?;
+            let (previous, now) = project::set_agent(&client, &name, agent).await?;
+            if previous == now {
+                println!("project {name:?} already runs {}", now.label());
+            } else {
+                println!("project {name:?}: {} -> {}", previous.label(), now.label());
+                // Be blunt about what this does NOT do. Silence here would let
+                // someone switch agents expecting their history to follow.
+                println!();
+                println!(
+                    "The existing conversation stays on the volume, but {} will not see it —",
+                    now.label()
+                );
+                println!("each agent stores its history in its own format, and Nemr runs one");
+                println!("agent at a time per project. This switches which one; it does not");
+                println!("migrate the conversation.");
+                println!();
+                println!("(Cross-agent migration is a planned, separate capability. When it");
+                println!(" lands, this command will be its home.)");
             }
         }
 
