@@ -105,6 +105,9 @@ pub enum Error {
     #[error("invalid project name {name:?}: {reason}")]
     InvalidName { name: String, reason: String },
 
+    #[error("unknown agent {requested:?}\nKnown agents: {known}")]
+    UnknownAgent { requested: String, known: String },
+
     #[error("no project named {name:?}\nCreate it first: nemr create {name} --size 2GB")]
     NoSuchProject { name: String },
 
@@ -244,6 +247,7 @@ impl Error {
     pub fn kind(&self) -> ErrorKind {
         match self {
             Self::InvalidName { .. } => ErrorKind::InvalidRequest,
+            Self::UnknownAgent { .. } => ErrorKind::InvalidRequest,
             Self::NoSuchProject { .. } => ErrorKind::InvalidRequest,
             Self::ProjectExists { .. } => ErrorKind::Conflict,
             Self::RestoreTargetExists { .. } => ErrorKind::Conflict,
