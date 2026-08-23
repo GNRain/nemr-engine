@@ -1955,7 +1955,7 @@ fn import_defers_the_credential_requirement() {
 
     // `create` is the AUTH-03 path and must stay Required.
     assert!(
-        source.contains("create_with_auth(client, name, size, AuthPolicy::Required)"),
+        source.contains("create_with_auth(client, name, size, agent, AuthPolicy::Required)"),
         "nemr create must keep AUTH-03: a missing credential is fatal at creation time"
     );
     // The restore path must defer.
@@ -2157,6 +2157,7 @@ fn status_distinguishes_unmounted_from_wrongly_mounted() {
     let detail = project::ProjectDetail {
         name: "demo".into(),
         container_id: "nemr-demo".into(),
+        agent: nemr_engine::engine::agent::Agent::ClaudeCode,
         running: false,
         quota: "500MB".into(),
         mount_point: paths.mount_point("demo"),
@@ -2415,5 +2416,147 @@ fn f83_project_volumes_are_mounted_nosuid_and_nodev() {
             "the project volume must be mounted nodev — without it device nodes on the \
              user-controlled image are usable (F-83). mount options were: {options:?}"
         );
+    });
+}
+
+/// Interactive `create` must never hang without a terminal (WP-H).
+///
+/// A `nemr create` that waits forever for input on a CI runner burns the whole
+/// job timeout and reports nothing — the worst failure shape there is. Every
+/// case here runs the real binary with stdin NOT a terminal and a short
+/// timeout: a hang shows up as the timeout killing the process, which these
+/// assertions would catch as a missing exit within the deadline.
+#[test]
+fn create_is_non_interactive_and_never_hangs_without_a_tty() {
+    // No host needed: resolution happens before containerd is contacted, and we
+    // point at a nonexistent socket so nothing is actually created.
+    let nemr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nemr"));
+
+    // Run with stdin taken from /dev/null (not a tty) and a hard 15s deadline.
+    let run = |args: &[&str], extra_env: &[(&str, &str)]| -> (Option<i32>, String) {
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new(&nemr);
+        cmd.args(args)
+            .env("CONTAINERD_ADDRESS", "/nonexistent-socket-for-this-test")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawn nemr");
+        // Poll for up to 15s; a hang is the failure this test exists to catch.
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                let out = child.wait_with_output().expect("output");
+                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&out.stderr));
+                return (status.code(), text);
+            }
+            if start.elapsed() > std::time::Duration::from_secs(15) {
+                let _ = child.kill();
+                panic!("`nemr {args:?}` did not exit within 15s — it hung waiting for input");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+
+    // 1. No name, no tty: must fail FAST, naming what was needed — never prompt.
+    let (code, out) = run(&["create"], &[]);
+    assert_eq!(
+        code,
+        Some(1),
+        "missing name with no tty must be a clean failure: {out}"
+    );
+    assert!(
+        out.contains("not a terminal") && out.contains("name"),
+        "the failure must say a name is required and why: {out}"
+    );
+
+    // 2. Name given, no tty: resolution succeeds (defaults fill size+agent) and
+    //    it proceeds far enough to try containerd — i.e. it did NOT prompt.
+    let (_code, out) = run(&["create", "wphcreate"], &[]);
+    assert!(
+        out.contains("containerd") || out.contains("socket"),
+        "with a name, create must resolve non-interactively and reach containerd: {out}"
+    );
+
+    // 3. The escape hatch forces non-interactive even where a tty might exist.
+    let (code, out) = run(&["create"], &[("NEMR_NON_INTERACTIVE", "1")]);
+    assert_eq!(
+        code,
+        Some(1),
+        "NEMR_NON_INTERACTIVE must force the fail-fast path: {out}"
+    );
+
+    // 4. A flag suppresses its own prompt: --agent given, still no name, no tty
+    //    → fails on the NAME, proving --agent was accepted without prompting.
+    let (code, out) = run(&["create", "--agent", "codex"], &[]);
+    assert_eq!(code, Some(1), "still no name: {out}");
+    assert!(
+        out.contains("name") && !out.contains("agent is required"),
+        "a supplied --agent must not itself be demanded: {out}"
+    );
+}
+
+/// A project records its agent, reports it, and can switch it (E-15).
+///
+/// The label is the source of truth — `start`/`attach` read it to launch the
+/// right CLI — so this asserts it round-trips through create, status and a
+/// switch, and that a running project refuses the switch (nothing should change
+/// agents mid-session).
+#[test]
+fn e15_a_project_records_reports_and_switches_its_agent() {
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    common::init_tracing();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        use nemr_engine::engine::agent::Agent;
+        let client = ContainerdClient::connect().await.expect("connect");
+
+        // Created as Codex — not the default, so a pass proves the value was
+        // recorded rather than defaulted.
+        let project =
+            TestProject::create_with_agent(&client, "e15", VolumeSize::Small, Agent::Codex).await;
+
+        let detail = project::status(&client, &project.name)
+            .await
+            .expect("status");
+        assert_eq!(
+            detail.agent,
+            Agent::Codex,
+            "the agent chosen at create must be recorded and reported"
+        );
+
+        // Switch to Claude Code and confirm it took.
+        let (previous, now) = project::set_agent(&client, &project.name, Agent::ClaudeCode)
+            .await
+            .expect("switch");
+        assert_eq!(previous, Agent::Codex);
+        assert_eq!(now, Agent::ClaudeCode);
+        assert_eq!(
+            project::status(&client, &project.name)
+                .await
+                .expect("status")
+                .agent,
+            Agent::ClaudeCode,
+            "the switch must persist to the label, not just return a value"
+        );
+
+        // A running project must refuse the switch.
+        project::start(&client, &project.name).await.expect("start");
+        let err = project::set_agent(&client, &project.name, Agent::Codex)
+            .await
+            .expect_err("switching a running project must fail");
+        assert_eq!(
+            err.kind(),
+            nemr_engine::error::ErrorKind::Conflict,
+            "switching mid-run is a conflict (wrong state), never an internal error: {err}"
+        );
+        project::stop(&client, &project.name).await.ok();
     });
 }
