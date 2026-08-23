@@ -338,7 +338,7 @@ gRPC, because only the *mount* needed the namespace, not the record.
 **Rule of thumb:** if the operation only sends a gRPC request, connect directly
 to the socket. If the client performs a mount, it must run inside the daemon's
 namespaces. This is expected to matter for the engine at Milestones 4–5, where
-container creation happens — see the note in README.md.
+container creation happens — see docs/ENGINEERING.md, "The engine does not need nsenter".
 
 ## Step 3 — Install the Rust stable toolchain via rustup
 

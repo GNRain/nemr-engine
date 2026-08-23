@@ -169,7 +169,7 @@ impl ContainerdClient {
             .with_context(|| {
                 format!(
                     "image {name:?} not found in containerd namespace {:?}. \
-                     Build and import the base image first (see README, Milestone 2).",
+                     Build and import the base image first: ./scripts/build_base_image.sh",
                     self.namespace()
                 )
             })?;
