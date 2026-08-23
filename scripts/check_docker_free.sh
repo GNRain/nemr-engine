@@ -93,13 +93,38 @@ fi
 # 4. Registry references are NOT violations — assert we still parse them as such
 # ---------------------------------------------------------------------------
 # A control, so this check cannot silently degrade into "found nothing because
-# it searched nothing": docker.io/ MUST appear (it is the base image reference),
-# and must NOT be counted above.
-if grep -rqE 'docker\.io/' src crates 2>/dev/null; then
-    ok "registry references (docker.io/...) present and correctly not flagged — OCI naming, not a Docker dependency"
+# it searched nothing". It must show the discrimination the check depends on:
+# `docker.io/...` is an OCI registry reference and must NOT be flagged, while
+# `docker run` is a real violation and MUST be.
+#
+# This used to assert that a docker.io/ reference existed somewhere under src/
+# — true while the base image was named `docker.io/nemr/base`. After the rename
+# to ghcr.io the only remaining matches were doc comments *about* the rename, so
+# the control still passed while testing nothing. A control that survives by
+# accident is worse than one that fails: it reports confidence it has not
+# earned. It is now self-contained, so it holds whatever the tree happens to
+# contain.
+probe=$(mktemp -d)
+trap 'rm -rf "$probe"' EXIT
+cat > "$probe/registry_reference.txt" <<'PROBE'
+image = "docker.io/library/alpine:latest"
+PROBE
+cat > "$probe/real_violation.txt" <<'PROBE'
+docker run --rm alpine true
+PROBE
+
+probe_pattern='(^|[^a-zA-Z0-9_./-])(docker|dockerd)([[:space:]]|$)|/var/run/docker\.sock|/run/docker\.sock|DOCKER_HOST'
+reference_flagged=$(grep -rnE "$probe_pattern" "$probe/registry_reference.txt" 2>/dev/null || true)
+violation_flagged=$(grep -rnE "$probe_pattern" "$probe/real_violation.txt" 2>/dev/null || true)
+
+if [[ -n "$reference_flagged" ]]; then
+    report "control failed: a docker.io/ registry reference was flagged as a Docker dependency. \
+The pattern is too broad and would reject legitimate OCI naming."
+elif [[ -z "$violation_flagged" ]]; then
+    report "control failed: 'docker run' was NOT flagged. The pattern matches nothing, so every \
+'ok' above is meaningless."
 else
-    report "control failed: expected a docker.io/ registry reference in src/ or crates/ and found none. \
-Either the base image reference moved (update this control) or this check is scanning the wrong paths."
+    ok "control: registry references pass, 'docker run' is caught — the pattern discriminates"
 fi
 
 printf '\n'
