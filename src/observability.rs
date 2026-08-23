@@ -32,12 +32,17 @@ use tracing_subscriber::filter::EnvFilter;
 /// they only emit spans and events — so the E-09 daemon can render them
 /// differently (structured JSON to a log service, say) without either library
 /// changing.
-pub fn init() {
+pub fn init(verbose: bool) {
     let filter = if let Ok(spec) = std::env::var("NEMR_LOG") {
         EnvFilter::new(spec)
-    } else if std::env::var_os("NEMR_DEBUG").is_some() {
+    } else if verbose || std::env::var_os("NEMR_DEBUG").is_some() {
         EnvFilter::new("nemr_engine=debug,nemr_containerd=debug")
     } else {
+        // `info` and above. The provisioning trail moved to `debug`, so this is
+        // a summary plus the one-line elevation note — not silence. WARN and
+        // ERROR are above INFO and therefore unaffected by this choice: quieting
+        // the success path cannot quiet the failure path, and
+        // `verbose_does_not_gate_warnings_or_errors` asserts it.
         EnvFilter::new("nemr_engine=info,nemr_containerd=info")
     };
 
@@ -46,7 +51,9 @@ pub fn init() {
     // timestamped, target-prefixed line for every mount would bury the thing an
     // operator is trying to read. Debug output does carry the target, because at
     // that point you are debugging and want to know where a line came from.
-    let debug = std::env::var_os("NEMR_DEBUG").is_some() || std::env::var_os("NEMR_LOG").is_some();
+    let debug = verbose
+        || std::env::var_os("NEMR_DEBUG").is_some()
+        || std::env::var_os("NEMR_LOG").is_some();
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

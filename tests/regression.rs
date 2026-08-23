@@ -1971,3 +1971,112 @@ fn import_defers_the_credential_requirement() {
          call sites. Widening it would repeal AUTH-03 rather than narrow it."
     );
 }
+
+/// Quieting the success path must not quieten the failure path.
+///
+/// The provisioning trace moved from `info` to `debug` so `nemr create` prints
+/// a summary instead of ten lines of loop devices. Everything F-65, F-67 and
+/// F-73 bought depends on failures still being loud, and a filter change is
+/// exactly the kind of edit that takes them out silently — WARN and ERROR sit
+/// above INFO, so lowering what INFO shows cannot touch them, but "cannot" is
+/// an argument and this is a test.
+#[test]
+fn quieting_the_success_path_does_not_quieten_failures() {
+    if !require_host(HostRequirements {
+        containerd: true,
+        helper: false,
+        base_image: false,
+    }) {
+        return;
+    }
+
+    let nemr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nemr"));
+    let socket = ContainerdClient::default_socket_path().expect("socket");
+    let absent = format!("no-such-project-{}", std::process::id());
+
+    let run = |args: &[&str]| {
+        std::process::Command::new(&nemr)
+            .args(args)
+            .env("CONTAINERD_ADDRESS", &socket)
+            .env_remove("NEMR_DEBUG")
+            .env_remove("NEMR_LOG")
+            .output()
+            .expect("run nemr")
+    };
+
+    // DEFAULT verbosity — the quiet one.
+    let quiet = run(&["start", &absent]);
+    let quiet_err = String::from_utf8_lossy(&quiet.stderr);
+    assert!(
+        !quiet.status.success(),
+        "starting a project that does not exist must fail"
+    );
+    assert!(
+        quiet_err.contains(&absent),
+        "the failure must name the project even at default verbosity: {quiet_err:?}"
+    );
+    assert!(
+        quiet_err.contains("nemr create"),
+        "the failure must still say what to do next at default verbosity: {quiet_err:?}"
+    );
+
+    // VERBOSE must not be required to see it, and must not lose it either.
+    let loud = run(&["--verbose", "start", &absent]);
+    let loud_err = String::from_utf8_lossy(&loud.stderr);
+    assert!(
+        loud_err.contains(&absent),
+        "the failure must survive --verbose too: {loud_err:?}"
+    );
+
+    // CONTROL: the quiet path really is quieter, or this test is asserting
+    // nothing about the change it exists to guard.
+    let quiet_lines = quiet_err.lines().count();
+    let loud_lines = loud_err.lines().count();
+    assert!(
+        loud_lines >= quiet_lines,
+        "verbose produced fewer lines ({loud_lines}) than default ({quiet_lines}); \
+         the verbosity switch is not doing what this test assumes"
+    );
+}
+
+/// The fact of elevation stays visible without any flag.
+///
+/// A user must be able to tell that something ran as root, even though the
+/// arguments moved behind `--verbose`. Silence about privilege would be a worse
+/// default than the firehose it replaced.
+#[test]
+fn the_elevation_note_is_visible_without_a_flag() {
+    if !require_host(HostRequirements::VOLUME) {
+        return;
+    }
+
+    let nemr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nemr"));
+    let socket = ContainerdClient::default_socket_path().expect("socket");
+    let name = common::unique_name("elev");
+    common::purge(&name);
+
+    let output = std::process::Command::new(&nemr)
+        .args(["create", &name, "--size", "500MB"])
+        .env("CONTAINERD_ADDRESS", &socket)
+        .env_remove("NEMR_DEBUG")
+        .env_remove("NEMR_LOG")
+        .output()
+        .expect("run nemr create");
+    let _cleanup = TestProject::adopt(name.clone());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "create must succeed: {stderr}\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("elevated:"),
+        "default output must say that the privileged helper ran: {stderr:?}"
+    );
+    // But NOT the arguments — that is what moved behind --verbose.
+    assert!(
+        !stderr.contains("sudo -n"),
+        "default output must not carry the full privileged command line: {stderr:?}"
+    );
+}

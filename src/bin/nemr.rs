@@ -21,6 +21,15 @@ use nemr_engine::engine::volume::{self, VolumeSize};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Show the full provisioning trace: every privileged call with its
+    /// arguments, every mount, every loop device.
+    ///
+    /// The default prints a summary and a one-line note whenever the privileged
+    /// helper runs. This restores the detail — the same trail `NEMR_DEBUG` gives
+    /// — for when you need to reconstruct exactly what happened.
+    #[arg(long, short, global = true)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -98,11 +107,14 @@ fn parse_size(input: &str) -> Result<VolumeSize, String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Install the subscriber before anything can log. NEMR_DEBUG=1 turns on the
-    // decision-point detail; NEMR_LOG takes a full env-filter.
-    nemr_engine::observability::init();
-
+    // Parse first: the subscriber's verbosity is now a flag, so it cannot be
+    // installed before the flag is known. Nothing logs during parsing.
     let cli = Cli::parse();
+
+    // Install the subscriber before anything else can log. --verbose and
+    // NEMR_DEBUG=1 turn on the decision-point detail; NEMR_LOG takes a full
+    // env-filter and overrides both.
+    nemr_engine::observability::init(cli.verbose);
 
     match cli.command {
         Command::Create { name, size } => {
