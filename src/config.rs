@@ -22,7 +22,31 @@
 ///
 /// GHCR per D-08: the org exists, CI already builds the image, and packages are
 /// free for public repos — no new vendor and no Docker Hub rate limits.
-pub const BASE_IMAGE: &str = "ghcr.io/gnrain/nemr-base:0.1.0";
+///
+/// # Versioning is load-bearing (F-85)
+///
+/// The version tag identifies a specific set of bytes and must NEVER be reused
+/// for different ones. **Any content change to the image — a new agent, a new
+/// package, an edited Dockerfile — is a version bump**, and every published
+/// version stays published, because a bundle records the digest it was built
+/// from and can only be restored where that exact image is available.
+///
+/// `0.1.0` was the single-agent image (`sha256:2be53736…`); `0.2.0` added Codex
+/// (`sha256:39c5ade9…`). Reusing `0.1.0` for the two-agent image — which an
+/// earlier pass did — left bundles referencing the old digest unrecoverable
+/// while the D-08 error's pull advice fetched the wrong bytes: a success signal
+/// over the wrong artifact. Every published version's digest is recorded under
+/// `image/digests/<version>`, and the build refuses to produce a digest that
+/// disagrees with the recorded one for its version.
+pub const BASE_IMAGE: &str = "ghcr.io/gnrain/nemr-base:0.2.0";
+
+/// The version tag of [`BASE_IMAGE`] — the part after the last `:`.
+///
+/// Derived from the one authoritative string so the version lives in exactly
+/// one place.
+pub fn base_image_version() -> &'static str {
+    BASE_IMAGE.rsplit(':').next().unwrap_or(BASE_IMAGE)
+}
 
 /// Prefix for engine-created container IDs.
 ///
