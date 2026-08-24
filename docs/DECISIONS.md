@@ -593,12 +593,31 @@ change. Established empirically that the field is v1-compatible in both
 directions (an old reader ignores it; its absence reads as Claude Code), so no
 bump was needed.
 
-**Not finished this pass, and not faked:** where Codex keeps its session state
-(the WP-C-equivalent empirical capture) and the M8/M10 portability acceptance
-for a Codex project both need a real Codex session with API round-trips, which
-needs Codex authenticated on the host. That was unavailable. The scaffolding is
-in place; the empirical discovery is the real work and must be measured, not
-assumed — WP-C's lesson was that the layout contradicted everyone's guess.
+**Auth (2d), RESOLVED (2026-08-24, Product Owner):** Codex authenticates exactly
+as Claude Code does — a per-device credential the user obtains on the host,
+injected read-only at attach, never in a bundle. AUTH-01–03 and D-02 are
+agent-agnostic (recorded in SPEC as AUTH-agent). There is deliberately no second
+credential model. **But the design being settled is not the evidence:** Codex's
+credential paths are unenumerated, so D-02 is *asserted* for Codex, not
+*enforced* — the enumeration WP-C did for Claude Code is what makes it
+enforceable, and it has not been done for Codex.
+
+**Not finished this pass, and not faked (F-84):** where Codex keeps its session
+state (the WP-C-equivalent empirical capture) and the M8/M10 portability
+acceptance both need a real Codex session with API round-trips, which needs Codex
+authenticated on the host. That is unavailable here — a regional purchase barrier,
+not a scheduling choice. Running the capture *without* round-trips was considered
+and rejected: Codex writes session state only when it talks to the model, so we
+would observe an empty directory a real session would have filled — the WP-C
+failure mode inverted, exactly how a "verified" feature ships having never held a
+conversation. Codex is therefore marked implemented-but-unverified everywhere it
+is read: the CLI warns at selection, and F-84 tracks the closure.
+
+**Gemini as the second VERIFIED agent, later:** Gemini CLI has a free tier
+reachable without a purchase, so it — not Codex — is the right target for a
+genuinely verified second agent when multi-agent work resumes. The scaffolding is
+agent-agnostic; only the image entry, the state-locality capture and the
+credential paths are agent-specific. Not now; recorded so it is not rediscovered.
 
 ---
 
@@ -923,6 +942,8 @@ is overstating what has been demonstrated.
 | 2026-08-22 | F-12 | **Scheduled** — confirmed in production during the cross-machine validation; recovery required delete+recreate (Rain) |
 | 2026-08-22 | D-11 | Opened — no user-facing path moves a bundle through storage; sync layer is commercial scope (Claude Code) |
 | 2026-08-22 | D-12 | Opened — import needs a pre-existing project and an invented quota the bundle already records (Claude Code) |
+| 2026-08-24 | E-15 | Auth ruling (2d): Codex authenticates as Claude Code; AUTH agent-agnostic. Codex marked implemented-but-unverified (F-84); Gemini recorded as next verified target (Product Owner + Claude Code) |
+| 2026-08-24 | F-85 | Opened — changing the base image under a fixed version orphans bundles referencing the old digest; needs versioning-discipline ruling (Claude Code) |
 | 2026-08-23 | E-15 | Resolved in code — one agent per project, recorded and switchable; Codex added; session-state capture blocked on Codex auth (Claude Code) |
 | 2026-08-23 | D-10 | Re-estimated after publishing: still 3–5 days; auth row mostly gone, digest verification newly mandatory, urgency dropped. Recommend leaving the ruling (Claude Code) |
 | 2026-08-23 | D-08 | Part 1 delivered — published to GHCR from CI with a digest-divergence check; base image renamed to ghcr.io/gnrain/nemr-base (Claude Code) |

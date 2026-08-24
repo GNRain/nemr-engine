@@ -231,6 +231,10 @@ ledger](docs/CONFORMANCE.md) lists what's still open, and the
 Written plainly, because finding these out by surprise is worse than reading
 them here.
 
+- **Codex support is unverified.** You can create a Codex project and Codex
+  runs, but whether a Codex conversation survives a stop/restart or travels in
+  an export has **not been tested** — only Claude Code has. Nemr warns you when
+  you pick Codex. Treat a Codex project's history as not yet safe to rely on.
 - **No external security review yet.** Setup installs a passwordless `sudo` rule
   for one small root-owned helper. The project separation above is not a security
   boundary — don't run code you don't trust inside a project.

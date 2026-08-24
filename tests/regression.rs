@@ -1950,25 +1950,69 @@ fn import_refuses_to_clobber_an_existing_project() {
 /// namespace — and that gap is recorded rather than hidden.
 #[test]
 fn import_defers_the_credential_requirement() {
-    // No host needed: this is about which policy each path selects.
+    // BRITTLE BY CONSTRUCTION, deliberately — read this before "fixing" a
+    // failure here as a regression.
+    //
+    // The property is behavioural: `create` must refuse without a host
+    // credential (AUTH-03), and a restore must not. The honest way to assert
+    // that is to run each with no credential visible and observe the outcome —
+    // and that is not cheaply available here, for two real reasons, neither a
+    // shortcut:
+    //   1. The full no-credential IMPORT is blocked by the helper-vs-namespace
+    //      wall (E-14's second consequence): a restore provisions a volume, so
+    //      it needs the privileged helper, which cannot run inside the user
+    //      namespace that would hide the host credential. The e11 offline test
+    //      documents exactly this.
+    //   2. Making CREATE fail-without-credential observable means removing the
+    //      real credential file for the duration — and a test that renames a
+    //      user's live credential risks leaving it renamed if it dies, the same
+    //      cleanup-before-verify hazard F-79 was about. Not worth it for this.
+    //
+    // So this inspects the source. What it asserts is now token-level, NOT the
+    // exact call-site argument list, because matching the arg list is what
+    // snapped when the `agent` parameter landed (a change unrelated to the
+    // property). Tokens survive signature changes; the property does not depend
+    // on them.
     let source = std::fs::read_to_string("src/engine/project.rs").expect("read project.rs");
 
-    // `create` is the AUTH-03 path and must stay Required.
+    // The public `create` must route through the Required policy. Checked
+    // against `create`'s own body, so an unrelated `Required` elsewhere cannot
+    // satisfy it.
+    let create_body = {
+        let start = source
+            .find("pub async fn create(")
+            .expect("create must exist");
+        let after = &source[start..];
+        let end = after
+            .find(
+                "
+}
+",
+            )
+            .map(|e| start + e)
+            .unwrap_or(source.len());
+        &source[start..end]
+    };
     assert!(
-        source.contains("create_with_auth(client, name, size, agent, AuthPolicy::Required)"),
-        "nemr create must keep AUTH-03: a missing credential is fatal at creation time"
+        create_body.contains("AuthPolicy::Required"),
+        "nemr create must keep AUTH-03: its body must route through AuthPolicy::Required"
     );
-    // The restore path must defer.
+
+    // The deferral must exist and be confined to exactly one site. This is the
+    // invariant that actually matters — widening it would repeal AUTH-03 rather
+    // than narrow it — and one stray extra site is what this catches.
     assert!(
         source.contains("AuthPolicy::DeferredForRestore"),
-        "a restore must not require a credential, or E-11's guarantee is broken"
+        "a restore must defer the credential check, or E-11's offline guarantee breaks"
     );
-    // And the deferral must be confined to the restore: exactly one call site.
-    let deferred_call_sites = source.matches("AuthPolicy::DeferredForRestore)").count();
+    let deferred_sites = source.matches("AuthPolicy::DeferredForRestore").count();
     assert_eq!(
-        deferred_call_sites, 1,
-        "the credential deferral must apply to the restore path only; found {deferred_call_sites} \
-         call sites. Widening it would repeal AUTH-03 rather than narrow it."
+        deferred_sites, 2,
+        "expected `AuthPolicy::DeferredForRestore` exactly twice — the match arm that \
+         implements the deferral and the single call site that selects it (the enum variant's \
+         own definition is spelled without the `AuthPolicy::` prefix and is not counted). \
+         {deferred_sites} occurrences means a new place selects the deferral, widening \
+         AUTH-03's exception."
     );
 }
 
@@ -2559,4 +2603,49 @@ fn e15_a_project_records_reports_and_switches_its_agent() {
         );
         project::stop(&client, &project.name).await.ok();
     });
+}
+
+/// The unverified-agent warning is data-driven and appears at selection (F-84).
+///
+/// "Implemented the same way" must not quietly become "works": selecting an
+/// unverified agent must warn at the point of selection, not only in docs. This
+/// asserts the property that drives the warning — `portability_verified()` —
+/// and that the CLI create output carries the note for an unverified agent and
+/// omits it for a verified one.
+#[test]
+fn f84_unverified_agents_are_flagged_at_selection() {
+    use nemr_engine::engine::agent::Agent;
+
+    // The property the warning is built on.
+    assert!(
+        Agent::ClaudeCode.portability_verified(),
+        "Claude Code was verified by WP-C (M8/M10)"
+    );
+    assert!(
+        !Agent::Codex.portability_verified(),
+        "Codex is implemented but not empirically verified; if this flips, it must be because \
+         the F-84 acceptance actually ran, not because someone assumed it"
+    );
+    // The menu description must itself carry the caveat, so it shows even in the
+    // arrow-key picker.
+    assert!(
+        Agent::Codex
+            .description()
+            .to_lowercase()
+            .contains("unverified"),
+        "an unverified agent's menu description must say so: {:?}",
+        Agent::Codex.description()
+    );
+
+    // At least one agent must be verified and one not, or this test is vacuous
+    // (a self-contained control, per the standing rule).
+    let verified = Agent::all()
+        .iter()
+        .filter(|a| a.portability_verified())
+        .count();
+    let unverified = Agent::all().len() - verified;
+    assert!(
+        verified >= 1 && unverified >= 1,
+        "control: the fixture must contain both a verified and an unverified agent"
+    );
 }
