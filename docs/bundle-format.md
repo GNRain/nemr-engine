@@ -114,7 +114,7 @@ not the layout, the manifest shape, or the reader.
   },
 
   "base_image": {
-    "reference": "ghcr.io/gnrain/nemr-base:0.1.0",
+    "reference": "ghcr.io/gnrain/nemr-base:0.2.0",
     "digest": "sha256:2c4127a5…"   // authoritative; the reference is a hint
   },
 

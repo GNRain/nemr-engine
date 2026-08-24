@@ -233,7 +233,7 @@ mod tests {
                 agent: "claude-code".into(),
             },
             base_image: BaseImageRef {
-                reference: "ghcr.io/gnrain/nemr-base:0.1.0".into(),
+                reference: "ghcr.io/gnrain/nemr-base:0.2.0".into(),
                 digest: "sha256:abc".into(),
             },
             chunks: vec![],

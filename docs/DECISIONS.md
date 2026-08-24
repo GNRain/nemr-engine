@@ -944,6 +944,7 @@ is overstating what has been demonstrated.
 | 2026-08-22 | D-12 | Opened — import needs a pre-existing project and an invented quota the bundle already records (Claude Code) |
 | 2026-08-24 | E-15 | Auth ruling (2d): Codex authenticates as Claude Code; AUTH agent-agnostic. Codex marked implemented-but-unverified (F-84); Gemini recorded as next verified target (Product Owner + Claude Code) |
 | 2026-08-24 | F-85 | Opened — changing the base image under a fixed version orphans bundles referencing the old digest; needs versioning-discipline ruling (Claude Code) |
+| 2026-08-24 | F-85 | **RESOLVED** — version the image (0.2.0 two-agent; 0.1.0 kept), per-version immutable digest ledger enforced at build/publish/CI, D-08 advice names the bundle's version (Product Owner ruling) |
 | 2026-08-23 | E-15 | Resolved in code — one agent per project, recorded and switchable; Codex added; session-state capture blocked on Codex auth (Claude Code) |
 | 2026-08-23 | D-10 | Re-estimated after publishing: still 3–5 days; auth row mostly gone, digest verification newly mandatory, urgency dropped. Recommend leaving the ruling (Claude Code) |
 | 2026-08-23 | D-08 | Part 1 delivered — published to GHCR from CI with a digest-divergence check; base image renamed to ghcr.io/gnrain/nemr-base (Claude Code) |

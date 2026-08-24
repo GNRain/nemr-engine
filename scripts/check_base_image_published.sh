@@ -23,8 +23,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 IMAGE_REPO="${NEMR_BASE_REPO:-gnrain/nemr-base}"
-IMAGE_TAG="${NEMR_BASE_TAG:-0.1.0}"
-DIGEST_FILE="image/PUBLISHED_DIGEST"
+IMAGE_TAG="${NEMR_BASE_TAG:-0.2.0}"
+DIGEST_FILE="image/digests/${IMAGE_TAG}"
 ACCEPT='application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json'
 
 RED=$'\033[31m'; GREEN=$'\033[32m'; RESET=$'\033[0m'

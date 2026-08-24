@@ -1488,8 +1488,12 @@ fn d08_the_unresolved_base_image_error_is_honest_about_not_fetching() {
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
         let absent = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        // A bundle that names an OLD version. The advice must tell the user to
+        // pull THIS version, not whatever the engine currently defaults to
+        // (F-85) — pulling the current version fetches different bytes.
+        let bundle_reference = "ghcr.io/gnrain/nemr-base:0.1.0";
 
-        let resolution = project::resolve_base_image(&client, absent).await;
+        let resolution = project::resolve_base_image(&client, absent, bundle_reference).await;
         let (where_looked, advice) = match resolution {
             nemr_engine::bundle::import::BaseImageResolution::Unresolved {
                 where_looked,
@@ -1517,6 +1521,20 @@ fn d08_the_unresolved_base_image_error_is_honest_about_not_fetching() {
         assert!(
             advice.contains("ctr") && advice.contains("images pull"),
             "must give the exact fetch command: {advice}"
+        );
+        // F-85: the pull target must be the bundle's OWN version, not the
+        // engine's current default — otherwise the remedy fetches the wrong
+        // image and fails confusingly on another machine.
+        assert!(
+            advice.contains(bundle_reference),
+            "the pull advice must name the version the bundle needs ({bundle_reference}), \
+             not the engine's current default: {advice}"
+        );
+        assert!(
+            !advice.contains(nemr_engine::config::BASE_IMAGE)
+                || nemr_engine::config::BASE_IMAGE == bundle_reference,
+            "the advice must not name the engine's current base image when the bundle needs a \
+             different version: {advice}"
         );
         assert!(
             advice.contains("--namespace"),
@@ -2364,7 +2382,7 @@ fn a_bundle_survives_a_rename_of_the_base_image() {
         // 3. Resolve. Everything after this must run even on failure, or the
         //    host is left without its base image.
         let resolution = if removed.is_ok() {
-            Some(project::resolve_base_image(&client, &digest).await)
+            Some(project::resolve_base_image(&client, &digest, canonical).await)
         } else {
             None
         };

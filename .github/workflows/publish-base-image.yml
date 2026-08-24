@@ -113,7 +113,7 @@ jobs:
               'Likely causes, in order:',
               '1. the package is private, so it is not obtainable without an account',
               '   (scripts/check_base_image_published.sh names the exact setting);',
-              '2. the published digest diverged from image/PUBLISHED_DIGEST;',
+              '2. the published digest diverged from image/digests/<version>, or the version tag was reused for different bytes (F-85);',
               '3. the build itself failed.',
             ].join('\n');
             const existing = await github.rest.issues.listForRepo({

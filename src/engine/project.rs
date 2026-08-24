@@ -1766,7 +1766,12 @@ pub async fn import(
         .map(|size| size.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let base_image = resolve_base_image(client, bundle.base_image_digest()).await;
+    let base_image = resolve_base_image(
+        client,
+        bundle.base_image_digest(),
+        bundle.base_image_reference(),
+    )
+    .await;
     bundle.check(&ImportChecks {
         base_image,
         destination_capacity: usage.available,
@@ -1795,6 +1800,7 @@ pub async fn import(
 pub async fn resolve_base_image(
     client: &ContainerdClient,
     wanted_digest: &str,
+    wanted_reference: &str,
 ) -> crate::bundle::import::BaseImageResolution {
     use crate::bundle::import::BaseImageResolution;
     let mut where_looked = Vec::new();
@@ -1848,7 +1854,7 @@ pub async fn resolve_base_image(
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|_| "$XDG_RUNTIME_DIR/containerd/containerd.sock".to_string()),
             namespace = client.namespace(),
-            reference = config::BASE_IMAGE,
+            reference = wanted_reference,
         ),
     }
 }

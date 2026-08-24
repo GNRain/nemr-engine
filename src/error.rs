@@ -367,7 +367,7 @@ mod tests {
             ),
             (
                 Error::BaseImageUnresolved {
-                    reference: "ghcr.io/gnrain/nemr-base:0.1.0".into(),
+                    reference: "ghcr.io/gnrain/nemr-base:0.2.0".into(),
                     digest: "sha256:abc".into(),
                     where_looked: "  - local containerd: not present".into(),
                     advice: "Build and import the base image.".into(),

@@ -182,6 +182,15 @@ impl Bundle {
         &self.manifest.base_image.digest
     }
 
+    /// The reference (repo:version) the base image was recorded under.
+    ///
+    /// Used by resolution to advise pulling *the version this bundle needs*
+    /// (F-85), not whatever version the engine currently defaults to — pulling
+    /// the current version would fetch different bytes and fail confusingly.
+    pub fn base_image_reference(&self) -> &str {
+        &self.manifest.base_image.reference
+    }
+
     pub fn check(&self, checks: &ImportChecks<'_>) -> Result<()> {
         // Base image: the digest is authoritative, the reference is a hint.
         // Substituting a different image would restore a session onto a rootfs
@@ -414,7 +423,7 @@ mod tests {
                 agent: "claude-code".into(),
             },
             base_image: BaseImageRef {
-                reference: "ghcr.io/gnrain/nemr-base:0.1.0".into(),
+                reference: "ghcr.io/gnrain/nemr-base:0.2.0".into(),
                 digest: DIGEST.into(),
             },
             chunks,
@@ -438,7 +447,7 @@ mod tests {
                 agent: "claude-code",
                 source_root: &root,
                 base_image: BaseImageRef {
-                    reference: "ghcr.io/gnrain/nemr-base:0.1.0".into(),
+                    reference: "ghcr.io/gnrain/nemr-base:0.2.0".into(),
                     digest: DIGEST.into(),
                 },
                 policy: Policy::default(),
@@ -452,7 +461,7 @@ mod tests {
     fn checks<'a>() -> ImportChecks<'a> {
         ImportChecks {
             base_image: BaseImageResolution::Present {
-                reference: "ghcr.io/gnrain/nemr-base:0.1.0".into(),
+                reference: "ghcr.io/gnrain/nemr-base:0.2.0".into(),
             },
             destination_capacity: 1 << 30,
             destination_quota: "2GB",
@@ -623,7 +632,7 @@ mod tests {
             .check(&ImportChecks {
                 base_image: BaseImageResolution::Unresolved {
                     where_looked: vec![
-                        "local containerd, by name ghcr.io/gnrain/nemr-base:0.1.0: not present"
+                        "local containerd, by name ghcr.io/gnrain/nemr-base:0.2.0: not present"
                             .into(),
                         "local containerd, by digest across all images: no match".into(),
                         "no registry was contacted: this build resolves locally only".into(),
