@@ -139,8 +139,8 @@ program's, the wrapper is wrong.
 
 [![publish base image](https://github.com/GNRain/nemr-engine/actions/workflows/publish-base-image.yml/badge.svg)](https://github.com/GNRain/nemr-engine/actions/workflows/publish-base-image.yml)
 
-The base image is published to `ghcr.io/gnrain/nemr-base:0.1.0` from CI, and
-`image/PUBLISHED_DIGEST` records the digest that was pushed. The publish
+The base image is published to `ghcr.io/gnrain/nemr-base:0.2.0` from CI, and
+`image/digests/<version>` records the digest each version was published with (F-85). The publish
 workflow fails if the two diverge, or if the package is not pullable without an
 account.
 

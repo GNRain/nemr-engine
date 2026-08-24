@@ -353,7 +353,7 @@ mod tests {
             agent: "claude-code",
             source_root: root,
             base_image: BaseImageRef {
-                reference: "ghcr.io/gnrain/nemr-base:0.1.0".into(),
+                reference: "ghcr.io/gnrain/nemr-base:0.2.0".into(),
                 digest: "sha256:deadbeef".into(),
             },
             policy: Policy::default(),

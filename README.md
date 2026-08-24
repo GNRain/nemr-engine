@@ -312,7 +312,7 @@ cargo test --test regression -- --test-threads=1    # full suite (needs a set-up
 
 [![publish base image](https://github.com/GNRain/nemr-engine/actions/workflows/publish-base-image.yml/badge.svg)](https://github.com/GNRain/nemr-engine/actions/workflows/publish-base-image.yml)
 
-The base image is pushed to `ghcr.io/gnrain/nemr-base:0.1.0`. It builds
+The base image is pushed to `ghcr.io/gnrain/nemr-base:0.2.0`. It builds
 reproducibly — the same source produces the same image, byte for byte, given the
 same package snapshots. It is **not yet anonymously pullable** (the GHCR package
 is private pending a one-time visibility change); `scripts/check_base_image_published.sh`
