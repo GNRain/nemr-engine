@@ -14,7 +14,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-IMAGE="${NEMR_BASE_IMAGE:-ghcr.io/gnrain/nemr-base:0.1.0}"
+IMAGE="${NEMR_BASE_IMAGE:-ghcr.io/gnrain/nemr-base:0.2.0}"
 
 # Reproducibility (F-74). Both halves are load-bearing, measured rather than
 # assumed: three cold builds with these flags produced one digest, and two cold
@@ -95,6 +95,37 @@ if [[ -n "${NEMR_EXPECT_BASE_DIGEST:-}" ]]; then
         echo "    MISMATCH: expected $NEMR_EXPECT_BASE_DIGEST" >&2
         exit 1
     fi
+fi
+
+# F-85: the built digest must match the digest recorded for THIS version. A
+# mismatch means the image contents changed without a version bump — the exact
+# failure that let the two-agent image reuse the 0.1.0 tag. Refuse it here, at
+# build time, so the tag can never name two different sets of bytes.
+version="${IMAGE##*:}"
+ledger="image/digests/${version}"
+if [[ -f "$ledger" ]]; then
+    recorded="$(tr -d "[:space:]" < "$ledger")"
+    if [[ "$built_digest" == "$recorded" ]]; then
+        echo "    matches image/digests/${version} (F-85)"
+    else
+        cat >&2 <<EOF
+
+    F-85 VERSION MISMATCH — the image built for version ${version} is not the
+    one recorded for that version.
+
+        recorded (image/digests/${version}): ${recorded}
+        just built:                          ${built_digest}
+
+    A version tag must never name two different images. If the image changed on
+    purpose, this is a NEW version: bump the tag in src/config.rs (BASE_IMAGE)
+    and add image/digests/<new-version> with the built digest. Do NOT overwrite
+    ${ledger}.
+EOF
+        exit 1
+    fi
+else
+    echo "    NOTE: no digest recorded for version ${version} yet." >&2
+    echo "          If this is a new version, record it: echo ${built_digest} > ${ledger}" >&2
 fi
 
 echo "==> Measured size (AC-2.2)"

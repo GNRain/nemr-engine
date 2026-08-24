@@ -23,8 +23,11 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-IMAGE="${NEMR_BASE_IMAGE:-ghcr.io/gnrain/nemr-base:0.1.0}"
-DIGEST_FILE="image/PUBLISHED_DIGEST"
+IMAGE="${NEMR_BASE_IMAGE:-ghcr.io/gnrain/nemr-base:0.2.0}"
+# F-85: digests are recorded per version, one file each, never a single
+# shared value.
+VERSION="${IMAGE##*:}"
+DIGEST_FILE="image/digests/${VERSION}"
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1700000000}"
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -75,9 +78,11 @@ fi
 
 echo "==> Published digest: $published"
 
-# The divergence check. A recorded digest that no longer matches what is
-# published means the reference in this repository names bytes that are not
-# there any more, which is exactly what the hash gates exist to prevent.
+# The per-version divergence check (F-85). A version tag names a specific set of
+# bytes forever: publishing DIFFERENT bytes under an existing version is refused
+# outright — that is the "success signal over the wrong artifact" this whole
+# change exists to stop. A version with no recorded digest is a genuinely new
+# version and prints the value to record.
 if [[ -f "$DIGEST_FILE" ]]; then
     recorded=$(tr -d '[:space:]' < "$DIGEST_FILE")
     if [[ "$recorded" == "$published" ]]; then
@@ -85,14 +90,15 @@ if [[ -f "$DIGEST_FILE" ]]; then
     else
         cat >&2 <<EOF
 
-DIGEST DIVERGENCE — the published image is not the one this repository records.
+VERSION TAG REUSED FOR DIFFERENT BYTES — refusing to publish.
 
-    recorded ($DIGEST_FILE):  $recorded
-    just published:           $published
+    version ${VERSION} is recorded as: $recorded
+    this build produced:               $published
 
-If the image legitimately changed, record the new digest and commit it:
-
-    echo $published > $DIGEST_FILE
+A version tag must never name two different images (F-85). This is NOT a digest
+to re-record — it means the image changed without a version bump. Bump BASE_IMAGE
+in src/config.rs to a new version and add image/digests/<new-version>. The
+existing ${DIGEST_FILE} is immutable and must not be edited.
 
 EOF
         exit 1
@@ -100,7 +106,7 @@ EOF
 else
     cat >&2 <<EOF
 
-No digest recorded yet. Record it and commit:
+New version ${VERSION} — no digest recorded yet. Record it and commit:
 
     echo $published > $DIGEST_FILE
 
