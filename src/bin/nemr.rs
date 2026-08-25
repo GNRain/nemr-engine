@@ -6,11 +6,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use nemr_engine::containerd::client::ContainerdClient;
-use nemr_engine::containerd::containers::StopOutcome;
+use nemr_engine::daemon::client as daemon;
 use nemr_engine::engine::agent::Agent;
-use nemr_engine::engine::project;
 use nemr_engine::engine::volume::{self, VolumeSize};
+use nemr_engine::proto;
 
 #[derive(Parser)]
 #[command(
@@ -124,6 +123,13 @@ enum Command {
 
 /// Parse `--size`, reusing the engine's own preset parsing so the CLI cannot
 /// drift from what the engine and the privileged helper accept.
+/// The human label for an agent id coming back over the wire.
+fn agent_label(id: &str) -> String {
+    id.parse::<Agent>()
+        .map(|a| a.label().to_string())
+        .unwrap_or_else(|_| id.to_string())
+}
+
 fn parse_agent(input: &str) -> Result<Agent, String> {
     input.parse::<Agent>().map_err(|e| e.to_string())
 }
@@ -235,6 +241,143 @@ fn resolve_agent(provided: Option<Agent>, interactive: bool) -> Result<Agent> {
     }
 }
 
+/// Turn a gRPC status into an error that prints its message plainly.
+///
+/// The daemon puts the full engine error — including the D-08-standard
+/// actionable ones — in the status message, so surfacing that verbatim keeps
+/// the CLI's error quality identical to the pre-daemon version.
+fn status_err(status: tonic::Status) -> anyhow::Error {
+    anyhow::anyhow!("{}", status.message())
+}
+
+/// Client side of `nemr attach`: stream stdin and resizes to the daemon, render
+/// stdout/stderr, and return the session's exit code. The terminal is entirely
+/// this side's concern — raw mode, SIGWINCH, private-mode restoration — and the
+/// daemon never sees it, only the messages this derives from it.
+async fn attach_client(mut client: daemon::Client, name: &str) -> Result<i32> {
+    use nemr_engine::engine::tty;
+    use nemr_engine::proto::{
+        attach_client, attach_server, AttachClient, AttachResize, AttachServer, AttachStart,
+    };
+    use std::io::Write;
+
+    let interactive = tty::stdin_is_terminal();
+    let (rows, cols) = tty::window_size().map(|(w, h)| (h, w)).unwrap_or((0, 0));
+
+    // Outbound channel: the stdin thread and the resize handler feed it; tonic
+    // reads it as the client->daemon stream.
+    let (tx, rx) = tokio::sync::mpsc::channel::<AttachClient>(64);
+    tx.send(AttachClient {
+        msg: Some(attach_client::Msg::Start(AttachStart {
+            name: name.to_string(),
+            rows,
+            cols,
+            interactive,
+        })),
+    })
+    .await
+    .ok();
+
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let mut inbound = client
+        .attach(outbound)
+        .await
+        .map_err(status_err)?
+        .into_inner();
+
+    // Raw mode only for a real terminal; the guard restores it on every path.
+    let _raw = tty::RawMode::enable()?;
+
+    // stdin -> Stdin messages, on a detached OS thread (a terminal read never
+    // reaches EOF, so this cannot be a cancellable task — the same reasoning as
+    // the pre-daemon attach). It signals StdinEof when local input ends (a pipe).
+    let stdin_tx = tx.clone();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdin = std::io::stdin();
+        let mut buf = [0u8; 8192];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => {
+                    let _ = stdin_tx.blocking_send(AttachClient {
+                        msg: Some(attach_client::Msg::StdinEof(true)),
+                    });
+                    break;
+                }
+                Ok(n) => {
+                    if stdin_tx
+                        .blocking_send(AttachClient {
+                            msg: Some(attach_client::Msg::Stdin(buf[..n].to_vec())),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // SIGWINCH -> Resize messages.
+    let mut winch =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()).ok();
+
+    // Track private modes the container's programs set, so they can be undone.
+    let mut modes = interactive.then(tty::ModeTracker::default);
+    let mut exit_code: i32 = 0;
+
+    loop {
+        tokio::select! {
+            msg = inbound.message() => {
+                match msg.map_err(status_err)? {
+                    Some(AttachServer { msg: Some(m) }) => match m {
+                        attach_server::Msg::Started(_) => {}
+                        attach_server::Msg::Stdout(bytes) => {
+                            if let Some(t) = modes.as_mut() { t.observe(&bytes); }
+                            let mut out = std::io::stdout();
+                            out.write_all(&bytes).ok();
+                            out.flush().ok();
+                        }
+                        attach_server::Msg::Stderr(bytes) => {
+                            let mut err = std::io::stderr();
+                            err.write_all(&bytes).ok();
+                            err.flush().ok();
+                        }
+                        attach_server::Msg::ExitCode(code) => { exit_code = code; break; }
+                        attach_server::Msg::Error(e) => {
+                            drop(_raw);
+                            anyhow::bail!("{e}");
+                        }
+                    },
+                    Some(_) => {}
+                    None => break,   // daemon closed the stream
+                }
+            }
+            Some(_) = async { match winch.as_mut() { Some(w) => w.recv().await, None => None } } => {
+                if let Some((w, h)) = tty::window_size() {
+                    tx.send(AttachClient {
+                        msg: Some(attach_client::Msg::Resize(AttachResize { rows: h, cols: w })),
+                    }).await.ok();
+                }
+            }
+        }
+    }
+
+    // Undo display modes the container left on, in one pass before the termios
+    // guard drops.
+    if let Some(t) = &modes {
+        let restore = t.restore_sequence();
+        if !restore.is_empty() {
+            let mut out = std::io::stdout();
+            out.write_all(restore.as_bytes()).ok();
+            out.flush().ok();
+        }
+    }
+
+    Ok(exit_code)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse first: the subscriber's verbosity is now a flag, so it cannot be
@@ -257,25 +400,28 @@ async fn main() -> Result<()> {
             let size = resolve_size(size, interactive)?;
             let agent = resolve_agent(agent, interactive)?;
 
-            let client = ContainerdClient::connect().await?;
-            eprintln!(
-                "[nemr] containerd: {} (namespace {})",
-                client.socket_path().display(),
-                client.namespace()
-            );
-
-            let project = project::create(&client, &name, size, agent).await?;
+            let mut client = daemon::connect().await?;
+            let project = client
+                .create(proto::CreateRequest {
+                    name,
+                    size: size.to_string(),
+                    agent: agent.id().to_string(),
+                })
+                .await
+                .map_err(status_err)?
+                .into_inner();
+            let project_agent: Agent = project.agent.parse().unwrap_or(Agent::ClaudeCode);
 
             println!("created project {:?}", project.name);
-            println!("  agent:     {}", project.agent.label());
-            if !project.agent.portability_verified() {
+            println!("  agent:     {}", agent_label(&project.agent));
+            if !project_agent.portability_verified() {
                 // At the point of selection, not only in docs someone may not
                 // read: "implemented the same way" must not quietly become
                 // "works" (E-15/F-84).
                 eprintln!();
                 eprintln!(
                     "  note: {} support is IMPLEMENTED BUT UNVERIFIED.",
-                    project.agent.label()
+                    agent_label(&project.agent)
                 );
                 eprintln!("        Where it stores its conversation has not been measured, so a");
                 eprintln!(
@@ -289,56 +435,97 @@ async fn main() -> Result<()> {
         }
 
         Command::Start { name } => {
-            let client = ContainerdClient::connect().await?;
-            let pid = project::start(&client, &name).await?;
+            let mut client = daemon::connect().await?;
+            let pid = client
+                .start(proto::StartRequest { name: name.clone() })
+                .await
+                .map_err(status_err)?
+                .into_inner()
+                .supervisor_pid;
             println!("started project {name:?} (supervisor pid {pid})");
             println!("  attach with: nemr attach {name}");
         }
 
         Command::Stop { name } => {
-            let client = ContainerdClient::connect().await?;
-            let outcome = project::stop(&client, &name).await?;
-            println!("stopped project {name:?} ({outcome})");
-
-            // A container that had to be killed got no chance to shut down
-            // cleanly. Not an error, but the user should not have to guess
-            // which of the two happened (PROC-06).
-            if outcome == StopOutcome::Killed {
-                eprintln!(
-                    "[nemr] warning: the container ignored SIGTERM and was killed after the \n\
-                     grace period. Its processes were given no opportunity to flush state."
-                );
+            let mut client = daemon::connect().await?;
+            let outcome = client
+                .stop(proto::StopRequest { name: name.clone() })
+                .await
+                .map_err(status_err)?
+                .into_inner()
+                .outcome;
+            match outcome.as_str() {
+                "graceful" => println!("stopped project {name:?} (terminated gracefully)"),
+                "no_task" => println!("project {name:?} was not running"),
+                "killed" => {
+                    println!("stopped project {name:?} (ignored SIGTERM; killed)");
+                    eprintln!(
+                        "[nemr] warning: the container ignored SIGTERM and was killed after the \n\
+                         grace period. Its processes were given no opportunity to flush state."
+                    );
+                }
+                "wedged" => {
+                    // F-78: a distinct, surfaced condition — never a silent
+                    // success. The task may still be running.
+                    eprintln!(
+                        "[nemr] project {name:?} did NOT stop: it is wedged in uninterruptible"
+                    );
+                    eprintln!(
+                        "       sleep — SIGKILL cannot reap a task blocked in the kernel until"
+                    );
+                    eprintln!(
+                        "       that operation returns (F-78). The task may still be running."
+                    );
+                    eprintln!(
+                        "       Check `nemr status {name}` and retry; if it persists the host"
+                    );
+                    eprintln!("       may be under heavy load or have stuck I/O.");
+                    std::process::exit(1);
+                }
+                other => println!("stopped project {name:?} ({other})"),
             }
         }
 
         Command::List => {
-            let client = ContainerdClient::connect().await?;
-            let projects = project::list(&client).await?;
+            let mut client = daemon::connect().await?;
+            let resp = client
+                .list(proto::ListRequest {})
+                .await
+                .map_err(status_err)?
+                .into_inner();
+            let projects = resp.projects;
 
-            if projects.is_empty() {
+            if projects.is_empty() && resp.untracked_volumes.is_empty() {
                 println!("no projects. Create one with: nemr create <name> --size 2GB");
                 return Ok(());
             }
 
-            println!(
-                "{:<18} {:<9} {:<18} {:<8} VOLUME",
-                "NAME", "STATUS", "USED", "QUOTA"
-            );
-            for p in &projects {
-                let status = if p.running { "running" } else { "stopped" };
-                let used = match p.usage {
-                    Some(u) => format!("{} ({:.0}%)", volume::human_bytes(u.used), u.percent()),
-                    None => "unmounted".to_string(),
-                };
+            if !projects.is_empty() {
                 println!(
-                    "{:<18} {:<9} {:<18} {:<8} {}",
-                    p.name, status, used, p.quota, p.volume_path
+                    "{:<18} {:<9} {:<18} {:<8} VOLUME",
+                    "NAME", "STATUS", "USED", "QUOTA"
                 );
+                for p in &projects {
+                    let status = if p.running { "running" } else { "stopped" };
+                    let used = if p.usage_known {
+                        format!(
+                            "{} ({:.0}%)",
+                            volume::human_bytes(p.used_bytes),
+                            p.used_percent
+                        )
+                    } else {
+                        "unmounted".to_string()
+                    };
+                    println!(
+                        "{:<18} {:<9} {:<18} {:<8} {}",
+                        p.name, status, used, p.quota, p.volume_path
+                    );
+                }
             }
 
             // F-77: a listing that shows only container-backed projects is true
             // and misleading when orphaned images are filling the disk.
-            let untracked = project::untracked_volumes(&client).await?;
+            let untracked = resp.untracked_volumes;
             if !untracked.is_empty() {
                 println!();
                 println!(
@@ -356,19 +543,25 @@ async fn main() -> Result<()> {
         }
 
         Command::Delete { name, yes } => {
-            let client = ContainerdClient::connect().await?;
+            let mut client = daemon::connect().await?;
 
             // AC-6.2: deletion is destructive and irreversible — the volume and
             // everything written to it goes. Confirm unless explicitly waived.
             if !yes {
-                let projects = project::list(&client).await?;
+                let projects = client
+                    .list(proto::ListRequest {})
+                    .await
+                    .map_err(status_err)?
+                    .into_inner()
+                    .projects;
                 let target = projects.iter().find(|p| p.name == name);
                 match target {
                     Some(p) => {
-                        let used = p
-                            .usage
-                            .map(|u| volume::human_bytes(u.used))
-                            .unwrap_or_else(|| "unknown".into());
+                        let used = if p.usage_known {
+                            volume::human_bytes(p.used_bytes)
+                        } else {
+                            "unknown".into()
+                        };
                         eprintln!("About to delete project {name:?}:");
                         eprintln!("  container: {}", p.container_id);
                         eprintln!(
@@ -399,14 +592,25 @@ async fn main() -> Result<()> {
                 }
             }
 
-            project::delete(&client, &name).await?;
+            client
+                .delete(proto::DeleteRequest { name: name.clone() })
+                .await
+                .map_err(status_err)?;
             println!("deleted project {name:?}");
         }
 
         Command::Reconcile => {
-            let client = ContainerdClient::connect().await?;
-            let report = project::reconcile_orphans(&client).await?;
-            if report.is_empty() {
+            let mut client = daemon::connect().await?;
+            let report = client
+                .reconcile(proto::ReconcileRequest {})
+                .await
+                .map_err(status_err)?
+                .into_inner();
+            if report.released.is_empty()
+                && report.not_released.is_empty()
+                && report.snapshots_removed.is_empty()
+                && report.orphan_backing_files.is_empty()
+            {
                 println!("nothing to reconcile: no orphaned mounts, loop devices or snapshots");
             } else {
                 for name in &report.released {
@@ -433,31 +637,36 @@ async fn main() -> Result<()> {
         }
 
         Command::Status { name } => {
-            let client = ContainerdClient::connect().await?;
-            let d = project::status(&client, &name).await?;
+            let mut client = daemon::connect().await?;
+            let d = client
+                .status(proto::StatusRequest { name: name.clone() })
+                .await
+                .map_err(status_err)?
+                .into_inner();
 
             println!("{}", d.name);
-            println!("  agent:        {}", d.agent.label());
+            println!("  agent:        {}", agent_label(&d.agent));
             println!(
                 "  state:        {}",
                 if d.running { "running" } else { "stopped" }
             );
             println!("  container:    {}", d.container_id);
 
-            let usage = match &d.usage {
-                Some(u) => format!(
+            let usage = if d.usage_known {
+                format!(
                     "{} of {} ({:.0}%)",
-                    volume::human_bytes(u.used),
+                    volume::human_bytes(d.used_bytes),
                     d.quota,
-                    u.percent()
-                ),
-                None => format!("unmounted (quota {})", d.quota),
+                    d.used_percent
+                )
+            } else {
+                format!("unmounted (quota {})", d.quota)
             };
-            println!("  volume:       {}", d.mount_point.display());
+            println!("  volume:       {}", d.mount_point);
             println!("  usage:        {usage}");
             println!(
                 "  image file:   {} ({})",
-                d.image_file.display(),
+                d.image_file,
                 if d.image_present {
                     "present"
                 } else {
@@ -466,62 +675,84 @@ async fn main() -> Result<()> {
             );
             println!(
                 "  loop device:  {}",
-                d.loop_device
-                    .map(|n| format!("/dev/loop{n}"))
-                    .unwrap_or_else(|| "none".into())
+                if d.loop_device.is_empty() {
+                    "none"
+                } else {
+                    &d.loop_device
+                }
             );
 
             // F-28: the question that cost the most time to answer by hand.
-            match d.mount_is_correct() {
-                None => println!("  mount check:  n/a (not mounted)"),
-                Some(true) => println!("  mount check:  ok (backed by this project's image)"),
-                Some(false) => println!(
+            match d.mount_check {
+                -1 => println!("  mount check:  n/a (not mounted)"),
+                1 => println!("  mount check:  ok (backed by this project's image)"),
+                _ => println!(
                     "  mount check:  WRONG VOLUME — mounted filesystem is backed by {}\n\
                      \x20               Run `nemr reconcile`, then start again.",
-                    d.mounted_image
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "something that is not a loop device".into())
+                    if d.mounted_image.is_empty() {
+                        "something that is not a loop device".to_string()
+                    } else {
+                        d.mounted_image.clone()
+                    }
                 ),
             }
 
             println!("  base image:   {}", d.base_image);
             println!(
                 "  base digest:  {}",
-                d.base_image_digest
-                    .as_deref()
-                    .unwrap_or("NOT PRESENT on this host")
+                if d.base_image_digest.is_empty() {
+                    "NOT PRESENT on this host"
+                } else {
+                    &d.base_image_digest
+                }
             );
 
             // The expired-credential failure took three steps to identify; this
             // is the line that would have made it one.
-            match (&d.credential, d.credential_modified) {
-                (Some(path), modified) => {
-                    let age = modified
-                        .and_then(|m| m.elapsed().ok())
-                        .map(|d| format!(", last written {} days ago", d.as_secs() / 86_400))
-                        .unwrap_or_default();
-                    println!("  credential:   present at {}{age}", path.display());
-                }
-                (None, _) => println!(
+            if d.credential_path.is_empty() {
+                println!(
                     "  credential:   ABSENT — `nemr start` will fail (AUTH-03).\n\
                      \x20               Authenticate on this host by running `claude`."
-                ),
+                );
+            } else {
+                let age = if d.credential_modified_secs > 0 {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let days = (now - d.credential_modified_secs).max(0) / 86_400;
+                    format!(", last written {days} days ago")
+                } else {
+                    String::new()
+                };
+                println!("  credential:   present at {}{age}", d.credential_path);
             }
         }
 
         Command::SwitchAgent { name, agent } => {
-            let client = ContainerdClient::connect().await?;
-            let (previous, now) = project::set_agent(&client, &name, agent).await?;
-            if previous == now {
-                println!("project {name:?} already runs {}", now.label());
+            let mut client = daemon::connect().await?;
+            let resp = client
+                .switch_agent(proto::SwitchAgentRequest {
+                    name: name.clone(),
+                    agent: agent.id().to_string(),
+                })
+                .await
+                .map_err(status_err)?
+                .into_inner();
+            let now_agent: Agent = resp.now.parse().unwrap_or(Agent::ClaudeCode);
+            if resp.previous == resp.now {
+                println!("project {name:?} already runs {}", agent_label(&resp.now));
             } else {
-                println!("project {name:?}: {} -> {}", previous.label(), now.label());
-                if !now.portability_verified() {
+                println!(
+                    "project {name:?}: {} -> {}",
+                    agent_label(&resp.previous),
+                    agent_label(&resp.now)
+                );
+                if !now_agent.portability_verified() {
                     eprintln!();
                     eprintln!(
                         "note: {} is IMPLEMENTED BUT UNVERIFIED — its session state may not",
-                        now.label()
+                        agent_label(&resp.now)
                     );
                     eprintln!("      survive a stop/restart or an export/import. See F-84.");
                 }
@@ -530,7 +761,7 @@ async fn main() -> Result<()> {
                 println!();
                 println!(
                     "The existing conversation stays on the volume, but {} will not see it —",
-                    now.label()
+                    agent_label(&resp.now)
                 );
                 println!("each agent stores its history in its own format, and Nemr runs one");
                 println!("agent at a time per project. This switches which one; it does not");
@@ -553,15 +784,22 @@ async fn main() -> Result<()> {
                 Some(path) => (Some(bundle_or_name), path),
                 None => (None, std::path::PathBuf::from(bundle_or_name)),
             };
-            let client = ContainerdClient::connect().await?;
-            let (name, summary) =
-                project::import_creating(&client, &bundle_path, explicit_name.as_deref(), size)
-                    .await?;
+            let mut client = daemon::connect().await?;
+            let resp = client
+                .import(proto::ImportRequest {
+                    bundle_path: bundle_path.to_string_lossy().into_owned(),
+                    name: explicit_name.unwrap_or_default(),
+                    size: size.map(|s| s.to_string()).unwrap_or_default(),
+                })
+                .await
+                .map_err(status_err)?
+                .into_inner();
+            let name = resp.name;
             println!(
                 "imported {} into project {name:?} ({} members, {})",
                 bundle_path.display(),
-                summary.members,
-                volume::human_bytes(summary.bytes)
+                resp.members,
+                volume::human_bytes(resp.bytes)
             );
             println!("\nThe bundle carried no credential, and never does (D-02).");
             println!("Authenticate on this host, then: nemr start {name} && nemr attach {name}");
@@ -572,32 +810,31 @@ async fn main() -> Result<()> {
             output,
             include_build_artifacts,
         } => {
-            let client = ContainerdClient::connect().await?;
+            let mut client = daemon::connect().await?;
             let destination =
                 output.unwrap_or_else(|| std::path::PathBuf::from(format!("{name}.nemr")));
-            let policy = nemr_engine::bundle::policy::Policy {
-                include_build_artifacts,
-            };
 
-            let summary = project::export(&client, &name, &destination, policy).await?;
-            let manifest = &summary.manifest;
+            let summary = client
+                .export(proto::ExportRequest {
+                    name: name.clone(),
+                    destination: destination.to_string_lossy().into_owned(),
+                    include_build_artifacts,
+                })
+                .await
+                .map_err(status_err)?
+                .into_inner();
 
-            println!("exported project {name:?} to {}", summary.path.display());
+            println!("exported project {name:?} to {}", summary.path);
             println!(
                 "  schema:    v{} (see docs/bundle-format.md)",
-                manifest.schema_version
+                summary.schema_version
             );
             println!(
                 "  contents:  {} members, {} uncompressed -> {} on disk",
-                manifest.members.len(),
-                volume::human_bytes(manifest.project.content_bytes),
+                summary.members,
+                volume::human_bytes(summary.content_bytes),
                 volume::human_bytes(summary.bundle_bytes)
             );
-            println!(
-                "  base image: {} ({})",
-                manifest.base_image.reference, manifest.base_image.digest
-            );
-            println!("  excluded:  {} entries", manifest.excluded.len());
 
             // F-54: schema drift must be visible, not silent.
             if !summary.unrecognised_fields.is_empty() {
@@ -620,12 +857,12 @@ async fn main() -> Result<()> {
         }
 
         Command::Attach { name } => {
-            let client = ContainerdClient::connect().await?;
-            let code = project::attach(&client, &name).await?;
+            let client = daemon::connect().await?;
+            let code = attach_client(client, &name).await?;
             // The session's exit code becomes ours, so scripts can branch on
             // what happened inside the container.
             if code != 0 {
-                std::process::exit(code as i32);
+                std::process::exit(code);
             }
         }
     }

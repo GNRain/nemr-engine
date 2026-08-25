@@ -87,6 +87,7 @@ message StatusRequest { string name = 1; }
 message StatusResponse {
   string name = 1;
   string agent = 2;
+  string container_id = 19;
   bool running = 3;
   string quota = 4;
   string mount_point = 5;

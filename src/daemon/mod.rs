@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 pub mod attach;
+pub mod client;
 pub mod socket;
 
 /// The service implementation. One containerd connection, shared.
@@ -189,6 +190,7 @@ impl Nemr for NemrService {
         Ok(Response::new(StatusResponse {
             name: d.name,
             agent: d.agent.id().to_string(),
+            container_id: d.container_id,
             running: d.running,
             quota: d.quota,
             mount_point: d.mount_point.to_string_lossy().into_owned(),
