@@ -138,6 +138,24 @@ In practice:
 - Under `set -e`, an assignment from a failing command aborts *there*. Put it in
   an `if` condition, or the handler beneath it is dead code.
 
+## Purpose-built checks beat plausible one-liners (the control earns its keep)
+
+Confirming the base image was reachable, three ad-hoc probes disagreed with each
+other and with reality: a hand-run `gh api` said 403, a `curl` one-liner said
+401, and `check_base_image_published.sh` correctly said it was fine. The
+difference was the check's **control** — it first proves a known-public package
+IS readable anonymously, so a 401/403 on our package can be told apart from
+"anonymous GHCR access is broken from here / my token is stale / I got the
+scope wrong." The one-liners had no control, so each failed for its own unrelated
+reason and reported it as our package being unreachable.
+
+The lesson, twice now (this and F-80): a check without a self-contained control
+can fail — or pass — for reasons unrelated to the property it guards, and a
+plausible one-liner is exactly the thing that looks authoritative while doing
+so. When the answer matters, reach for the checked tool, not the quick probe;
+and every checker this project ships carries a control that would fail if the
+check were testing nothing.
+
 ## The cleanup rule (a failure that destroyed its own evidence)
 
 The evidence rule says a failure must leave something inspectable. Cleanup paths
