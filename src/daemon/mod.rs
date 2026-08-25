@@ -358,12 +358,24 @@ impl Nemr for NemrService {
 
         let registry = self.audit.clone();
         tokio::spawn(async move {
-            while let Some(ev) = raw_rx.recv().await {
-                if out_tx.send(Ok(ev)).is_err() {
-                    break; // client hung up
+            loop {
+                tokio::select! {
+                    // The client dropped its stream (command finished). Without
+                    // this, the task would block in `recv().await` forever
+                    // holding the registry entry — a leak on EVERY command,
+                    // since `recv` only returns None once the entry (which holds
+                    // the sender) is removed, and it is removed only here.
+                    _ = out_tx.closed() => break,
+                    ev = raw_rx.recv() => match ev {
+                        Some(ev) => {
+                            if out_tx.send(Ok(ev)).is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    },
                 }
             }
-            // Unregister when the client disconnects or the channel closes.
             if let Ok(mut reg) = registry.lock() {
                 reg.remove(&request_id);
             }

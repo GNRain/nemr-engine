@@ -2537,16 +2537,18 @@ fn f83_project_volumes_are_mounted_nosuid_and_nodev() {
 /// assertions would catch as a missing exit within the deadline.
 #[test]
 fn create_is_non_interactive_and_never_hangs_without_a_tty() {
-    // No host needed: resolution happens before containerd is contacted, and we
-    // point at a nonexistent socket so nothing is actually created.
+    // The never-hang property lives in the CLI's resolve layer (decide), which
+    // runs BEFORE any daemon contact: cases 1/3/4 fail fast there. Case 2 (name
+    // given) proceeds to the daemon. CONTAINERD_ADDRESS is deliberately NOT
+    // overridden here — the CLI no longer reads it (the daemon does), so
+    // overriding it only poisons case 2's daemon into a slow failure while
+    // proving nothing about the CLI.
     let nemr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nemr"));
 
-    // Run with stdin taken from /dev/null (not a tty) and a hard 15s deadline.
     let run = |args: &[&str], extra_env: &[(&str, &str)]| -> (Option<i32>, String) {
         use std::process::{Command, Stdio};
         let mut cmd = Command::new(&nemr);
         cmd.args(args)
-            .env("CONTAINERD_ADDRESS", "/nonexistent-socket-for-this-test")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

@@ -88,9 +88,19 @@ pub async fn connect() -> Result<Session> {
 fn next_request_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+    // pid + a high-entropy timestamp + a per-process counter. The nanos guard
+    // against PID reuse: two CLI processes that happen to share a pid would
+    // otherwise both start at "pid-0" and one's stream teardown could unregister
+    // the other's. Uniqueness here is what keeps one client from receiving or
+    // tearing down another's audit stream on a shared daemon.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     format!(
-        "{}-{}",
+        "{}-{}-{}",
         std::process::id(),
+        nanos,
         COUNTER.fetch_add(1, Ordering::Relaxed)
     )
 }

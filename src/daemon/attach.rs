@@ -181,13 +181,18 @@ async fn run_session(
     let _ = client.close_exec_stdin(&container_id, &exec_id).await;
     let _ = client.delete_exec(&container_id, &exec_id).await;
 
-    // Drain and stop the output pumps: we hold a write end of the FIFO, so they
-    // would never see EOF and joining would hang otherwise.
+    // Drain and stop the output pumps. Join OFF the runtime: the pumps now honour
+    // `stop` even mid-send (F-88), so they exit promptly, but joining a thread
+    // on an async worker would still briefly stall a worker that is serving
+    // other clients on the shared daemon, so do it on the blocking pool.
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = stdout_thread.join();
-    if let Some(handle) = stderr_thread {
-        let _ = handle.join();
-    }
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = stdout_thread.join();
+        if let Some(handle) = stderr_thread {
+            let _ = handle.join();
+        }
+    })
+    .await;
 
     let _ = tx.send(out(attach_server::Msg::ExitCode(exit_code))).await;
 
@@ -230,8 +235,24 @@ fn pump_fifo_to_stream(
                     } else {
                         attach_server::Msg::Stdout(chunk)
                     };
-                    if tx.blocking_send(out(msg)).is_err() {
-                        break; // client gone
+                    // F-88: honour `stop` even when the channel is full. A client
+                    // that stops reading fills the bounded channel; a plain
+                    // blocking_send would park here forever, so the stop flag
+                    // set at teardown would never be seen and the async task
+                    // joining this thread would pin a worker permanently.
+                    let mut pending = out(msg);
+                    loop {
+                        match tx.try_send(pending) {
+                            Ok(()) => break,
+                            Err(mpsc::error::TrySendError::Closed(_)) => return,
+                            Err(mpsc::error::TrySendError::Full(m)) => {
+                                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return;
+                                }
+                                pending = m;
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                            }
+                        }
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
