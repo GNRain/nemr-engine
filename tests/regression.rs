@@ -2146,19 +2146,29 @@ fn the_elevation_note_is_visible_without_a_flag() {
         String::from_utf8_lossy(&output.stdout)
     );
 
-    // The audit trail must be in the daemon log — the privileged helper ran.
+    // The elevation note must be INLINE in the CLI output (NFR-04): the daemon
+    // streams the engine's audit events back over WatchAudit, restoring across
+    // the daemon boundary the inline note the pre-daemon CLI printed — a user
+    // can tell a command elevated without going to the log.
+    assert!(
+        stderr.contains("elevated:"),
+        "the CLI output must show inline that the privileged helper ran (NFR-04): {stderr:?}"
+    );
+    assert!(
+        stderr.contains("mount"),
+        "the elevation note must name the privileged operation: {stderr:?}"
+    );
+    // The full command line stays out of the DEFAULT output (only --verbose).
+    assert!(
+        !stderr.contains("sudo -n"),
+        "the default output must not carry the full privileged command line: {stderr:?}"
+    );
+    // The durable trail is ALSO kept in the daemon log.
     let log =
         std::fs::read_to_string(test_state.join("nemr").join("nemrd.log")).unwrap_or_default();
     assert!(
         log.contains("elevated:"),
-        "the daemon audit log must record that the privileged helper ran (NFR-04): {log:?}"
-    );
-    // CONTROL: and it must name the operation, not just the fact — a bare
-    // "elevated" with nothing more would be a weaker trail than before.
-    assert!(
-        log.contains("mount"),
-        "the audit trail must name the privileged operation (mount), not just that one ran: \
-         {log:?}"
+        "the daemon log must also keep the audit trail (NFR-04): {log:?}"
     );
 
     // Stop the dedicated test daemon and clean up.

@@ -67,6 +67,7 @@ prost = "0.14"
 tokio-stream = "0.1"
 tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

@@ -69,3 +69,49 @@ pub fn init(verbose: bool) {
             .init();
     }
 }
+
+/// Install the daemon's subscriber: the terse fmt log (the durable NFR-04 audit
+/// trail) plus the audit Layer that streams events to clients (E-09).
+///
+/// The audit Layer carries its OWN filter at `debug`, independent of the fmt
+/// log's verbosity, so an elevation (info) is always captured for the stream and
+/// a client's `--verbose` can receive the debug trace even when the daemon log
+/// is running terse. Emission follows the union of all layers' interest, so the
+/// fmt log stays clean while the audit Layer still sees debug.
+pub fn init_daemon(verbose: bool, registry: crate::daemon::audit::AuditRegistry) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+
+    let fmt_filter = if let Ok(spec) = std::env::var("NEMR_LOG") {
+        EnvFilter::new(spec)
+    } else if verbose || std::env::var_os("NEMR_DEBUG").is_some() {
+        EnvFilter::new("nemr_engine=debug,nemr_containerd=debug")
+    } else {
+        EnvFilter::new("nemr_engine=info,nemr_containerd=info")
+    };
+    let debug = verbose
+        || std::env::var_os("NEMR_DEBUG").is_some()
+        || std::env::var_os("NEMR_LOG").is_some();
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_target(debug)
+        .with_level(debug);
+    // `without_time` is only available before boxing, so branch on it here.
+    let fmt_layer = if debug {
+        fmt_layer.boxed()
+    } else {
+        fmt_layer.without_time().boxed()
+    }
+    .with_filter(fmt_filter);
+
+    let audit_layer = crate::daemon::audit::AuditLayer::new(registry)
+        .with_filter(EnvFilter::new("nemr_engine=debug"));
+
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(audit_layer)
+        .init();
+}

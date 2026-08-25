@@ -604,7 +604,9 @@ pub fn human_bytes(bytes: u64) -> String {
 /// [`audit_elevated`]. What changed is that reconstructing a run is now
 /// something you ask for rather than something you scroll past.
 fn audit(message: &str) {
-    tracing::debug!("[nemr:volume] {message}");
+    // `nemr_audit` lets the daemon's audit Layer (E-09) classify this event
+    // structurally rather than by matching the message text.
+    tracing::debug!(nemr_audit = "trace", "[nemr:volume] {message}");
 }
 
 /// The one thing that stays visible by default: something ran as root.
@@ -613,8 +615,18 @@ fn audit(message: &str) {
 /// anything, even though they do not see the arguments. The full command line —
 /// which is the audit record — is emitted alongside at `debug`.
 fn audit_elevated(operation: &str, full_command: &str) {
-    tracing::info!("[nemr] elevated: {operation} (via the privileged helper)");
-    tracing::debug!("[nemr:volume] ELEVATED: {full_command}");
+    // The elevation event is the one a user must be able to see without going
+    // to look (NFR-04): `nemr_audit = "elevated"` marks it for the daemon's
+    // audit stream, which surfaces it inline in the CLI.
+    tracing::info!(
+        nemr_audit = "elevated",
+        nemr_op = operation,
+        "[nemr] elevated: {operation} (via the privileged helper)"
+    );
+    tracing::debug!(
+        nemr_audit = "trace",
+        "[nemr:volume] ELEVATED: {full_command}"
+    );
 }
 
 /// A provisioned volume.

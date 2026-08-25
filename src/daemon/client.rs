@@ -12,6 +12,7 @@
 
 use crate::daemon::socket::socket_path;
 use crate::proto::nemr_client::NemrClient;
+use crate::proto::{AuditEvent, WatchAuditRequest};
 use crate::proto::{HandshakeRequest, PROTOCOL_VERSION};
 use anyhow::{bail, Context, Result};
 use std::time::Duration;
@@ -21,21 +22,126 @@ use tower::service_fn;
 
 pub type Client = NemrClient<Channel>;
 
-/// Connect to the daemon, autostarting it if needed, and complete the version
-/// handshake. Every command goes through this — there is no direct path.
-pub async fn connect() -> Result<Client> {
-    let path = socket_path()?;
+/// Set once at startup so the audit printer knows whether to show trace lines.
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_verbose(v: bool) {
+    VERBOSE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
 
-    // Try an existing daemon first; only autostart if nothing answers.
-    if let Ok(client) = try_connect(&path).await {
-        return handshake(client).await;
+/// A connected session: the client, plus a live audit stream whose events are
+/// printed as the command runs. The audit printer stops when the session drops
+/// (at the end of a command), so a command's elevation notes appear inline —
+/// exactly what the pre-daemon CLI did, restored across the daemon boundary.
+pub struct Session {
+    client: Client,
+    request_id: String,
+    printer: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Session {
+    /// The client for issuing RPCs.
+    pub fn client(&mut self) -> &mut Client {
+        &mut self.client
     }
 
-    autostart(&path).await?;
-    let client = try_connect(&path)
+    /// Wrap a message in a request carrying this session's id, so the daemon
+    /// attributes the audit events it produces to this session's stream.
+    pub fn req<T>(&self, msg: T) -> tonic::Request<T> {
+        let mut r = tonic::Request::new(msg);
+        if let Ok(v) = self.request_id.parse() {
+            r.metadata_mut().insert("nemr-request-id", v);
+        }
+        r
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(p) = self.printer.take() {
+            p.abort();
+        }
+    }
+}
+
+/// Connect to the daemon, autostarting it if needed, complete the version
+/// handshake, and open this command's audit stream. Every command goes through
+/// this — there is no direct path.
+pub async fn connect() -> Result<Session> {
+    let path = socket_path()?;
+
+    let client = match try_connect(&path).await {
+        Ok(client) => handshake(client).await?,
+        Err(_) => {
+            autostart(&path).await?;
+            let client = try_connect(&path)
+                .await
+                .context("the daemon did not become reachable after autostart")?;
+            handshake(client).await?
+        }
+    };
+
+    open_session(client).await
+}
+
+/// A monotonic-ish request id: pid plus a per-process counter. Unique per
+/// command within this CLI process, which is all the correlation needs.
+fn next_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+async fn open_session(client: Client) -> Result<Session> {
+    let request_id = next_request_id();
+
+    // Open the audit stream on a clone of the channel (tonic clients are cheap
+    // and share the channel), and wait for Ready before returning — so the
+    // command the caller runs next cannot race the events it produces.
+    let mut audit_client = client.clone();
+    let mut stream = audit_client
+        .watch_audit(WatchAuditRequest {
+            request_id: request_id.clone(),
+        })
         .await
-        .context("the daemon did not become reachable after autostart")?;
-    handshake(client).await
+        .context("failed to open the audit stream")?
+        .into_inner();
+
+    // Wait for the Ready sentinel (bounded, so a misbehaving daemon cannot hang
+    // the CLI forever).
+    let ready = tokio::time::timeout(Duration::from_secs(15), stream.message())
+        .await
+        .context("timed out waiting for the audit stream to become ready")?
+        .context("audit stream error")?;
+    match ready {
+        Some(AuditEvent { ready: true, .. }) => {}
+        _ => bail!("audit stream did not open with a ready event"),
+    }
+
+    // Print events as they arrive, for the life of the command.
+    let printer = tokio::spawn(async move {
+        let verbose = VERBOSE.load(std::sync::atomic::Ordering::Relaxed);
+        while let Ok(Some(ev)) = stream.message().await {
+            if ev.ready {
+                continue;
+            }
+            if ev.privileged {
+                // Always: a user must be able to tell a command elevated (NFR-04).
+                eprintln!("{}", ev.message);
+            } else if verbose {
+                eprintln!("{}", ev.message);
+            }
+        }
+    });
+
+    Ok(Session {
+        client,
+        request_id,
+        printer: Some(printer),
+    })
 }
 
 async fn try_connect(path: &std::path::Path) -> Result<Client> {
@@ -139,7 +245,7 @@ async fn autostart(path: &std::path::Path) -> Result<()> {
     cmd.spawn().context("failed to spawn nemrd")?;
 
     // Wait for the socket to accept a connection (bounded).
-    for _ in 0..50 {
+    for _ in 0..150 {
         if try_connect(path).await.is_ok() {
             return Ok(());
         }

@@ -388,6 +388,7 @@ async fn main() -> Result<()> {
     // NEMR_DEBUG=1 turn on the decision-point detail; NEMR_LOG takes a full
     // env-filter and overrides both.
     nemr_engine::observability::init(cli.verbose);
+    daemon::set_verbose(cli.verbose);
 
     match cli.command {
         Command::Create { name, size, agent } => {
@@ -400,16 +401,20 @@ async fn main() -> Result<()> {
             let size = resolve_size(size, interactive)?;
             let agent = resolve_agent(agent, interactive)?;
 
-            let mut client = daemon::connect().await?;
-            let project = client
-                .create(proto::CreateRequest {
+            let mut session = daemon::connect().await?;
+            let project = {
+                let __req = session.req(proto::CreateRequest {
                     name,
                     size: size.to_string(),
                     agent: agent.id().to_string(),
-                })
-                .await
-                .map_err(status_err)?
-                .into_inner();
+                });
+                session
+                    .client()
+                    .create(__req)
+                    .await
+                    .map_err(status_err)?
+                    .into_inner()
+            };
             let project_agent: Agent = project.agent.parse().unwrap_or(Agent::ClaudeCode);
 
             println!("created project {:?}", project.name);
@@ -435,25 +440,33 @@ async fn main() -> Result<()> {
         }
 
         Command::Start { name } => {
-            let mut client = daemon::connect().await?;
-            let pid = client
-                .start(proto::StartRequest { name: name.clone() })
-                .await
-                .map_err(status_err)?
-                .into_inner()
-                .supervisor_pid;
+            let mut session = daemon::connect().await?;
+            let pid = {
+                let __req = session.req(proto::StartRequest { name: name.clone() });
+                session
+                    .client()
+                    .start(__req)
+                    .await
+                    .map_err(status_err)?
+                    .into_inner()
+                    .supervisor_pid
+            };
             println!("started project {name:?} (supervisor pid {pid})");
             println!("  attach with: nemr attach {name}");
         }
 
         Command::Stop { name } => {
-            let mut client = daemon::connect().await?;
-            let outcome = client
-                .stop(proto::StopRequest { name: name.clone() })
-                .await
-                .map_err(status_err)?
-                .into_inner()
-                .outcome;
+            let mut session = daemon::connect().await?;
+            let outcome = {
+                let __req = session.req(proto::StopRequest { name: name.clone() });
+                session
+                    .client()
+                    .stop(__req)
+                    .await
+                    .map_err(status_err)?
+                    .into_inner()
+                    .outcome
+            };
             match outcome.as_str() {
                 "graceful" => println!("stopped project {name:?} (terminated gracefully)"),
                 "no_task" => println!("project {name:?} was not running"),
@@ -487,12 +500,16 @@ async fn main() -> Result<()> {
         }
 
         Command::List => {
-            let mut client = daemon::connect().await?;
-            let resp = client
-                .list(proto::ListRequest {})
-                .await
-                .map_err(status_err)?
-                .into_inner();
+            let mut session = daemon::connect().await?;
+            let resp = {
+                let __req = session.req(proto::ListRequest {});
+                session
+                    .client()
+                    .list(__req)
+                    .await
+                    .map_err(status_err)?
+                    .into_inner()
+            };
             let projects = resp.projects;
 
             if projects.is_empty() && resp.untracked_volumes.is_empty() {
@@ -543,17 +560,21 @@ async fn main() -> Result<()> {
         }
 
         Command::Delete { name, yes } => {
-            let mut client = daemon::connect().await?;
+            let mut session = daemon::connect().await?;
 
             // AC-6.2: deletion is destructive and irreversible — the volume and
             // everything written to it goes. Confirm unless explicitly waived.
             if !yes {
-                let projects = client
-                    .list(proto::ListRequest {})
-                    .await
-                    .map_err(status_err)?
-                    .into_inner()
-                    .projects;
+                let projects = {
+                    let __req = session.req(proto::ListRequest {});
+                    session
+                        .client()
+                        .list(__req)
+                        .await
+                        .map_err(status_err)?
+                        .into_inner()
+                        .projects
+                };
                 let target = projects.iter().find(|p| p.name == name);
                 match target {
                     Some(p) => {
@@ -592,20 +613,24 @@ async fn main() -> Result<()> {
                 }
             }
 
-            client
-                .delete(proto::DeleteRequest { name: name.clone() })
-                .await
-                .map_err(status_err)?;
+            {
+                let __req = session.req(proto::DeleteRequest { name: name.clone() });
+                session.client().delete(__req).await.map_err(status_err)?
+            };
             println!("deleted project {name:?}");
         }
 
         Command::Reconcile => {
-            let mut client = daemon::connect().await?;
-            let report = client
-                .reconcile(proto::ReconcileRequest {})
-                .await
-                .map_err(status_err)?
-                .into_inner();
+            let mut session = daemon::connect().await?;
+            let report = {
+                let __req = session.req(proto::ReconcileRequest {});
+                session
+                    .client()
+                    .reconcile(__req)
+                    .await
+                    .map_err(status_err)?
+                    .into_inner()
+            };
             if report.released.is_empty()
                 && report.not_released.is_empty()
                 && report.snapshots_removed.is_empty()
@@ -637,12 +662,16 @@ async fn main() -> Result<()> {
         }
 
         Command::Status { name } => {
-            let mut client = daemon::connect().await?;
-            let d = client
-                .status(proto::StatusRequest { name: name.clone() })
-                .await
-                .map_err(status_err)?
-                .into_inner();
+            let mut session = daemon::connect().await?;
+            let d = {
+                let __req = session.req(proto::StatusRequest { name: name.clone() });
+                session
+                    .client()
+                    .status(__req)
+                    .await
+                    .map_err(status_err)?
+                    .into_inner()
+            };
 
             println!("{}", d.name);
             println!("  agent:        {}", agent_label(&d.agent));
@@ -730,15 +759,19 @@ async fn main() -> Result<()> {
         }
 
         Command::SwitchAgent { name, agent } => {
-            let mut client = daemon::connect().await?;
-            let resp = client
-                .switch_agent(proto::SwitchAgentRequest {
+            let mut session = daemon::connect().await?;
+            let resp = {
+                let __req = session.req(proto::SwitchAgentRequest {
                     name: name.clone(),
                     agent: agent.id().to_string(),
-                })
-                .await
-                .map_err(status_err)?
-                .into_inner();
+                });
+                session
+                    .client()
+                    .switch_agent(__req)
+                    .await
+                    .map_err(status_err)?
+                    .into_inner()
+            };
             let now_agent: Agent = resp.now.parse().unwrap_or(Agent::ClaudeCode);
             if resp.previous == resp.now {
                 println!("project {name:?} already runs {}", agent_label(&resp.now));
@@ -784,16 +817,20 @@ async fn main() -> Result<()> {
                 Some(path) => (Some(bundle_or_name), path),
                 None => (None, std::path::PathBuf::from(bundle_or_name)),
             };
-            let mut client = daemon::connect().await?;
-            let resp = client
-                .import(proto::ImportRequest {
+            let mut session = daemon::connect().await?;
+            let resp = {
+                let __req = session.req(proto::ImportRequest {
                     bundle_path: bundle_path.to_string_lossy().into_owned(),
                     name: explicit_name.unwrap_or_default(),
                     size: size.map(|s| s.to_string()).unwrap_or_default(),
-                })
-                .await
-                .map_err(status_err)?
-                .into_inner();
+                });
+                session
+                    .client()
+                    .import(__req)
+                    .await
+                    .map_err(status_err)?
+                    .into_inner()
+            };
             let name = resp.name;
             println!(
                 "imported {} into project {name:?} ({} members, {})",
@@ -810,19 +847,23 @@ async fn main() -> Result<()> {
             output,
             include_build_artifacts,
         } => {
-            let mut client = daemon::connect().await?;
+            let mut session = daemon::connect().await?;
             let destination =
                 output.unwrap_or_else(|| std::path::PathBuf::from(format!("{name}.nemr")));
 
-            let summary = client
-                .export(proto::ExportRequest {
+            let summary = {
+                let __req = session.req(proto::ExportRequest {
                     name: name.clone(),
                     destination: destination.to_string_lossy().into_owned(),
                     include_build_artifacts,
-                })
-                .await
-                .map_err(status_err)?
-                .into_inner();
+                });
+                session
+                    .client()
+                    .export(__req)
+                    .await
+                    .map_err(status_err)?
+                    .into_inner()
+            };
 
             println!("exported project {name:?} to {}", summary.path);
             println!(
@@ -857,8 +898,9 @@ async fn main() -> Result<()> {
         }
 
         Command::Attach { name } => {
-            let client = daemon::connect().await?;
-            let code = attach_client(client, &name).await?;
+            let mut session = daemon::connect().await?;
+            let code = attach_client(session.client().clone(), &name).await?;
+            drop(session);
             // The session's exit code becomes ours, so scripts can branch on
             // what happened inside the container.
             if code != 0 {

@@ -24,6 +24,14 @@ service Nemr {
   rpc Import(ImportRequest) returns (ImportResponse);
   rpc Export(ExportRequest) returns (ExportResponse);
 
+  // Daemon->client audit event stream (E-09/NFR-04). A client opens this with
+  // its own request id BEFORE running a command; the daemon streams the audit
+  // events that command produces — every privileged (helper) operation — so a
+  // user can tell inline that a command elevated, without going to the log. A
+  // one-way stream, and the channel the lease/sync work will reuse for its own
+  // events.
+  rpc WatchAudit(WatchAuditRequest) returns (stream AuditEvent);
+
   // Interactive shell. Bidirectional: the client streams stdin and window
   // resizes, the daemon streams stdout/stderr and the final exit. Bytes flow
   // over the stream — never local paths — so the transport can swap.
@@ -175,3 +183,19 @@ message AttachServer {
   }
 }
 message AttachStarted {}
+
+message WatchAuditRequest {
+  // Correlates the stream with the command RPC the client runs next, which
+  // carries the same id in its `nemr-request-id` metadata.
+  string request_id = 1;
+}
+message AuditEvent {
+  // The first event on every stream: the subscription is live, so the client
+  // may now run its command without racing the events it would produce.
+  bool ready = 1;
+  // The formatted audit line (empty on a ready event).
+  string message = 2;
+  // True for a privileged (helper) operation — the event a user must see by
+  // default. Non-privileged trace lines are shown only under --verbose.
+  bool privileged = 3;
+}
