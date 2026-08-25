@@ -21,6 +21,7 @@ pub mod proto {
 pub mod auth;
 pub mod bundle;
 pub mod config;
+pub mod daemon;
 pub mod engine;
 pub mod error;
 pub mod interactive;

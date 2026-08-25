@@ -134,9 +134,12 @@ message ExportRequest {
   bool include_build_artifacts = 3;
 }
 message ExportResponse {
-  uint64 members = 1;
-  uint64 uncompressed_bytes = 2;
-  uint64 compressed_bytes = 3;
+  string path = 1;
+  uint32 schema_version = 2;
+  uint64 members = 3;
+  uint64 content_bytes = 4;   // uncompressed
+  uint64 bundle_bytes = 5;    // on disk
+  repeated string unrecognised_fields = 6;  // F-54 schema-drift surface
 }
 
 // --- Attach streaming ---

@@ -597,6 +597,13 @@ pub enum StopOutcome {
     Killed,
     /// There was no task to stop.
     NoTask,
+    /// SIGKILL was sent but the task did not exit within the window — it is in
+    /// an uninterruptible wait (F-78: a task in `D` state, e.g. inside
+    /// `kernel_clone`, cannot be reaped until the kernel operation returns).
+    /// Distinct from every other outcome ON PURPOSE: it is neither a success
+    /// nor a generic error but a specific, surfaced condition — the task may
+    /// still be running, and a caller must say so, never claim the stop worked.
+    Wedged,
 }
 
 impl std::fmt::Display for StopOutcome {
@@ -605,7 +612,21 @@ impl std::fmt::Display for StopOutcome {
             Self::Graceful => "terminated gracefully",
             Self::Killed => "ignored SIGTERM; killed after the grace period",
             Self::NoTask => "no task was running",
+            Self::Wedged => "did NOT stop: wedged in uninterruptible sleep (SIGKILL cannot                              reap it until the kernel operation it is blocked in returns)",
         })
+    }
+}
+
+impl StopOutcome {
+    /// The stable identifier crossing the daemon protocol (E-09). Never change
+    /// these — the CLI branches on them.
+    pub fn wire_str(self) -> &'static str {
+        match self {
+            Self::Graceful => "graceful",
+            Self::Killed => "killed",
+            Self::NoTask => "no_task",
+            Self::Wedged => "wedged",
+        }
     }
 }
 
@@ -735,12 +756,26 @@ impl ContainerdClient {
 
         let outcome = if timeout(GRACE, self.wait_task(id)).await.is_err() {
             self.signal_task(id, 9).await?;
-            timeout(KILL_TIMEOUT, self.wait_task(id))
-                .await
-                .with_context(|| {
-                    format!("task for {id:?} did not exit within {KILL_TIMEOUT:?} of SIGKILL")
-                })??;
-            StopOutcome::Killed
+            // F-78: a task inside an uninterruptible kernel wait cannot be
+            // reaped by SIGKILL until that operation returns. Classify that as
+            // Wedged and RETURN — do not error generically, and do not fall
+            // through to delete the task record (the process is still there).
+            // Caution, also from F-78: under CPU starvation tokio's timer fires
+            // late, so this branch may be reached well after KILL_TIMEOUT of
+            // wall-clock; the classification is still correct, the timing is
+            // not to be trusted as elapsed time.
+            match timeout(KILL_TIMEOUT, self.wait_task(id)).await {
+                Ok(result) => {
+                    result?;
+                    StopOutcome::Killed
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "[nemr] task for {id:?} did not exit within {KILL_TIMEOUT:?} of SIGKILL                          — wedged in uninterruptible sleep (F-78)"
+                    );
+                    return Ok(StopOutcome::Wedged);
+                }
+            }
         } else {
             StopOutcome::Graceful
         };
