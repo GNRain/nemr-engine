@@ -7,6 +7,17 @@
 //! The wrapper is re-exported here as `containerd` so existing call sites read
 //! `crate::containerd::…` unchanged after the crate extraction.
 
+/// The nemrd control-plane gRPC service (E-09), generated from
+/// `proto/nemr.proto` at build time.
+pub mod proto {
+    tonic::include_proto!("nemr.v1");
+
+    /// The wire protocol version. Bump on ANY incompatible change to the
+    /// service. The daemon refuses a client whose version differs (the
+    /// hash-gate lesson applied to the protocol).
+    pub const PROTOCOL_VERSION: u32 = 1;
+}
+
 pub mod auth;
 pub mod bundle;
 pub mod config;

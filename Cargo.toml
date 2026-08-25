@@ -58,3 +58,14 @@ zstd = "0.13.3"
 # TTY and no flag supplied the value; the never-hang logic lives in
 # src/interactive.rs, not here. Minimal features: no fuzzy-search, no history.
 dialoguer = { version = "0.11", default-features = false }
+# The nemrd daemon (E-09): gRPC over a Unix domain socket. Pinned to the same
+# 0.14 line containerd-client re-exports, so cargo unifies to one tonic rather
+# than resolving a second, incompatible version (the M1 lesson).
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tokio-stream = "0.1"
+tower = "0.5"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
