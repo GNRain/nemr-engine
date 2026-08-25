@@ -2556,7 +2556,11 @@ fn create_is_non_interactive_and_never_hangs_without_a_tty() {
             cmd.env(k, v);
         }
         let mut child = cmd.spawn().expect("spawn nemr");
-        // Poll for up to 15s; a hang is the failure this test exists to catch.
+        // Poll for up to 30s; a hang is the failure this test exists to catch.
+        // The deadline exceeds the client's daemon-autostart wait (15s), so a
+        // case that legitimately fails via a failed autostart (e.g. no host in
+        // CI's no-host step) is not mistaken for a hang — only a real input hang,
+        // which never returns, would trip it.
         let start = std::time::Instant::now();
         loop {
             if let Some(status) = child.try_wait().expect("wait") {
@@ -2565,9 +2569,9 @@ fn create_is_non_interactive_and_never_hangs_without_a_tty() {
                 text.push_str(&String::from_utf8_lossy(&out.stderr));
                 return (status.code(), text);
             }
-            if start.elapsed() > std::time::Duration::from_secs(15) {
+            if start.elapsed() > std::time::Duration::from_secs(30) {
                 let _ = child.kill();
-                panic!("`nemr {args:?}` did not exit within 15s — it hung waiting for input");
+                panic!("`nemr {args:?}` did not exit within 30s — it hung waiting for input");
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
