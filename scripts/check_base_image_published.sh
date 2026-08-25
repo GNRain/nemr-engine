@@ -57,26 +57,57 @@ fi
 printf '%sok%s        control: a known-public GHCR package is readable anonymously (HTTP 200)\n' \
     "$GREEN" "$RESET"
 
-status="$(manifest_status "$IMAGE_REPO" "$IMAGE_TAG")"
+# Test seam (F-86): force the subject's HTTP status so the message-selection
+# branches are provable without a live registry. The control above still runs
+# against the real network, so a forced run cannot pass vacuously.
+status="${NEMR_TEST_FORCE_STATUS:-$(manifest_status "$IMAGE_REPO" "$IMAGE_TAG")}"
 if [[ "$status" != "200" ]]; then
-    cat >&2 <<EOF
+    # 403 and 404 are DIFFERENT failures with different fixes, and conflating
+    # them (F-86) sent someone to toggle visibility when the real problem was
+    # that the version was never published. Name the actual cause.
+    case "$status" in
+        403)
+            cat >&2 <<EOF
 
-${RED}FAIL${RESET} — ghcr.io/${IMAGE_REPO}:${IMAGE_TAG} is not pullable without an account (HTTP ${status}).
+${RED}FAIL${RESET} — ghcr.io/${IMAGE_REPO}:${IMAGE_TAG} exists but is PRIVATE (HTTP 403).
 
-  The push succeeded and the digest is recorded, so nothing else reports this.
-  But D-08 chose GHCR because the image would be obtainable without an account,
-  and E-11 depends on the open half being usable without paying. A private
-  package satisfies neither.
-
-  GHCR packages published with GITHUB_TOKEN default to private. Fix once, by
-  hand — a workflow cannot set its own package visibility:
+  The package is published but not obtainable without an account, which
+  satisfies neither D-08 nor E-11. GHCR packages published with GITHUB_TOKEN
+  default to private, and a workflow cannot set its own package visibility.
+  Fix once, by hand:
 
     https://github.com/users/gnrain/packages/container/nemr-base/settings
     -> Danger Zone -> Change visibility -> Public
 
-  Then re-run this check.
+EOF
+            ;;
+        404)
+            cat >&2 <<EOF
+
+${RED}FAIL${RESET} — ghcr.io/${IMAGE_REPO}:${IMAGE_TAG} is NOT PUBLISHED (HTTP 404).
+
+  The registry has no such version. This is not a visibility problem — the
+  image was never pushed, or the push failed. Publish it:
+
+    ./scripts/publish_base_image.sh        (or the publish-base-image workflow)
+
+  If the package's OTHER versions 403 anonymously, its visibility is also
+  private — fix that too, at the settings page above.
 
 EOF
+            ;;
+        *)
+            cat >&2 <<EOF
+
+${RED}FAIL${RESET} — ghcr.io/${IMAGE_REPO}:${IMAGE_TAG} is not readable anonymously (HTTP ${status}).
+
+  Unexpected status. The control above confirmed anonymous GHCR access works,
+  so this is specific to this package/version. Inspect it by hand before
+  assuming a cause.
+
+EOF
+            ;;
+    esac
     exit 1
 fi
 printf '%sok%s        ghcr.io/%s:%s is pullable anonymously\n' "$GREEN" "$RESET" "$IMAGE_REPO" "$IMAGE_TAG"

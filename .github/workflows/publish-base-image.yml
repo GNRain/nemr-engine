@@ -80,12 +80,6 @@ jobs:
           echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
           echo "PATH=$HOME/.local/bin:$PATH" >> "$GITHUB_ENV"
 
-      - name: Verify the image is obtainable WITHOUT an account
-        # Publishing is not the goal; being obtainable is. GHCR packages
-        # published with GITHUB_TOKEN default to private, and a private package
-        # looks identical to success from the publishing side.
-        run: ./scripts/check_base_image_published.sh
-
       - name: Publish and verify the digest
         env:
           # The workflow's own token — no secret anyone has to hand over, which
@@ -94,6 +88,15 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
         run: ./scripts/publish_base_image.sh
+
+      - name: Verify the image is obtainable WITHOUT an account
+        # AFTER publishing, not before (F-86): a version is 404 until it is
+        # pushed, so checking pullability first meant a NEW version could never
+        # publish — the check demanded what only the publish it blocked could
+        # provide. Publishing is not the goal, being obtainable is, so this
+        # still runs — it just verifies what was actually pushed rather than
+        # gating on it.
+        run: ./scripts/check_base_image_published.sh
 
       - name: Report a publish failure where someone will see it
         if: failure()
