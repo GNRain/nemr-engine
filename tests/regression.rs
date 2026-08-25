@@ -2112,14 +2112,27 @@ fn the_elevation_note_is_visible_without_a_flag() {
         return;
     }
 
+    // E-09: the engine now runs in the daemon, so the VOL-03/NFR-04 privileged-
+    // operation audit trail — every time the helper runs — is written to the
+    // DAEMON's log, not the CLI's own output. This asserts the trail survives
+    // the move (it must, NFR-04), by pointing a dedicated test daemon at a known
+    // log and checking it after a create. (The CLI-side inline note is a
+    // casualty of the daemon architecture, flagged for a ruling.)
     let nemr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nemr"));
     let socket = ContainerdClient::default_socket_path().expect("socket");
     let name = common::unique_name("elev");
     common::purge(&name);
 
+    let test_state = std::env::temp_dir().join(format!("nemr-elev-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&test_state);
+    let test_sock = test_state.join("nemrd.sock");
+    std::fs::create_dir_all(&test_state).expect("state dir");
+
     let output = std::process::Command::new(&nemr)
         .args(["create", &name, "--size", "500MB"])
         .env("CONTAINERD_ADDRESS", &socket)
+        .env("NEMR_DAEMON_SOCKET", &test_sock)
+        .env("XDG_STATE_HOME", &test_state)
         .env_remove("NEMR_DEBUG")
         .env_remove("NEMR_LOG")
         .output()
@@ -2129,18 +2142,42 @@ fn the_elevation_note_is_visible_without_a_flag() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "create must succeed: {stderr}\n{}",
+        "create must succeed through the daemon: {stderr}\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
+
+    // The audit trail must be in the daemon log — the privileged helper ran.
+    let log =
+        std::fs::read_to_string(test_state.join("nemr").join("nemrd.log")).unwrap_or_default();
     assert!(
-        stderr.contains("elevated:"),
-        "default output must say that the privileged helper ran: {stderr:?}"
+        log.contains("elevated:"),
+        "the daemon audit log must record that the privileged helper ran (NFR-04): {log:?}"
     );
-    // But NOT the arguments — that is what moved behind --verbose.
+    // CONTROL: and it must name the operation, not just the fact — a bare
+    // "elevated" with nothing more would be a weaker trail than before.
     assert!(
-        !stderr.contains("sudo -n"),
-        "default output must not carry the full privileged command line: {stderr:?}"
+        log.contains("mount"),
+        "the audit trail must name the privileged operation (mount), not just that one ran: \
+         {log:?}"
     );
+
+    // Stop the dedicated test daemon and clean up.
+    for pid in String::from_utf8_lossy(
+        &std::process::Command::new("pgrep")
+            .args(["-f", &test_sock.to_string_lossy()])
+            .output()
+            .map(|o| o.stdout)
+            .unwrap_or_default(),
+    )
+    .lines()
+    {
+        if let Ok(pid) = pid.trim().parse::<i32>() {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&test_state);
 }
 
 /// `nemr status` must answer the questions that previously took three commands.
@@ -2537,12 +2574,18 @@ fn create_is_non_interactive_and_never_hangs_without_a_tty() {
     );
 
     // 2. Name given, no tty: resolution succeeds (defaults fill size+agent) and
-    //    it proceeds far enough to try containerd — i.e. it did NOT prompt.
-    let (_code, out) = run(&["create", "wphcreate"], &[]);
-    assert!(
-        out.contains("containerd") || out.contains("socket"),
-        "with a name, create must resolve non-interactively and reach containerd: {out}"
-    );
+    //    the command PROCEEDS without prompting or hanging. Post-daemon, "reach
+    //    containerd" is the daemon's job, not the CLI's, so the property here is
+    //    purely no-hang: it exits within the deadline. It may create a real
+    //    project via the daemon, so it is deleted afterward.
+    let unique = format!("wphcreate-{}", std::process::id());
+    let (_code, _out) = run(&["create", &unique], &[]);
+    // Best-effort cleanup of anything it created (the daemon uses the real host).
+    // Cleanup goes through the ambient daemon (real containerd); the CLI no
+    // longer reads CONTAINERD_ADDRESS, so no override is needed here.
+    let _ = std::process::Command::new(&nemr)
+        .args(["delete", &unique, "--yes"])
+        .output();
 
     // 3. The escape hatch forces non-interactive even where a tty might exist.
     let (code, out) = run(&["create"], &[("NEMR_NON_INTERACTIVE", "1")]);
@@ -2666,4 +2709,69 @@ fn f84_unverified_agents_are_flagged_at_selection() {
         verified >= 1 && unverified >= 1,
         "control: the fixture must contain both a verified and an unverified agent"
     );
+}
+
+/// The daemon refuses a protocol-version mismatch cleanly (E-09).
+///
+/// The hash-gate lesson applied to the daemon protocol: a client and daemon
+/// from different builds must be refused with an actionable message, not
+/// discovered as a confusing downstream failure. A daemon started with a forced
+/// protocol version stands in for a stale build.
+#[test]
+fn e09_daemon_refuses_a_protocol_version_mismatch() {
+    if !require_host(HostRequirements {
+        containerd: true,
+        helper: false,
+        base_image: false,
+    }) {
+        return;
+    }
+
+    let nemr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nemr"));
+    let dir = std::env::temp_dir().join(format!("nemr-e09-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let sock = dir.join("nemrd.sock");
+
+    // A CLI command that would autostart a daemon — but with the daemon forced
+    // to a different protocol version, so the handshake must be refused.
+    let output = std::process::Command::new(&nemr)
+        .args(["list"])
+        .env("NEMR_DAEMON_SOCKET", &sock)
+        .env("XDG_STATE_HOME", &dir)
+        .env("NEMR_TEST_DAEMON_PROTOCOL", "999")
+        .output()
+        .expect("run nemr list");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a protocol mismatch must fail, not succeed: {combined}"
+    );
+    assert!(
+        combined.contains("protocol version mismatch") || combined.contains("999"),
+        "the failure must name the version mismatch actionably: {combined}"
+    );
+
+    // Stop the forced daemon.
+    for pid in String::from_utf8_lossy(
+        &std::process::Command::new("pgrep")
+            .args(["-f", &sock.to_string_lossy()])
+            .output()
+            .map(|o| o.stdout)
+            .unwrap_or_default(),
+    )
+    .lines()
+    {
+        if let Ok(pid) = pid.trim().parse::<i32>() {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

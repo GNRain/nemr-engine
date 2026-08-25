@@ -727,6 +727,129 @@ pub async fn exec_capture(
 /// Per PROC-02 this is a **task exec with its own TTY**, not a connection to
 /// PID 1's terminal. Exiting the shell ends only this exec; the project keeps
 /// running, and concurrent attaches get independent terminals.
+/// A running attach exec, with the FIFO handles to pump and the ids to control
+/// it. Produced by [`attach_exec_start`] for the daemon (E-09), which streams
+/// between these FIFOs and a gRPC client rather than the local terminal.
+pub struct AttachExec {
+    pub container_id: String,
+    pub exec_id: String,
+    pub io_dir: std::path::PathBuf,
+    pub stdin_fifo: std::fs::File,
+    pub stdout_fifo: std::fs::File,
+    pub stderr_fifo: Option<std::fs::File>,
+    /// Whether the exec was created with a pty (interactive) or pipes.
+    pub terminal: bool,
+}
+
+/// Set up and start an attach exec: resolve the container, create the FIFOs,
+/// launch the agent's login shell, and apply the initial window size. Returns
+/// the handles for the caller to pump and control.
+///
+/// Factored out of the terminal-bound `attach` so the daemon can drive the same
+/// exec while streaming its IO over gRPC. `interactive`/`rows`/`cols` come from
+/// the client's own terminal (the daemon has none), replacing the local
+/// `stdin_is_terminal()` / `window_size()` calls.
+pub async fn attach_exec_start(
+    client: &ContainerdClient,
+    name: &str,
+    interactive: bool,
+    rows: u16,
+    cols: u16,
+) -> Result<AttachExec> {
+    use crate::containerd::containers::ExecIo;
+    use crate::engine::tty;
+
+    let container_id = resolve(client, name).await?;
+    if !client.task_state(&container_id).await?.is_running() {
+        bail!(
+            "project {name:?} is not running.\n\
+             Start it first: nemr start {name}"
+        );
+    }
+
+    let exec_id = format!(
+        "attach-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    sweep_stale_attach_dirs();
+
+    let io_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .context("XDG_RUNTIME_DIR is not set; cannot place attach FIFOs")?
+        .join("nemr")
+        .join(&exec_id);
+    std::fs::create_dir_all(&io_dir)
+        .with_context(|| format!("failed to create {}", io_dir.display()))?;
+
+    let io = ExecIo {
+        stdin: io_dir.join("stdin"),
+        stdout: io_dir.join("stdout"),
+        stderr: (!interactive).then(|| io_dir.join("stderr")),
+        terminal: interactive,
+    };
+    tty::make_fifo(&io.stdin)?;
+    tty::make_fifo(&io.stdout)?;
+    if let Some(stderr) = &io.stderr {
+        tty::make_fifo(stderr)?;
+    }
+
+    let process = serde_json::json!({
+        "terminal": interactive,
+        "user": { "uid": 0, "gid": 0 },
+        "args": ["/bin/bash", "-l"],
+        "env": [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME=/root",
+            "TERM=".to_string() + &std::env::var("TERM").unwrap_or_else(|_| "xterm".into()),
+            "USE_BUILTIN_RIPGREP=0".to_string(),
+            PROMPT_TIDY.to_string(),
+        ],
+        "cwd": config::CONTAINER_WORKDIR,
+        "capabilities": {
+            "bounding":  ["CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FSETID","CAP_FOWNER","CAP_MKNOD",
+                          "CAP_NET_RAW","CAP_SETGID","CAP_SETUID","CAP_SETFCAP","CAP_SETPCAP",
+                          "CAP_NET_BIND_SERVICE","CAP_SYS_CHROOT","CAP_KILL","CAP_AUDIT_WRITE"],
+            "effective": ["CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FSETID","CAP_FOWNER","CAP_MKNOD",
+                          "CAP_NET_RAW","CAP_SETGID","CAP_SETUID","CAP_SETFCAP","CAP_SETPCAP",
+                          "CAP_NET_BIND_SERVICE","CAP_SYS_CHROOT","CAP_KILL","CAP_AUDIT_WRITE"],
+            "permitted": ["CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FSETID","CAP_FOWNER","CAP_MKNOD",
+                          "CAP_NET_RAW","CAP_SETGID","CAP_SETUID","CAP_SETFCAP","CAP_SETPCAP",
+                          "CAP_NET_BIND_SERVICE","CAP_SYS_CHROOT","CAP_KILL","CAP_AUDIT_WRITE"]
+        },
+        "noNewPrivileges": true
+    });
+
+    client
+        .exec_process(&container_id, &exec_id, process, &io)
+        .await?;
+
+    let stdin_fifo = tty::open_fifo(&io.stdin)?;
+    let stdout_fifo = tty::open_fifo(&io.stdout)?;
+    let stderr_fifo = io.stderr.as_ref().map(|p| tty::open_fifo(p)).transpose()?;
+
+    client.start_exec(&container_id, &exec_id).await?;
+
+    if interactive && rows > 0 && cols > 0 {
+        let _ = client
+            .resize_pty(&container_id, &exec_id, cols as u32, rows as u32)
+            .await;
+    }
+
+    Ok(AttachExec {
+        container_id,
+        exec_id,
+        io_dir,
+        stdin_fifo,
+        stdout_fifo,
+        stderr_fifo,
+        terminal: interactive,
+    })
+}
+
 pub async fn attach(client: &ContainerdClient, name: &str) -> Result<u32> {
     use crate::containerd::containers::ExecIo;
     use crate::engine::tty;

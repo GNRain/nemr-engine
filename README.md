@@ -196,6 +196,12 @@ Each project is three things:
    itself as the only sources of truth, so there's no private database to drift
    out of sync with reality.
 
+**A background service does the work.** `nemr` commands talk to a small
+background service (`nemrd`) that manages your projects; it starts automatically
+the first time you run a command. Keeping one service in charge means two
+commands can never trip over each other. If it isn't running, the next command
+starts it — you never have to.
+
 **On the isolation:** a project can only see its own disk — no other project's
 files are attached to it. This is ordinary container separation, good for
 keeping work tidy and independent. It has **not** been hardened or reviewed as a

@@ -1,0 +1,177 @@
+syntax = "proto3";
+
+// The local control-plane API between the `nemr` CLI and the `nemrd` daemon
+// (E-09). Transport is a Unix domain socket; filesystem permissions
+// authenticate, so there is nothing auth-related here. The service definition
+// is deliberately transport-agnostic — if E-10's remote engine ever happens,
+// the transport swaps and this does not.
+package nemr.v1;
+
+service Nemr {
+  // Version negotiation, first call on every connection. A mismatch is refused
+  // cleanly rather than discovered as a confusing failure later (the hash-gate
+  // lesson, applied to the daemon protocol).
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+
+  rpc Create(CreateRequest) returns (CreateResponse);
+  rpc Start(StartRequest) returns (StartResponse);
+  rpc Stop(StopRequest) returns (StopResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc SwitchAgent(SwitchAgentRequest) returns (SwitchAgentResponse);
+  rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
+  rpc Import(ImportRequest) returns (ImportResponse);
+  rpc Export(ExportRequest) returns (ExportResponse);
+
+  // Interactive shell. Bidirectional: the client streams stdin and window
+  // resizes, the daemon streams stdout/stderr and the final exit. Bytes flow
+  // over the stream — never local paths — so the transport can swap.
+  rpc Attach(stream AttachClient) returns (stream AttachServer);
+}
+
+message HandshakeRequest {
+  // The protocol version the CLI was built with.
+  uint32 protocol_version = 1;
+  // The CLI's own build hash, logged by the daemon for diagnosis (not gating).
+  string client_build = 2;
+}
+message HandshakeResponse {
+  uint32 protocol_version = 1;
+  string daemon_build = 2;
+}
+
+message CreateRequest {
+  string name = 1;
+  string size = 2;   // volume size preset, e.g. "2GB"
+  string agent = 3;  // agent id, e.g. "claude-code"
+}
+message CreateResponse {
+  string name = 1;
+  string container_id = 2;
+  string volume_path = 3;
+  string size = 4;
+  string agent = 5;
+}
+
+message StartRequest { string name = 1; }
+message StartResponse { uint32 supervisor_pid = 1; }
+
+message StopRequest { string name = 1; }
+message StopResponse {
+  // "graceful" | "killed" | "no_task" | "wedged" (F-78: a task in
+  // uninterruptible sleep that SIGKILL could not reap within the window).
+  string outcome = 1;
+}
+
+message DeleteRequest { string name = 1; }
+message DeleteResponse {}
+
+message ListRequest {}
+message ListResponse {
+  repeated ProjectStatus projects = 1;
+  repeated string untracked_volumes = 2;
+}
+message ProjectStatus {
+  string name = 1;
+  string container_id = 2;
+  string quota = 3;
+  bool running = 4;
+  string volume_path = 5;
+  bool usage_known = 6;
+  uint64 used_bytes = 7;
+  double used_percent = 8;
+}
+
+message StatusRequest { string name = 1; }
+message StatusResponse {
+  string name = 1;
+  string agent = 2;
+  string container_id = 19;
+  bool running = 3;
+  string quota = 4;
+  string mount_point = 5;
+  string image_file = 6;
+  bool image_present = 7;
+  bool mounted = 8;
+  string loop_device = 9;      // empty if none
+  string mounted_image = 10;   // empty if none
+  bool usage_known = 11;
+  uint64 used_bytes = 12;
+  double used_percent = 13;
+  string base_image = 14;
+  string base_image_digest = 15;  // empty if absent
+  string credential_path = 16;    // empty if absent
+  int64 credential_modified_secs = 17;  // unix secs, 0 if unknown
+  // -1 = not mounted, 0 = wrong volume, 1 = correct (mirrors mount_is_correct).
+  int32 mount_check = 18;
+}
+
+message SwitchAgentRequest { string name = 1; string agent = 2; }
+message SwitchAgentResponse { string previous = 1; string now = 2; }
+
+message ReconcileRequest {}
+message ReconcileResponse {
+  repeated string released = 1;
+  repeated string not_released = 2;
+  repeated string snapshots_removed = 3;
+  repeated string orphan_backing_files = 4;
+}
+
+message ImportRequest {
+  string bundle_path = 1;
+  string name = 2;   // empty = derive from manifest
+  string size = 3;   // empty = derive from manifest
+}
+message ImportResponse {
+  string name = 1;
+  uint64 members = 2;
+  uint64 bytes = 3;
+}
+
+message ExportRequest {
+  string name = 1;
+  string destination = 2;
+  bool include_build_artifacts = 3;
+}
+message ExportResponse {
+  string path = 1;
+  uint32 schema_version = 2;
+  uint64 members = 3;
+  uint64 content_bytes = 4;   // uncompressed
+  uint64 bundle_bytes = 5;    // on disk
+  repeated string unrecognised_fields = 6;  // F-54 schema-drift surface
+}
+
+// --- Attach streaming ---
+
+message AttachClient {
+  oneof msg {
+    AttachStart start = 1;
+    bytes stdin = 2;
+    AttachResize resize = 3;
+    // The client's local input reached EOF (a pipe closed); the shell inside
+    // must be told or it never exits.
+    bool stdin_eof = 4;
+  }
+}
+message AttachStart {
+  string name = 1;
+  uint32 rows = 2;
+  uint32 cols = 3;
+  bool interactive = 4;  // whether the client has a real terminal
+}
+message AttachResize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+message AttachServer {
+  oneof msg {
+    AttachStarted started = 1;
+    bytes stdout = 2;
+    bytes stderr = 3;
+    int32 exit_code = 4;
+    string error = 5;
+  }
+}
+message AttachStarted {}
