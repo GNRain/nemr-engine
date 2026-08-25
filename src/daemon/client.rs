@@ -92,13 +92,39 @@ async fn autostart(path: &std::path::Path) -> Result<()> {
         );
     }
 
-    // Detach fully: new session, IO to /dev/null, so it outlives this CLI.
+    // Detach fully, but keep the daemon's output: it carries the VOL-03/NFR-04
+    // audit trail (every privileged call, every mount), which must not vanish
+    // just because the engine now runs in the daemon. Append to a durable log
+    // under $XDG_STATE_HOME (or ~/.local/state), so an operator can reconstruct
+    // what happened — the same guarantee the pre-daemon CLI gave inline.
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    let log_dir = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("nemr");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("nemrd.log"))
+        .ok();
     let mut cmd = Command::new(&nemrd);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    cmd.stdin(Stdio::null());
+    match log {
+        Some(f) => {
+            let f2 = f
+                .try_clone()
+                .unwrap_or_else(|_| f.try_clone().expect("clone log"));
+            cmd.stdout(Stdio::from(f)).stderr(Stdio::from(f2));
+        }
+        None => {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
     if let Some(sock) = std::env::var_os("NEMR_DAEMON_SOCKET") {
         cmd.env("NEMR_DAEMON_SOCKET", sock);
     }

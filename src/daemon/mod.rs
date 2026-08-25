@@ -73,14 +73,19 @@ impl Nemr for NemrService {
         request: Request<HandshakeRequest>,
     ) -> Result<Response<HandshakeResponse>, Status> {
         let req = request.into_inner();
-        if req.protocol_version != crate::proto::PROTOCOL_VERSION {
+        // Test seam: force a version so the mismatch-refusal gate is provable
+        // end to end without two builds. Production never sets this.
+        let expected = std::env::var("NEMR_TEST_DAEMON_PROTOCOL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(crate::proto::PROTOCOL_VERSION);
+        if req.protocol_version != expected {
             // Refuse a mismatch cleanly — the hash-gate lesson. Do not try to
             // serve a client speaking a protocol this daemon does not.
             return Err(Status::failed_precondition(format!(
                 "protocol version mismatch: the CLI speaks v{}, this daemon speaks v{}. \
                  Reinstall so both come from the same build: ./scripts/install_engine.sh",
-                req.protocol_version,
-                crate::proto::PROTOCOL_VERSION
+                req.protocol_version, expected
             )));
         }
         tracing::debug!(
@@ -89,7 +94,7 @@ impl Nemr for NemrService {
             req.protocol_version
         );
         Ok(Response::new(HandshakeResponse {
-            protocol_version: crate::proto::PROTOCOL_VERSION,
+            protocol_version: expected,
             daemon_build: env!("CARGO_PKG_VERSION").to_string(),
         }))
     }

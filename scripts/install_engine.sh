@@ -14,14 +14,32 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 DEST="${NEMR_INSTALLED_BIN:-$HOME/.local/bin/nemr}"
+DAEMON_DEST="$(dirname "$DEST")/nemrd"
 
-cargo build --release --bin nemr
+# Both binaries, from one build, installed side by side. The CLI autostarts the
+# daemon from beside itself, so they must be the same build (E-09).
+cargo build --release --bin nemr --bin nemrd
 mkdir -p "$(dirname "$DEST")"
 install -m 0755 target/release/nemr "$DEST"
+install -m 0755 target/release/nemrd "$DAEMON_DEST"
+
+# Stop any running daemon so the next command autostarts the freshly installed
+# one. This is how a stale daemon is prevented structurally rather than
+# discovered the hard way — the CLI protocol handshake catches incompatible
+# versions, and stopping here catches same-version behavioural drift.
+if [[ -n "${XDG_RUNTIME_DIR:-}" && -S "$XDG_RUNTIME_DIR/nemr/nemrd.sock" ]]; then
+    for pid in $(pgrep -f "$DAEMON_DEST" 2>/dev/null || true); do
+        kill "$pid" 2>/dev/null || true
+    done
+    rm -f "$XDG_RUNTIME_DIR/nemr/nemrd.sock"
+    echo "  stopped the running daemon; the next command will start the new one"
+fi
 
 echo "installed $DEST"
 echo "  sha256 $(sha256sum "$DEST" | cut -d' ' -f1)"
 echo "  built  $(sha256sum target/release/nemr | cut -d' ' -f1)"
+echo "installed $DAEMON_DEST"
+echo "  sha256 $(sha256sum "$DAEMON_DEST" | cut -d' ' -f1)"
 
 command -v nemr >/dev/null && [ "$(command -v nemr)" = "$DEST" ] || {
     echo "note: $DEST is not the 'nemr' on PATH ($(command -v nemr || echo none))." >&2

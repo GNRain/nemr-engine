@@ -1,0 +1,18 @@
+[Unit]
+Description=nemrd — Nemr session daemon (E-09)
+Documentation=https://github.com/GNRain/nemr-engine
+# The daemon needs the rootless containerd it is a client of.
+After=containerd-rootless.service
+Wants=containerd-rootless.service
+
+[Service]
+Type=simple
+# The daemon binary installed beside the CLI.
+ExecStart=%h/.local/bin/nemrd
+Restart=on-failure
+RestartSec=2
+# The audit trail (NFR-04) goes to the journal when managed this way; the CLI's
+# autostart path logs to ~/.local/state/nemr/nemrd.log instead.
+
+[Install]
+WantedBy=default.target
