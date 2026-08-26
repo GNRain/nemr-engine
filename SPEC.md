@@ -84,6 +84,7 @@
 | 1.68 | Revision | **F-78 requirement built into the daemon: `StopOutcome::Wedged`.** A task SIGKILL cannot reap within the window because it is in uninterruptible sleep (a task in `kernel_clone`/D-state) is now a distinct, surfaced outcome — never a generic error, never a silent success. `nemr stop` reports it plainly and exits non-zero, saying the task may still be running. The wall-clock caution is recorded at the timeout: under CPU starvation the runtime's timer fires late, so the branch may be reached after the nominal window; the classification is correct, the timing is not to be trusted as elapsed. | Claude Code |
 | 1.69 | Revision | **The VOL-03/NFR-04 audit trail moves into the daemon, and the per-command CLI elevation note is a flagged casualty.** The engine now runs in the daemon, so the privileged-operation audit trail (every helper call, every mount) is written to the daemon log (`$XDG_STATE_HOME/nemr/nemrd.log`, or the journal when systemd-managed) rather than the CLI's own output. The trail is preserved — asserted by test — but the inline note the pre-daemon CLI printed to say "the helper just ran" is gone: the CLI no longer performs privileged operations and cannot narrate them. Surfacing per-command elevation back to the CLI needs the daemon to stream audit events (which the lease/sync future wants regardless); **deferred and raised for a Product Owner ruling.** | Claude Code |
 | 1.70 | Revision | **The audit trail streams to the CLI: elevation notes are inline again** (E-09, Product Owner ruling on 1.68's deferred question — build it now). A user can tell that a command they just ran elevated privileges without going to the log, restoring across the daemon boundary the inline note the pre-daemon CLI printed. The daemon captures the engine's existing `tracing` audit events with a Layer and routes each to the client whose command produced it (correlated by a `nemr-request-id` span), streaming them over a new one-way `WatchAudit` RPC — the same channel the lease/sync work will reuse. Privileged (elevation) events show by default; trace lines only under `--verbose`. The durable trail is still kept in the daemon log. The only engine change is a structured `nemr_audit` field so classification is by field, not text. | Product Owner ruling, recorded by Claude Code |
+| 1.72 | Revision | **E-16 resolved and the key scheme built: `crates/nemr-crypto`** (WP-J, commercial side of E-11). The server stores ciphertext it cannot read; a random 256-bit master key is wrapped by a password-derived envelope (Argon2id → HKDF-SHA256 domain-separated auth/wrap keys → XChaCha20-Poly1305), so every future access method — OAuth, per-device caching, recovery — is another envelope over the same key with no re-encryption. Recovery is generated **at registration** and confirmed before the account is usable (Product Owner ruling, overriding a defer). New normative §3.10 fixes the Argon2id parameters (19 MiB, t=2, p=1) and the AEAD/AAD scheme; E-16 in `docs/DECISIONS.md` records the D-02-vs-E-16 distinction (Anthropic's per-device credential that never travels vs the user's own bundle key that must travel as ciphertext) and the accepted cost (a forgotten password with no recovery is permanent data loss). `scripts/check_seam.sh` generalised to a list of commercial crates with a per-crate control; the engine depends on none. 19 crypto unit tests, each red when its property is violated. | Product Owner ruling, recorded by Claude Code |
 | 1.64 | Revision | **F-81 resolved and F-86 fixed** (both gate the D-08 remedy). F-81: the Product Owner made the GHCR package public — verified anonymously, `nemr-base:0.1.0` returns HTTP 200 — so a published version is pullable on another machine today; the ledger had it stale one pass too long, confirmed by live probe not memory. F-86: the publish workflow ran its "obtainable without an account" check BEFORE publishing, so a new version (404 until pushed) blocked its own publish — which is why 0.2.0 was unpublished while 0.1.0 was public. The check now runs after publish, and distinguishes 404 (not published) from 403 (private) with the right remedy for each. | Claude Code |
 
 ---
@@ -374,6 +375,30 @@ Code failing with `ENOTIMP` against `api.anthropic.com` while otherwise
 running correctly — `/proc/net/dev` inside the container listed `lo` alone.
 Inheriting rootlesskit's namespace instead gives the container the `tap0`
 device slirp4netns already provides, and DNS and TLS then work.
+
+---
+
+### 3.10 Client-Side Encryption (Normative, E-16)
+
+The commercial sync server stores ciphertext it cannot read. The scheme is
+E-16 (`docs/DECISIONS.md`), implemented in `crates/nemr-crypto`. This section
+fixes the parameters so they are stated and justified in the spec, per the
+standing requirement that cryptography meets the same bar as the privileged
+helper.
+
+| Requirement ID | Requirement |
+|---|---|
+| CRY-01 | The data key is a random 256-bit **master key (MK)**, generated once per account at registration from the OS CSPRNG. The server never receives MK or any key that derives it. |
+| CRY-02 | MK is stored only **wrapped** in an AEAD envelope. The password envelope's key is `HKDF-SHA256(Argon2id(password, salt), info="nemr/kdf/wrap/v1")`. A separate `auth_key` uses `info="nemr/kdf/auth/v1"`; the two labels are the domain separation that lets `auth_key` travel to the server while `wrap_key` does not. |
+| CRY-03 | **Argon2id parameters:** m = 19 MiB (19456 KiB), t = 2 iterations, p = 1 lane, 32-byte output, Argon2 v1.3. These are OWASP's 2024 recommendation; the memory floor is the barrier to GPU/ASIC brute force, since the salt is public (the server must return it at login). Parameters are stored per-user so cost can be raised for new accounts without invalidating existing ones. |
+| CRY-04 | Wrapping and bundle encryption use **XChaCha20-Poly1305**. Its 192-bit nonce is drawn at random per operation; there is no nonce counter to persist or synchronise across machines. Associated data binds each ciphertext to its purpose (`nemr/envelope/v1` vs `nemr/bundle/v1`) so the two are not interchangeable under one key. |
+| CRY-05 | A **recovery envelope** wraps the same MK under a key derived from a random recovery code (`info="nemr/kdf/recovery-wrap/v1"`). It is generated **at registration**, the code is shown once, and the account is not usable until the client confirms it by recovering MK through that envelope and matching `SHA-256("nemr/recovery-ack/v1" || MK)`. Recovery is not deferrable. |
+| CRY-06 | No decryption path distinguishes "wrong key" from "tampered ciphertext": both surface as one opaque error, so a probe learns nothing. Every property in CRY-01–05 is asserted by a test that fails when the property is violated. |
+
+**Consequence, accepted (E-16).** A forgotten password with no recovery
+envelope means the bundles are unrecoverable, permanently — there is no
+server-side reset that preserves data, because the server cannot read the data.
+That is the price of the server holding nothing it can open.
 
 ---
 

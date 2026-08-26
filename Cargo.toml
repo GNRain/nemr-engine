@@ -6,7 +6,7 @@
 # The wrapper layer (SPEC §3.2) is its own crate so the GUI and the resolved
 # E-09 daemon can consume it without pulling in the engine. deploy/nemr-volume
 # has its own [workspace] and stays a separate privilege domain.
-members = ["crates/nemr-containerd", "crates/nemr-storage"]
+members = ["crates/nemr-containerd", "crates/nemr-storage", "crates/nemr-crypto"]
 
 [package]
 name = "nemr-engine"

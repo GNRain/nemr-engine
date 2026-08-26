@@ -412,6 +412,98 @@ The **bundle format stays open and documented** — a proprietary format
 undermines the open-core story and makes the engine useless without the paid
 layer, which is the opposite of the intent.
 
+**Ruling — what is commercial (2026-08-20, recorded in SPEC 1.31).** Engine +
+wrapper + volume layer + privileged helper + **bundle format spec** are open.
+Sync, lease, storage backends, identity, and the client-side encryption are
+commercial. The test: *can someone use the open half productively without ever
+paying?*
+
+**Ruling — packaging shape (2026-08-26).** The commercial code is a **crate in
+the workspace**, not a sibling repo. The seam is `scripts/check_seam.sh`, which
+proves at the dependency-graph level (plus a source grep, plus a self-contained
+control) that the open half reaches no commercial crate. That is isolation by
+*evidence*; a sibling repo isolates by *absence*, which is unfalsifiable — no
+test can fail on it — and this project isolates by evidence everywhere else.
+Two further reasons: the server shares the open bundle/manifest/digest types by
+path (dependency flowing commercial → open, the allowed direction), which a
+repo split would force into duplicated-or-published crates, taxing every
+bundle-format change; and crate → repo is a mechanical extraction of a
+self-contained directory, whereas repo → shared-crate is a merge of drifted
+types, so crate-first keeps the cheaper reversal open. **Licensing is upstream
+of packaging and remains unchosen** (no `LICENSE` file; `publish = false` on
+every crate). If the server source must later be closed, extraction is cheap
+*because* it is already a clean crate. Commercial crates so far:
+`crates/nemr-storage` (M12), `crates/nemr-crypto` (E-16), and `crates/nemr-server`.
+
+---
+
+### E-16 — Encryption key origin
+
+**Status:** Resolved · 2026-08-26
+**Relates to:** D-02, D-03, E-11, E-13, D-06 · **Implemented in:** `crates/nemr-crypto`
+
+**Question.** The server stores ciphertext it cannot read, yet a user must log
+in on a new machine with only email + password and decrypt their sessions.
+Those pull in opposite directions: the key must be recoverable from what the
+user carries between machines, but never derivable by the server that
+authenticates them. Where does the key come from?
+
+**Ruling — Option B, a wrapped master key.** A random 256-bit **master key
+(MK)** is the data key, generated once at registration. It is wrapped by a
+**password-derived envelope** — `AEAD(kdf(password), MK)` — which the server
+stores as an opaque blob. Login on any machine fetches the envelope, derives the
+wrap key locally, and unwraps MK. The server never sees the password's wrap key
+or MK.
+
+The decisive property is decoupling: because MK is random and merely *wrapped*
+by the password, every future access method — GitHub OAuth, per-device caching,
+recovery — is **another envelope over the same MK, with no re-encryption of any
+bundle**. Deriving the data key straight from the password (the rejected Option
+A) would make the first added login method a re-encrypt-everything event.
+
+**Mechanism (all standard primitives, no invented constructions).** One
+Argon2id over `(password, salt)` yields a root; HKDF-SHA256 with distinct `info`
+labels splits it into an `auth_key` (sent to the server) and a `wrap_key` (never
+leaves the client) — domain separation is what lets authentication travel
+through the server while the data key does not. Wrapping and bundle encryption
+use XChaCha20-Poly1305 (random 192-bit nonce, no counter to manage). Argon2id
+parameters are stated and justified in SPEC §crypto and stored per-user so cost
+can be raised for new accounts without invalidating old ones.
+
+**D-02 is a different secret — record it in these terms.** D-02 governs
+Anthropic's credential: **someone else's secret, per-device, which never
+travels.** E-16 governs **the user's own bundle key, which must travel — as
+ciphertext the server cannot open — or the product does not work.** Same word
+"key", opposite requirement; they do not conflict. Reading both without this
+distinction, one would assume they contradict.
+
+**Recovery is not deferrable (Product Owner ruling, overriding the initial
+proposal to defer it).** The recovery envelope is generated **at registration**,
+the recovery code is shown once, and the account is **not usable until the user
+confirms** they stored it. The confirmation is server-enforced without the
+server learning MK: registration records `SHA-256(domain || MK)`; to confirm,
+the client recovers MK from the recovery envelope with the re-entered code and
+recomputes the hash — a match proves recovery actually recovers the *same* MK.
+Deferring recovery to a later settings flow would leave every bundle created
+before that flow unrecoverable, and the silent, permanent failure would land on
+the users least likely to have gone looking for it.
+
+**Cost, accepted explicitly (Product Owner's words).** *A forgotten password
+with no recovery envelope means the user's bundles are unrecoverable,
+permanently. There is no server-side reset that preserves data, because the
+server cannot read the data. That is inherent to real client-side encryption,
+not a shortcoming of this design — and it is the price of the server being
+unable to read one byte of anyone's source code or transcripts.*
+
+**Per-device caching** is a layer, not a fork: after first unwrap, MK can be
+cached in the OS keychain wrapped by a device key, so the password is needed
+only at first login on a device and revoking a device deletes its envelope. The
+envelope table is built so this is addable; it is **not** built in this pass.
+
+**Does not resolve E-13.** E-13 (authenticating on a second machine revoked the
+first's credential) concerns Anthropic's OAuth credential — D-02's secret, not
+MK — so it is orthogonal and stays open on its own terms.
+
 ---
 
 ### D-05 — Storage backend
