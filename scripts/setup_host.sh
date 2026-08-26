@@ -349,6 +349,30 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
+# 9b. Developer workflow: the fmt pre-push guard
+# ---------------------------------------------------------------------------
+# Structural fix for a lapse that recurred in WP-J (pushing code that was
+# clippy-checked but not fmt-checked). Repo-local, no root.
+step "Install git hooks (fmt pre-push guard)"
+chmod +x scripts/git-hooks/* 2>/dev/null || true
+git config core.hooksPath scripts/git-hooks
+ok "core.hooksPath = scripts/git-hooks"
+
+# ---------------------------------------------------------------------------
+# 9c. Sync-server test database (WP-J) — the Postgres nemr-sync tests need
+# ---------------------------------------------------------------------------
+# Orthogonal to the engine, so this is non-fatal: a failure here (e.g. no podman
+# yet) must not fail engine provisioning. Skip with NEMR_SKIP_SYNC_DB=1.
+step "Provision the sync-server test database (Postgres, WP-J)"
+if [[ "${NEMR_SKIP_SYNC_DB:-0}" == "1" ]]; then
+    ok "skipped (NEMR_SKIP_SYNC_DB=1)"
+elif ./scripts/setup_sync_test_db.sh; then
+    ok "sync-server test Postgres is up (see the printed DATABASE_URL)"
+else
+    warn "sync-server test DB not provisioned; run ./scripts/setup_sync_test_db.sh later"
+fi
+
+# ---------------------------------------------------------------------------
 # 10. Acceptance — setup is done when the host passes, not when commands exit 0
 # ---------------------------------------------------------------------------
 step "Verification"

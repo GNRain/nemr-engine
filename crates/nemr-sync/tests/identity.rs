@@ -165,3 +165,54 @@ async fn repeated_failures_are_rate_limited() {
         .unwrap();
     assert_eq!(r.status(), 429, "the fourth attempt must be rate limited");
 }
+
+async fn params_for(app: &common::TestApp, email: &str) -> (u16, serde_json::Value) {
+    let r = app
+        .http
+        .post(app.url("/v1/auth/params"))
+        .json(&serde_json::json!({ "email": email }))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    (status, r.json().await.unwrap_or(serde_json::Value::Null))
+}
+
+#[tokio::test]
+async fn kdf_params_does_not_reveal_whether_an_email_exists() {
+    // F-89: the pre-login KDF-params endpoint is unauthenticated. A known and an
+    // unknown email must be indistinguishable, or it is an enumeration oracle.
+    let app = spawn().await;
+    let e = Enrolled::new();
+    app.enroll(&e).await;
+
+    let (kstatus, kbody) = params_for(&app, &e.email).await;
+    assert_eq!(kstatus, 200);
+    assert_eq!(
+        common::unb64(kbody["kdf_salt"].as_str().unwrap()).len(),
+        16,
+        "a real account returns a 16-byte salt"
+    );
+
+    let unknown = "definitely-not-registered@example.com";
+    let (ustatus, ubody) = params_for(&app, unknown).await;
+    // The load-bearing assertion: same status (not a 404), so status does not
+    // leak existence. This goes red if the endpoint 404s an unknown email.
+    assert_eq!(
+        ustatus, 200,
+        "an unknown email must not be distinguishable by status code"
+    );
+    assert_eq!(
+        common::unb64(ubody["kdf_salt"].as_str().unwrap()).len(),
+        16,
+        "the pseudo-salt must have the same shape as a real salt"
+    );
+    assert!(ubody["kdf_m_cost"].is_number());
+
+    // Deterministic, like a real account's stable salt: two probes match.
+    let (_, ubody2) = params_for(&app, unknown).await;
+    assert_eq!(
+        ubody2["kdf_salt"], ubody["kdf_salt"],
+        "the pseudo-salt must be stable across probes"
+    );
+}
