@@ -17,8 +17,8 @@ use nemr_crypto::{
     decrypt_bundle, derive_root, encrypt_bundle, recovery_acknowledgement, Envelope, KdfParams,
     MasterKey, RecoveryCode,
 };
-use nemr_sync::{connect_and_migrate, router, AppState, Config, DynStore, KdfCost};
 use nemr_storage::local::LocalStore;
+use nemr_sync::{connect_and_migrate, router, AppState, Config, DynStore, KdfCost};
 use sqlx::PgPool;
 use time::Duration;
 
@@ -215,7 +215,8 @@ impl TestApp {
         assert_eq!(r.status(), 200, "login: {}", r.text().await.unwrap());
         let body: serde_json::Value = r.json().await.unwrap();
         let token = body["token"].as_str().unwrap().to_string();
-        let env = Envelope::from_bytes(&unb64(body["password_envelope"].as_str().unwrap())).unwrap();
+        let env =
+            Envelope::from_bytes(&unb64(body["password_envelope"].as_str().unwrap())).unwrap();
         let mk = e.root().wrap_key().open(&env).unwrap();
         (token, mk)
     }
@@ -225,5 +226,7 @@ impl TestApp {
 /// no bytes: a bundle encrypted under one decrypts under the other.
 pub fn keys_match(a: &MasterKey, b: &MasterKey) -> bool {
     let ct = encrypt_bundle(a, b"probe");
-    decrypt_bundle(b, &ct).map(|p| p == b"probe").unwrap_or(false)
+    decrypt_bundle(b, &ct)
+        .map(|p| p == b"probe")
+        .unwrap_or(false)
 }

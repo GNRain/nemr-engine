@@ -53,9 +53,7 @@ fn hash_auth_key(auth_key: &[u8], cost: KdfCost) -> ApiResult<String> {
 
 fn verify_auth_key(auth_key: &[u8], verifier: &str) -> bool {
     match PasswordHash::new(verifier) {
-        Ok(parsed) => Argon2::default()
-            .verify_password(auth_key, &parsed)
-            .is_ok(),
+        Ok(parsed) => Argon2::default().verify_password(auth_key, &parsed).is_ok(),
         Err(_) => false,
     }
 }
@@ -218,7 +216,7 @@ pub struct KdfParamsResponse {
 /// Return the KDF salt and parameters for an email so a fresh machine can derive
 /// its auth key before it can log in.
 ///
-/// Enumeration resistance is a documented gap for this pass (F-J1): an unknown
+/// Enumeration resistance is a documented gap for this pass (F-89): an unknown
 /// email currently 404s, which distinguishes it from a known one. The hardening
 /// is a deterministic pseudo-salt from a server pepper, tracked separately.
 pub async fn kdf_params(
@@ -226,11 +224,12 @@ pub async fn kdf_params(
     Json(req): Json<KdfParamsRequest>,
 ) -> ApiResult<Json<KdfParamsResponse>> {
     let email = normalize_email(&req.email)?;
-    let row: Option<(Vec<u8>, i32, i32, i32)> =
-        sqlx::query_as("SELECT kdf_salt, kdf_m_cost, kdf_t_cost, kdf_p_cost FROM users WHERE email = $1")
-            .bind(&email)
-            .fetch_optional(&state.pool)
-            .await?;
+    let row: Option<(Vec<u8>, i32, i32, i32)> = sqlx::query_as(
+        "SELECT kdf_salt, kdf_m_cost, kdf_t_cost, kdf_p_cost FROM users WHERE email = $1",
+    )
+    .bind(&email)
+    .fetch_optional(&state.pool)
+    .await?;
     let (salt, m, t, p) = row.ok_or_else(|| ApiError::NotFound("no such account".into()))?;
     Ok(Json(KdfParamsResponse {
         kdf_salt: b64_encode(&salt),

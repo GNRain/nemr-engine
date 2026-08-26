@@ -8,20 +8,20 @@
 
 use std::sync::Arc;
 
-use nemr_sync::{connect_and_migrate, router, AppState, Config, DynStore};
 use nemr_storage::local::LocalStore;
+use nemr_sync::{connect_and_migrate, router, AppState, Config, DynStore};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "nemr_server=info".into()),
+                .unwrap_or_else(|_| "nemr_sync=info".into()),
         )
         .init();
 
-    let database_url = std::env::var("DATABASE_URL")
-        .map_err(|_| anyhow::anyhow!("DATABASE_URL is required"))?;
+    let database_url =
+        std::env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL is required"))?;
     let addr = std::env::var("NEMR_SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let bundle_dir = std::env::var("NEMR_BUNDLE_DIR")
         .map_err(|_| anyhow::anyhow!("NEMR_BUNDLE_DIR is required for the local backend"))?;
