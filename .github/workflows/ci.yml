@@ -186,6 +186,24 @@ jobs:
     # Provisioning rootless containerd on a runner is the long pole; keep it off
     # the critical path for a lint typo but never let it be silently skipped.
     needs: [docker-free, lint, unit-tests]
+    services:
+      # For the WP-K sync acceptance: the product flow (create -> push ->
+      # delete -> pull -> continue) runs here, engine and server together —
+      # "two things that don't know about each other" is the state this job
+      # exists to prevent regressing to.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nemr
+          POSTGRES_PASSWORD: nemr
+          POSTGRES_DB: nemr
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nemr"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v5
       - name: Install Rust
@@ -241,3 +259,13 @@ jobs:
         run: |
           export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
           NEMR_SKIP_API=1 ./scripts/e2e_smoke_test.sh
+      - name: Sync acceptance — the product flow (WP-K)
+        # Engine + server, together: register, create, work, push, DELETE THE
+        # PROJECT, pull, continue. NEMR_SKIP_API asserts transcript
+        # byte-fidelity (no credential on a runner); the full continuity claim
+        # is the developer run, and the script's footer states which ran.
+        env:
+          DATABASE_URL: postgres://nemr:nemr@localhost:5432/nemr
+        run: |
+          export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
+          NEMR_SKIP_API=1 ./scripts/sync_acceptance.sh
