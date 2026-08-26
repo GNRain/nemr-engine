@@ -2791,3 +2791,67 @@ fn e09_daemon_refuses_a_protocol_version_mismatch() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// WP-K: `nemr <unknown>` execs `nemr-<unknown>` from PATH — the cargo/git
+/// external-subcommand pattern the sync client installs under. The open CLI
+/// carries no extension names (the E-11 seam grep proves no commercial name
+/// appears in this tree); this test proves the generic mechanism: argv
+/// passthrough, exit-code passthrough, and stdout untouched.
+#[test]
+fn wpk_an_external_subcommand_is_execed_with_args_and_exit_code() {
+    let dir = std::env::temp_dir().join(format!("nemr-ext-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stub = dir.join("nemr-frobnicate");
+    std::fs::write(&stub, "#!/bin/sh\necho \"FROBNICATED args=$*\"\nexit 7\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_nemr"))
+        .args(["frobnicate", "--alpha", "beta"])
+        .env("PATH", path)
+        .output()
+        .expect("running nemr");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "the extension's exit code must pass through unchanged"
+    );
+    assert!(
+        stdout.contains("FROBNICATED args=--alpha beta"),
+        "args must pass through in order: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The not-found half: an unknown subcommand with no matching extension fails
+/// with a message that names both the subcommand and the `nemr-<name>` form —
+/// so the mechanism is discoverable from its own error — and does not touch the
+/// daemon (no autostart wait: this must fail fast).
+#[test]
+fn wpk_an_unknown_subcommand_without_an_extension_fails_helpfully() {
+    let started = std::time::Instant::now();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_nemr"))
+        .arg("definitely-not-a-subcommand")
+        .env("PATH", "/nonexistent") // control: nothing can be found
+        .output()
+        .expect("running nemr");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("definitely-not-a-subcommand")
+            && stderr.contains("nemr-definitely-not-a-subcommand"),
+        "the error must teach the extension form: {stderr}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "not-found must fail fast, never wait on a daemon"
+    );
+}

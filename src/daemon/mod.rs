@@ -177,6 +177,7 @@ impl Nemr for NemrService {
                     usage_known: p.usage.is_some(),
                     used_bytes: p.usage.as_ref().map(|u| u.used).unwrap_or(0),
                     used_percent: p.usage.as_ref().map(|u| u.percent()).unwrap_or(0.0),
+                    agent: p.agent,
                 })
                 .collect(),
             untracked_volumes: untracked,
