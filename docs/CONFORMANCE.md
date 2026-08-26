@@ -226,6 +226,7 @@ raised since. IDs are stable; disposition tracked here.
 | F-25 | med | NFR-01 | `BASE_IMAGE` in a squattable Docker Hub namespace | pin by digest (WP-B reproducible build) |
 | F-46 | low | PROC-02 | `std::process::exit` in attach/delete skips destructors | WP-B error-model unification |
 | F-49 | low | NFR-01 | `~/.docker` created by buildctl's vendored telemetry (not Docker) — audit tripwire | document |
+| F-89 | low | WP-J | The pre-login KDF-params endpoint (`/v1/auth/params`) 404s an unknown email, distinguishing it from a known one — user enumeration. | Return a deterministic pseudo-salt derived from a server pepper for unknown emails, so responses are indistinguishable; WP-J follow-up |
 
 **Refuted / no-change** (12 findings): kept in the audit record; not reproduced
 against the code (e.g. names are validated in two places, killing several

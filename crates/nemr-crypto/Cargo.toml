@@ -1,0 +1,35 @@
+# E-16: the client-side encryption envelope. COMMERCIAL side of E-11 (the sync
+# layer). `nemr-engine` must NOT depend on this — see scripts/check_seam.sh. The
+# server never depends on it either: the server stores the envelopes this crate
+# produces as opaque blobs and cannot open them. It lives here so the future
+# daemon client and the acceptance tests share one implementation.
+[package]
+name = "nemr-crypto"
+version = "0.1.0"
+edition = "2021"
+description = "Nemr client-side key derivation and bundle encryption (E-16)"
+# Not published; licensing is a Product Owner decision tied to E-11. deny.toml
+# `private` skips the licence check for unpublished workspace members.
+publish = false
+
+[dependencies]
+# Password stretching. Argon2id specifically — the OWASP-recommended memory-hard
+# KDF; the brute-force barrier against a stolen server database lives here.
+argon2 = "0.5"
+# Domain separation: one Argon2id root is expanded into purpose-bound subkeys
+# with distinct `info` strings, so no subkey can derive another.
+hkdf = "0.12"
+sha2 = "0.10"
+# AEAD for wrapping the master key and encrypting bundles. XChaCha20-Poly1305:
+# a 192-bit nonce is safe to generate randomly with no counter to manage.
+chacha20poly1305 = "0.10"
+# CSPRNG for the master key, salts, nonces and the recovery code.
+rand = "0.8"
+# Constant-time comparison for verifiers and the recovery acknowledgement.
+subtle = "2"
+# Secrets are wiped from memory on drop.
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+hex = "0.4"
