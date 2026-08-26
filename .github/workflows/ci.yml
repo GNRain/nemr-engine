@@ -165,6 +165,15 @@ jobs:
         # -p nemr-sync builds only the commercial crate and its deps (no
         # containerd-client, so no protoc needed here). Runs lib + integration.
         run: cargo test -p nemr-sync
+      - name: nemr-cloud tests against the in-process server (WP-K)
+        env:
+          DATABASE_URL: postgres://nemr:nemr@localhost:5432/nemr
+          NEMR_DB_MAX_CONN: "5"
+        # The client binary driven as real processes — including the detached
+        # lease-heartbeat holder and the stale-machine lockout proof. The
+        # engine is a stub here; the real-engine flow is
+        # scripts/sync_acceptance.sh in the host job.
+        run: cargo test -p nemr-cloud
 
   # ---------------------------------------------------------------------------
   # Host-backed: needs rootless containerd, the privileged helper, and the base
