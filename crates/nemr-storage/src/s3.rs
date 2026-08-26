@@ -314,10 +314,15 @@ mod tests {
     /// does — so a pass cannot come from `Debug` printing nothing useful.
     #[test]
     fn debug_redacts_the_credential_but_keeps_diagnostics() {
+        // Illustrative placeholders — not a live bucket. Any concrete-looking
+        // R2 values here were removed when the project's R2 bucket was deleted
+        // and its token revoked, so no future reader mistakes a fixture for a
+        // real target. The property under test (Debug redaction) is
+        // provider-agnostic.
         let config = S3Config {
             provider: Provider::R2,
-            bucket: "nemr-bundles".into(),
-            endpoint: "https://acct.r2.cloudflarestorage.com".into(),
+            bucket: "example-bucket".into(),
+            endpoint: "https://s3.example.com".into(),
             region: "auto".into(),
             access_key_id: "AKIA-SHOULD-NOT-APPEAR".into(),
             secret_access_key: "SECRET-SHOULD-NOT-APPEAR".into(),
@@ -335,13 +340,10 @@ mod tests {
         // Control: the fields that SHOULD appear do, so this is not passing
         // merely because Debug prints nothing.
         assert!(
-            rendered.contains("nemr-bundles"),
+            rendered.contains("example-bucket"),
             "bucket should appear: {rendered}"
         );
-        assert!(
-            rendered.contains("r2.cloudflarestorage.com"),
-            "endpoint should appear"
-        );
+        assert!(rendered.contains("example.com"), "endpoint should appear");
     }
 
     /// An unconfigured environment is not an error: it is the normal state for
