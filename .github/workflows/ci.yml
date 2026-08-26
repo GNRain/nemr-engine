@@ -130,6 +130,43 @@ jobs:
           cargo deny --manifest-path deploy/nemr-volume/Cargo.toml --config deny.toml check
 
   # ---------------------------------------------------------------------------
+  # Commercial sync server (WP-J): identity, index, storage, lease. Needs a real
+  # Postgres — D-03 mandates it from day one, because the lease's concurrency
+  # semantics (atomic takeover, TTL expiry, two clients racing) are exactly what
+  # SQLite cannot give and what these tests exercise. A service container is that
+  # Postgres; the tests are not `#[ignore]`d and fail loudly without it.
+  # ---------------------------------------------------------------------------
+  sync-tests:
+    name: sync server tests (Postgres)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nemr
+          POSTGRES_PASSWORD: nemr
+          POSTGRES_DB: nemr
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nemr"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: nemr-sync tests against Postgres
+        env:
+          DATABASE_URL: postgres://nemr:nemr@localhost:5432/nemr
+          # Keep the many per-test pools well under Postgres's default 100.
+          NEMR_DB_MAX_CONN: "5"
+        # -p nemr-sync builds only the commercial crate and its deps (no
+        # containerd-client, so no protoc needed here). Runs lib + integration.
+        run: cargo test -p nemr-sync
+
+  # ---------------------------------------------------------------------------
   # Host-backed: needs rootless containerd, the privileged helper, and the base
   # image. Runs on a clean Ubuntu runner, provisioned by the same scripts a
   # developer uses — which is what makes AC-7.1 ("clean host") a tested claim.
