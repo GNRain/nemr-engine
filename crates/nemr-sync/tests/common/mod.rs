@@ -67,6 +67,8 @@ pub async fn spawn() -> TestApp {
         max_login_failures: 3,
         login_window: Duration::minutes(15),
         bundle_prefix: "test-bundles".into(),
+        // Fixed pepper so the F-89 pseudo-salt is deterministic within a test.
+        auth_pepper: [7u8; 32],
     };
 
     let state = AppState {

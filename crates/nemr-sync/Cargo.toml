@@ -52,6 +52,10 @@ password-hash = { version = "0.5", features = ["std"] }
 
 rand = "0.8"
 sha2 = "0.10"
+# HMAC-SHA256 for the F-89 pseudo-salt: an unknown email gets a deterministic,
+# pepper-keyed salt so the KDF-params endpoint cannot be used to enumerate
+# accounts.
+hmac = "0.12"
 subtle = "2"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4", "serde"] }

@@ -189,6 +189,25 @@ In practice:
 - A cleanup command's false all-clear is worse than a noisy one: it ends the
   investigation.
 
+## The pre-push rule (a check CI runs is a hook, not a memory)
+
+Twice in WP-J the same lapse shipped: code that was `cargo clippy`-checked but
+not `cargo fmt`-checked, pushed, and rejected by CI's lint job only after a
+round-trip. Naming it twice and resolving to "remember fmt next time" is exactly
+the wrong fix — a discipline that lives in memory fails the moment attention is
+elsewhere, which is when it matters.
+
+The fix is structural: `scripts/git-hooks/pre-push` runs `cargo fmt --all --
+--check` (both workspaces) and blocks the push if the tree is not clean;
+`scripts/setup_host.sh` installs it via `git config core.hooksPath
+scripts/git-hooks`. `cargo fmt --check` only parses, so it is cheap enough to run
+on every push.
+
+General rule: **any fast check CI performs should run locally before the push,
+enforced by a hook rather than a habit.** fmt is the first; clippy is too slow
+for a pre-push gate, but if a second cheap check earns a CI job, add it to the
+hook in the same breath.
+
 ## Fix autonomously
 
 - A newly `#[ignore]`d or skipped test — de-skip it and make it run.

@@ -216,9 +216,13 @@ pub struct KdfParamsResponse {
 /// Return the KDF salt and parameters for an email so a fresh machine can derive
 /// its auth key before it can log in.
 ///
-/// Enumeration resistance is a documented gap for this pass (F-89): an unknown
-/// email currently 404s, which distinguishes it from a known one. The hardening
-/// is a deterministic pseudo-salt from a server pepper, tracked separately.
+/// F-89: an unknown email must not be distinguishable from a registered one, or
+/// this unauthenticated endpoint is an account-enumeration oracle. So an unknown
+/// email gets a **deterministic pseudo-salt** — `HMAC(pepper, email)` — and the
+/// default parameters, with the same 200 response shape as a real account. The
+/// pepper is secret, so an observer cannot recompute the pseudo-salt to tell it
+/// apart from a stored salt; and it is deterministic, so probing the same email
+/// twice returns the same salt, exactly as a real account would.
 pub async fn kdf_params(
     State(state): State<AppState>,
     Json(req): Json<KdfParamsRequest>,
@@ -230,13 +234,34 @@ pub async fn kdf_params(
     .bind(&email)
     .fetch_optional(&state.pool)
     .await?;
-    let (salt, m, t, p) = row.ok_or_else(|| ApiError::NotFound("no such account".into()))?;
+    let (salt, m, t, p) = match row {
+        Some(r) => r,
+        None => {
+            let d = &state.config.server_kdf;
+            (
+                pseudo_salt(&state.config.auth_pepper, &email),
+                d.m_cost as i32,
+                d.t_cost as i32,
+                d.p_cost as i32,
+            )
+        }
+    };
     Ok(Json(KdfParamsResponse {
         kdf_salt: b64_encode(&salt),
         kdf_m_cost: m as u32,
         kdf_t_cost: t as u32,
         kdf_p_cost: p as u32,
     }))
+}
+
+/// A deterministic 16-byte pseudo-salt for an unknown email (F-89). Keyed by the
+/// server pepper so it is unpredictable to an observer.
+fn pseudo_salt(pepper: &[u8; 32], email: &str) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    let mut mac =
+        <Hmac<sha2::Sha256>>::new_from_slice(pepper).expect("HMAC accepts any key length");
+    mac.update(email.as_bytes());
+    mac.finalize().into_bytes()[..16].to_vec()
 }
 
 // --- Login ----------------------------------------------------------------
@@ -289,6 +314,11 @@ pub async fn login(
     .await?;
 
     let Some(u) = row else {
+        // F-89: spend one Argon2id here too, so a nonexistent email is not
+        // distinguishable from a wrong password by response time. Without this,
+        // the miss returns fast and the wrong-password path pays the KDF cost —
+        // a timing oracle for whether an account exists. The result is discarded.
+        let _ = hash_auth_key(&auth_key, state.config.server_kdf);
         record_attempt(&state.pool, &email, false).await;
         return Err(ApiError::Unauthorized);
     };

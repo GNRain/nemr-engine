@@ -28,10 +28,27 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = connect_and_migrate(&database_url).await?;
     let store: Arc<dyn DynStore> = Arc::new(LocalStore::new(bundle_dir));
+
+    // F-89 pepper. Default is random per process (enumeration-resistant within a
+    // run); NEMR_AUTH_PEPPER makes the pseudo-salts stable across restarts. Any
+    // string works — it is hashed to 32 bytes — so an operator need not produce
+    // exact key material.
+    let mut config = Config::default();
+    match std::env::var("NEMR_AUTH_PEPPER") {
+        Ok(p) if !p.is_empty() => {
+            use sha2::{Digest, Sha256};
+            config.auth_pepper = Sha256::digest(p.as_bytes()).into();
+        }
+        _ => tracing::warn!(
+            "NEMR_AUTH_PEPPER not set — using a random pepper; account-enumeration \
+             resistance at /v1/auth/params is not stable across restarts"
+        ),
+    }
+
     let state = AppState {
         pool,
         store,
-        config: Config::default(),
+        config,
     };
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

@@ -45,6 +45,13 @@ pub struct Config {
     pub login_window: Duration,
     /// Key prefix under which bundles are stored in the object store.
     pub bundle_prefix: String,
+    /// Secret used to derive a deterministic pseudo-salt for an unknown email at
+    /// the KDF-params endpoint, so it cannot be used to enumerate accounts
+    /// (F-89). It must be secret: if an observer knew it, they could recompute
+    /// the pseudo-salt and tell it apart from a real account's stored salt. The
+    /// default is random per process; set `NEMR_AUTH_PEPPER` for a value stable
+    /// across restarts.
+    pub auth_pepper: [u8; 32],
 }
 
 /// Argon2id cost, mirrored from `nemr_crypto::KdfParams` but named here so the
@@ -70,8 +77,19 @@ impl Default for Config {
             max_login_failures: 5,
             login_window: Duration::minutes(15),
             bundle_prefix: "bundles".to_string(),
+            auth_pepper: random_pepper(),
         }
     }
+}
+
+/// A random 32-byte pepper from the OS CSPRNG. Used as the default so a server
+/// started with no `NEMR_AUTH_PEPPER` is still enumeration-resistant within a
+/// process; `main` prefers the env value for stability across restarts.
+pub fn random_pepper() -> [u8; 32] {
+    use rand::RngCore;
+    let mut p = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut p);
+    p
 }
 
 /// Everything a handler needs. Cheap to clone (a pool handle, an `Arc`, and

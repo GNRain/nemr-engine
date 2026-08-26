@@ -417,6 +417,43 @@ ctr plugins ls | grep snapshotter
 On the reference host both `overlayfs` and `native` report `ok`, so no
 `fuse-overlayfs` fallback is required.
 
+## Step 5 — Sync-server integration tests (WP-J)
+
+The `nemr-sync` crate (the commercial sync server) is tested against a **real
+Postgres**, not SQLite — D-03 requires real concurrency semantics for the lease.
+The tests are not `#[ignore]`d and do not skip: without a database they fail
+loudly. `scripts/setup_host.sh` provisions this automatically (step 9c); to do
+it by hand, or on a machine that only runs these tests:
+
+```bash
+./scripts/setup_sync_test_db.sh
+```
+
+**Why a container, not a host install.** It pins the exact image CI runs
+(`postgres:16`), so a local pass and a CI pass are the same claim; it leaves no
+system service behind; and it matches the rootless posture. Podman's rootless
+dependencies (`slirp4netns`, `uidmap`) are already installed for rootless
+containerd (Step 1), so the only new package is `podman` itself, which the
+script installs on first run.
+
+**What you do not have to do.** The role and database are created by the image
+from its environment (no `createuser`/`createdb`), and the schema is created by
+the test harness itself — `connect_and_migrate` runs the embedded migrations on
+connect, so there is no manual `sqlx migrate` step.
+
+Then run the suite (the script prints these two lines when it finishes):
+
+```bash
+export DATABASE_URL=postgres://nemr:nemr@127.0.0.1:5433/nemr
+cargo test -p nemr-sync
+```
+
+Stop and remove the container with `./scripts/setup_sync_test_db.sh --stop`. In
+CI the same coverage comes from a `postgres:16` **service container** (the
+`sync-tests` job), so this local database mirrors CI rather than substituting a
+different backend. Port `5433` is used so it never collides with a system
+Postgres on `5432`.
+
 ## Explicitly NOT prerequisites
 
 Docker Engine and Docker Desktop are prohibited by NFR-01. If any step here, or
