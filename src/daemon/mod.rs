@@ -18,18 +18,21 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 pub mod attach;
+pub mod audit;
 pub mod client;
 pub mod socket;
 
 /// The service implementation. One containerd connection, shared.
 pub struct NemrService {
     client: Arc<ContainerdClient>,
+    audit: audit::AuditRegistry,
 }
 
 impl NemrService {
-    pub fn new(client: ContainerdClient) -> Self {
+    pub fn new(client: ContainerdClient, audit: audit::AuditRegistry) -> Self {
         Self {
             client: Arc::new(client),
+            audit,
         }
     }
 }
@@ -316,6 +319,71 @@ impl Nemr for NemrService {
             bundle_bytes: summary.bundle_bytes,
             unrecognised_fields: summary.unrecognised_fields,
         }))
+    }
+
+    type WatchAuditStream =
+        tokio_stream::wrappers::UnboundedReceiverStream<Result<AuditEvent, Status>>;
+
+    async fn watch_audit(
+        &self,
+        request: Request<WatchAuditRequest>,
+    ) -> Result<Response<Self::WatchAuditStream>, Status> {
+        let request_id = request.into_inner().request_id;
+        if request_id.is_empty() {
+            return Err(Status::invalid_argument("watch_audit: empty request_id"));
+        }
+
+        // Register a raw (non-Result) sender for the tracing Layer to route to,
+        // and a task that forwards those events into the response stream and
+        // sends the Ready sentinel first. The registration is dropped when the
+        // client disconnects (the forwarding task ends), so the map does not
+        // grow without bound.
+        let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel::<AuditEvent>();
+        {
+            let mut reg = self
+                .audit
+                .lock()
+                .map_err(|_| Status::internal("audit registry poisoned"))?;
+            reg.insert(request_id.clone(), raw_tx);
+        }
+
+        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<Result<AuditEvent, Status>>();
+        // Ready first: the client waits for this before running its command, so
+        // it cannot race the events that command produces.
+        let _ = out_tx.send(Ok(AuditEvent {
+            ready: true,
+            message: String::new(),
+            privileged: false,
+        }));
+
+        let registry = self.audit.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // The client dropped its stream (command finished). Without
+                    // this, the task would block in `recv().await` forever
+                    // holding the registry entry — a leak on EVERY command,
+                    // since `recv` only returns None once the entry (which holds
+                    // the sender) is removed, and it is removed only here.
+                    _ = out_tx.closed() => break,
+                    ev = raw_rx.recv() => match ev {
+                        Some(ev) => {
+                            if out_tx.send(Ok(ev)).is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    },
+                }
+            }
+            if let Ok(mut reg) = registry.lock() {
+                reg.remove(&request_id);
+            }
+        });
+
+        Ok(Response::new(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx),
+        ))
     }
 
     type AttachStream = attach::AttachStream;

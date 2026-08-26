@@ -2146,19 +2146,29 @@ fn the_elevation_note_is_visible_without_a_flag() {
         String::from_utf8_lossy(&output.stdout)
     );
 
-    // The audit trail must be in the daemon log — the privileged helper ran.
+    // The elevation note must be INLINE in the CLI output (NFR-04): the daemon
+    // streams the engine's audit events back over WatchAudit, restoring across
+    // the daemon boundary the inline note the pre-daemon CLI printed — a user
+    // can tell a command elevated without going to the log.
+    assert!(
+        stderr.contains("elevated:"),
+        "the CLI output must show inline that the privileged helper ran (NFR-04): {stderr:?}"
+    );
+    assert!(
+        stderr.contains("mount"),
+        "the elevation note must name the privileged operation: {stderr:?}"
+    );
+    // The full command line stays out of the DEFAULT output (only --verbose).
+    assert!(
+        !stderr.contains("sudo -n"),
+        "the default output must not carry the full privileged command line: {stderr:?}"
+    );
+    // The durable trail is ALSO kept in the daemon log.
     let log =
         std::fs::read_to_string(test_state.join("nemr").join("nemrd.log")).unwrap_or_default();
     assert!(
         log.contains("elevated:"),
-        "the daemon audit log must record that the privileged helper ran (NFR-04): {log:?}"
-    );
-    // CONTROL: and it must name the operation, not just the fact — a bare
-    // "elevated" with nothing more would be a weaker trail than before.
-    assert!(
-        log.contains("mount"),
-        "the audit trail must name the privileged operation (mount), not just that one ran: \
-         {log:?}"
+        "the daemon log must also keep the audit trail (NFR-04): {log:?}"
     );
 
     // Stop the dedicated test daemon and clean up.
@@ -2527,16 +2537,18 @@ fn f83_project_volumes_are_mounted_nosuid_and_nodev() {
 /// assertions would catch as a missing exit within the deadline.
 #[test]
 fn create_is_non_interactive_and_never_hangs_without_a_tty() {
-    // No host needed: resolution happens before containerd is contacted, and we
-    // point at a nonexistent socket so nothing is actually created.
+    // The never-hang property lives in the CLI's resolve layer (decide), which
+    // runs BEFORE any daemon contact: cases 1/3/4 fail fast there. Case 2 (name
+    // given) proceeds to the daemon. CONTAINERD_ADDRESS is deliberately NOT
+    // overridden here — the CLI no longer reads it (the daemon does), so
+    // overriding it only poisons case 2's daemon into a slow failure while
+    // proving nothing about the CLI.
     let nemr = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nemr"));
 
-    // Run with stdin taken from /dev/null (not a tty) and a hard 15s deadline.
     let run = |args: &[&str], extra_env: &[(&str, &str)]| -> (Option<i32>, String) {
         use std::process::{Command, Stdio};
         let mut cmd = Command::new(&nemr);
         cmd.args(args)
-            .env("CONTAINERD_ADDRESS", "/nonexistent-socket-for-this-test")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -2544,7 +2556,11 @@ fn create_is_non_interactive_and_never_hangs_without_a_tty() {
             cmd.env(k, v);
         }
         let mut child = cmd.spawn().expect("spawn nemr");
-        // Poll for up to 15s; a hang is the failure this test exists to catch.
+        // Poll for up to 30s; a hang is the failure this test exists to catch.
+        // The deadline exceeds the client's daemon-autostart wait (15s), so a
+        // case that legitimately fails via a failed autostart (e.g. no host in
+        // CI's no-host step) is not mistaken for a hang — only a real input hang,
+        // which never returns, would trip it.
         let start = std::time::Instant::now();
         loop {
             if let Some(status) = child.try_wait().expect("wait") {
@@ -2553,9 +2569,9 @@ fn create_is_non_interactive_and_never_hangs_without_a_tty() {
                 text.push_str(&String::from_utf8_lossy(&out.stderr));
                 return (status.code(), text);
             }
-            if start.elapsed() > std::time::Duration::from_secs(15) {
+            if start.elapsed() > std::time::Duration::from_secs(30) {
                 let _ = child.kill();
-                panic!("`nemr {args:?}` did not exit within 15s — it hung waiting for input");
+                panic!("`nemr {args:?}` did not exit within 30s — it hung waiting for input");
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }

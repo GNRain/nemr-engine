@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use nemr_engine::containerd::client::ContainerdClient;
+use nemr_engine::daemon::audit;
 use nemr_engine::daemon::socket::socket_path;
 use nemr_engine::daemon::NemrService;
 use nemr_engine::proto::nemr_server::NemrServer;
@@ -11,7 +12,11 @@ use tokio_stream::wrappers::UnixListenerStream;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    nemr_engine::observability::init(std::env::var_os("NEMR_VERBOSE").is_some());
+    let audit_registry = audit::new_registry();
+    nemr_engine::observability::init_daemon(
+        std::env::var_os("NEMR_VERBOSE").is_some(),
+        audit_registry.clone(),
+    );
 
     let path = socket_path()?;
     if let Some(parent) = path.parent() {
@@ -46,7 +51,7 @@ async fn main() -> Result<()> {
         nemr_engine::proto::PROTOCOL_VERSION
     );
 
-    let service = NemrService::new(client);
+    let service = NemrService::new(client, audit_registry);
     let incoming = UnixListenerStream::new(listener);
 
     // Shut down cleanly on SIGTERM/SIGINT so the socket file is removed and a
@@ -64,6 +69,9 @@ async fn main() -> Result<()> {
     };
 
     tonic::transport::Server::builder()
+        // Wrap every RPC in a request-id span so the audit Layer can attribute
+        // the engine events it produces to the right client (E-09).
+        .layer(audit::RequestSpanLayer)
         .add_service(NemrServer::new(service))
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await
