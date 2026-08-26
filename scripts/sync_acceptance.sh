@@ -95,6 +95,8 @@ step "Register (recovery code shown once, typed back, account activated)"
 # ---------------------------------------------------------------------------
 export NEMR_CLOUD_EMAIL="$EMAIL"
 coproc REG { nemr register 2>&1; }
+# bash unsets REG_PID the moment the coproc exits; hold it while it exists.
+REG_WAIT_PID=$REG_PID
 CODE=""
 while IFS= read -r line <&"${REG[0]}"; do
     echo "   | $line"
@@ -105,7 +107,7 @@ while IFS= read -r line <&"${REG[0]}"; do
     fi
     [[ "$line" == *"logged in as"* ]] && break
 done
-wait "$REG_PID" || fail "register exited non-zero"
+wait "$REG_WAIT_PID" || fail "register exited non-zero"
 [[ -n "$CODE" ]] || fail "no recovery code appeared"
 pass "registered, recovery confirmed by typing the code back, logged in"
 
