@@ -179,6 +179,63 @@ pub async fn takeover(
     }))
 }
 
+#[derive(Deserialize)]
+pub struct ReleaseRequest {
+    pub holder: String,
+    pub fence: i64,
+}
+
+/// Release the lease on a clean stop, so another machine can acquire immediately
+/// instead of waiting out the TTL (WP-K).
+///
+/// Release **expires** the row rather than deleting it. Deleting would reset the
+/// fence to 1 on the next acquire, and a zombie holder from a previous hold of
+/// the same (holder, fence) could then match the fresh lease; expiring keeps the
+/// fence monotonic for the session's whole life, so every stale credential stays
+/// stale forever. An expired row is exactly what [`acquire`] already treats as
+/// free.
+///
+/// Only the current (holder, fence) may release: a stale client releasing after
+/// a takeover would free the *winner's* lease, so a mismatched fence on a live
+/// row is a 409. A release matching an already-expired own row — a retried
+/// clean shutdown — is idempotent success.
+pub async fn release(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(name): Path<String>,
+    Json(req): Json<ReleaseRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let session_id = index::resolve(&state, user.id, &name).await?;
+
+    let expired = sqlx::query(
+        "UPDATE leases SET expires_at = to_timestamp(0)
+          WHERE session_id = $1 AND holder = $2 AND fence = $3",
+    )
+    .bind(session_id)
+    .bind(&req.holder)
+    .bind(req.fence)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+
+    if expired > 0 {
+        return Ok(Json(serde_json::json!({ "released": true })));
+    }
+
+    // Nothing matched. If a lease row still exists it belongs to someone else
+    // (or a newer fence) — refuse. If none exists, the release already happened.
+    let exists: Option<(i64,)> = sqlx::query_as("SELECT fence FROM leases WHERE session_id = $1")
+        .bind(session_id)
+        .fetch_optional(&state.pool)
+        .await?;
+    match exists {
+        Some(_) => Err(ApiError::Conflict(
+            "lease not held: it was taken over or renewed by another client".into(),
+        )),
+        None => Ok(Json(serde_json::json!({ "released": false }))),
+    }
+}
+
 /// Verify the caller currently holds the lease with the given fence. Used to gate
 /// writes: a stale fence (someone took over) or an expired lease is refused, so
 /// a losing client cannot write even if it ignores its own heartbeat failure.

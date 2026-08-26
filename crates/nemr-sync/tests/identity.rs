@@ -166,6 +166,54 @@ async fn repeated_failures_are_rate_limited() {
     assert_eq!(r.status(), 429, "the fourth attempt must be rate limited");
 }
 
+#[tokio::test]
+async fn logout_revokes_the_token_server_side() {
+    // "Log out" that merely deletes a local file leaves a live token on the
+    // server for its whole TTL. Logout must revoke it.
+    let app = spawn().await;
+    let e = Enrolled::new();
+    let (token, _mk) = app.enroll(&e).await;
+
+    // Control: the token works before logout.
+    let r = app
+        .http
+        .get(app.url("/v1/sessions"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "token must work before logout");
+
+    let r = app
+        .http
+        .post(app.url("/v1/logout"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "logout: {}", r.text().await.unwrap());
+
+    // The same token is now dead.
+    let r = app
+        .http
+        .get(app.url("/v1/sessions"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401, "a revoked token must not authenticate");
+
+    // Logout again with the dead token: idempotent, not an oracle.
+    let r = app
+        .http
+        .post(app.url("/v1/logout"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "logout is idempotent");
+}
+
 async fn params_for(app: &common::TestApp, email: &str) -> (u16, serde_json::Value) {
     let r = app
         .http

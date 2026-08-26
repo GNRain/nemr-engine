@@ -37,6 +37,33 @@ pub fn hash_token(secret: &str) -> Vec<u8> {
     h.finalize().to_vec()
 }
 
+/// Revoke the presented bearer token (logout).
+///
+/// A local-only logout would leave a live token on the server for its whole
+/// TTL. Deleting by the presented token's hash is idempotent — a token that is
+/// already gone (or was never valid) deletes zero rows and still returns 200,
+/// so the endpoint is not an oracle for token validity.
+pub async fn logout(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    parts: axum::http::HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let header = parts
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(ApiError::Unauthorized)?;
+    let secret = header
+        .strip_prefix("Bearer ")
+        .ok_or(ApiError::Unauthorized)?;
+    let hash = hash_token(secret);
+
+    sqlx::query("DELETE FROM auth_tokens WHERE token_hash = $1")
+        .bind(&hash)
+        .execute(&state.pool)
+        .await?;
+
+    Ok(axum::Json(serde_json::json!({ "logged_out": true })))
+}
+
 /// An authenticated, active user. Extracting it is the auth gate: any handler
 /// that takes it as an argument requires a valid, unexpired token for an active
 /// account.

@@ -69,6 +69,123 @@ async fn upload_status(
         .as_u16()
 }
 
+async fn release_status(
+    app: &common::TestApp,
+    token: &str,
+    name: &str,
+    holder: &str,
+    fence: i64,
+) -> u16 {
+    app.http
+        .post(app.url(&format!("/v1/sessions/{name}/lease/release")))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "holder": holder, "fence": fence }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+#[tokio::test]
+async fn release_frees_the_lease_without_waiting_for_the_ttl() {
+    // A clean stop releases the lease explicitly (WP-K), so another machine can
+    // acquire immediately rather than waiting out the TTL.
+    let app = spawn().await;
+    let e = Enrolled::new();
+    let (token, _mk) = app.enroll(&e).await;
+    create_session(&app, &token, "proj").await;
+
+    let a = acquire(&app, &token, "proj", "machine-A").await;
+    assert_eq!(a["granted"], true);
+    let fence_a = a["fence"].as_i64().unwrap();
+
+    // While held, B cannot acquire (control: release below is what frees it,
+    // not the lease never having been held).
+    let b = acquire(&app, &token, "proj", "machine-B").await;
+    assert_eq!(
+        b["granted"], false,
+        "held lease must block B before release"
+    );
+
+    assert_eq!(
+        release_status(&app, &token, "proj", "machine-A", fence_a).await,
+        200
+    );
+
+    // A retried release — the response was lost, the client sends it again
+    // before anyone else acquires — is idempotent success, not an error.
+    assert_eq!(
+        release_status(&app, &token, "proj", "machine-A", fence_a).await,
+        200,
+        "a retried clean release is idempotent"
+    );
+
+    // No TTL wait: B acquires immediately, outright, no takeover.
+    let b = acquire(&app, &token, "proj", "machine-B").await;
+    assert_eq!(b["granted"], true, "a released lease is free immediately");
+
+    // The fence stays monotonic ACROSS a release: if release reset it, a zombie
+    // holder from the earlier hold could match the fresh lease's credentials.
+    let fence_b = b["fence"].as_i64().unwrap();
+    assert!(
+        fence_b > fence_a,
+        "the fence must advance across release ({fence_b} vs {fence_a}), \
+         or a stale holder's credentials could come back to life"
+    );
+
+    // Once B holds the lease, A's old fence can no longer release anything.
+    assert_eq!(
+        release_status(&app, &token, "proj", "machine-A", fence_a).await,
+        409,
+        "A's stale release must not free B's live lease"
+    );
+    assert_eq!(
+        heartbeat_status(&app, &token, "proj", "machine-B", fence_b).await,
+        200,
+        "B's lease is undisturbed by A's refused release"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_fence_cannot_release_someone_elses_lease() {
+    let app = spawn().await;
+    let e = Enrolled::new();
+    let (token, _mk) = app.enroll(&e).await;
+    create_session(&app, &token, "proj").await;
+
+    let a = acquire(&app, &token, "proj", "machine-A").await;
+    let fence_a = a["fence"].as_i64().unwrap();
+
+    // B takes over; A's fence is now stale.
+    let t: Value = app
+        .http
+        .post(app.url("/v1/sessions/proj/lease/takeover"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "holder": "machine-B" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fence_b = t["fence"].as_i64().unwrap();
+
+    // A's release with the stale fence must be refused — releasing a lease you
+    // lost would let a stale client free the *winner's* lease.
+    assert_eq!(
+        release_status(&app, &token, "proj", "machine-A", fence_a).await,
+        409,
+        "a stale fence must not release the current holder's lease"
+    );
+
+    // B is undisturbed.
+    assert_eq!(
+        heartbeat_status(&app, &token, "proj", "machine-B", fence_b).await,
+        200
+    );
+}
+
 #[tokio::test]
 async fn takeover_locks_the_loser_out_of_writing() {
     let app = spawn().await;
