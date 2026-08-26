@@ -433,7 +433,7 @@ types, so crate-first keeps the cheaper reversal open. **Licensing is upstream
 of packaging and remains unchosen** (no `LICENSE` file; `publish = false` on
 every crate). If the server source must later be closed, extraction is cheap
 *because* it is already a clean crate. Commercial crates so far:
-`crates/nemr-storage` (M12), `crates/nemr-crypto` (E-16), and `crates/nemr-server`.
+`crates/nemr-storage` (M12), `crates/nemr-crypto` (E-16), and `crates/nemr-sync`.
 
 ---
 
