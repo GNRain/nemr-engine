@@ -433,7 +433,20 @@ types, so crate-first keeps the cheaper reversal open. **Licensing is upstream
 of packaging and remains unchosen** (no `LICENSE` file; `publish = false` on
 every crate). If the server source must later be closed, extraction is cheap
 *because* it is already a clean crate. Commercial crates so far:
-`crates/nemr-storage` (M12), `crates/nemr-crypto` (E-16), and `crates/nemr-sync`.
+`crates/nemr-storage` (M12), `crates/nemr-crypto` (E-16), `crates/nemr-sync`,
+and `crates/nemr-cloud` (WP-K).
+
+**How commercial commands reach the open CLI without breaching the seam
+(2026-08-26, WP-K).** The open `nemr` gains one generic mechanism — cargo/git
+external subcommands: `nemr <unknown> …` execs `nemr-<unknown> …` from PATH.
+The commercial client is one binary installed under several names
+(`nemr-login`, `nemr-push`, …) with argv[0] dispatch. So `nemr login` works end
+to end, while the open CLI carries no extension names and no dependency on any
+extension — the seam grep continues to prove no commercial name appears in the
+open tree, and `nemr export`/`import` keep working with no network, no account,
+and no extension installed. The alternative — subcommands compiled into the
+open CLI behind a feature flag — would have put commercial names and wiring
+into the open tree, exactly the erosion E-11 exists to prevent.
 
 ---
 

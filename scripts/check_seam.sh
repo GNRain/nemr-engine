@@ -25,7 +25,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 # The commercial crates. Add a crate here the moment it is created, or the seam
 # check silently stops covering it.
-COMMERCIAL=(nemr-storage nemr-crypto nemr-sync)
+COMMERCIAL=(nemr-storage nemr-crypto nemr-sync nemr-cloud)
 
 VIOLATIONS=0
 report() { printf '\033[31mVIOLATION\033[0m %s\n' "$*"; VIOLATIONS=$((VIOLATIONS + 1)); }
