@@ -69,6 +69,123 @@ async fn upload_status(
         .as_u16()
 }
 
+async fn release_status(
+    app: &common::TestApp,
+    token: &str,
+    name: &str,
+    holder: &str,
+    fence: i64,
+) -> u16 {
+    app.http
+        .post(app.url(&format!("/v1/sessions/{name}/lease/release")))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "holder": holder, "fence": fence }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+#[tokio::test]
+async fn release_frees_the_lease_without_waiting_for_the_ttl() {
+    // A clean stop releases the lease explicitly (WP-K), so another machine can
+    // acquire immediately rather than waiting out the TTL.
+    let app = spawn().await;
+    let e = Enrolled::new();
+    let (token, _mk) = app.enroll(&e).await;
+    create_session(&app, &token, "proj").await;
+
+    let a = acquire(&app, &token, "proj", "machine-A").await;
+    assert_eq!(a["granted"], true);
+    let fence_a = a["fence"].as_i64().unwrap();
+
+    // While held, B cannot acquire (control: release below is what frees it,
+    // not the lease never having been held).
+    let b = acquire(&app, &token, "proj", "machine-B").await;
+    assert_eq!(
+        b["granted"], false,
+        "held lease must block B before release"
+    );
+
+    assert_eq!(
+        release_status(&app, &token, "proj", "machine-A", fence_a).await,
+        200
+    );
+
+    // A retried release — the response was lost, the client sends it again
+    // before anyone else acquires — is idempotent success, not an error.
+    assert_eq!(
+        release_status(&app, &token, "proj", "machine-A", fence_a).await,
+        200,
+        "a retried clean release is idempotent"
+    );
+
+    // No TTL wait: B acquires immediately, outright, no takeover.
+    let b = acquire(&app, &token, "proj", "machine-B").await;
+    assert_eq!(b["granted"], true, "a released lease is free immediately");
+
+    // The fence stays monotonic ACROSS a release: if release reset it, a zombie
+    // holder from the earlier hold could match the fresh lease's credentials.
+    let fence_b = b["fence"].as_i64().unwrap();
+    assert!(
+        fence_b > fence_a,
+        "the fence must advance across release ({fence_b} vs {fence_a}), \
+         or a stale holder's credentials could come back to life"
+    );
+
+    // Once B holds the lease, A's old fence can no longer release anything.
+    assert_eq!(
+        release_status(&app, &token, "proj", "machine-A", fence_a).await,
+        409,
+        "A's stale release must not free B's live lease"
+    );
+    assert_eq!(
+        heartbeat_status(&app, &token, "proj", "machine-B", fence_b).await,
+        200,
+        "B's lease is undisturbed by A's refused release"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_fence_cannot_release_someone_elses_lease() {
+    let app = spawn().await;
+    let e = Enrolled::new();
+    let (token, _mk) = app.enroll(&e).await;
+    create_session(&app, &token, "proj").await;
+
+    let a = acquire(&app, &token, "proj", "machine-A").await;
+    let fence_a = a["fence"].as_i64().unwrap();
+
+    // B takes over; A's fence is now stale.
+    let t: Value = app
+        .http
+        .post(app.url("/v1/sessions/proj/lease/takeover"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "holder": "machine-B" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let fence_b = t["fence"].as_i64().unwrap();
+
+    // A's release with the stale fence must be refused — releasing a lease you
+    // lost would let a stale client free the *winner's* lease.
+    assert_eq!(
+        release_status(&app, &token, "proj", "machine-A", fence_a).await,
+        409,
+        "a stale fence must not release the current holder's lease"
+    );
+
+    // B is undisturbed.
+    assert_eq!(
+        heartbeat_status(&app, &token, "proj", "machine-B", fence_b).await,
+        200
+    );
+}
+
 #[tokio::test]
 async fn takeover_locks_the_loser_out_of_writing() {
     let app = spawn().await;
@@ -165,5 +282,77 @@ async fn an_expired_lease_is_reacquired_and_the_stale_holder_is_locked_out() {
     assert_eq!(
         upload_status(&app, &token, "proj", "machine-B", fence_b, ct).await,
         200
+    );
+}
+
+/// A fenced-out write is refused **and publishes nothing** — the stored bundle
+/// and its recorded digest are exactly what the rightful holder left.
+///
+/// **What this test does and does not prove.** It proves the outcome: after a
+/// takeover, the loser's upload is refused and the good bundle still stands. It
+/// does NOT isolate the in-`UPDATE` fence re-check added for F-92, because the
+/// pre-flight `require_held` refuses the stale fence first and the two use
+/// identical conditions — removing the in-`UPDATE` guard leaves this test green
+/// (verified). That guard closes a genuine TOCTOU (a takeover landing between
+/// the pre-check and the write, a window a long body transfer widens), but
+/// triggering it from outside would need the server to pause mid-request, and a
+/// test-only hook in the request path is a worse thing to own than an unproven
+/// line of defence-in-depth. Recorded as a known coverage gap rather than
+/// claimed as a guard — see F-92 in docs/CONFORMANCE.md.
+#[tokio::test]
+async fn a_fenced_out_write_is_refused_and_publishes_nothing() {
+    let app = spawn().await;
+    let e = Enrolled::new();
+    let (token, mk) = app.enroll(&e).await;
+    create_session(&app, &token, "proj").await;
+
+    // A holds and publishes a first bundle: this is the content that must
+    // survive.
+    let a = acquire(&app, &token, "proj", "machine-A").await;
+    let fence_a = a["fence"].as_i64().unwrap();
+    let good = encrypt_bundle(&mk, b"the content that must survive");
+    assert_eq!(
+        upload_status(&app, &token, "proj", "machine-A", fence_a, good).await,
+        200
+    );
+    let published_before: Option<(Option<Vec<u8>>,)> =
+        sqlx::query_as("SELECT ciphertext_sha256 FROM sessions WHERE name = 'proj'")
+            .fetch_optional(&app.pool)
+            .await
+            .unwrap();
+    let digest_before = published_before.unwrap().0;
+
+    // B takes over. A's fence is now stale — but imagine A's upload was already
+    // in flight, having passed its pre-check a moment earlier.
+    let t: Value = app
+        .http
+        .post(app.url("/v1/sessions/proj/lease/takeover"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "holder": "machine-B" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(t["granted"], true);
+
+    // A's write with the stale fence must be refused AND must not publish.
+    let stale = encrypt_bundle(&mk, b"the stale machine's divergent work");
+    assert_eq!(
+        upload_status(&app, &token, "proj", "machine-A", fence_a, stale).await,
+        409,
+        "a fenced-out write must be refused"
+    );
+
+    let published_after: Option<(Option<Vec<u8>>,)> =
+        sqlx::query_as("SELECT ciphertext_sha256 FROM sessions WHERE name = 'proj'")
+            .fetch_optional(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        published_after.unwrap().0,
+        digest_before,
+        "the refused write must not have published its bundle over the good one"
     );
 }

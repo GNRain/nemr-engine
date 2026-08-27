@@ -454,6 +454,15 @@ CI the same coverage comes from a `postgres:16` **service container** (the
 different backend. Port `5433` is used so it never collides with a system
 Postgres on `5432`.
 
+**The sync client (WP-K).** `./scripts/install_sync_client.sh` installs
+`nemr-cloud` and its command symlinks (`nemr-login`, `nemr-push`, …), which the
+open CLI resolves as external subcommands: `nemr login`, `nemr push <name>`,
+`nemr pull <name>`, `nemr sessions`. `setup_host.sh` does this too (step 9d,
+non-fatal). The end-to-end product flow — create, converse, push, delete, pull,
+continue — is `scripts/sync_acceptance.sh`, which needs this database, the
+provisioned host, and (for the full continuity claim) a live credential; with
+`NEMR_SKIP_API=1` it asserts transcript byte-fidelity instead and says so.
+
 ## Explicitly NOT prerequisites
 
 Docker Engine and Docker Desktop are prohibited by NFR-01. If any step here, or

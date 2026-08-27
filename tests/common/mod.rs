@@ -388,20 +388,38 @@ fn newest_helper_source() -> Result<Option<(PathBuf, std::time::SystemTime)>, St
     ]))
 }
 
-/// Newest source file of the engine and everything it is built from.
+/// Newest source file of the engine and everything it is built from — and
+/// nothing else (F-90).
 ///
-/// `crates/` is included because the engine links them: a change in
-/// `crates/nemr-containerd` changes the `nemr` binary just as surely as a change
-/// in `src/`, and a gate watching only `src/` would call a stale install
-/// current. The workspace manifests are included here because here they do
-/// determine the binary.
+/// The list is the engine's actual dependency closure, not the workspace:
+///
+/// - `src/`, `build.rs`, `proto/` — the engine crate itself. `build.rs`
+///   compiles `proto/nemr.proto` into the binary, so both belong here; before
+///   F-90 neither was scanned and a proto edit left the gate green.
+/// - `crates/nemr-containerd/` — the one workspace crate the engine links.
+///   Before F-90 this was `crates/` wholesale, which swept the COMMERCIAL
+///   crates the engine must never depend on (`check_seam.sh` proves it does
+///   not), so editing a sync-server test reported the engine stale. A gate
+///   that cries wolf teaches people to reinstall past it without reading, and
+///   then it stops working on the day the drift is real. The helper's gate
+///   learned this same lesson from the other direction — see
+///   `newest_helper_source`.
+/// - `Cargo.toml` — the engine's own manifest (it is the workspace root
+///   package), where its dependency versions live.
+///
+/// `Cargo.lock` is deliberately **excluded**: the lockfile is workspace-wide,
+/// so a commercial crate adding a dependency touches it and would re-open the
+/// same false positive. The residual gap — a bare `cargo update` that changes
+/// only the lock — is accepted and named: the next `install_engine.sh` still
+/// rebuilds from the updated lock and the hash gate re-arms.
 fn newest_engine_source() -> Result<Option<(PathBuf, std::time::SystemTime)>, String> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     Ok(newest_under(&[
         root.join("src"),
-        root.join("crates"),
+        root.join("build.rs"),
+        root.join("proto"),
+        root.join("crates/nemr-containerd"),
         root.join("Cargo.toml"),
-        root.join("Cargo.lock"),
     ]))
 }
 
@@ -524,6 +542,37 @@ pub fn installed_engine_matches_built() -> Result<(), String> {
              fix: ./scripts/install_engine.sh",
             installed.display(),
             built.display()
+        ));
+    }
+
+    // The daemon is installed beside the CLI by install_engine.sh and every
+    // command runs through it — an unverified nemrd is a bigger hole than an
+    // unverified nemr, yet until F-90 nothing hashed it. Same rule, same fix.
+    let installed_daemon = installed
+        .parent()
+        .map(|dir| dir.join("nemrd"))
+        .unwrap_or_else(|| PathBuf::from("nemrd"));
+    let built_daemon = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/nemrd");
+    if !installed_daemon.exists() || !built_daemon.exists() {
+        return Err(format!(
+            "the daemon is not installed/built ({} / {})\n     \
+             fix: ./scripts/install_engine.sh",
+            installed_daemon.display(),
+            built_daemon.display()
+        ));
+    }
+    let installed_daemon_hash = sha256_of(&installed_daemon)
+        .map_err(|e| format!("cannot hash {}: {e}", installed_daemon.display()))?;
+    let built_daemon_hash = sha256_of(&built_daemon)
+        .map_err(|e| format!("cannot hash {}: {e}", built_daemon.display()))?;
+    if installed_daemon_hash != built_daemon_hash {
+        return Err(format!(
+            "the installed nemrd does not match the built source:\n     \
+             installed {} = {installed_daemon_hash}\n     \
+             built     {} = {built_daemon_hash}\n     \
+             fix: ./scripts/install_engine.sh",
+            installed_daemon.display(),
+            built_daemon.display()
         ));
     }
     Ok(())

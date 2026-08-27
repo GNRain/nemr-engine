@@ -89,6 +89,8 @@ message ProjectStatus {
   bool usage_known = 6;
   uint64 used_bytes = 7;
   double used_percent = 8;
+  // The agent id from the container label (WP-K, for `nemr list --json`).
+  string agent = 9;
 }
 
 message StatusRequest { string name = 1; }

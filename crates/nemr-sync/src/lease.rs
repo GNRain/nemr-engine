@@ -35,10 +35,19 @@ pub struct AcquireResponse {
     pub holder: String,
     pub fence: i64,
     pub expires_at_unix: i64,
+    /// The lease's FULL TTL, so a client can pace its heartbeat off the policy
+    /// rather than off however much of a partly-elapsed lease happens to
+    /// remain — guessing that from `expires_at` collapses to a hot loop on a
+    /// reused hold (F-92).
+    pub ttl_seconds: i64,
 }
 
 fn expiry(state: &AppState) -> OffsetDateTime {
     OffsetDateTime::now_utc() + state.config.lease_ttl
+}
+
+fn ttl_seconds(state: &AppState) -> i64 {
+    state.config.lease_ttl.whole_seconds()
 }
 
 /// Acquire the lease if it is free or already ours. A lease held by another
@@ -76,6 +85,7 @@ pub async fn acquire(
             holder: req.holder,
             fence,
             expires_at_unix: expires_at.unix_timestamp(),
+            ttl_seconds: ttl_seconds(&state),
         }));
     }
 
@@ -90,6 +100,7 @@ pub async fn acquire(
         holder,
         fence,
         expires_at_unix: expires_at.unix_timestamp(),
+        ttl_seconds: ttl_seconds(&state),
     }))
 }
 
@@ -103,6 +114,7 @@ pub struct HeartbeatRequest {
 pub struct HeartbeatResponse {
     pub fence: i64,
     pub expires_at_unix: i64,
+    pub ttl_seconds: i64,
 }
 
 /// Renew the lease. Succeeds only while the caller still holds it (holder and
@@ -133,6 +145,7 @@ pub async fn heartbeat(
         Some((fence, expires_at)) => Ok(Json(HeartbeatResponse {
             fence,
             expires_at_unix: expires_at.unix_timestamp(),
+            ttl_seconds: ttl_seconds(&state),
         })),
         None => Err(ApiError::Conflict(
             "lease lost: it was taken over or expired; stop writing and re-acquire".into(),
@@ -176,7 +189,65 @@ pub async fn takeover(
         holder: req.holder,
         fence,
         expires_at_unix: expires_at.unix_timestamp(),
+        ttl_seconds: ttl_seconds(&state),
     }))
+}
+
+#[derive(Deserialize)]
+pub struct ReleaseRequest {
+    pub holder: String,
+    pub fence: i64,
+}
+
+/// Release the lease on a clean stop, so another machine can acquire immediately
+/// instead of waiting out the TTL (WP-K).
+///
+/// Release **expires** the row rather than deleting it. Deleting would reset the
+/// fence to 1 on the next acquire, and a zombie holder from a previous hold of
+/// the same (holder, fence) could then match the fresh lease; expiring keeps the
+/// fence monotonic for the session's whole life, so every stale credential stays
+/// stale forever. An expired row is exactly what [`acquire`] already treats as
+/// free.
+///
+/// Only the current (holder, fence) may release: a stale client releasing after
+/// a takeover would free the *winner's* lease, so a mismatched fence on a live
+/// row is a 409. A release matching an already-expired own row — a retried
+/// clean shutdown — is idempotent success.
+pub async fn release(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(name): Path<String>,
+    Json(req): Json<ReleaseRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let session_id = index::resolve(&state, user.id, &name).await?;
+
+    let expired = sqlx::query(
+        "UPDATE leases SET expires_at = to_timestamp(0)
+          WHERE session_id = $1 AND holder = $2 AND fence = $3",
+    )
+    .bind(session_id)
+    .bind(&req.holder)
+    .bind(req.fence)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+
+    if expired > 0 {
+        return Ok(Json(serde_json::json!({ "released": true })));
+    }
+
+    // Nothing matched. If a lease row still exists it belongs to someone else
+    // (or a newer fence) — refuse. If none exists, the release already happened.
+    let exists: Option<(i64,)> = sqlx::query_as("SELECT fence FROM leases WHERE session_id = $1")
+        .bind(session_id)
+        .fetch_optional(&state.pool)
+        .await?;
+    match exists {
+        Some(_) => Err(ApiError::Conflict(
+            "lease not held: it was taken over or renewed by another client".into(),
+        )),
+        None => Ok(Json(serde_json::json!({ "released": false }))),
+    }
 }
 
 /// Verify the caller currently holds the lease with the given fence. Used to gate

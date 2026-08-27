@@ -373,6 +373,17 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 9d. Sync client (WP-K) — the commercial half's CLI
+# ---------------------------------------------------------------------------
+# Non-fatal like the test DB: the open engine must provision fully without it.
+step "Install the sync client (nemr login / push / pull / sessions)"
+if ./scripts/install_sync_client.sh; then
+    ok "sync client installed"
+else
+    warn "sync client not installed; run ./scripts/install_sync_client.sh later"
+fi
+
+# ---------------------------------------------------------------------------
 # 10. Acceptance — setup is done when the host passes, not when commands exit 0
 # ---------------------------------------------------------------------------
 step "Verification"

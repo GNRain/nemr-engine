@@ -110,6 +110,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/recovery/confirm", post(identity::confirm_recovery))
         .route("/v1/auth/params", post(identity::kdf_params))
         .route("/v1/login", post(identity::login))
+        .route("/v1/logout", post(auth::logout))
         .route("/v1/sessions", get(index::list).post(index::upsert))
         .route(
             "/v1/sessions/{name}/bundle",
@@ -121,5 +122,6 @@ pub fn router(state: AppState) -> Router {
             post(lease::heartbeat),
         )
         .route("/v1/sessions/{name}/lease/takeover", post(lease::takeover))
+        .route("/v1/sessions/{name}/lease/release", post(lease::release))
         .with_state(state)
 }

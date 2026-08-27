@@ -1,0 +1,52 @@
+# The sync client (WP-K): the commercial half's CLI. COMMERCIAL side of E-11 —
+# `nemr-engine` must NOT depend on this (scripts/check_seam.sh).
+#
+# One binary, installed under several names (nemr-login, nemr-push, …); the open
+# `nemr` CLI reaches it only through its generic external-subcommand fallback
+# (`nemr <cmd>` execs `nemr-<cmd>` from PATH), so the open half carries no
+# knowledge of this crate — not even its name.
+#
+# It drives the OPEN engine as a subprocess (`nemr export` / `nemr import` /
+# `nemr list --json`) rather than linking it: the engine's CLI is its public
+# surface, and invoking it keeps the client honest about what a user could do by
+# hand. It links nemr-crypto because E-16's client-side encryption is exactly
+# this crate's job.
+[package]
+name = "nemr-cloud"
+version = "0.1.0"
+edition = "2021"
+description = "Nemr sync client — login, push, pull, sessions, lease (WP-K)"
+publish = false
+
+[[bin]]
+name = "nemr-cloud"
+path = "src/main.rs"
+
+[dependencies]
+nemr-crypto = { path = "../nemr-crypto", version = "0.1.0" }
+
+clap = { version = "4.6.6", features = ["derive"] }
+# Blocking HTTP: a CLI has no concurrency to exploit, and blocking keeps the
+# whole crate free of an async runtime.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+rand = "0.8"
+base64 = "0.22"
+# Password prompting with echo off.
+rpassword = "7"
+# setsid for the detached lease-heartbeat holder (the same pattern as the
+# daemon's autostart).
+libc = "0.2"
+tempfile = "3"
+
+[dev-dependencies]
+# The integration tests spawn the real sync server in-process (against the same
+# Postgres the nemr-sync suite uses) and drive THIS crate's binary as separate
+# processes — the same shape a user runs.
+nemr-sync = { path = "../nemr-sync", version = "0.1.0" }
+nemr-storage = { path = "../nemr-storage", version = "0.1.0" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+axum = { version = "0.8" }
+time = "0.3"

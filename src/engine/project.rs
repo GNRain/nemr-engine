@@ -1387,6 +1387,10 @@ pub struct ProjectStatus {
     pub quota: String,
     pub running: bool,
     pub volume_path: String,
+    /// The agent id recorded on the container label (WP-K: external tooling
+    /// reads this from `nemr list --json` to describe a project without
+    /// guessing).
+    pub agent: String,
     /// Measured usage, absent when the volume is not currently mounted.
     pub usage: Option<crate::engine::volume::Usage>,
 }
@@ -1589,6 +1593,7 @@ pub async fn list(client: &ContainerdClient) -> Result<Vec<ProjectStatus>> {
                 .unwrap_or_else(|| "unknown".into()),
             running,
             volume_path,
+            agent: agent_from_labels(&container.labels).id().to_string(),
             usage,
         });
     }

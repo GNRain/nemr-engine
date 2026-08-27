@@ -3,6 +3,8 @@
 //! Subcommands arrive per milestone: `create` at Milestone 4, start/attach/stop
 //! at Milestone 5, list/delete at Milestone 6.
 
+use std::ffi::OsString;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -61,7 +63,13 @@ enum Command {
     Attach { name: String },
 
     /// List all projects with status and storage usage.
-    List,
+    List {
+        /// Machine-readable output: one JSON object with `projects` and
+        /// `untracked_volumes`. The stable surface for tooling built on top of
+        /// the CLI, so scripts need not scrape the human table.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Delete a project and release all its resources.
     Delete {
@@ -119,6 +127,16 @@ enum Command {
         #[arg(long)]
         include_build_artifacts: bool,
     },
+
+    /// Anything else: `nemr <cmd> …` runs `nemr-<cmd> …` from PATH.
+    ///
+    /// The cargo/git external-subcommand pattern. This is how optional tooling
+    /// extends the CLI without the CLI knowing it exists — the engine carries no
+    /// list of extension names and no dependency on any of them, which is what
+    /// keeps the E-11 seam structural: `nemr export`/`import` work with no
+    /// network and no account whether or not any extension is installed.
+    #[command(external_subcommand)]
+    External(Vec<OsString>),
 }
 
 /// Parse `--size`, reusing the engine's own preset parsing so the CLI cannot
@@ -499,7 +517,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::List => {
+        Command::List { json } => {
             let mut session = daemon::connect().await?;
             let resp = {
                 let __req = session.req(proto::ListRequest {});
@@ -510,6 +528,27 @@ async fn main() -> Result<()> {
                     .map_err(status_err)?
                     .into_inner()
             };
+
+            if json {
+                // The machine-readable contract: field names are stable surface
+                // for external tooling; extend, never rename.
+                let out = serde_json::json!({
+                    "projects": resp.projects.iter().map(|p| serde_json::json!({
+                        "name": p.name,
+                        "agent": p.agent,
+                        "quota": p.quota,
+                        "running": p.running,
+                        "volume_path": p.volume_path,
+                        "usage_known": p.usage_known,
+                        "used_bytes": p.used_bytes,
+                        "used_percent": p.used_percent,
+                    })).collect::<Vec<_>>(),
+                    "untracked_volumes": resp.untracked_volumes,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
+
             let projects = resp.projects;
 
             if projects.is_empty() && resp.untracked_volumes.is_empty() {
@@ -906,6 +945,40 @@ async fn main() -> Result<()> {
             if code != 0 {
                 std::process::exit(code);
             }
+        }
+
+        Command::External(args) => {
+            // `nemr <cmd> …` → exec `nemr-<cmd> …` from PATH, cargo/git style.
+            //
+            // exec(), not spawn-and-wait: the extension inherits our stdio and
+            // TTY and its exit code is the process's own, with no wrapper in
+            // between to garble signals or codes. This match arm touches no
+            // daemon and no engine state — it is pure delegation.
+            use std::os::unix::process::CommandExt;
+            let name = args[0].to_string_lossy().into_owned();
+
+            // A subcommand name never contains a path separator. Without this,
+            // `Command::new` treats any name with a `/` as a PATH-free path —
+            // so `nemr ../evil` would run `nemr-../evil` relative to the
+            // current directory, executing a binary from a location PATH never
+            // sanctioned (F-92). Refuse rather than resolve.
+            if name.contains('/') {
+                eprintln!("error: not a subcommand name: {name}");
+                eprintln!("       (subcommand names cannot contain '/'. Extensions are");
+                eprintln!("       found on PATH as `nemr-<name>`, never by path.)");
+                std::process::exit(2);
+            }
+            let program = format!("nemr-{name}");
+            let err = std::process::Command::new(&program).args(&args[1..]).exec();
+            // exec only returns on failure.
+            if err.kind() == std::io::ErrorKind::NotFound {
+                eprintln!("error: no such subcommand: {name}");
+                eprintln!("       (also looked for `{program}` on PATH — the form optional");
+                eprintln!("       extensions install under. See `nemr --help` for built-ins.)");
+            } else {
+                eprintln!("error: could not run `{program}`: {err}");
+            }
+            std::process::exit(2);
         }
     }
 

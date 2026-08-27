@@ -90,6 +90,58 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 3b. A CI service container IS a Docker dependency (F-94)
+# ---------------------------------------------------------------------------
+# GitHub Actions `services:` blocks are started by the runner with literal
+# `docker pull` / `docker create` / `docker start` — verified in our own job
+# logs, not inferred. They are therefore a Docker dependency we REQUEST, which
+# E-17 puts squarely inside NFR-01.
+#
+# Section 3's pattern could never see them: a `services:` block names no
+# command, so it matched a *comment about* Docker while `docker pull postgres`
+# executed three jobs above, in a workflow this script was already scanning.
+# A guard that catches descriptions of the thing but not the thing (the F-56
+# family, third variant). Hence a check keyed on the shape that requests a
+# container rather than on the word "docker".
+service_hits=$(grep -rnE '^[[:space:]]*(services:|image:[[:space:]]*[^[:space:]#])' \
+    .github 2>/dev/null || true)
+if [[ -n "$service_hits" ]]; then
+    report "a CI service container is declared — the runner starts these with \`docker\` (F-94, E-17):"
+    printf '%s\n' "$service_hits" | sed 's/^/          /'
+    printf '          %s\n' "Run the dependency under podman instead (scripts/setup_sync_test_db.sh)."
+else
+    ok "no CI service container declared (no docker-started containers requested)"
+fi
+
+# Control for 3b, self-contained: the pattern must actually catch a services
+# block, or the 'ok' above is green over nothing — which is exactly how this
+# dependency survived from WP-J until now.
+svc_probe=$(mktemp -d)
+cat > "$svc_probe/workflow.yml" <<'PROBE'
+jobs:
+  x:
+    services:
+      postgres:
+        image: postgres:16
+PROBE
+cat > "$svc_probe/innocent.yml" <<'PROBE'
+jobs:
+  x:
+    steps:
+      - run: echo "no containers here"
+PROBE
+svc_caught=$(grep -rnE '^[[:space:]]*(services:|image:[[:space:]]*[^[:space:]#])' "$svc_probe/workflow.yml" 2>/dev/null || true)
+svc_false=$(grep -rnE '^[[:space:]]*(services:|image:[[:space:]]*[^[:space:]#])' "$svc_probe/innocent.yml" 2>/dev/null || true)
+rm -rf "$svc_probe"
+if [[ -z "$svc_caught" ]]; then
+    report "control failed: a 'services:' block was NOT caught, so 3b proves nothing."
+elif [[ -n "$svc_false" ]]; then
+    report "control failed: a workflow with no containers was flagged; 3b is too broad."
+else
+    ok "control: a services: block is caught, a plain workflow is not — 3b discriminates"
+fi
+
+# ---------------------------------------------------------------------------
 # 4. Registry references are NOT violations — assert we still parse them as such
 # ---------------------------------------------------------------------------
 # A control, so this check cannot silently degrade into "found nothing because

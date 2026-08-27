@@ -433,7 +433,20 @@ types, so crate-first keeps the cheaper reversal open. **Licensing is upstream
 of packaging and remains unchosen** (no `LICENSE` file; `publish = false` on
 every crate). If the server source must later be closed, extraction is cheap
 *because* it is already a clean crate. Commercial crates so far:
-`crates/nemr-storage` (M12), `crates/nemr-crypto` (E-16), and `crates/nemr-sync`.
+`crates/nemr-storage` (M12), `crates/nemr-crypto` (E-16), `crates/nemr-sync`,
+and `crates/nemr-cloud` (WP-K).
+
+**How commercial commands reach the open CLI without breaching the seam
+(2026-08-26, WP-K).** The open `nemr` gains one generic mechanism — cargo/git
+external subcommands: `nemr <unknown> …` execs `nemr-<unknown> …` from PATH.
+The commercial client is one binary installed under several names
+(`nemr-login`, `nemr-push`, …) with argv[0] dispatch. So `nemr login` works end
+to end, while the open CLI carries no extension names and no dependency on any
+extension — the seam grep continues to prove no commercial name appears in the
+open tree, and `nemr export`/`import` keep working with no network, no account,
+and no extension installed. The alternative — subcommands compiled into the
+open CLI behind a feature flag — would have put commercial names and wiring
+into the open tree, exactly the erosion E-11 exists to prevent.
 
 ---
 
@@ -503,6 +516,60 @@ envelope table is built so this is addable; it is **not** built in this pass.
 **Does not resolve E-13.** E-13 (authenticating on a second machine revoked the
 first's credential) concerns Anthropic's OAuth credential — D-02's secret, not
 MK — so it is orthogonal and stays open on its own terms.
+
+---
+
+### E-17 — Does NFR-01 reach the CI provider's own substrate?
+
+**Status:** Resolved · 2026-08-27
+**Raised by:** Claude Code (from a constraint check firing) · **Relates to:** NFR-01, R-03, F-94
+
+**Question.** The Docker-freeness gate flagged a comment stating that GitHub
+Actions service containers are started by Docker. Reading what the comment
+claimed rather than silencing it raised a real question: our CI asked for a
+`services: postgres` block, so does NFR-01 — "no component of the stack may
+depend on Docker Engine, directly or transitively" — cover it? And if it
+covers that, does it also cover the Docker daemon the runner image ships?
+
+**Established first, not argued.** From our own job log, the runner executes
+`/usr/bin/docker version`, `docker network create`, `docker pull postgres:16`,
+`docker create --name …_postgres16_… -p 5432:5432 … postgres:16`, and
+`docker start`. Those commands run **because our workflow file asked for
+them**; delete the block and they do not.
+
+**Ruling.** NFR-01 covers everything we build, ship, script, or **request**,
+including the test harness and CI configuration. A `services:` block is a
+request, so it is in scope and it was a violation. NFR-01 does **not** cover
+the Docker daemon preinstalled on runner images.
+
+**Rationale.** The line is fine but real: we control what we ask for, and we do
+not control what the provider preinstalls. The deciding argument is that a
+constraint reaching the substrate would be **unsatisfiable on every
+GitHub-hosted runner** — and a constraint that cannot be satisfied is not a
+constraint, it is a permanent violation everyone learns to ignore. That is
+worse than a written exclusion.
+
+**Why it is written into the spec rather than left understood.** The scope had
+been resting on an inference — "whoever wrote the gate already scanned
+`.github`, so CI must be in scope". Unstated scope is how a hard constraint
+quietly becomes unenforceable in one direction and unsatisfiable in the other.
+
+**Consequences.**
+- The `services: postgres` blocks are replaced by rootless podman, which is
+  daemonless and does not use the system containerd — so it also survives
+  `ci_provision_host.sh` disabling that containerd under PRIV-01, which is what
+  killed the database in the host job (F-93). One mechanism, both jobs, and the
+  same mechanism developers run locally.
+- The gate is widened to catch `services:`/`image:` (F-94). Widening is always
+  safe; narrowing needs a ruling.
+- Nothing else about NFR-01 is softened: Docker at any layer we build, ship,
+  script or request remains release-blocking.
+
+**Process note, recorded because the shape recurs.** The first response to the
+check firing was to reword the comment so it stopped matching. That kept the
+build green and made a real finding invisible; it was recoverable only by
+re-reading the edited prose. **When a constraint check fires, the first
+question is what it found, not how to make it pass.**
 
 ---
 
