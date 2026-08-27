@@ -82,12 +82,48 @@ BUNDLES="$WORK/bundles"; mkdir -p "$BUNDLES"
 NEMR_BUNDLE_DIR="$BUNDLES" NEMR_SERVER_ADDR="$SERVER_ADDR" \
     "$REPO/target/release/nemr-sync" >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 1 30); do
-    curl -fsS "http://${SERVER_ADDR}/health" >/dev/null 2>&1 && break
+
+# Probe the database FIRST and separately, so "the server did not come up"
+# cannot silently mean "the database was unreachable". Two causes that need
+# different remedies must not share one message.
+db_host_port="$(sed -E 's|.*@([^/]+)/.*|\1|' <<<"$DATABASE_URL")"
+db_host="${db_host_port%%:*}"; db_port="${db_host_port##*:}"
+[[ "$db_port" == "$db_host" ]] && db_port=5432
+if ! timeout 5 bash -c ">/dev/tcp/${db_host}/${db_port}" 2>/dev/null; then
+    fail "no Postgres listening on ${db_host}:${db_port} (DATABASE_URL host:port).
+        Start one:  ./scripts/setup_sync_test_db.sh
+        The sync server cannot come up without it, and this is that failure,
+        not a server bug."
+fi
+pass "Postgres reachable at ${db_host}:${db_port}"
+
+# Wait for the server, but stop the moment it DIES rather than burning the whole
+# window on a process that is already gone — and report which of the two
+# happened. A fixed wall-clock wait that reports only "did not come up" is the
+# F-65 shape: the evidence exists and never reaches anyone.
+server_up=0
+for _ in $(seq 1 60); do
+    if curl -fsS "http://${SERVER_ADDR}/health" >/dev/null 2>&1; then server_up=1; break; fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then break; fi
     sleep 0.5
 done
-curl -fsS "http://${SERVER_ADDR}/health" >/dev/null || {
-    cat "$WORK/server.log" >&2; fail "server did not come up"; }
+if [[ "$server_up" != "1" ]]; then
+    if kill -0 "$SERVER_PID" 2>/dev/null; then
+        printf '   the server process is still alive but never answered /health on %s\n' \
+            "$SERVER_ADDR" >&2
+    else
+        wait "$SERVER_PID" 2>/dev/null
+        printf '   the server process exited with status %s before answering\n' "$?" >&2
+    fi
+    printf '   --- server log (%s) ---\n' "$WORK/server.log" >&2
+    if [[ -s "$WORK/server.log" ]]; then
+        sed 's/^/   | /' "$WORK/server.log" >&2
+    else
+        printf '   | (empty — the server wrote nothing at all)\n' >&2
+    fi
+    printf '   --- end server log ---\n' >&2
+    fail "server did not come up on ${SERVER_ADDR}"
+fi
 pass "server answering on ${SERVER_ADDR}"
 
 # ---------------------------------------------------------------------------
