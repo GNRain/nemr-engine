@@ -35,10 +35,19 @@ pub struct AcquireResponse {
     pub holder: String,
     pub fence: i64,
     pub expires_at_unix: i64,
+    /// The lease's FULL TTL, so a client can pace its heartbeat off the policy
+    /// rather than off however much of a partly-elapsed lease happens to
+    /// remain — guessing that from `expires_at` collapses to a hot loop on a
+    /// reused hold (F-92).
+    pub ttl_seconds: i64,
 }
 
 fn expiry(state: &AppState) -> OffsetDateTime {
     OffsetDateTime::now_utc() + state.config.lease_ttl
+}
+
+fn ttl_seconds(state: &AppState) -> i64 {
+    state.config.lease_ttl.whole_seconds()
 }
 
 /// Acquire the lease if it is free or already ours. A lease held by another
@@ -76,6 +85,7 @@ pub async fn acquire(
             holder: req.holder,
             fence,
             expires_at_unix: expires_at.unix_timestamp(),
+            ttl_seconds: ttl_seconds(&state),
         }));
     }
 
@@ -90,6 +100,7 @@ pub async fn acquire(
         holder,
         fence,
         expires_at_unix: expires_at.unix_timestamp(),
+        ttl_seconds: ttl_seconds(&state),
     }))
 }
 
@@ -103,6 +114,7 @@ pub struct HeartbeatRequest {
 pub struct HeartbeatResponse {
     pub fence: i64,
     pub expires_at_unix: i64,
+    pub ttl_seconds: i64,
 }
 
 /// Renew the lease. Succeeds only while the caller still holds it (holder and
@@ -133,6 +145,7 @@ pub async fn heartbeat(
         Some((fence, expires_at)) => Ok(Json(HeartbeatResponse {
             fence,
             expires_at_unix: expires_at.unix_timestamp(),
+            ttl_seconds: ttl_seconds(&state),
         })),
         None => Err(ApiError::Conflict(
             "lease lost: it was taken over or expired; stop writing and re-acquire".into(),
@@ -176,6 +189,7 @@ pub async fn takeover(
         holder: req.holder,
         fence,
         expires_at_unix: expires_at.unix_timestamp(),
+        ttl_seconds: ttl_seconds(&state),
     }))
 }
 

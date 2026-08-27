@@ -284,3 +284,75 @@ async fn an_expired_lease_is_reacquired_and_the_stale_holder_is_locked_out() {
         200
     );
 }
+
+/// A fenced-out write is refused **and publishes nothing** — the stored bundle
+/// and its recorded digest are exactly what the rightful holder left.
+///
+/// **What this test does and does not prove.** It proves the outcome: after a
+/// takeover, the loser's upload is refused and the good bundle still stands. It
+/// does NOT isolate the in-`UPDATE` fence re-check added for F-92, because the
+/// pre-flight `require_held` refuses the stale fence first and the two use
+/// identical conditions — removing the in-`UPDATE` guard leaves this test green
+/// (verified). That guard closes a genuine TOCTOU (a takeover landing between
+/// the pre-check and the write, a window a long body transfer widens), but
+/// triggering it from outside would need the server to pause mid-request, and a
+/// test-only hook in the request path is a worse thing to own than an unproven
+/// line of defence-in-depth. Recorded as a known coverage gap rather than
+/// claimed as a guard — see F-92 in docs/CONFORMANCE.md.
+#[tokio::test]
+async fn a_fenced_out_write_is_refused_and_publishes_nothing() {
+    let app = spawn().await;
+    let e = Enrolled::new();
+    let (token, mk) = app.enroll(&e).await;
+    create_session(&app, &token, "proj").await;
+
+    // A holds and publishes a first bundle: this is the content that must
+    // survive.
+    let a = acquire(&app, &token, "proj", "machine-A").await;
+    let fence_a = a["fence"].as_i64().unwrap();
+    let good = encrypt_bundle(&mk, b"the content that must survive");
+    assert_eq!(
+        upload_status(&app, &token, "proj", "machine-A", fence_a, good).await,
+        200
+    );
+    let published_before: Option<(Option<Vec<u8>>,)> =
+        sqlx::query_as("SELECT ciphertext_sha256 FROM sessions WHERE name = 'proj'")
+            .fetch_optional(&app.pool)
+            .await
+            .unwrap();
+    let digest_before = published_before.unwrap().0;
+
+    // B takes over. A's fence is now stale — but imagine A's upload was already
+    // in flight, having passed its pre-check a moment earlier.
+    let t: Value = app
+        .http
+        .post(app.url("/v1/sessions/proj/lease/takeover"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "holder": "machine-B" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(t["granted"], true);
+
+    // A's write with the stale fence must be refused AND must not publish.
+    let stale = encrypt_bundle(&mk, b"the stale machine's divergent work");
+    assert_eq!(
+        upload_status(&app, &token, "proj", "machine-A", fence_a, stale).await,
+        409,
+        "a fenced-out write must be refused"
+    );
+
+    let published_after: Option<(Option<Vec<u8>>,)> =
+        sqlx::query_as("SELECT ciphertext_sha256 FROM sessions WHERE name = 'proj'")
+            .fetch_optional(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        published_after.unwrap().0,
+        digest_before,
+        "the refused write must not have published its bundle over the good one"
+    );
+}

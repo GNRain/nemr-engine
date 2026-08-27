@@ -111,9 +111,12 @@ impl Machine {
                list) cat \"$STUB/list.json\" ;;\n\
                export)\n\
                  name=$2; out=$4  # export <name> -o <path>\n\
-                 cp \"$STUB/bundle.plain\" \"$out\" ;;\n\
+                 cp \"$STUB/bundle.plain\" \"$out\"\n\
+                 stat -c %a \"$(dirname \"$out\")\" > \"$STUB/export_dir_mode\" ;;\n\
                import)\n\
                  cp \"$2\" \"$STUB/imported.plain\"\n\
+                 stat -c %a \"$(dirname \"$2\")\" > \"$STUB/import_dir_mode\"\n\
+                 stat -c %a \"$2\" > \"$STUB/import_file_mode\"\n\
                  echo \"imported $2 into project (stub)\" ;;\n\
                *) echo \"stub nemr: unhandled: $*\" >&2; exit 9 ;;\n\
              esac\n",
@@ -158,6 +161,13 @@ impl Machine {
             serde_json::json!({ "projects": [], "untracked_volumes": [] }).to_string(),
         )
         .unwrap();
+    }
+
+    /// Permission bits the stub engine observed on the plaintext bundle (or its
+    /// directory) at the one moment they can be observed: while it existed.
+    pub fn observed_mode(&self, which: &str) -> Option<u32> {
+        let raw = std::fs::read_to_string(self.stub_dir().join(which)).ok()?;
+        u32::from_str_radix(raw.trim(), 8).ok()
     }
 
     /// What the stub engine captured from `nemr import`.

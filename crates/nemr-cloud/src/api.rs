@@ -65,6 +65,10 @@ pub struct LeaseResponse {
     pub holder: String,
     pub fence: i64,
     pub expires_at_unix: i64,
+    /// The lease policy's full TTL, reported by the server so the heartbeat is
+    /// paced off policy rather than off a partly-elapsed lease (F-92).
+    #[serde(default)]
+    pub ttl_seconds: i64,
 }
 
 impl Api {
@@ -218,6 +222,8 @@ impl Api {
         struct Hb {
             fence: i64,
             expires_at_unix: i64,
+            #[serde(default)]
+            ttl_seconds: i64,
         }
         let hb: Hb = Self::decode(resp, "renewing the lease", true)?;
         Ok(LeaseResponse {
@@ -225,6 +231,7 @@ impl Api {
             holder: holder.to_string(),
             fence: hb.fence,
             expires_at_unix: hb.expires_at_unix,
+            ttl_seconds: hb.ttl_seconds,
         })
     }
 

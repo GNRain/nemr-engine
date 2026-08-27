@@ -72,6 +72,10 @@ pub struct LeaseState {
     pub holder: String,
     pub fence: i64,
     pub expires_at_unix: i64,
+    /// The lease policy's full TTL (F-92): heartbeat pacing comes from this,
+    /// never from what remains of a partly-elapsed lease.
+    #[serde(default)]
+    pub ttl_seconds: i64,
     pub status: String, // held | lost | released
     /// PID of the heartbeat holder process, if one was spawned.
     pub holder_pid: Option<u32>,

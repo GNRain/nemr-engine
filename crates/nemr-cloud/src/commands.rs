@@ -106,28 +106,53 @@ pub fn register(server: Option<String>, email: Option<String>) -> Result<()> {
     // Piped stdout is block-buffered: flush so a driver (or a human paging
     // output) sees the code before we block waiting for it to be typed back.
     std::io::stdout().flush().ok();
-    eprint!("Type the recovery code to confirm you stored it: ");
-    std::io::stderr().flush().ok();
-    let mut typed = String::new();
-    std::io::stdin()
-        .read_line(&mut typed)
-        .context("reading the recovery code")?;
-    let typed_code = RecoveryCode::parse(typed.trim()).map_err(|_| {
-        anyhow!(
-            "that is not a valid recovery code; registration is incomplete — run register again"
-        )
-    })?;
 
-    // The confirmation is real, not a string compare: recover the master key
-    // THROUGH the recovery envelope with the typed code and prove it matches.
-    let typed_root = nemr_crypto::derive_root(typed_code.as_secret(), &recovery_salt, params)
-        .map_err(|e| anyhow!("deriving from the typed code: {e}"))?;
-    let recovered = typed_root
-        .recovery_wrap_key()
-        .open(&recovery_envelope)
-        .map_err(|_| {
-            anyhow!("that code does not open the recovery envelope; registration is incomplete")
-        })?;
+    // Retry rather than abort (F-92). The account row already exists at this
+    // point, so a single-shot confirm that exits on a typo strands the user:
+    // re-running `register` hits "email already registered", and the code was
+    // shown once and is now gone from the screen. The code is still in memory
+    // here, so ask again — and if the user gives up, say exactly how to finish.
+    let mut recovered = None;
+    for attempt in 1..=5 {
+        eprint!("Type the recovery code to confirm you stored it: ");
+        std::io::stderr().flush().ok();
+        let mut typed = String::new();
+        if std::io::stdin()
+            .read_line(&mut typed)
+            .context("reading the recovery code")?
+            == 0
+        {
+            break; // stdin closed
+        }
+        // The confirmation is real, not a string compare: recover the master
+        // key THROUGH the recovery envelope with the typed code and prove it
+        // matches.
+        let opened = RecoveryCode::parse(typed.trim()).ok().and_then(|code| {
+            nemr_crypto::derive_root(code.as_secret(), &recovery_salt, params)
+                .ok()
+                .and_then(|root| root.recovery_wrap_key().open(&recovery_envelope).ok())
+        });
+        match opened {
+            Some(mk) => {
+                recovered = Some(mk);
+                break;
+            }
+            None if attempt < 5 => {
+                eprintln!("that code does not open the recovery envelope — try again.");
+                eprintln!("(it is the code printed above, hyphens and case do not matter)");
+            }
+            None => {}
+        }
+    }
+    let Some(recovered) = recovered else {
+        bail!(
+            "recovery was not confirmed, so the account is registered but NOT usable.\n\
+             The recovery code above is the only copy — store it, then finish with:\n\
+             \n    nemr login\n\n\
+             and re-run the confirmation. Registering again with this email will be\n\
+             refused because the account now exists."
+        );
+    };
     api.confirm_recovery(&email, &b64(&recovery_acknowledgement(&recovered)))?;
     println!("Recovery confirmed. Account is active.");
 
@@ -145,15 +170,14 @@ pub fn login(server: Option<String>, email: Option<String>) -> Result<()> {
 
     let p = api.kdf_params(&email)?;
     let salt = unb64(&p.kdf_salt, "server KDF salt")?;
-    let root = keys::derive(
-        &password,
-        &salt,
-        nemr_crypto::KdfParams {
-            m_cost: p.kdf_m_cost,
-            t_cost: p.kdf_t_cost,
-            p_cost: p.kdf_p_cost,
-        },
-    )?;
+    // The params come from an unauthenticated endpoint: hold them to a floor
+    // before stretching the real password with them (F-92).
+    let params = keys::check_params_floor(nemr_crypto::KdfParams {
+        m_cost: p.kdf_m_cost,
+        t_cost: p.kdf_t_cost,
+        p_cost: p.kdf_p_cost,
+    })?;
+    let root = keys::derive(&password, &salt, params)?;
     finish_login(&api, &server, &email, root.auth_key().as_bytes())
 }
 
@@ -306,7 +330,7 @@ fn ensure_lease(api: &Api, name: &str, take_over: bool) -> Result<LeaseResponse>
     if let Some(lease) = state::load_lease(name) {
         let holder_alive = lease
             .holder_pid
-            .is_some_and(|pid| holder_process_is_ours(pid, name));
+            .is_some_and(|pid| holder_process_is_ours(pid, name, lease.fence));
         if lease.status == "held"
             && lease.holder == me
             && lease.expires_at_unix > now_unix() + 2
@@ -317,9 +341,16 @@ fn ensure_lease(api: &Api, name: &str, take_over: bool) -> Result<LeaseResponse>
                 holder: lease.holder,
                 fence: lease.fence,
                 expires_at_unix: lease.expires_at_unix,
+                ttl_seconds: lease.ttl_seconds,
             });
         }
     }
+
+    // We are about to take a NEW fence. Any holder still running carries the
+    // old one, and the server would keep honouring its heartbeats (it matches
+    // holder+fence, and this machine's holder string is unchanged) — so retire
+    // it BEFORE acquiring rather than leaving two holders racing (F-92).
+    stop_holder(name);
 
     let resp = api.acquire_lease(name, &me)?;
     if resp.granted {
@@ -341,22 +372,70 @@ fn ensure_lease(api: &Api, name: &str, take_over: bool) -> Result<LeaseResponse>
     )
 }
 
-/// Is `pid` one of OUR holder processes for this session? Checked before any
-/// kill: destroying a PID without verifying what it is would be the F-79 shape.
-fn holder_process_is_ours(pid: u32, session: &str) -> bool {
-    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+/// Is `pid` one of OUR holder processes for this session AND this fence?
+///
+/// Checked before any kill: destroying a PID without verifying what it is would
+/// be the F-79 shape. The match is on **exact argv elements**, not a substring
+/// of the joined cmdline (F-92): PIDs are reused, and a substring test matches
+/// any holder whose session name merely contains ours (`proj` inside
+/// `proj-backup`), so the wrong process could be signalled. The fence is part of
+/// the identity because a holder on a stale fence is precisely NOT the holder we
+/// think we have.
+fn holder_process_is_ours(pid: u32, session: &str, fence: i64) -> bool {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
-    let cmdline = String::from_utf8_lossy(&cmdline);
-    cmdline.contains("__hold") && cmdline.contains(session)
+    // /proc cmdline is NUL-separated argv with a trailing NUL.
+    let argv: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    let has = |needle: &str| argv.iter().any(|a| a == needle);
+    has("__hold") && has(session) && has(&fence.to_string())
 }
 
-/// Spawn the detached heartbeat holder (setsid, like the daemon's autostart) and
-/// record the lease state it will maintain.
-fn spawn_holder(name: &str, lease: &LeaseResponse) -> Result<()> {
+/// Ensure a heartbeat holder is running for exactly this (session, fence), and
+/// record the lease state.
+///
+/// Idempotent by design (F-92): if a holder is already live on this same fence
+/// it is kept — spawning a second would leak the first, whose heartbeats the
+/// server would keep honouring because they carry identical credentials. A
+/// holder on any *other* fence is retired first.
+fn ensure_holder(name: &str, lease: &LeaseResponse) -> Result<()> {
+    if let Some(existing) = state::load_lease(name) {
+        if existing.fence == lease.fence
+            && existing
+                .holder_pid
+                .is_some_and(|pid| holder_process_is_ours(pid, name, lease.fence))
+        {
+            // Already held by a live holder on this fence: refresh the recorded
+            // expiry and keep the process.
+            return state::save_lease(
+                name,
+                &LeaseState {
+                    holder: lease.holder.clone(),
+                    fence: lease.fence,
+                    expires_at_unix: lease.expires_at_unix,
+                    ttl_seconds: lease.ttl_seconds,
+                    status: "held".into(),
+                    holder_pid: existing.holder_pid,
+                },
+            );
+        }
+        stop_holder(name);
+    }
+
     let exe = std::env::current_exe().context("locating our own binary")?;
-    let ttl = (lease.expires_at_unix - now_unix()).max(3);
-    let interval_ms = (ttl as u64 * 1000) / 3;
+    // Heartbeat at a third of the lease's FULL TTL, which the server reports —
+    // never at a third of what happens to remain on a partly-elapsed lease,
+    // which on a reused hold would collapse to a hot loop (F-92).
+    //
+    // The floor clamps the INTERVAL, never the TTL: clamping the TTL upward
+    // would make the holder renew more slowly than the lease actually expires,
+    // eating the 3x safety margin and letting a live session's lease lapse
+    // under load. TTL/3 is the margin; 200ms only stops a pathological spin.
+    let interval_ms = ((lease.ttl_seconds.max(1) as u64 * 1000) / 3).max(200);
 
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(exe);
@@ -386,26 +465,54 @@ fn spawn_holder(name: &str, lease: &LeaseResponse) -> Result<()> {
             holder: lease.holder.clone(),
             fence: lease.fence,
             expires_at_unix: lease.expires_at_unix,
+            ttl_seconds: lease.ttl_seconds,
             status: "held".into(),
             holder_pid: Some(child.id()),
         },
     )
 }
 
-/// Stop our holder process for a session, verifying it is ours first.
+/// Stop our holder process for a session, verifying it is ours first, and wait
+/// for it to actually go — a release that races its own holder's next heartbeat
+/// would re-create the state it just cleared.
 fn stop_holder(name: &str) {
-    if let Some(lease) = state::load_lease(name) {
-        if let Some(pid) = lease.holder_pid {
-            if holder_process_is_ours(pid, name) {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
-            }
+    let Some(lease) = state::load_lease(name) else {
+        return;
+    };
+    let Some(pid) = lease.holder_pid else {
+        return;
+    };
+    if !holder_process_is_ours(pid, name, lease.fence) {
+        return;
+    }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    for _ in 0..100 {
+        if !holder_process_is_ours(pid, name, lease.fence) {
+            return;
         }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
 // --- push / pull / release ---------------------------------------------------
+
+/// A temp directory only this user can enter, for the **plaintext** bundle.
+///
+/// F-92: `tempfile::tempdir()` honours the process umask — measured 0775 with a
+/// 0664 file on the reference host — so the decrypted session, the very thing
+/// E-16 exists to keep private, sat world-readable in `/tmp` for the length of a
+/// push or pull. Any local user could read it. The mode is set on the directory
+/// **before** anything is written into it, so there is no window where the
+/// bundle exists under a permissive mode.
+fn private_tempdir() -> Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().context("creating a temp directory")?;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+        .context("restricting the temp directory to this user")?;
+    Ok(dir)
+}
 
 pub fn push(name: &str, release_after: bool, take_over: bool) -> Result<()> {
     let account = state::load_account()?;
@@ -435,7 +542,7 @@ pub fn push(name: &str, release_after: bool, take_over: bool) -> Result<()> {
     // Export through the open CLI, encrypt here, upload ciphertext. The
     // plaintext bundle exists only inside this tempdir, briefly — the same
     // artifact a manual `nemr export` produces, on the user's own disk.
-    let tmp = tempfile::tempdir().context("creating a temp directory")?;
+    let tmp = private_tempdir()?;
     let bundle_path = tmp.path().join(format!("{name}.nemr"));
     engine_cli::export(name, &bundle_path)?;
     let plaintext = std::fs::read(&bundle_path).context("reading the exported bundle")?;
@@ -460,6 +567,7 @@ pub fn push(name: &str, release_after: bool, take_over: bool) -> Result<()> {
                         holder: lease.holder.clone(),
                         fence: lease.fence,
                         expires_at_unix: lease.expires_at_unix,
+                        ttl_seconds: lease.ttl_seconds,
                         status: "lost".into(),
                         holder_pid: None,
                     },
@@ -479,11 +587,15 @@ pub fn push(name: &str, release_after: bool, take_over: bool) -> Result<()> {
         api.release_lease(name, &lease.holder, lease.fence)?;
         state::delete_lease(name);
         println!("lease released");
-    } else if state::load_lease(name)
-        .and_then(|l| l.holder_pid)
-        .is_none_or(|pid| !holder_process_is_ours(pid, name))
-    {
-        spawn_holder(name, &lease)?;
+    } else {
+        // Unconditionally, because ensure_holder is idempotent per fence. The
+        // old fence-blind "only if no live holder" guard was the defect (F-92):
+        // when a re-acquire advanced the fence while the previous holder was
+        // still alive, the guard saw a live process and skipped — leaving the
+        // NEW fence recorded nowhere, no one heartbeating it, and a later
+        // release sending a stale fence that the server refused, stranding the
+        // lease held until its TTL ran out.
+        ensure_holder(name, &lease)?;
     }
     Ok(())
 }
@@ -512,13 +624,13 @@ pub fn pull(name: &str, take_over: bool) -> Result<()> {
         anyhow!("the downloaded bundle does not decrypt — wrong key or corrupted ciphertext")
     })?;
 
-    let tmp = tempfile::tempdir().context("creating a temp directory")?;
+    let tmp = private_tempdir()?;
     let bundle_path = tmp.path().join(format!("{name}.nemr"));
     std::fs::write(&bundle_path, &plaintext).context("writing the decrypted bundle")?;
     let out = engine_cli::import(&bundle_path)?;
     print!("{out}");
 
-    spawn_holder(name, &lease)?;
+    ensure_holder(name, &lease)?;
     println!(
         "holding the lease as {} (heartbeating in the background)",
         lease.holder
@@ -573,6 +685,7 @@ pub fn hold(name: &str, holder: &str, fence: i64, interval_ms: u64) -> Result<()
                         holder: holder.to_string(),
                         fence,
                         expires_at_unix: expires_at,
+                        ttl_seconds: (interval_ms as i64 * 3) / 1000,
                         status: "held".into(),
                         holder_pid: Some(std::process::id()),
                     },
@@ -588,6 +701,7 @@ pub fn hold(name: &str, holder: &str, fence: i64, interval_ms: u64) -> Result<()
                             holder: holder.to_string(),
                             fence,
                             expires_at_unix: expires_at,
+                            ttl_seconds: (interval_ms as i64 * 3) / 1000,
                             status: "lost".into(),
                             holder_pid: None,
                         },

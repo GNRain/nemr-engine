@@ -45,6 +45,8 @@ pub async fn upload(
     let fence: i64 = header_str(&headers, "x-nemr-lease-fence")?
         .parse()
         .map_err(|_| ApiError::BadRequest("x-nemr-lease-fence must be an integer".into()))?;
+    // Fail fast on a fence we can already see is stale, so a doomed upload does
+    // not transfer its body first.
     lease::require_held(&state, session_id, &holder, fence).await?;
 
     let digest = Sha256::digest(&body);
@@ -55,19 +57,40 @@ pub async fn upload(
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("store put: {e}")))?;
 
-    sqlx::query(
+    // F-92: re-check the fence **inside the metadata write itself**. The check
+    // above is a separate read, so a takeover landing between it and here would
+    // let a fenced-out machine's in-flight upload publish anyway — the exact
+    // race D-03's fencing exists to prevent, and one a long body transfer makes
+    // wide. The guard is in the WHERE clause, so the update is atomic with the
+    // lease test; a stale writer touches no row and is told so.
+    let published = sqlx::query(
         "UPDATE sessions
             SET storage_key = $2, ciphertext_sha256 = $3, ciphertext_bytes = $4,
                 last_machine = $5, updated_at = now()
-          WHERE id = $1",
+          WHERE id = $1
+            AND EXISTS (
+                SELECT 1 FROM leases l
+                 WHERE l.session_id = $1 AND l.holder = $5 AND l.fence = $6
+                   AND l.expires_at >= now()
+            )",
     )
     .bind(session_id)
     .bind(key.as_str())
     .bind(digest.as_slice())
     .bind(body.len() as i64)
     .bind(&holder)
+    .bind(fence)
     .execute(&state.pool)
-    .await?;
+    .await?
+    .rows_affected();
+
+    if published == 0 {
+        return Err(ApiError::Conflict(
+            "lease lost during the upload: it was taken over or expired mid-transfer; \
+             the bundle was not published. Re-acquire the lease and push again."
+                .into(),
+        ));
+    }
 
     Ok(Json(UploadResponse {
         bytes: body.len() as i64,

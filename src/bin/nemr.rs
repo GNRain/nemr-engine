@@ -956,6 +956,18 @@ async fn main() -> Result<()> {
             // daemon and no engine state — it is pure delegation.
             use std::os::unix::process::CommandExt;
             let name = args[0].to_string_lossy().into_owned();
+
+            // A subcommand name never contains a path separator. Without this,
+            // `Command::new` treats any name with a `/` as a PATH-free path —
+            // so `nemr ../evil` would run `nemr-../evil` relative to the
+            // current directory, executing a binary from a location PATH never
+            // sanctioned (F-92). Refuse rather than resolve.
+            if name.contains('/') {
+                eprintln!("error: not a subcommand name: {name}");
+                eprintln!("       (subcommand names cannot contain '/'. Extensions are");
+                eprintln!("       found on PATH as `nemr-<name>`, never by path.)");
+                std::process::exit(2);
+            }
             let program = format!("nemr-{name}");
             let err = std::process::Command::new(&program).args(&args[1..]).exec();
             // exec only returns on failure.
