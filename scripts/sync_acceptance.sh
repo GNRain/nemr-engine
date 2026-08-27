@@ -101,8 +101,15 @@ pass "Postgres reachable at ${db_host}:${db_port}"
 # window on a process that is already gone — and report which of the two
 # happened. A fixed wall-clock wait that reports only "did not come up" is the
 # F-65 shape: the evidence exists and never reaches anyone.
+#
+# 15s, deliberately unchanged. It was briefly raised to 30s while the cause of a
+# CI failure was unknown; the cause turned out to be a missing database, so the
+# raise was never attributable and is reverted. Leaving it would have left "we
+# raised the timeout and CI went green" available as a remembered fix for a
+# problem it never solved. If a cold start on a loaded runner ever proves to
+# need longer, that will be a measurement and will justify itself.
 server_up=0
-for _ in $(seq 1 60); do
+for _ in $(seq 1 30); do
     if curl -fsS "http://${SERVER_ADDR}/health" >/dev/null 2>&1; then server_up=1; break; fi
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then break; fi
     sleep 0.5
