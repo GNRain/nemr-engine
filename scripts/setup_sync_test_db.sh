@@ -41,10 +41,12 @@ if [[ "${1:-}" == "--stop" ]]; then
 fi
 
 # Podman, installed once. Needs root; nothing else here does.
-if ! command -v podman >/dev/null 2>&1; then
+if command -v podman >/dev/null 2>&1; then
+    ok "podman already present ($(podman --version 2>/dev/null || echo 'version unknown'))"
+else
     echo "==> installing podman (one-time; rootless deps already present)"
     sudo apt-get update
-    sudo apt-get install -y podman
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y podman
 fi
 
 if podman ps --format '{{.Names}}' | grep -qx "$NAME"; then
