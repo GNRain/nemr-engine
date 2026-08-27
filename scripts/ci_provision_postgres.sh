@@ -3,7 +3,7 @@
 # Provision Postgres for the WP-K sync acceptance, natively — no container.
 #
 # WHY NOT A SERVICE CONTAINER. The host job cannot use GitHub's `services:`
-# block. Service containers are started by **Docker**, Docker runs on the
+# block. Service containers are started by **Docker**, which itself sits on the
 # system **containerd**, and `ci_provision_host.sh` disables containerd.service
 # (PRIV-01: a socket-resolution mistake must not be able to reach a root
 # daemon). So provisioning the Docker-free rootless stack pulls the rug from

@@ -187,7 +187,7 @@ jobs:
     # the critical path for a lint typo but never let it be silently skipped.
     needs: [docker-free, lint, unit-tests]
     # NO `services:` block here, deliberately. Service containers are started by
-    # Docker, Docker runs on the system containerd, and ci_provision_host.sh
+    # Docker, which itself sits on the system containerd, and ci_provision_host.sh
     # disables containerd.service (PRIV-01) — so the Postgres container dies
     # mid-job, after provisioning has already passed. NFR-01 and GitHub's
     # service model are genuinely incompatible in this job; Postgres is
