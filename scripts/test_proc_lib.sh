@@ -109,6 +109,39 @@ out=$(require_tcp 127.0.0.1 "$PORT" "the probe listener" "run ./scripts/start-it
 check "require_tcp names the remedy" "$out" "run ./scripts/start-it.sh"
 check "require_tcp says this is not the dependent's failure" "$out" "not a failure of whatever needed it"
 
+
+# --- output_has -------------------------------------------------------------
+# The helper exists to keep three outcomes apart that `cmd | grep -q` collapses
+# into two. Each is asserted, and the third is asserted with a CONTROL showing
+# the old shape getting it wrong on the same input.
+
+output_has "^b" -- printf 'a\nb\nc\n'; rc=$?
+[[ $rc -eq 0 ]] && ok "output_has says yes when the output matches" || bad "should have matched"
+
+output_has "^z" -- printf 'a\nb\nc\n'; rc=$?
+[[ $rc -eq 1 ]] && ok "output_has says no when the output does not match" || bad "should have missed"
+
+# A command that FAILS while its output happens to contain the pattern. Read as
+# a pipeline this is the worst case: the answer is "yes" and the instrument is
+# broken, and `grep -q` reports "no" either way.
+out=$( (output_has "^b" -- bash -c 'echo b; echo "boom" >&2; exit 3') 2>&1 ); rc=$?
+[[ $rc -ne 0 ]] && ok "output_has refuses to answer when the command failed" || bad "should have refused"
+check "it names the exit status"              "$out" "exited 3"
+check "it says this is not an absence"        "$out" 'not "^b is absent"'
+check "it prints the command's stderr"        "$out" "boom"
+
+# CONTROL: the shape this replaces, on the same input, under the same options.
+# It reports a failure indistinguishable from "the pattern was absent" — which
+# is the whole defect, so it is proven here rather than asserted in a comment.
+( set -o pipefail; bash -c 'echo b; echo "boom" >&2; exit 3' 2>/dev/null | grep -q "^b" ); ctl=$?
+[[ $ctl -ne 0 ]] \
+    && ok "CONTROL: \`cmd | grep -q\` reports failure for a MATCH, indistinguishably" \
+    || bad "control did not reproduce the conflation — the helper's premise is wrong"
+
+# The haystack is kept, so an assertion can show what it actually saw.
+output_has "^z" -- printf 'a\nb\n' || true
+check "output_has leaves the output for the caller to print" "$_LAST_OUTPUT" "b"
+
 printf '\n'
 if [[ $FAIL -eq 0 ]]; then
     printf '%sPASS%s — %d assertions.\n' "$GREEN" "$RESET" "$PASS"; exit 0

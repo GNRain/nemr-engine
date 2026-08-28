@@ -178,7 +178,11 @@ pass "the stored object is ciphertext ($(stat -c%s "$STORED") bytes)"
 step "Delete the local project entirely"
 # ---------------------------------------------------------------------------
 nemr delete "$PROJECT" --yes
-nemr list 2>/dev/null | grep -q "^$PROJECT " && fail "project still listed after delete"
+# output_has, not `nemr list | grep -q`: a listing that FAILED must not read as
+# "the project is gone" (F-109). This assertion is the negative one, where that
+# conflation is a false PASS.
+output_has "^$PROJECT " -- nemr list && fail "project still listed after delete:
+$_LAST_OUTPUT"
 [[ -e "$HOME/.local/share/nemr/volumes/$PROJECT.img" ]] && fail "volume image survived delete"
 pass "the project is gone from this machine"
 
@@ -186,12 +190,34 @@ pass "the project is gone from this machine"
 step "Pull it back and continue"
 # ---------------------------------------------------------------------------
 nemr pull "$PROJECT"
-nemr list 2>/dev/null | grep -q "^$PROJECT " || fail "pulled project not in nemr list"
+
+# Restore is the one flow where a silent failure means someone's session appears
+# to come back and has not. So the claim is USABLE, not merely listed, and each
+# clause is asserted separately with the evidence printed when it fails.
+output_has "^$PROJECT " -- nemr list || fail "pull reported success but the project is not listed.
+   \`nemr list\` succeeded and named:
+$_LAST_OUTPUT"
+pass "the pulled project is listed"
+
 NEW_SHA=$(cd "$MOUNT/.nemr-state" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
 [[ "$NEW_SHA" == "$STATE_SHA" ]] || fail "session state differs after the round-trip"
 pass "session state is byte-identical through encrypt->push->delete->pull->import"
 
 nemr start "$PROJECT"
+output_has "^$PROJECT  *running" -- nemr list || fail "the pulled project did not reach running:
+$_LAST_OUTPUT"
+pass "the pulled project starts and reports running"
+
+# A restored session with no network looks identical to a working one until
+# Claude Code tries to reach the API — which is the failure NET-02's wiring can
+# produce silently, so the restore path asserts it rather than assuming it.
+resolved=$(echo 'getent hosts api.anthropic.com >/dev/null && echo NET-OK || echo NET-FAIL' \
+    | nemr attach "$PROJECT" 2>&1 | tr -d '\r')
+grep -q NET-OK <<<"$resolved" || {
+    printf '%s\n' "$resolved" | head -20 >&2
+    fail "the restored session has no working network (DNS did not resolve inside it)"; }
+pass "the restored session has a working network (DNS resolves inside it)"
+
 if [[ "$SKIP_API" == "1" ]]; then
     got=$(echo 'cat /root/.claude/projects/-workspace/acceptance.jsonl' \
         | nemr attach "$PROJECT" 2>&1 | tr -d '\r')
