@@ -26,6 +26,10 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Shared shell helpers: output_has keeps a failed command distinct from a
+# negative answer, which `nemr list | grep -q` cannot do (F-109).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/proc.sh"
+
 # A dedicated project name, suffixed with the PID so a stale run cannot collide
 # with a live one and so the script never touches a real project.
 readonly PROJECT="e2e-smoke-$$"
@@ -354,8 +358,14 @@ assert_eq "systemd scope gone" "0" \
 assert_eq "no loop device backed by this project's (deleted) file" "0" \
     "$(losetup -a 2>/dev/null | grep -F "${VOLUME_DIR}/${PROJECT}.img" | grep -ci deleted || true)"
 
-assert "project gone from list" \
-    bash -c "! $NEMR list 2>/dev/null | grep -q '^${PROJECT} '"
+# Not `! nemr list | grep -q`: a listing that FAILED would satisfy that, so the
+# strongest assertion in the whole script — the project is really gone — would
+# pass on an engine that could not answer at all (F-109).
+if output_has "^${PROJECT} " -- "$NEMR" list; then
+    fail "project gone from list (still listed: $(grep "^${PROJECT} " <<<"$_LAST_OUTPUT"))"
+else
+    ok "project gone from list"
+fi
 
 # ---------------------------------------------------------------------------
 # Result

@@ -174,17 +174,30 @@ async fn try_connect(path: &std::path::Path) -> Result<Client> {
 }
 
 async fn handshake(mut client: Client) -> Result<Client> {
-    let resp = client
-        .handshake(HandshakeRequest {
+    // Bounded, like the connect (5s) and the audit-stream Ready wait (15s)
+    // around it. Without this a socket that accepts and completes the HTTP/2
+    // handshake but never answers the RPC hangs the CLI forever — measured at
+    // 61 seconds and still going when it was killed. In CI that is a step that
+    // burns its whole timeout and produces no diagnosis at all.
+    let resp = tokio::time::timeout(
+        Duration::from_secs(15),
+        client.handshake(HandshakeRequest {
             protocol_version: PROTOCOL_VERSION,
             client_build: env!("CARGO_PKG_VERSION").to_string(),
-        })
-        .await
-        .map_err(|status| {
-            // A version mismatch is a FailedPrecondition with an actionable
-            // message; surface it as-is rather than a generic RPC error.
-            anyhow::anyhow!("{}", status.message())
-        })?;
+        }),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "the daemon accepted a connection but did not answer the version handshake \
+             within 15s. It may be wedged; stop it and retry:\n    pkill -f nemrd"
+        )
+    })?
+    .map_err(|status| {
+        // A version mismatch is a FailedPrecondition with an actionable
+        // message; surface it as-is rather than a generic RPC error.
+        anyhow::anyhow!("{}", status.message())
+    })?;
     let resp = resp.into_inner();
     if resp.protocol_version != PROTOCOL_VERSION {
         bail!(
@@ -256,12 +269,22 @@ async fn autostart(path: &std::path::Path) -> Result<()> {
     }
     cmd.spawn().context("failed to spawn nemrd")?;
 
-    // Wait for the socket to accept a connection (bounded).
-    for _ in 0..150 {
+    // Wait for the socket to accept a connection (bounded). The window is
+    // stated once, from the loop, rather than written twice and allowed to
+    // disagree — it said "within 5s" while waiting 15, which sends anyone
+    // debugging an autostart failure looking for a window that does not exist.
+    const POLLS: u32 = 150;
+    const INTERVAL: Duration = Duration::from_millis(100);
+    for _ in 0..POLLS {
         if try_connect(path).await.is_ok() {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(INTERVAL).await;
     }
-    bail!("nemrd was spawned but did not start listening within 5s")
+    bail!(
+        "nemrd was spawned but did not start listening on {} within {}s. Its own output is in \
+         $XDG_STATE_HOME/nemr/nemrd.log.",
+        path.display(),
+        (POLLS * INTERVAL.as_millis() as u32) / 1000
+    )
 }

@@ -257,6 +257,13 @@ jobs:
         run: |
           export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
           ./scripts/port_acceptance.sh
+      - name: NET-02 acceptance — two sessions, same internal port (WP-N)
+        # The thing NET-01 made impossible. Asserts on host-observable state,
+        # with a control proving the NAT is what provides egress. NEMR_SKIP_API
+        # omits only the live API call; the footer states which mode ran.
+        run: |
+          export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
+          NEMR_SKIP_API=1 ./scripts/netns_acceptance.sh
       - name: Sync acceptance — the product flow (WP-K)
         # Engine + server, together: register, create, work, push, DELETE THE
         # PROJECT, pull, continue. NEMR_SKIP_API asserts transcript
@@ -267,3 +274,31 @@ jobs:
         run: |
           export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
           NEMR_SKIP_API=1 ./scripts/sync_acceptance.sh
+
+      - name: What the host looked like when it failed
+        # Only on failure, and only reading. An intermittent failure in this job
+        # cost a full CI round-trip to a question the daemon log already
+        # answered — it just was not collected. The engine's own log is the one
+        # place the daemon's side of a failed command is recorded, and a
+        # scripted assertion cannot print what it never had.
+        if: failure()
+        run: |
+          export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
+          dump() { printf '\n===== %s =====\n' "$1"; shift; "$@" 2>&1 | tail -120 || echo "(unavailable)"; }
+          log="${XDG_STATE_HOME:-$HOME/.local/state}/nemr/nemrd.log"
+          printf '\n===== nemrd.log (last 200 lines of %s) =====\n' "$log"
+          if [ -s "$log" ]; then tail -200 "$log"
+          elif [ -e "$log" ]; then echo "(the file exists and is EMPTY)"
+          else echo "(no such file — the daemon never wrote one)"; fi
+          dump "nemr list"            nemr list
+          dump "nemrd processes"      pgrep -a nemrd
+          dump "containerd containers" ctr -n default containers list
+          dump "containerd tasks"     ctr -n default tasks list
+          rk="$(cat "$XDG_RUNTIME_DIR/containerd-rootless/child_pid" 2>/dev/null || true)"
+          if [ -n "$rk" ]; then
+            dump "rootlesskit links" nsenter -t "$rk" -U -n --preserve-credentials -- ip -brief link show
+            dump "rootlesskit NAT"   nsenter -t "$rk" -U -n --preserve-credentials -- iptables -w 5 -t nat -S POSTROUTING
+          else
+            echo "(rootlesskit child_pid unreadable — cannot inspect its namespace)"
+          fi
+          dump "host routes"          ip -4 route show table all

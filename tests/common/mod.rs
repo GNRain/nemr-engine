@@ -703,8 +703,30 @@ pub fn purge(name: &str) {
             runtime.block_on(async {
                 if let Ok(client) = ContainerdClient::connect().await {
                     let id = nemr_engine::config::container_id(&owned);
+
+                    // NET-02: release the session network before the record
+                    // that names it. Going straight at the host is deliberate
+                    // (above), but the veth and the NAT rule are host state
+                    // too, and skipping them leaked one of each per purged
+                    // test — which then failed the NET-02 acceptance's teardown
+                    // check for reasons that had nothing to do with the code
+                    // under test. Read the label first: after
+                    // `delete_container` there is nothing left to read it from.
+                    let alloc = client
+                        .list_containers()
+                        .await
+                        .ok()
+                        .and_then(|cs| cs.into_iter().find(|c| c.id == id))
+                        .and_then(|c| {
+                            nemr_engine::engine::project::allocation_from_labels(&c.labels)
+                        });
+
                     let _ = client.stop_task(&id).await;
                     let _ = client.delete_container(&id).await;
+
+                    if let Some(alloc) = alloc {
+                        nemr_engine::engine::netns::disconnect_session(alloc);
+                    }
                 }
             });
         }

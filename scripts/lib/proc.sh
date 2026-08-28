@@ -169,3 +169,70 @@ require_tcp() {
     _proc_bad "$what unreachable"
     return 1
 }
+
+# --- asking a question of a command's output --------------------------------
+
+# `cmd | grep -q PATTERN` answers "no" in three different ways: the pattern was
+# absent, the command failed, or the command never ran. Only the first is an
+# answer. Two further ways it lies:
+#
+#   - under `set -o pipefail` a failing command turns a SUCCESSFUL match into a
+#     failed pipeline, so a true "yes" is reported as "no";
+#   - `grep -q` exits at the first match and closes the pipe, so the writer can
+#     take EPIPE mid-write — for a Rust binary that is a panic, not a quiet
+#     stop — and again a "yes" is reported as "no".
+#
+# F-109 cost a CI round-trip to this: `nemr list 2>/dev/null | grep -q "^$P "`
+# reported "pulled project not in nemr list" while discarding the only thing
+# that could say whether the project was absent or the listing had failed.
+#
+#   output_has "^$PROJECT " -- nemr list
+#
+# Returns 0 (yes) or 1 (no), and on a FAILURE of the command itself it does not
+# return at all: it prints the status, the stderr and the stdout, and exits.
+# A broken instrument must not be read as a measurement.
+#
+# The command's stdout is left in $_LAST_OUTPUT so the caller can show what it
+# actually saw when the answer is "no" — an assertion that names the pattern but
+# never the haystack is the same failure one step later.
+_LAST_OUTPUT=""
+_LAST_STDERR=""
+output_has() {
+    if [[ $# -lt 2 ]]; then
+        _proc_bad "output_has: usage: <pattern> [--] <cmd...>"
+        exit 2
+    fi
+    local pattern="$1"; shift
+    [[ "${1:-}" == "--" ]] && shift
+
+    local err status
+    err="$(mktemp)"
+    # No pipe anywhere: the output is captured whole, then searched in memory,
+    # so neither pipefail nor EPIPE can turn an answer into a failure.
+    _LAST_OUTPUT="$("$@" 2>"$err")" && status=0 || status=$?
+    _LAST_STDERR="$(cat "$err")"
+    rm -f "$err"
+
+    if (( status != 0 )); then
+        printf '   `%s` exited %s, so its output answers nothing.\n' "$*" "$status" >&2
+        printf '   This is THAT failure, not "%s is absent".\n' "$pattern" >&2
+        _proc_dump_stream "its stderr" "$_LAST_STDERR"
+        _proc_dump_stream "its stdout" "$_LAST_OUTPUT"
+        _proc_bad "$1 failed"
+        exit 1
+    fi
+
+    grep -q -- "$pattern" <<<"$_LAST_OUTPUT"
+}
+
+# Print a captured stream with the same "empty is stated, not implied" rule
+# _proc_dump_log uses.
+_proc_dump_stream() {
+    printf '   --- %s ---\n' "$1" >&2
+    if [[ -n "$2" ]]; then
+        sed 's/^/   | /' <<<"$2" >&2
+    else
+        printf '   | (empty)\n' >&2
+    fi
+    printf '   --- end ---\n' >&2
+}
