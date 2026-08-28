@@ -2172,22 +2172,40 @@ fn the_elevation_note_is_visible_without_a_flag() {
     );
 
     // Stop the dedicated test daemon and clean up.
-    for pid in String::from_utf8_lossy(
-        &std::process::Command::new("pgrep")
-            .args(["-f", &test_sock.to_string_lossy()])
-            .output()
-            .map(|o| o.stdout)
-            .unwrap_or_default(),
-    )
-    .lines()
-    {
-        if let Ok(pid) = pid.trim().parse::<i32>() {
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
+    stop_test_daemon(&test_state, &test_sock);
+    let _ = std::fs::remove_dir_all(&test_state);
+}
+
+/// Stop a daemon a test started on its own socket.
+///
+/// Not `pgrep -f <socket path>`: the path reaches nemrd through the
+/// ENVIRONMENT, not its argv, so that matched nothing (or, worse, an unrelated
+/// process that happened to mention the path) and every such test leaked its
+/// daemon. Daemons accumulated until six were live on one machine. The daemon
+/// announces its own pid in its log, and the test owns that log because it owns
+/// XDG_STATE_HOME, so that is what identifies it.
+fn stop_test_daemon(state_dir: &std::path::Path, sock: &std::path::Path) {
+    let log = state_dir.join("nemr/nemrd.log");
+    let Ok(text) = std::fs::read_to_string(&log) else {
+        return;
+    };
+    let needle = sock.to_string_lossy().into_owned();
+    for line in text.lines() {
+        // "[nemrd 12345] listening on /path/to.sock (protocol vN)"
+        if !line.contains("listening on") || !line.contains(&needle) {
+            continue;
+        }
+        let Some(pid) = line
+            .split_once("[nemrd ")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .and_then(|(pid, _)| pid.trim().parse::<i32>().ok())
+        else {
+            continue;
+        };
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
         }
     }
-    let _ = std::fs::remove_dir_all(&test_state);
 }
 
 /// `nemr status` must answer the questions that previously took three commands.
@@ -2774,21 +2792,7 @@ fn e09_daemon_refuses_a_protocol_version_mismatch() {
     );
 
     // Stop the forced daemon.
-    for pid in String::from_utf8_lossy(
-        &std::process::Command::new("pgrep")
-            .args(["-f", &sock.to_string_lossy()])
-            .output()
-            .map(|o| o.stdout)
-            .unwrap_or_default(),
-    )
-    .lines()
-    {
-        if let Ok(pid) = pid.trim().parse::<i32>() {
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-        }
-    }
+    stop_test_daemon(&dir, &sock);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
