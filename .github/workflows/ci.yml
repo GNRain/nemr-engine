@@ -257,6 +257,13 @@ jobs:
         run: |
           export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
           ./scripts/port_acceptance.sh
+      - name: NET-02 acceptance — two sessions, same internal port (WP-N)
+        # The thing NET-01 made impossible. Asserts on host-observable state,
+        # with a control proving the NAT is what provides egress. NEMR_SKIP_API
+        # omits only the live API call; the footer states which mode ran.
+        run: |
+          export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
+          NEMR_SKIP_API=1 ./scripts/netns_acceptance.sh
       - name: Sync acceptance — the product flow (WP-K)
         # Engine + server, together: register, create, work, push, DELETE THE
         # PROJECT, pull, continue. NEMR_SKIP_API asserts transcript
