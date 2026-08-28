@@ -208,6 +208,15 @@ enforced by a hook rather than a habit.** fmt is the first; clippy is too slow
 for a pre-push gate, but if a second cheap check earns a CI job, add it to the
 hook in the same breath.
 
+**The same lesson, applied to waiting (F-95).** Seven wait loops shipped
+unable to explain their own failures, and the seventh was written *in a script
+authored after this file already said not to*. That is the evidence that a rule
+here competes with the moment of writing and loses. Waiting now lives in
+`scripts/lib/proc.sh` (`wait_for_service`, `wait_for_ready`, `require_tcp`) and
+`scripts/check_wait_discipline.sh` fails the build when a script backgrounds a
+process without it. **When a rule in this file recurs, the question is not how
+to remember it harder — it is what would make forgetting impossible.**
+
 ## Fix autonomously
 
 - A newly `#[ignore]`d or skipped test — de-skip it and make it run.
