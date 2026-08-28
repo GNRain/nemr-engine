@@ -255,6 +255,13 @@ async fn create_with_auth(
     mounts.extend(session_state_mounts(&mount_point));
 
     let spec = ContainerSpec {
+        // Test seam, the same shape as NEMR_TEST_DAEMON_PROTOCOL: creates a
+        // container with the pre-NET-02 namespace list, so the upgrade path
+        // every existing user takes can be exercised end to end. No freshly
+        // created container can otherwise have that shape, and an untested
+        // upgrade path is how a working project stops working. Production never
+        // sets it.
+        own_network_namespace: std::env::var_os("NEMR_TEST_PRE_NET02").is_none(),
         id: container_id.clone(),
         image: config::BASE_IMAGE.to_string(),
         mounts,
@@ -416,6 +423,28 @@ pub async fn start(client: &ContainerdClient, name: &str) -> Result<u32> {
             client.stop_task(&container_id).await?;
         }
         _ => {}
+    }
+
+    // NET-02 migration, BEFORE the task exists: the OCI spec is frozen into the
+    // container record at create time and read again at every task start, so a
+    // project created before NET-02 asks for no network namespace and its task
+    // joins rootlesskit's — for ever, whatever the engine does afterwards. The
+    // first migration recorded an allocation and then wired it, which built a
+    // session network inside the SHARED namespace and failed with "RTNETLINK
+    // answers: File exists" against rootlesskit's own default route. A project
+    // that used to start stopped starting.
+    if client
+        .ensure_own_network_namespace(&container_id)
+        .await
+        .with_context(|| format!("migrating {name:?} to a per-session network namespace"))?
+    {
+        // Tagged so it reaches the user (F-98): the project's container record
+        // was changed, once, and silently changing someone's project is not the
+        // same as changing it.
+        tracing::warn!(
+            nemr_audit = "warning",
+            "[nemr] {name}: gave this project its own network namespace (NET-02 migration)"
+        );
     }
 
     let pid = client.start_task(&container_id).await?;
@@ -2294,6 +2323,23 @@ async fn allocate_and_record(
 /// Separated from `start` so every failure below leaves through one place, and
 /// one place decides what to do about the task that is already running.
 async fn wire_session(client: &ContainerdClient, name: &str, pid: u32) -> Result<()> {
+    // The control on the migration above. If the task is in rootlesskit's own
+    // namespace, wiring would put this session's addresses on rootlesskit's
+    // interfaces and collide with its default route — so refuse, and say which
+    // of the two situations this is. Reported rather than assumed: the inode
+    // comparison is the same evidence NET-01 and NET-02 both rest on.
+    if netns::shares_rootlesskit_namespace(pid)
+        .context("checking whether the task received its own network namespace")?
+    {
+        bail!(
+            "{name:?} started in rootlesskit's shared network namespace rather than its own, \
+             so it cannot be given a session network.\n\
+             Its container record asks for no network namespace and the migration that adds \
+             one did not take effect. Recreate the project, or report this — wiring a session \
+             into the shared namespace would put its addresses on rootlesskit's interfaces."
+        );
+    }
+
     let container = find_container(client, name).await?;
     let alloc = match allocation_from_labels(&container.labels) {
         Some(alloc) => alloc,

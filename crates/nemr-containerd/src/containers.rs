@@ -83,6 +83,30 @@ impl ContainerdClient {
     }
 }
 
+/// Add a network namespace to an OCI spec if it does not already ask for one.
+///
+/// Returns whether it changed anything, so the caller can avoid a pointless
+/// containerd write and can report a real migration to the user. Pure, and
+/// therefore testable against a spec captured from a container that predates
+/// NET-02 — which is the only shape that matters here and the one no freshly
+/// created container can produce.
+pub fn add_network_namespace(oci: &mut serde_json::Value) -> Result<bool> {
+    let namespaces = oci
+        .get_mut("linux")
+        .and_then(|l| l.get_mut("namespaces"))
+        .and_then(|n| n.as_array_mut())
+        .context("the OCI spec has no linux.namespaces array")?;
+
+    if namespaces
+        .iter()
+        .any(|n| n.get("type").and_then(|t| t.as_str()) == Some("network"))
+    {
+        return Ok(false);
+    }
+    namespaces.push(serde_json::json!({ "type": "network" }));
+    Ok(true)
+}
+
 /// A host path bind-mounted into a container.
 #[derive(Debug, Clone)]
 pub struct BindMount {
@@ -157,6 +181,31 @@ pub struct ContainerSpec {
     /// caller metadata is discoverable through containerd itself rather than a
     /// side database the caller would have to keep in sync.
     pub labels: HashMap<String, String>,
+    /// Ask for a private network namespace (NET-02). Always true in production.
+    ///
+    /// It is a field rather than a constant because the OTHER shape genuinely
+    /// exists on every machine that ran this engine before NET-02: those
+    /// container records are frozen without it, and the migration that repairs
+    /// them is the upgrade path every existing user takes. A test cannot cover
+    /// that path without being able to build the shape it repairs.
+    pub own_network_namespace: bool,
+}
+
+impl Default for ContainerSpec {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            image: String::new(),
+            mounts: Vec::new(),
+            working_dir: None,
+            extra_env: Vec::new(),
+            args: None,
+            cgroup_name: None,
+            cgroup_prefix: String::new(),
+            labels: HashMap::new(),
+            own_network_namespace: true,
+        }
+    }
 }
 
 impl ContainerdClient {
@@ -398,6 +447,118 @@ impl ContainerdClient {
         Ok(())
     }
 
+    /// Give a container its own network namespace if its stored OCI spec does
+    /// not already ask for one (NET-02 migration). Returns whether the record
+    /// was changed.
+    ///
+    /// # Why this exists
+    ///
+    /// The OCI spec is frozen into the container record at CREATE time and read
+    /// again at every task start. So a project created before NET-02 keeps a
+    /// spec with `namespaces: [pid, ipc, uts, mount]` for ever, and its task
+    /// joins rootlesskit's network namespace exactly as it always did — no
+    /// amount of new engine code changes that. Recording an allocation on such a
+    /// project and then wiring it, as the first NET-02 migration did, tries to
+    /// build a session network inside the SHARED namespace: the veth is created,
+    /// the addresses land in rootlesskit's own namespace, and
+    /// `ip route add default` fails with "RTNETLINK answers: File exists"
+    /// because rootlesskit already has one. That is a project that used to start
+    /// and no longer does.
+    ///
+    /// The edit is deliberately minimal — one entry appended to
+    /// `linux.namespaces`, every other byte of the spec left as it was. A
+    /// project that has travelled between machines carries mounts, a cgroup path
+    /// and process arguments in that spec, and regenerating it from today's
+    /// inputs could change any of them.
+    pub async fn ensure_own_network_namespace(&self, id: &str) -> Result<bool> {
+        let request = ListContainersRequest {
+            filters: vec![format!("id=={id}")],
+        };
+        // (read-only sibling: `has_own_network_namespace`)
+        let mut containers = self
+            .raw()
+            .containers()
+            .list(with_namespace!(request, self.namespace()))
+            .await
+            .context("containerd ListContainers request failed")?
+            .into_inner()
+            .containers;
+        let Some(container) = containers.pop() else {
+            anyhow::bail!("container {id:?} does not exist");
+        };
+        let Some(spec) = container.spec.clone() else {
+            anyhow::bail!("container {id:?} has no OCI spec recorded");
+        };
+
+        let mut oci: serde_json::Value = serde_json::from_slice(&spec.value)
+            .with_context(|| format!("parsing the OCI spec recorded for {id:?}"))?;
+
+        if !add_network_namespace(&mut oci)
+            .with_context(|| format!("reading linux.namespaces from the spec for {id:?}"))?
+        {
+            return Ok(false);
+        }
+
+        let updated = serde_json::to_vec(&oci).context("re-serialising the OCI spec")?;
+        let request = UpdateContainerRequest {
+            container: Some(Container {
+                id: id.to_string(),
+                spec: Some(Any {
+                    type_url: spec.type_url,
+                    value: updated,
+                }),
+                ..Default::default()
+            }),
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["spec".to_string()],
+            }),
+        };
+        self.raw()
+            .containers()
+            .update(with_namespace!(request, self.namespace()))
+            .await
+            .with_context(|| {
+                format!("failed to add a network namespace to the OCI spec of {id:?}")
+            })?;
+        Ok(true)
+    }
+
+    /// Does this container's stored OCI spec ask for its own network namespace?
+    ///
+    /// Read-only, deliberately. A test that established the same fact by calling
+    /// `ensure_own_network_namespace` performed the migration it was checking
+    /// for, so the subject was already repaired before the code under test ran —
+    /// and the test stayed green with the migration deleted. A control that
+    /// changes what it observes is not a control.
+    pub async fn has_own_network_namespace(&self, id: &str) -> Result<bool> {
+        let request = ListContainersRequest {
+            filters: vec![format!("id=={id}")],
+        };
+        let mut containers = self
+            .raw()
+            .containers()
+            .list(with_namespace!(request, self.namespace()))
+            .await
+            .context("containerd ListContainers request failed")?
+            .into_inner()
+            .containers;
+        let Some(container) = containers.pop() else {
+            anyhow::bail!("container {id:?} does not exist");
+        };
+        let spec = container
+            .spec
+            .with_context(|| format!("container {id:?} has no OCI spec recorded"))?;
+        let oci: serde_json::Value = serde_json::from_slice(&spec.value)
+            .with_context(|| format!("parsing the OCI spec recorded for {id:?}"))?;
+        Ok(oci
+            .get("linux")
+            .and_then(|l| l.get("namespaces"))
+            .and_then(|n| n.as_array())
+            .context("the OCI spec has no linux.namespaces array")?
+            .iter()
+            .any(|n| n.get("type").and_then(|t| t.as_str()) == Some("network")))
+    }
+
     /// Delete a container record and its rootfs snapshot.
     ///
     /// Tolerates a missing container so it is safe on cleanup paths.
@@ -433,6 +594,15 @@ impl ContainerdClient {
 /// inherits rootlesskit's existing user namespace. Adding one here would ask
 /// runc to nest a second namespace and require its own uid mappings.
 fn oci_spec(spec: &ContainerSpec, image_config: &ImageConfig) -> serde_json::Value {
+    let mut namespaces = vec![
+        serde_json::json!({ "type": "pid" }),
+        serde_json::json!({ "type": "ipc" }),
+        serde_json::json!({ "type": "uts" }),
+        serde_json::json!({ "type": "mount" }),
+    ];
+    if spec.own_network_namespace {
+        namespaces.push(serde_json::json!({ "type": "network" }));
+    }
     let mut env = image_config.env.clone();
     env.extend(spec.extra_env.iter().cloned());
 
@@ -482,18 +652,16 @@ fn oci_spec(spec: &ContainerSpec, image_config: &ImageConfig) -> serde_json::Val
                 spec.cgroup_prefix,
                 spec.cgroup_name.as_deref().unwrap_or(&spec.id)
             ),
-            "namespaces": [
-                { "type": "pid" }, { "type": "ipc" }, { "type": "uts" },
-                { "type": "mount" },
-                // NET-02: each session gets its OWN network namespace, so two
-                // sessions can both bind port 8000 internally — the normal
-                // expectation, and what Docker does. A fresh netns has only a
-                // down loopback; the engine wires a veth pair and NAT into it
-                // immediately after start (engine::netns). Before NET-02 this
-                // entry was absent, so sessions shared rootlesskit's namespace
-                // (NET-01) and the second bind of any port simply failed.
-                { "type": "network" }
-            ],
+            // NET-02: each session gets its OWN network namespace, so two
+            // sessions can both bind port 8000 internally — the normal
+            // expectation, and what Docker does. A fresh netns has only a down
+            // loopback; the engine wires a veth pair and NAT into it
+            // immediately after start (engine::netns). Before NET-02 this entry
+            // was absent, so sessions shared rootlesskit's namespace (NET-01)
+            // and the second bind of any port simply failed — and records
+            // created then still carry that shape, which is what
+            // `ensure_own_network_namespace` repairs.
+            "namespaces": namespaces,
             "maskedPaths": [
                 "/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys",
                 "/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats",
@@ -1000,5 +1168,130 @@ impl ContainerdClient {
             Err(status) => Err(anyhow::Error::from(status))
                 .with_context(|| format!("failed to delete exec {exec_id:?}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact `linux.namespaces` a container created before NET-02 carries.
+    /// Read off a real record on 2026-08-29 (`nemr-htmltest`, created
+    /// 2026-08-23): a spec frozen at create time and never revisited, which is
+    /// why the migration exists at all.
+    fn pre_net02_spec() -> serde_json::Value {
+        serde_json::json!({
+            "ociVersion": "1.0.2-dev",
+            "linux": {
+                "namespaces": [
+                    { "type": "pid" }, { "type": "ipc" },
+                    { "type": "uts" }, { "type": "mount" }
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn a_pre_net02_spec_gains_a_network_namespace() {
+        let mut oci = pre_net02_spec();
+        assert!(
+            add_network_namespace(&mut oci).unwrap(),
+            "a spec with no network namespace must be changed"
+        );
+        let types: Vec<&str> = oci["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["pid", "ipc", "uts", "mount", "network"]);
+    }
+
+    /// Idempotent, and it says so — the caller reports a migration to the user
+    /// and must not report one on every start for ever after.
+    #[test]
+    fn migrating_a_spec_twice_changes_nothing_the_second_time() {
+        let mut oci = pre_net02_spec();
+        assert!(add_network_namespace(&mut oci).unwrap());
+        let after_first = oci.clone();
+        assert!(
+            !add_network_namespace(&mut oci).unwrap(),
+            "the second call must report no change"
+        );
+        assert_eq!(oci, after_first, "and must not change the spec either");
+    }
+
+    /// Nothing outside `linux.namespaces` may move. These records carry mounts,
+    /// a cgroup path and process arguments for projects that have travelled
+    /// between machines; regenerating the spec from today's inputs could change
+    /// any of them, so the migration is additive and this pins that.
+    #[test]
+    fn the_migration_touches_nothing_but_the_namespace_list() {
+        let mut oci = serde_json::json!({
+            "ociVersion": "1.0.2-dev",
+            "process": { "args": ["/usr/local/bin/nemr-supervisor"], "cwd": "/workspace" },
+            "mounts": [{ "destination": "/workspace", "source": "/host/vol" }],
+            "linux": {
+                "cgroupsPath": "user.slice:nemr:demo",
+                "namespaces": [{ "type": "pid" }, { "type": "mount" }]
+            }
+        });
+        let before = oci.clone();
+        assert!(add_network_namespace(&mut oci).unwrap());
+
+        assert_eq!(oci["process"], before["process"]);
+        assert_eq!(oci["mounts"], before["mounts"]);
+        assert_eq!(oci["ociVersion"], before["ociVersion"]);
+        assert_eq!(oci["linux"]["cgroupsPath"], before["linux"]["cgroupsPath"]);
+    }
+
+    /// A spec that is not shaped like one must not be silently "migrated" into
+    /// something else. Refusing names the problem; adding a namespaces array to
+    /// a spec that has none would write a record runc cannot use.
+    #[test]
+    fn a_spec_without_a_namespace_list_is_refused_rather_than_invented() {
+        let mut oci = serde_json::json!({ "ociVersion": "1.0.2-dev" });
+        assert!(add_network_namespace(&mut oci).is_err());
+    }
+
+    /// The two shapes the builder can produce. `own_network_namespace` exists so
+    /// a test can construct the pre-NET-02 one; nothing in production sets it
+    /// false, and this pins both directions.
+    #[test]
+    fn the_spec_builder_emits_the_network_namespace_only_when_asked() {
+        let image = ImageConfig::default();
+        let base = ContainerSpec {
+            id: "demo".into(),
+            image: "img".into(),
+            cgroup_prefix: "nemr".into(),
+            ..Default::default()
+        };
+
+        let with = oci_spec(&base, &image);
+        let types: Vec<String> = with["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["type"].as_str().unwrap().to_string())
+            .collect();
+        assert!(types.contains(&"network".to_string()));
+
+        let without = oci_spec(
+            &ContainerSpec {
+                own_network_namespace: false,
+                ..base
+            },
+            &image,
+        );
+        let types: Vec<String> = without["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["type"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !types.contains(&"network".to_string()),
+            "this is the shape every pre-NET-02 record has, and the migration's subject"
+        );
     }
 }
