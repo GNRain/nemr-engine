@@ -446,8 +446,36 @@ async fn attach_client(mut client: daemon::Client, name: &str) -> Result<i32> {
     Ok(exit_code)
 }
 
+/// Behave like every other command-line tool when its reader goes away.
+///
+/// Rust sets `SIGPIPE` to `SIG_IGN` before `main`, so a write to a closed pipe
+/// returns `EPIPE` and `println!` PANICS. `nemr list | head -1` therefore
+/// printed a Rust panic and exited 101 in about one run in five — and the same
+/// race turned a SUCCESSFUL `nemr list | grep -q <project>` into a failed
+/// pipeline, which is how an acceptance came to report "pulled project not in
+/// nemr list" about a project that was listed (F-109).
+///
+/// Restoring the default disposition makes the process die of SIGPIPE like
+/// `cat` or `ls` do: quietly, with no panic and no stack trace. It does not on
+/// its own make `cmd | grep -q` a safe way to ask a question — the pipeline
+/// status is still non-zero — which is what `output_has` in
+/// `scripts/lib/proc.sh` is for.
+///
+/// # Safety
+///
+/// `signal(2)` with `SIG_DFL` for `SIGPIPE`, before any thread is spawned and
+/// before anything writes. This is the documented way to undo the Rust runtime's
+/// choice for a program that is a filter.
+fn restore_default_sigpipe() {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    restore_default_sigpipe();
+
     // Parse first: the subscriber's verbosity is now a flag, so it cannot be
     // installed before the flag is known. Nothing logs during parsing.
     let cli = Cli::parse();
