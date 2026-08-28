@@ -226,11 +226,14 @@ async fn create_with_auth(
     }
 
     // NET-02: allocate this session's network now, so it is recorded once and
-    // reapplied verbatim at every start. Refuse before creating anything if the
-    // host already routes our range — allocating into a conflict does not
-    // error, it silently misroutes, which is the worst failure in this area.
-    netns::check_range_is_free()?;
-    let network = netns::allocate_index(&allocated_indices(client).await)?;
+    // reapplied verbatim at every start.
+    //
+    // The lock is taken here and held until the container record carries the
+    // label, below: the index becomes "taken" only when it is visible to the
+    // next reader, so releasing between choosing and publishing would leave the
+    // window open that the lock exists to close.
+    let allocation_guard = NETWORK_ALLOCATION.lock().await;
+    let network = allocate_index_locked(client).await?;
     let labels = project_labels(
         name,
         &mount_point.to_string_lossy(),
@@ -280,6 +283,10 @@ async fn create_with_auth(
             format!("failed to create container for project {name:?}; volume released")
         });
     }
+
+    // The index is now published on the record, so the next allocator can see
+    // it. Only here, not a line earlier.
+    drop(allocation_guard);
 
     // Committed: the container depends on this mount now.
     let mount_point = volume.persist();
@@ -417,20 +424,31 @@ pub async fn start(client: &ContainerdClient, name: &str) -> Result<u32> {
     // anything else touches the network — a session with an address and no
     // route is a session where Claude Code cannot reach the API, and the
     // failure would surface much later as an authentication error.
-    if let Some(alloc) = find_container(client, name)
-        .await
-        .ok()
-        .and_then(|c| allocation_from_labels(&c.labels))
-    {
-        if let Err(e) = netns::connect_session(pid, alloc) {
-            // Tear the task down rather than leave a session that looks started
-            // and has no network: a half-connected session is worse than a
-            // refusal, because the user only finds out when something fails.
-            let _ = client.stop_task(&container_id).await;
-            return Err(e.context(format!(
-                "starting {name:?}: its network could not be configured, so the task was stopped"
-            )));
-        }
+    //
+    // Not conditional on a lucky read. The first version was
+    // `find_container(...).ok().and_then(...)`, which made two very different
+    // situations silent: a containerd hiccup, and a project with no allocation
+    // recorded. Both then started a session into a namespace containing nothing
+    // at all — no address, no route, not even loopback up — and reported
+    // success. Failing to wire was fatal while not knowing whether to wire was
+    // silent, which is exactly backwards.
+    if let Err(e) = wire_session(client, name, pid).await {
+        // Tear the task down rather than leave a session that looks started and
+        // has no network: a half-connected session is worse than a refusal,
+        // because the user only finds out when something fails.
+        //
+        // And say which of those actually happened. Claiming "the task was
+        // stopped" without checking is the same class of untruth one level down.
+        let note = match client.stop_task(&container_id).await {
+            Ok(_) => "so the task was stopped".to_string(),
+            Err(stop_err) => format!(
+                "and the task could NOT be stopped afterwards ({stop_err:#}) — it is running \
+                 with no network. Stop it with: nemr stop {name}"
+            ),
+        };
+        return Err(e.context(format!(
+            "starting {name:?}: its network could not be configured, {note}"
+        )));
     }
 
     // Re-apply declared forwards (WP-M). They are derived state: torn down on
@@ -478,13 +496,18 @@ pub async fn stop(client: &ContainerdClient, name: &str) -> Result<StopOutcome> 
 
     // NET-02: the session's namespace dies with the task, taking the container
     // end of the veth with it; this removes our end and the NAT rule. After the
-    // task, so nothing is torn down while it might still be serving.
-    if let Some(alloc) = find_container(client, name)
-        .await
-        .ok()
-        .and_then(|c| allocation_from_labels(&c.labels))
-    {
-        netns::disconnect_session(alloc);
+    // task, so nothing is torn down while it might still be serving — and only
+    // if the task really stopped. Tearing the network out from under a session
+    // that is still running would take away its address and its egress while it
+    // was working, which is worse than the failed stop we are already reporting.
+    if outcome.is_ok() {
+        if let Some(alloc) = find_container(client, name)
+            .await
+            .ok()
+            .and_then(|c| allocation_from_labels(&c.labels))
+        {
+            let _ = tokio::task::spawn_blocking(move || netns::disconnect_session(alloc)).await;
+        }
     }
 
     outcome
@@ -1793,7 +1816,7 @@ pub async fn delete(client: &ContainerdClient, name: &str) -> Result<()> {
     client.stop_task(&container_id).await?;
 
     if let Some(alloc) = session_network {
-        netns::disconnect_session(alloc);
+        let _ = tokio::task::spawn_blocking(move || netns::disconnect_session(alloc)).await;
     }
 
     // 2. Release the volume (unmount + detach) BEFORE the record, so a failure
@@ -2165,18 +2188,119 @@ pub fn allocation_from_labels(
 }
 
 /// Every session network index currently spoken for.
-async fn allocated_indices(client: &ContainerdClient) -> Vec<u8> {
-    client
+///
+/// The error is propagated, not swallowed. `unwrap_or_default()` here turned a
+/// containerd read failure into "nothing is allocated", which hands the next
+/// project index 0 on top of a live one — and a duplicate index does not error,
+/// it silently points one project's host forwards at another project's session.
+/// Refusing to create is the cheap failure; the quiet one costs a debugging
+/// session that starts nowhere near this line.
+async fn allocated_indices(client: &ContainerdClient) -> Result<Vec<u8>> {
+    let containers = client
         .list_containers()
         .await
-        .map(|cs| {
-            cs.iter()
-                .filter(|c| c.labels.contains_key(LABEL_PROJECT))
-                .filter_map(|c| allocation_from_labels(&c.labels))
-                .map(|a| a.index)
-                .collect()
-        })
-        .unwrap_or_default()
+        .context("reading the projects that already hold a session network")?;
+    Ok(containers
+        .iter()
+        .filter(|c| c.labels.contains_key(LABEL_PROJECT))
+        .filter_map(|c| allocation_from_labels(&c.labels))
+        .map(|a| a.index)
+        .collect())
+}
+
+/// Allocate this project's session network, or return the one it already has.
+///
+/// Serialised process-wide. Allocation is a read-modify-write — read the set in
+/// use, pick a free index, publish it on the container record — and the daemon
+/// answers RPCs concurrently, so two `nemr create` calls could both read the set
+/// without the other's project in it and both take the same index. Nothing
+/// downstream detects the duplicate: the two projects derive the same /24, the
+/// same addresses and the same link name, and the loser starts with no network
+/// while its host ports forward into the winner's session.
+///
+/// The lock is process-wide, which is exactly as strong as the daemon's own
+/// claim to be the single writer to containerd (see src/daemon/mod.rs). If that
+/// ever stops being true, this needs to become a lock in containerd itself —
+/// recorded as F-99.
+static NETWORK_ALLOCATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Pick a free index. The caller must hold [`NETWORK_ALLOCATION`] and must not
+/// release it until the choice is published on a container record — an index
+/// nobody can see is an index the next caller will pick too.
+async fn allocate_index_locked(client: &ContainerdClient) -> Result<netns::Allocation> {
+    // Refuse before recording anything if the host already routes our range —
+    // allocating into a conflict does not error, it silently misroutes, which is
+    // the worst failure in this area.
+    blocking(netns::check_range_is_free).await?;
+    netns::allocate_index(&allocated_indices(client).await?)
+}
+
+/// Run one of `engine::netns`'s synchronous host commands off the async
+/// workers.
+///
+/// Everything in `netns` shells out — `nsenter`, `ip`, `iptables`, `sysctl` —
+/// through `std::process::Command::output()`, which blocks the thread it runs
+/// on. Called straight from an async handler that pins a tokio worker for the
+/// duration: measured at 0.49–0.95s per call, against four workers on a CI
+/// runner. Enough concurrent sessions and the daemon stops answering unrelated
+/// RPCs, which surfaces as a command that failed for no reason it can name.
+async fn blocking<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .context("a host networking command could not be run")?
+}
+
+/// Choose and record a session network for an existing project that has none.
+///
+/// Used by `start` for a project that predates NET-02: those carry no
+/// allocation, and their task now gets an empty namespace whether or not
+/// anything wires it, so "no label" cannot mean "no networking wanted".
+async fn allocate_and_record(
+    client: &ContainerdClient,
+    container: &crate::containerd::containers::ContainerSummary,
+) -> Result<netns::Allocation> {
+    let _guard = NETWORK_ALLOCATION.lock().await;
+
+    // Re-read under the lock: another start may have allocated for this same
+    // project while we were waiting, and taking a second index would leave the
+    // first one recorded nowhere and reserved forever.
+    let fresh = find_container_by_id(client, &container.id).await?;
+    if let Some(existing) = allocation_from_labels(&fresh.labels) {
+        return Ok(existing);
+    }
+
+    let alloc = allocate_index_locked(client).await?;
+    let mut labels = fresh.labels.clone();
+    labels.insert(LABEL_NETNS.to_string(), netns::encode_allocation(alloc));
+    client
+        .update_container_labels(&fresh.id, labels)
+        .await
+        .with_context(|| {
+            format!(
+                "recording the session network {} on {:?}",
+                alloc.cidr(),
+                fresh.id
+            )
+        })?;
+    Ok(alloc)
+}
+
+/// Wire a freshly started task into its session network (NET-02).
+///
+/// Separated from `start` so every failure below leaves through one place, and
+/// one place decides what to do about the task that is already running.
+async fn wire_session(client: &ContainerdClient, name: &str, pid: u32) -> Result<()> {
+    let container = find_container(client, name).await?;
+    let alloc = match allocation_from_labels(&container.labels) {
+        Some(alloc) => alloc,
+        // A project created before NET-02. Allocate and record one now, once.
+        None => allocate_and_record(client, &container).await?,
+    };
+    blocking(move || netns::connect_session(pid, alloc)).await
 }
 
 /// The container record for a project, or NoSuchProject.
@@ -2193,6 +2317,24 @@ async fn find_container(
         .find(|c| c.id == container_id)
         .ok_or_else(|| crate::error::Error::NoSuchProject {
             name: name.to_string(),
+        })
+}
+
+/// The container record for a project by its container id.
+///
+/// Used where the caller already holds a record and needs to re-read it under a
+/// lock, so it must not go back through the name.
+async fn find_container_by_id(
+    client: &ContainerdClient,
+    id: &str,
+) -> Result<crate::containerd::containers::ContainerSummary> {
+    client
+        .list_containers()
+        .await?
+        .into_iter()
+        .find(|c| c.id == id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("container {id:?} disappeared while allocating its session network")
         })
 }
 
