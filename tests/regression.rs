@@ -1439,6 +1439,7 @@ fn f63_create_container_holds_its_snapshot_against_a_collection_inside_the_windo
             cgroup_name: None,
             cgroup_prefix: nemr_engine::config::CGROUP_PREFIX.to_string(),
             labels: Default::default(),
+            own_network_namespace: true,
         };
 
         client
@@ -1596,6 +1597,7 @@ fn proc_06_a_container_ignoring_sigterm_is_escalated_to_sigkill() {
             cgroup_name: Some(name.clone()),
             cgroup_prefix: nemr_engine::config::CGROUP_PREFIX.to_string(),
             labels: Default::default(),
+            own_network_namespace: true,
         };
         let id = spec.id.clone();
 
@@ -3227,4 +3229,163 @@ fn f109_the_cli_does_not_panic_when_its_reader_closes_the_pipe() {
          A tool that is piped into `head`, `grep -q` or `less` must exit quietly \
          like every other one.\nexit statuses seen: {statuses:?}\nlast panic:\n{observed}"
     );
+}
+
+/// NET-02 upgrade path: a project created BEFORE NET-02 is repaired on start.
+///
+/// The defect this pins cost a real project. A container's OCI spec is frozen
+/// into its record at create time and read again at every task start, so a
+/// project created before NET-02 asks for no network namespace and its task
+/// joins rootlesskit's — for ever, whatever the engine does afterwards. The
+/// first migration recorded an allocation on such a project and then wired it,
+/// which built a session network inside the SHARED namespace and died on
+/// `ip route add default` with "RTNETLINK answers: File exists", because
+/// rootlesskit already has a default route. `htmltest` — a project that had
+/// moved between two machines — stopped starting.
+///
+/// `NEMR_TEST_PRE_NET02` creates the old shape, because no freshly created
+/// container can have it and an untested upgrade path is how this happened.
+#[test]
+fn net02_a_project_created_before_net02_is_migrated_and_starts_wired() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+
+        std::env::set_var("NEMR_TEST_PRE_NET02", "1");
+        let project = TestProject::create(&client, "net02pre", VolumeSize::Small).await;
+        std::env::remove_var("NEMR_TEST_PRE_NET02");
+
+        // Control: the subject really has the shape under test. READ-ONLY — the
+        // first version of this asked `ensure_own_network_namespace`, which
+        // MIGRATED the subject, so the code under test was handed an
+        // already-repaired container and the test stayed green with the
+        // migration deleted. A control that changes what it observes is not a
+        // control.
+        let id = nemr_engine::config::container_id(&project.name);
+        assert!(
+            !client
+                .has_own_network_namespace(&id)
+                .await
+                .expect("read the spec"),
+            "the subject must START without a network namespace, or this proves nothing"
+        );
+
+        // Now the real path: start it the way a user would.
+        let pid = project::start(&client, &project.name)
+            .await
+            .expect("a project created before NET-02 must still start");
+
+        assert!(
+            client
+                .has_own_network_namespace(&id)
+                .await
+                .expect("read the spec"),
+            "start must have repaired the container record"
+        );
+        assert!(
+            !nemr_engine::engine::netns::shares_rootlesskit_namespace(pid)
+                .expect("compare namespaces"),
+            "the migrated project is still in rootlesskit's shared namespace"
+        );
+        let alloc = recorded_allocation(&client, &project.name)
+            .await
+            .expect("start must record an allocation");
+        assert_session_is_wired(pid, alloc);
+
+        let _ = project::stop(&client, &project.name).await;
+    });
+}
+
+/// The control the migration rests on: a task that shares rootlesskit's network
+/// namespace is DETECTED, not wired.
+///
+/// Wiring a session into the shared namespace puts its addresses on
+/// rootlesskit's own interfaces and collides with rootlesskit's default route.
+/// The comparison is the same `net:` inode evidence NET-01 was established with.
+#[test]
+fn net02_sharing_rootlesskits_namespace_is_detected() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR");
+    let rk: u32 = std::fs::read_to_string(format!("{runtime_dir}/containerd-rootless/child_pid"))
+        .expect("rootlesskit child_pid")
+        .trim()
+        .parse()
+        .expect("a pid");
+
+    // rootlesskit shares its own namespace with itself, by definition.
+    assert!(
+        nemr_engine::engine::netns::shares_rootlesskit_namespace(rk).expect("compare"),
+        "rootlesskit's own child must compare equal, or the check cannot detect anything"
+    );
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "net02own", VolumeSize::Small).await;
+        let pid = project::start(&client, &project.name).await.expect("start");
+
+        assert!(
+            !nemr_engine::engine::netns::shares_rootlesskit_namespace(pid).expect("compare"),
+            "a NET-02 session must NOT share rootlesskit's namespace"
+        );
+
+        let _ = project::stop(&client, &project.name).await;
+    });
+}
+
+/// The wiring RECONCILES to the declared state: running it twice is a no-op,
+/// not a collision.
+///
+/// The pattern this closes has cost this project repeatedly — a path that works
+/// from clean and fails on a second run. Volumes and port forwards already
+/// reconcile: the declaration is authoritative and the live state is brought to
+/// match it. The session wiring used `ip addr add` and `ip route add`, which
+/// answer "RTNETLINK answers: File exists" rather than "already so", so any
+/// second application was a hard failure — and `start` turns that into a
+/// refusal to start at all.
+#[test]
+fn net02_wiring_a_live_session_again_reconciles_rather_than_colliding() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "net02idem", VolumeSize::Small).await;
+        let pid = project::start(&client, &project.name).await.expect("start");
+        let alloc = recorded_allocation(&client, &project.name)
+            .await
+            .expect("an allocation");
+
+        // Control: it is wired now, so a second application is being asked to
+        // reconcile something that already exists — which is the case under
+        // test, not a fresh build.
+        assert_session_is_wired(pid, alloc);
+
+        for attempt in 1..=2 {
+            nemr_engine::engine::netns::connect_session(pid, alloc).unwrap_or_else(|e| {
+                panic!("re-wiring a live session failed on attempt {attempt}: {e:#}")
+            });
+            assert_session_is_wired(pid, alloc);
+        }
+
+        let _ = project::stop(&client, &project.name).await;
+    });
 }
