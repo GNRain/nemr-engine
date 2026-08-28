@@ -139,6 +139,14 @@ pub enum Error {
     #[error("project {name:?} is {state}")]
     WrongState { name: String, state: &'static str },
 
+    /// A port forward that cannot be established or removed as asked.
+    ///
+    /// Its own variant because the remedies are specific and the message has to
+    /// carry them: which port, who holds it, and what to type instead. A
+    /// collision reported as a generic failure sends the user hunting.
+    #[error("{detail}")]
+    PortRefused { detail: String },
+
     // --- host ------------------------------------------------------------
     #[error("{what} is not available on this host: {detail}\n{remedy}")]
     HostPrerequisite {
@@ -252,6 +260,7 @@ impl Error {
             Self::ProjectExists { .. } => ErrorKind::Conflict,
             Self::RestoreTargetExists { .. } => ErrorKind::Conflict,
             Self::WrongState { .. } => ErrorKind::Conflict,
+            Self::PortRefused { .. } => ErrorKind::Conflict,
             Self::HostPrerequisite { .. } => ErrorKind::HostPrerequisite,
             Self::HelperProtocolMismatch { .. } => ErrorKind::Incompatible,
             Self::BundleCorrupt { .. } => ErrorKind::DataIntegrity,

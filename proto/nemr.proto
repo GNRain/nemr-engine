@@ -36,6 +36,11 @@ service Nemr {
   // resizes, the daemon streams stdout/stderr and the final exit. Bytes flow
   // over the stream — never local paths — so the transport can swap.
   rpc Attach(stream AttachClient) returns (stream AttachServer);
+
+  // Port forwarding (WP-M): reach a server inside a session from the host.
+  rpc PortAdd(PortAddRequest) returns (PortListResponse);
+  rpc PortRemove(PortRemoveRequest) returns (PortListResponse);
+  rpc PortList(PortListRequest) returns (PortListResponse);
 }
 
 message HandshakeRequest {
@@ -93,6 +98,28 @@ message ProjectStatus {
   string agent = 9;
 }
 
+message PortSpec {
+  string host_ip = 1;
+  uint32 host_port = 2;
+  uint32 container_port = 3;
+  string url = 4;
+  // Whether a forward for this declaration is actually bound right now. A
+  // declared-but-unbound port must not be shown as a working URL (F-98).
+  bool live = 5;
+}
+message PortAddRequest {
+  string name = 1;
+  // The user's port argument, verbatim: 8000, 9000:8000, or 0.0.0.0:9000:8000.
+  string port = 2;
+  bool expose = 3;
+}
+message PortRemoveRequest {
+  string name = 1;
+  uint32 host_port = 2;
+}
+message PortListRequest { string name = 1; }
+message PortListResponse { repeated PortSpec ports = 1; }
+
 message StatusRequest { string name = 1; }
 message StatusResponse {
   string name = 1;
@@ -115,6 +142,8 @@ message StatusResponse {
   int64 credential_modified_secs = 17;  // unix secs, 0 if unknown
   // -1 = not mounted, 0 = wrong volume, 1 = correct (mirrors mount_is_correct).
   int32 mount_check = 18;
+  // Declared port forwards (WP-M): "what's my URL" is the question people ask.
+  repeated PortSpec ports = 20;
 }
 
 message SwitchAgentRequest { string name = 1; string agent = 2; }
@@ -126,6 +155,8 @@ message ReconcileResponse {
   repeated string not_released = 2;
   repeated string snapshots_removed = 3;
   repeated string orphan_backing_files = 4;
+  repeated string stale_forwards = 5;
+  repeated string unattributable_forwards = 6;
 }
 
 message ImportRequest {
@@ -200,4 +231,8 @@ message AuditEvent {
   // True for a privileged (helper) operation — the event a user must see by
   // default. Non-privileged trace lines are shown only under --verbose.
   bool privileged = 3;
+  // True for a warning the user must see even though nothing elevated — e.g. a
+  // declared port that could not be forwarded (F-98). Without this such
+  // failures were logged where only the daemon could see them.
+  bool warning = 4;
 }

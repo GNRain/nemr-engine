@@ -250,6 +250,13 @@ jobs:
         # is daemonless and does not use it, so this survives where a service
         # container did not.
         run: ./scripts/setup_sync_test_db.sh
+      - name: Port acceptance — reach a session's server from the host (WP-M)
+        # The blocker this closed: a dev server inside a session was
+        # unreachable. Asserts on host-observable state (curl, ss), with a
+        # control proving the port was refused before the forward existed.
+        run: |
+          export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
+          ./scripts/port_acceptance.sh
       - name: Sync acceptance — the product flow (WP-K)
         # Engine + server, together: register, create, work, push, DELETE THE
         # PROJECT, pull, continue. NEMR_SKIP_API asserts transcript

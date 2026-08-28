@@ -184,11 +184,43 @@ impl Nemr for NemrService {
         }))
     }
 
+    async fn port_add(
+        &self,
+        request: Request<PortAddRequest>,
+    ) -> Result<Response<PortListResponse>, Status> {
+        let req = request.into_inner();
+        let port = crate::engine::ports::parse_port_arg(&req.port, req.expose)
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+        crate::engine::project::add_port(&self.client, &req.name, port)
+            .await
+            .map_err(status_from_typed)?;
+        self.port_list_response(&req.name).await
+    }
+
+    async fn port_remove(
+        &self,
+        request: Request<PortRemoveRequest>,
+    ) -> Result<Response<PortListResponse>, Status> {
+        let req = request.into_inner();
+        crate::engine::project::remove_port(&self.client, &req.name, req.host_port as u16)
+            .await
+            .map_err(status_from_typed)?;
+        self.port_list_response(&req.name).await
+    }
+
+    async fn port_list(
+        &self,
+        request: Request<PortListRequest>,
+    ) -> Result<Response<PortListResponse>, Status> {
+        self.port_list_response(&request.into_inner().name).await
+    }
+
     async fn status(
         &self,
         request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        let d = crate::engine::project::status(&self.client, &request.into_inner().name)
+        let name = request.into_inner().name;
+        let d = crate::engine::project::status(&self.client, &name)
             .await
             .map_err(status_from_typed)?;
         let mount_check = match d.mount_is_correct() {
@@ -196,7 +228,25 @@ impl Nemr for NemrService {
             Some(false) => 0,
             Some(true) => 1,
         };
+        let ports = crate::engine::project::list_ports(&self.client, &name)
+            .await
+            .unwrap_or_default();
+        let live_set = crate::engine::ports::list_live().unwrap_or_default();
         Ok(Response::new(StatusResponse {
+            ports: ports
+                .into_iter()
+                .map(|p| PortSpec {
+                    live: live_set.iter().any(|f| {
+                        f.host_ip == p.host_ip
+                            && f.host_port == p.host_port
+                            && f.container_port == p.container_port
+                    }),
+                    host_ip: p.host_ip.clone(),
+                    host_port: p.host_port as u32,
+                    container_port: p.container_port as u32,
+                    url: p.url(),
+                })
+                .collect(),
             name: d.name,
             agent: d.agent.id().to_string(),
             container_id: d.container_id,
@@ -262,6 +312,8 @@ impl Nemr for NemrService {
             not_released: report.not_released,
             snapshots_removed: report.snapshots_removed,
             orphan_backing_files: report.orphan_backing_files,
+            stale_forwards: report.stale_forwards,
+            unattributable_forwards: report.unattributable_forwards,
         }))
     }
 
@@ -352,6 +404,7 @@ impl Nemr for NemrService {
         // Ready first: the client waits for this before running its command, so
         // it cannot race the events that command produces.
         let _ = out_tx.send(Ok(AuditEvent {
+            warning: false,
             ready: true,
             message: String::new(),
             privileged: false,
@@ -394,5 +447,32 @@ impl Nemr for NemrService {
         request: Request<tonic::Streaming<AttachClient>>,
     ) -> Result<Response<Self::AttachStream>, Status> {
         attach::serve(self.client.clone(), request.into_inner()).await
+    }
+}
+
+impl NemrService {
+    /// One project's declared forwards, in the shape the wire uses. Shared by
+    /// add/remove/list so every port RPC answers with the same current truth.
+    async fn port_list_response(&self, name: &str) -> Result<Response<PortListResponse>, Status> {
+        let ports = crate::engine::project::list_ports(&self.client, name)
+            .await
+            .map_err(status_from_typed)?;
+        let live_set = crate::engine::ports::list_live().unwrap_or_default();
+        Ok(Response::new(PortListResponse {
+            ports: ports
+                .into_iter()
+                .map(|p| PortSpec {
+                    live: live_set.iter().any(|f| {
+                        f.host_ip == p.host_ip
+                            && f.host_port == p.host_port
+                            && f.container_port == p.container_port
+                    }),
+                    host_ip: p.host_ip.clone(),
+                    host_port: p.host_port as u32,
+                    container_port: p.container_port as u32,
+                    url: p.url(),
+                })
+                .collect(),
+        }))
     }
 }

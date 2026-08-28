@@ -121,6 +121,7 @@ where
         let mut v = AuditVisitor::default();
         event.record(&mut v);
         let privileged = v.category.as_deref() == Some("elevated");
+        let warning = v.category.as_deref() == Some("warning");
         let message = v.message.unwrap_or_default();
         // Only surface the engine's audit lines (they set nemr_audit); skip any
         // other nemr_engine event that happens to be in scope.
@@ -134,6 +135,7 @@ where
                     ready: false,
                     message,
                     privileged,
+                    warning,
                 });
             }
         }

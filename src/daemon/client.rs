@@ -138,8 +138,10 @@ async fn open_session(client: Client) -> Result<Session> {
             if ev.ready {
                 continue;
             }
-            if ev.privileged {
-                // Always: a user must be able to tell a command elevated (NFR-04).
+            if ev.privileged || ev.warning {
+                // Elevation: NFR-04, a user must be able to tell a command
+                // elevated. Warning: something the command could not do, which
+                // is useless in a log the user never opens (F-98).
                 eprintln!("{}", ev.message);
             } else if verbose {
                 eprintln!("{}", ev.message);

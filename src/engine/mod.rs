@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod image;
+pub mod ports;
 pub mod project;
 pub mod tty;
 pub mod volume;
