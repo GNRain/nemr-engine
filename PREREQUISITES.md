@@ -463,6 +463,28 @@ continue — is `scripts/sync_acceptance.sh`, which needs this database, the
 provisioned host, and (for the full continuity claim) a live credential; with
 `NEMR_SKIP_API=1` it asserts transcript byte-fidelity instead and says so.
 
+## Session networking (NET-02)
+
+Each session runs in its **own network namespace**, so two sessions can both
+bind port 8000 internally — the normal expectation. Nothing extra to install:
+the veth pair, addressing and NAT are set up by the engine inside rootlesskit's
+namespace using `iproute2` and `iptables`, both already required by Step 1, and
+all of it is rootless (no `sudo`, no privileged helper, no system daemon).
+
+Sessions are allocated a `/24` from **`10.99.0.0/16`**. `nemr create` **refuses**
+if this host already routes anything overlapping that range — on a `10.x`
+corporate network or VPN, allocating into a conflict would not error, it would
+silently send session traffic to the wrong place. If you hit that refusal, the
+message names the conflicting route; the range is not configurable yet, so tell
+the maintainer rather than working around it.
+
+To reach a server running inside a session, forward a port:
+
+```bash
+nemr port add myproject 8000        # then open http://127.0.0.1:8000
+nemr port ls myproject
+```
+
 ## Explicitly NOT prerequisites
 
 Docker Engine and Docker Desktop are prohibited by NFR-01. If any step here, or
