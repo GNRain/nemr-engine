@@ -215,6 +215,38 @@ pub fn classify_add_error(stderr: &str) -> AddFailure {
     }
 }
 
+/// Is this host address free to bind right now?
+///
+/// Declaring a port on a *stopped* project does not bind anything, so without
+/// this the conflict would be discovered only at `start` — long after the user
+/// could act on it, and reported as a warning they may not read. A test bind is
+/// the honest way to ask, and it disturbs nothing: the socket is closed
+/// immediately.
+///
+/// Inherently a point-in-time answer — the port can be taken between this check
+/// and the real bind — so `start` still reports a failure if one occurs. This
+/// makes the common case immediate, not the race impossible.
+pub fn host_port_is_free(host_ip: &str, host_port: u16) -> std::result::Result<(), String> {
+    use std::net::TcpListener;
+    // Binding 0.0.0.0 also conflicts with a loopback-only holder, which is the
+    // behaviour we want: --expose must not appear to succeed where a plain
+    // forward would be refused.
+    match TcpListener::bind((host_ip, host_port)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            Err(format!("{host_ip}:{host_port} is already in use"))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(format!(
+            "binding {host_ip}:{host_port} was refused: {e}. Ports below 1024 \
+             need privilege this engine deliberately does not have (PRIV-01)"
+        )),
+        Err(e) => Err(format!("cannot bind {host_ip}:{host_port}: {e}")),
+    }
+}
+
 fn rootlessctl(args: &[String]) -> Result<std::process::Output> {
     let socket = api_socket()?;
     Command::new("rootlessctl")

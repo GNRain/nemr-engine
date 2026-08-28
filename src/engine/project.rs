@@ -77,6 +77,9 @@ pub const LABEL_SIZE: &str = "nemr.size";
 /// field existed — those are Claude Code by construction, so a missing label
 /// reads back as the default.
 pub const LABEL_AGENT: &str = "nemr.agent";
+/// Declared port forwards, comma-separated rootlesskit specs. The project's
+/// authoritative record; the live forward set is derived from it (WP-M).
+pub const LABEL_PORTS: &str = "nemr.ports";
 
 /// Labels written onto a project's container record.
 ///
@@ -381,6 +384,16 @@ pub async fn start(client: &ContainerdClient, name: &str) -> Result<u32> {
     }
 
     let pid = client.start_task(&container_id).await?;
+
+    // Re-apply declared forwards (WP-M). They are derived state: torn down on
+    // stop, and gone entirely after a rootlesskit restart, so the declaration
+    // is applied rather than assumed live. A port that cannot be bound is
+    // reported by the caller and skipped — one unavailable port must not stop a
+    // session from starting, and silently dropping it would be worse.
+    for problem in apply_declared_ports(client, name).await {
+        tracing::warn!("[nemr] port not forwarded: {problem}");
+    }
+
     Ok(pid)
 }
 
@@ -401,6 +414,11 @@ pub async fn stop(client: &ContainerdClient, name: &str) -> Result<StopOutcome> 
              Start it with: nemr start {name}"
         );
     }
+
+    // Drop live forwards but keep the declaration (WP-M): a stopped project
+    // must not hold a host port against another project, while the port still
+    // belongs to it across runs.
+    withdraw_declared_ports(client, name).await;
 
     client.stop_task(&container_id).await
 }
@@ -1149,6 +1167,11 @@ pub struct ReconcileReport {
     /// they may hold user data. Their mount and loop device are released, but the
     /// file is left for the operator to remove deliberately.
     pub orphan_backing_files: Vec<String>,
+    /// Host port forwards no project declares any more (WP-M). Removed: unlike a
+    /// backing file these hold no data, and leaving one bound means a host port
+    /// is held hostage by a project that no longer exists — with a collision
+    /// message naming a project the user cannot find.
+    pub stale_forwards: Vec<String>,
 }
 
 impl ReconcileReport {
@@ -1306,6 +1329,26 @@ pub async fn reconcile_orphans(client: &ContainerdClient) -> Result<ReconcileRep
                     eprintln!(
                         "[nemr:reconcile] could not remove orphan snapshot {key:?}: {error:#}"
                     )
+                }
+            }
+        }
+    }
+
+    // Host port forwards whose project is gone (WP-M). Same shape as the
+    // orphan sweep above: rootlesskit's live set is derived state, and a
+    // forward outliving its project is exactly the disagreement the label is
+    // authoritative over.
+    if let Ok(live) = ports::list_live() {
+        let declared: HashSet<u16> = containers
+            .iter()
+            .flat_map(|c| ports_from_labels(&c.labels))
+            .map(|p| p.host_port)
+            .collect();
+        for f in live {
+            if !declared.contains(&f.host_port) {
+                let label = format!("{}:{} -> {}", f.host_ip, f.host_port, f.container_port);
+                if ports::remove_live(f.id).is_ok() {
+                    report.stale_forwards.push(label);
                 }
             }
         }
@@ -1629,6 +1672,12 @@ pub async fn list(client: &ContainerdClient) -> Result<Vec<ProjectStatus>> {
 pub async fn delete(client: &ContainerdClient, name: &str) -> Result<()> {
     let container_id = resolve(client, name).await?;
     let paths = VolumePaths::from_env()?;
+
+    // Release this project's host ports first (WP-M). They live in rootlesskit,
+    // not in the container, so removing the container alone leaves them bound
+    // to nothing — a host port held hostage by a project that no longer exists,
+    // and a collision message that would name a project the user cannot find.
+    withdraw_declared_ports(client, name).await;
 
     // 1. Stop the task. Idempotent: stop_task returns NoTask if none is running.
     client.stop_task(&container_id).await?;
@@ -1984,5 +2033,262 @@ pub async fn resolve_base_image(
             namespace = client.namespace(),
             reference = wanted_reference,
         ),
+    }
+}
+
+// --- port forwarding (WP-M) -------------------------------------------------
+
+use crate::engine::ports;
+
+/// The container record for a project, or NoSuchProject.
+async fn find_container(
+    client: &ContainerdClient,
+    name: &str,
+) -> crate::error::Result<crate::containerd::containers::ContainerSummary> {
+    let container_id = config::container_id(name);
+    client
+        .list_containers()
+        .await
+        .map_err(crate::error::Error::Internal)?
+        .into_iter()
+        .find(|c| c.id == container_id)
+        .ok_or_else(|| crate::error::Error::NoSuchProject {
+            name: name.to_string(),
+        })
+}
+
+/// The forwards a project declares, from its container label.
+pub fn ports_from_labels(
+    labels: &std::collections::HashMap<String, String>,
+) -> Vec<ports::PortForward> {
+    labels
+        .get(LABEL_PORTS)
+        .map(|raw| ports::decode_label(raw))
+        .unwrap_or_default()
+}
+
+/// Read one project's declared forwards.
+pub async fn list_ports(
+    client: &ContainerdClient,
+    name: &str,
+) -> crate::error::Result<Vec<ports::PortForward>> {
+    let container = find_container(client, name).await?;
+    Ok(ports_from_labels(&container.labels))
+}
+
+/// Which project (if any) declares a forward on this host port.
+///
+/// The engine owns this mapping — rootlesskit knows only that some forward
+/// holds the port, so naming the culprit is our job, and it is the difference
+/// between a useful collision message and a shrug.
+async fn project_holding_host_port(
+    client: &ContainerdClient,
+    host_port: u16,
+    excluding: &str,
+) -> crate::error::Result<Option<String>> {
+    for c in client
+        .list_containers()
+        .await
+        .map_err(crate::error::Error::Internal)?
+    {
+        let Some(project) = c.labels.get(LABEL_PROJECT) else {
+            continue;
+        };
+        if project == excluding {
+            continue;
+        }
+        if ports_from_labels(&c.labels)
+            .iter()
+            .any(|p| p.host_port == host_port)
+        {
+            return Ok(Some(project.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// Declare a forward for a project, and apply it now if the project is running.
+///
+/// The declaration is what persists; the live forward is derived. A stopped
+/// project records the port without holding it, so it never blocks another
+/// project with a port it is not using.
+pub async fn add_port(
+    client: &ContainerdClient,
+    name: &str,
+    port: ports::PortForward,
+) -> crate::error::Result<ports::PortForward> {
+    use crate::error::Error;
+
+    let container = find_container(client, name).await?;
+    let container_id = config::container_id(name);
+    let mut declared = ports_from_labels(&container.labels);
+
+    if let Some(existing) = declared.iter().find(|p| p.host_port == port.host_port) {
+        return Err(Error::PortRefused {
+            detail: format!(
+                "{name} already forwards host port {} (to container port {}). \
+                 Remove it first: nemr port rm {name} {}",
+                existing.host_port, existing.container_port, existing.host_port
+            ),
+        });
+    }
+    if let Some(other) = project_holding_host_port(client, port.host_port, name).await? {
+        return Err(Error::PortRefused {
+            detail: format!(
+                "host port {} is already declared by project {other:?}. \
+                 Choose another host port (e.g. nemr port add {name} {}:{}), \
+                 or free it: nemr port rm {other} {}",
+                port.host_port,
+                port.host_port + 1,
+                port.container_port,
+                port.host_port
+            ),
+        });
+    }
+
+    // Only bind now if the project is running; a stopped project's declaration
+    // is applied at start.
+    let running = client
+        .task_state(&container_id)
+        .await
+        .map_err(Error::Internal)?
+        .is_running();
+    if running {
+        apply_one(&port).map_err(|detail| Error::PortRefused { detail })?;
+    } else if let Err(detail) = ports::host_port_is_free(&port.host_ip, port.host_port) {
+        // The project is stopped, so nothing is bound yet — but accepting a
+        // declaration that cannot work would defer the bad news to `start`,
+        // where it is a warning the user may never read. Say it now.
+        return Err(Error::PortRefused {
+            detail: format!(
+                "{detail} by something else on this machine (not a nemr project).\n\
+                 Choose another host port — e.g. nemr port add {name} {}:{} — \
+                 or stop whatever holds it.",
+                port.host_port + 1,
+                port.container_port
+            ),
+        });
+    }
+
+    declared.push(port.clone());
+    let mut labels = container.labels.clone();
+    labels.insert(LABEL_PORTS.to_string(), ports::encode_label(&declared));
+    client
+        .update_container_labels(&container_id, labels)
+        .await
+        .map_err(Error::Internal)?;
+    Ok(port)
+}
+
+/// Bind one forward now, translating rootlesskit's two refusals into messages
+/// with different remedies.
+fn apply_one(port: &ports::PortForward) -> std::result::Result<(), String> {
+    match ports::add_live(port) {
+        Ok(_) => Ok(()),
+        Err(ports::AddFailure::HeldByTheHost { detail }) => Err(format!(
+            "host port {} is in use by something else on this machine \
+             (not a nemr project). Choose another host port, or stop whatever \
+             holds it.\n  rootlesskit said: {detail}",
+            port.host_port
+        )),
+        Err(ports::AddFailure::HeldByAForward { detail }) => Err(format!(
+            "host port {} is already forwarded. If no project claims it, a \
+             stale forward may have outlived its project; `nemr reconcile` \
+             clears those.\n  rootlesskit said: {detail}",
+            port.host_port
+        )),
+        Err(other) => Err(format!("could not forward port: {other}")),
+    }
+}
+
+/// Stop declaring a forward, and drop it now if it is live.
+pub async fn remove_port(
+    client: &ContainerdClient,
+    name: &str,
+    host_port: u16,
+) -> crate::error::Result<ports::PortForward> {
+    use crate::error::Error;
+
+    let container = find_container(client, name).await?;
+    let container_id = config::container_id(name);
+    let mut declared = ports_from_labels(&container.labels);
+
+    let idx = declared
+        .iter()
+        .position(|p| p.host_port == host_port)
+        .ok_or_else(|| Error::PortRefused {
+            detail: format!(
+                "{name} does not forward host port {host_port}. \
+                 See what it does forward: nemr port ls {name}"
+            ),
+        })?;
+    let removed = declared.remove(idx);
+
+    // Drop the live forward if there is one. Best-effort by design: the
+    // declaration is authoritative, so failing to unbind must not leave the
+    // label claiming a port the project no longer wants.
+    if let Ok(live) = ports::list_live() {
+        for f in live.iter().filter(|f| f.host_port == host_port) {
+            let _ = ports::remove_live(f.id);
+        }
+    }
+
+    let mut labels = container.labels.clone();
+    if declared.is_empty() {
+        labels.remove(LABEL_PORTS);
+    } else {
+        labels.insert(LABEL_PORTS.to_string(), ports::encode_label(&declared));
+    }
+    client
+        .update_container_labels(&container_id, labels)
+        .await
+        .map_err(Error::Internal)?;
+    Ok(removed)
+}
+
+/// Re-apply a project's declared forwards. Called on `start`.
+///
+/// Forwards do not survive a rootlesskit restart, and are torn down on stop, so
+/// the declaration is re-applied rather than assumed live. A port that cannot
+/// be bound is reported and skipped: one unavailable port must not stop a
+/// session from starting.
+pub async fn apply_declared_ports(client: &ContainerdClient, name: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let Ok(container) = find_container(client, name).await else {
+        return problems;
+    };
+    let declared = ports_from_labels(&container.labels);
+    if declared.is_empty() {
+        return problems;
+    }
+    let live = ports::list_live().unwrap_or_default();
+    for port in declared {
+        if live.iter().any(|f| f.host_port == port.host_port) {
+            continue; // already bound; re-adding would collide with ourselves
+        }
+        if let Err(detail) = apply_one(&port) {
+            problems.push(detail);
+        }
+    }
+    problems
+}
+
+/// Drop a project's live forwards, leaving the declaration intact. Called on
+/// `stop`, so a stopped project does not hold a host port it is not serving.
+pub async fn withdraw_declared_ports(client: &ContainerdClient, name: &str) {
+    let Ok(container) = find_container(client, name).await else {
+        return;
+    };
+    let declared = ports_from_labels(&container.labels);
+    if declared.is_empty() {
+        return;
+    }
+    let Ok(live) = ports::list_live() else {
+        return;
+    };
+    for port in &declared {
+        for f in live.iter().filter(|f| f.host_port == port.host_port) {
+            let _ = ports::remove_live(f.id);
+        }
     }
 }

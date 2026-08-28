@@ -128,6 +128,21 @@ enum Command {
         include_build_artifacts: bool,
     },
 
+    /// Forward a port from this host into a running session.
+    ///
+    /// A server started inside a session listens in the session's network
+    /// namespace, so nothing on the host can reach it until a forward exists.
+    ///
+    ///   nemr port add web 8000              http://127.0.0.1:8000
+    ///   nemr port add web 9000:8000         a different host port
+    ///   nemr port add web 8000 --expose     reachable from the network
+    ///   nemr port ls web
+    ///   nemr port rm web 8000
+    Port {
+        #[command(subcommand)]
+        action: PortAction,
+    },
+
     /// Anything else: `nemr <cmd> …` runs `nemr-<cmd> …` from PATH.
     ///
     /// The cargo/git external-subcommand pattern. This is how optional tooling
@@ -137,6 +152,24 @@ enum Command {
     /// network and no account whether or not any extension is installed.
     #[command(external_subcommand)]
     External(Vec<OsString>),
+}
+
+#[derive(Subcommand)]
+enum PortAction {
+    /// Forward a host port into the session.
+    Add {
+        name: String,
+        /// 8000, or 9000:8000 (host:container), or 0.0.0.0:9000:8000.
+        port: String,
+        /// Bind all interfaces instead of loopback, making the port reachable
+        /// by anything that can reach this machine.
+        #[arg(long)]
+        expose: bool,
+    },
+    /// Stop forwarding a host port.
+    Rm { name: String, host_port: u16 },
+    /// Show a project's forwards and their URLs.
+    Ls { name: String },
 }
 
 /// Parse `--size`, reusing the engine's own preset parsing so the CLI cannot
@@ -674,8 +707,12 @@ async fn main() -> Result<()> {
                 && report.not_released.is_empty()
                 && report.snapshots_removed.is_empty()
                 && report.orphan_backing_files.is_empty()
+                && report.stale_forwards.is_empty()
             {
-                println!("nothing to reconcile: no orphaned mounts, loop devices or snapshots");
+                println!(
+                    "nothing to reconcile: no orphaned mounts, loop devices, snapshots or \
+                     port forwards"
+                );
             } else {
                 for name in &report.released {
                     println!("released orphan volume {name:?} (mount + loop device)");
@@ -695,6 +732,12 @@ async fn main() -> Result<()> {
                     println!(
                         "orphan backing file for {name:?}: mount/loop released, but the file was \
                          KEPT — it may hold data. Remove it deliberately if you are sure."
+                    );
+                }
+                for f in &report.stale_forwards {
+                    println!(
+                        "removed stale port forward {f} — it was holding a host port for a \
+                         project that no longer declares it"
                     );
                 }
             }
@@ -763,6 +806,30 @@ async fn main() -> Result<()> {
                         d.mounted_image.clone()
                     }
                 ),
+            }
+
+            // "What's my URL" is the question people actually ask when a dev
+            // server is running, so status answers it rather than making them
+            // reconstruct it from a port number.
+            if d.ports.is_empty() {
+                println!("  ports:        none forwarded (nemr port add {name} 8000)");
+            } else {
+                for (i, p) in d.ports.iter().enumerate() {
+                    let label = if i == 0 {
+                        "  ports:      "
+                    } else {
+                        "              "
+                    };
+                    let exposed = if p.host_ip == "0.0.0.0" {
+                        "  (exposed to the network)"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "{label}  {} -> container {}{exposed}",
+                        p.url, p.container_port
+                    );
+                }
             }
 
             println!("  base image:   {}", d.base_image);
@@ -944,6 +1011,74 @@ async fn main() -> Result<()> {
             // what happened inside the container.
             if code != 0 {
                 std::process::exit(code);
+            }
+        }
+
+        Command::Port { action } => {
+            let mut session = daemon::connect().await?;
+            let (name, resp) = match action {
+                PortAction::Add { name, port, expose } => {
+                    if expose {
+                        // Say it at the moment it becomes true, not in a manual.
+                        // No prompt: there is a sensible default and this is the
+                        // deliberate departure from it.
+                        eprintln!(
+                            "[nemr] --expose: this port will be reachable by anything that can \
+                             reach this machine, not just you."
+                        );
+                    }
+                    let request = session.req(proto::PortAddRequest {
+                        name: name.clone(),
+                        port,
+                        expose,
+                    });
+                    let r = session
+                        .client()
+                        .port_add(request)
+                        .await
+                        .map_err(status_err)?
+                        .into_inner();
+                    (name, r)
+                }
+                PortAction::Rm { name, host_port } => {
+                    let request = session.req(proto::PortRemoveRequest {
+                        name: name.clone(),
+                        host_port: host_port as u32,
+                    });
+                    let r = session
+                        .client()
+                        .port_remove(request)
+                        .await
+                        .map_err(status_err)?
+                        .into_inner();
+                    (name, r)
+                }
+                PortAction::Ls { name } => {
+                    let request = session.req(proto::PortListRequest { name: name.clone() });
+                    let r = session
+                        .client()
+                        .port_list(request)
+                        .await
+                        .map_err(status_err)?
+                        .into_inner();
+                    (name, r)
+                }
+            };
+
+            if resp.ports.is_empty() {
+                println!("{name:?} forwards no ports.");
+                println!("Forward one with: nemr port add {name} 8000");
+                return Ok(());
+            }
+            println!("{:<22} {:<16} URL", "HOST", "CONTAINER PORT");
+            for p in &resp.ports {
+                let bind = format!("{}:{}", p.host_ip, p.host_port);
+                let exposed = if p.host_ip == "0.0.0.0" {
+                    "  (exposed)"
+                } else {
+                    ""
+                };
+                println!("{bind:<22} {:<16} {}{exposed}", p.container_port, p.url);
             }
         }
 
