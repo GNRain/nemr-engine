@@ -153,6 +153,7 @@ message ReconcileResponse {
   repeated string snapshots_removed = 3;
   repeated string orphan_backing_files = 4;
   repeated string stale_forwards = 5;
+  repeated string unattributable_forwards = 6;
 }
 
 message ImportRequest {

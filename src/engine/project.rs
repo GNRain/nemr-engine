@@ -1167,11 +1167,14 @@ pub struct ReconcileReport {
     /// they may hold user data. Their mount and loop device are released, but the
     /// file is left for the operator to remove deliberately.
     pub orphan_backing_files: Vec<String>,
-    /// Host port forwards no project declares any more (WP-M). Removed: unlike a
-    /// backing file these hold no data, and leaving one bound means a host port
-    /// is held hostage by a project that no longer exists — with a collision
-    /// message naming a project the user cannot find.
+    /// Forwards reclaimed because a *stopped* project declares exactly them —
+    /// ours by construction, since stop withdraws forwards (WP-M).
     pub stale_forwards: Vec<String>,
+    /// Live forwards matching no project declaration. **Reported, never
+    /// removed** (F-97): rootlesskit is shared with everything else the user
+    /// runs, so a forward we cannot attribute may well be theirs, and deleting
+    /// it would make a cleanup command destroy configuration it never created.
+    pub unattributable_forwards: Vec<String>,
 }
 
 impl ReconcileReport {
@@ -1334,21 +1337,52 @@ pub async fn reconcile_orphans(client: &ContainerdClient) -> Result<ReconcileRep
         }
     }
 
-    // Host port forwards whose project is gone (WP-M). Same shape as the
-    // orphan sweep above: rootlesskit's live set is derived state, and a
-    // forward outliving its project is exactly the disagreement the label is
-    // authoritative over.
+    // Host port forwards (WP-M), with ownership PROVEN before anything is
+    // removed (F-97). rootlesskit's forward table is shared with everything
+    // else the user runs, and a forward they added by hand is indistinguishable
+    // from one of our orphans — so the previous rule ("remove anything no
+    // project declares") deleted the user's own configuration. A cleanup
+    // command destroying what it did not create is the F-79 shape aimed at
+    // something worse than a volume.
     if let Ok(live) = ports::list_live() {
-        let declared: HashSet<u16> = containers
-            .iter()
-            .flat_map(|c| ports_from_labels(&c.labels))
-            .map(|p| p.host_port)
-            .collect();
+        let mut declarations = Vec::new();
+        for c in &containers {
+            let Some(project) = c.labels.get(LABEL_PROJECT) else {
+                continue;
+            };
+            let running = client
+                .task_state(&c.id)
+                .await
+                .map(|s| s.is_running())
+                .unwrap_or(false);
+            for port in ports_from_labels(&c.labels) {
+                declarations.push(ports::Declaration {
+                    project: project.clone(),
+                    port,
+                    running,
+                });
+            }
+        }
+
         for f in live {
-            if !declared.contains(&f.host_port) {
-                let label = format!("{}:{} -> {}", f.host_ip, f.host_port, f.container_port);
-                if ports::remove_live(f.id).is_ok() {
-                    report.stale_forwards.push(label);
+            let label = format!("{}:{} -> {}", f.host_ip, f.host_port, f.container_port);
+            match ports::classify_forward(&f, &declarations) {
+                // Correct state: a running project's own forward. Nothing to say.
+                ports::Disposition::Correct => {}
+                // Ours by construction — stop withdraws forwards, so a live one
+                // for a stopped project is our own leftover.
+                ports::Disposition::Reclaim { project } => {
+                    if ports::remove_live(f.id).is_ok() {
+                        report
+                            .stale_forwards
+                            .push(format!("{label} (stopped project {project:?})"));
+                    }
+                }
+                // Not ours as far as we can prove. Report it; never remove it.
+                ports::Disposition::Unattributable => {
+                    report
+                        .unattributable_forwards
+                        .push(format!("{label} (id {})", f.id));
                 }
             }
         }

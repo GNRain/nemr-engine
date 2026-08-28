@@ -337,6 +337,58 @@ pub fn remove_live(id: u32) -> Result<()> {
     bail!("rootlessctl remove-ports {id} failed: {}", stderr.trim());
 }
 
+// --- ownership, for safe reclamation (F-97) -----------------------------------
+
+/// One project's claim on a forward, as reconcile sees it.
+pub struct Declaration {
+    pub project: String,
+    pub port: PortForward,
+    pub running: bool,
+}
+
+/// What reconcile may do with a live forward.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Disposition {
+    /// Exactly matches a running project's declaration: this is the correct
+    /// state, not an orphan. Leave it, say nothing.
+    Correct,
+    /// Exactly matches a *stopped* project's declaration. Ours by construction
+    /// — stop withdraws forwards, so a live one here is our own leftover — and
+    /// therefore safe to reclaim.
+    Reclaim { project: String },
+    /// Matches no declaration at all. We cannot prove we created it, so we must
+    /// not remove it: rootlesskit is shared with whatever else the user runs,
+    /// and a forward they added themselves is indistinguishable from one of our
+    /// orphans. Leave it and report it (F-97).
+    Unattributable,
+}
+
+/// Decide what reconcile may do with one live forward.
+///
+/// The rule is ownership by *exact* declaration match — host address, host port
+/// and container port together, not host port alone. Before F-97 the sweep
+/// removed every forward no project declared, which silently destroyed the
+/// user's own `rootlessctl` forwards: a cleanup command deleting configuration
+/// it never created, on the assumption that anything unfamiliar was its own
+/// litter. Cleanup verifies before destroying.
+pub fn classify_forward(f: &LiveForward, declarations: &[Declaration]) -> Disposition {
+    for d in declarations {
+        let matches = d.port.host_ip == f.host_ip
+            && d.port.host_port == f.host_port
+            && d.port.container_port == f.container_port;
+        if matches {
+            return if d.running {
+                Disposition::Correct
+            } else {
+                Disposition::Reclaim {
+                    project: d.project.clone(),
+                }
+            };
+        }
+    }
+    Disposition::Unattributable
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,6 +515,78 @@ ID    PROTO    PARENTIP     PARENTPORT    CHILDIP    CHILDPORT
             classify_add_error("error: connection refused"),
             AddFailure::Other { .. }
         ));
+    }
+
+    fn decl(project: &str, spec: &str, running: bool) -> Declaration {
+        Declaration {
+            project: project.into(),
+            port: parse_port_arg(spec, false).unwrap(),
+            running,
+        }
+    }
+    fn live(id: u32, host_ip: &str, host_port: u16, container_port: u16) -> LiveForward {
+        LiveForward {
+            id,
+            host_ip: host_ip.into(),
+            host_port,
+            container_port,
+        }
+    }
+
+    /// THE F-97 GUARD. A forward nemr did not create must never be removed by a
+    /// cleanup command. The user's own rootlessctl forwards are
+    /// indistinguishable from our orphans, so the only safe rule is: no
+    /// declaration, no deletion.
+    #[test]
+    fn a_forward_no_project_declares_is_left_alone_not_deleted() {
+        let decls = [decl("web", "127.0.0.1:8000:8000", true)];
+        let theirs = live(7, "127.0.0.1", 5433, 5432); // a user's own forward
+        assert_eq!(
+            classify_forward(&theirs, &decls),
+            Disposition::Unattributable,
+            "a forward we cannot prove we created must be left alone"
+        );
+    }
+
+    #[test]
+    fn a_running_projects_forward_is_correct_not_an_orphan() {
+        let decls = [decl("web", "127.0.0.1:8000:8000", true)];
+        assert_eq!(
+            classify_forward(&live(1, "127.0.0.1", 8000, 8000), &decls),
+            Disposition::Correct
+        );
+    }
+
+    /// A stopped project should have no live forward — stop withdraws them — so
+    /// one that exists is our own leftover and is safe to reclaim.
+    #[test]
+    fn a_stopped_projects_leftover_forward_is_reclaimed() {
+        let decls = [decl("web", "127.0.0.1:8000:8000", false)];
+        assert_eq!(
+            classify_forward(&live(1, "127.0.0.1", 8000, 8000), &decls),
+            Disposition::Reclaim {
+                project: "web".into()
+            }
+        );
+    }
+
+    /// Ownership is the WHOLE tuple. Matching on host port alone would claim a
+    /// forward that merely shares a port number but goes somewhere else.
+    #[test]
+    fn ownership_requires_the_whole_tuple_not_just_the_host_port() {
+        let decls = [decl("web", "127.0.0.1:8000:8000", false)];
+        // Same host port, different container port — not the one we declared.
+        assert_eq!(
+            classify_forward(&live(1, "127.0.0.1", 8000, 9999), &decls),
+            Disposition::Unattributable,
+            "a different container port is a different forward"
+        );
+        // Same ports, different bind address.
+        assert_eq!(
+            classify_forward(&live(1, "0.0.0.0", 8000, 8000), &decls),
+            Disposition::Unattributable,
+            "a different bind address is a different forward"
+        );
     }
 
     /// Whatever the classification, the operator's own words survive — a

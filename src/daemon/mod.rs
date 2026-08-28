@@ -307,6 +307,7 @@ impl Nemr for NemrService {
             snapshots_removed: report.snapshots_removed,
             orphan_backing_files: report.orphan_backing_files,
             stale_forwards: report.stale_forwards,
+            unattributable_forwards: report.unattributable_forwards,
         }))
     }
 

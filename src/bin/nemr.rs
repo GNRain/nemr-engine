@@ -708,6 +708,7 @@ async fn main() -> Result<()> {
                 && report.snapshots_removed.is_empty()
                 && report.orphan_backing_files.is_empty()
                 && report.stale_forwards.is_empty()
+                && report.unattributable_forwards.is_empty()
             {
                 println!(
                     "nothing to reconcile: no orphaned mounts, loop devices, snapshots or \
@@ -736,8 +737,17 @@ async fn main() -> Result<()> {
                 }
                 for f in &report.stale_forwards {
                     println!(
-                        "removed stale port forward {f} — it was holding a host port for a \
-                         project that no longer declares it"
+                        "reclaimed port forward {f} — the project is stopped, so this was \
+                         nemr's own leftover"
+                    );
+                }
+                for f in &report.unattributable_forwards {
+                    println!(
+                        "LEFT ALONE: port forward {f} matches no project declaration, so nemr \
+                         cannot prove it created it and will not remove it. If it is yours, \
+                         that is correct. If it is a nemr orphan, remove it deliberately:\n  \
+                         rootlessctl --socket=$XDG_RUNTIME_DIR/containerd-rootless/api.sock \
+                         remove-ports <id>"
                     );
                 }
             }
