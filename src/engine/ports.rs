@@ -214,6 +214,11 @@ pub struct LiveForward {
     pub id: u32,
     pub host_ip: String,
     pub host_port: u16,
+    /// Where inside rootlesskit's namespace the forward points. Absent means
+    /// loopback there — the pre-NET-02 shape, where the session shared that
+    /// namespace. With per-session namespaces this carries the session's own
+    /// address (NET-02).
+    pub container_ip: Option<String>,
     pub container_port: u16,
 }
 
@@ -308,37 +313,61 @@ fn rootlessctl(args: &[String]) -> Result<std::process::Output> {
 /// Every forward rootlesskit currently holds — across all projects, since the
 /// namespace is shared. Used to detect collisions and to reconcile.
 pub fn list_live() -> Result<Vec<LiveForward>> {
-    let out = rootlessctl(&["list-ports".to_string()])?;
+    let out = rootlessctl(&["list-ports".to_string(), "--json".to_string()])?;
     if !out.status.success() {
         bail!(
             "rootlessctl list-ports failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(parse_list_ports(&String::from_utf8_lossy(&out.stdout)))
+    Ok(parse_list_ports_json(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// Parse `rootlessctl list-ports` table output.
+/// Parse `rootlessctl list-ports --json`.
 ///
-/// Columns: ID PROTO PARENTIP PARENTPORT CHILDIP CHILDPORT. CHILDIP is commonly
-/// blank, so fields are taken from the ends rather than by fixed index — a
-/// blank middle column would otherwise shift everything after it.
-pub fn parse_list_ports(stdout: &str) -> Vec<LiveForward> {
+/// Newline-delimited JSON, one object per forward:
+/// `{"id":16,"spec":{"proto":"tcp","parentIP":"127.0.0.1","parentPort":19777,"childPort":8000}}`
+///
+/// **Why not the table** (F-98/F-100). The table was parsed positionally, and
+/// `CHILDIP` is printed blank when unset — so a row had five fields instead of
+/// six and every column after it shifted, making the host port read as the
+/// container port. Nothing errored; the values were simply wrong, and the
+/// forward became impossible to match and therefore impossible to tear down.
+/// That is the F-80 shape: a parser correct only for the layout in front of it,
+/// failing as a misread rather than as an error. In JSON an absent field is
+/// absent, so the failure mode cannot recur, and an unparseable line is
+/// visibly unparseable.
+pub fn parse_list_ports_json(stdout: &str) -> Vec<LiveForward> {
+    #[derive(serde::Deserialize)]
+    struct Spec {
+        #[serde(rename = "parentIP")]
+        parent_ip: String,
+        #[serde(rename = "parentPort")]
+        parent_port: u16,
+        #[serde(rename = "childIP", default)]
+        child_ip: Option<String>,
+        #[serde(rename = "childPort")]
+        child_port: u16,
+    }
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        id: u32,
+        spec: Spec,
+    }
+
     stdout
         .lines()
-        .skip(1) // header
-        .filter_map(|line| {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() < 4 {
-                return None;
-            }
-            Some(LiveForward {
-                id: f[0].parse().ok()?,
-                host_ip: f[2].to_string(),
-                host_port: f[3].parse().ok()?,
-                // CHILDPORT is last; CHILDIP may be absent entirely.
-                container_port: f[f.len() - 1].parse().ok()?,
-            })
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter_map(|line| serde_json::from_str::<Entry>(line).ok())
+        .map(|e| LiveForward {
+            id: e.id,
+            host_ip: e.spec.parent_ip,
+            host_port: e.spec.parent_port,
+            // An empty string is the same as absent; normalise so callers have
+            // one thing to test.
+            container_ip: e.spec.child_ip.filter(|s| !s.is_empty()),
+            container_port: e.spec.child_port,
         })
         .collect()
 }
@@ -515,34 +544,49 @@ mod tests {
         assert_eq!(decoded[1].host_port, 9000);
     }
 
-    /// CHILDIP is commonly blank in rootlessctl's table. Indexing from the left
-    /// would read CHILDPORT out of the wrong column when it is.
+    /// The exact line shape rootlessctl emits, captured from a live run.
     #[test]
-    fn list_ports_parses_a_blank_child_ip_column() {
-        let stdout = "\
-ID    PROTO    PARENTIP     PARENTPORT    CHILDIP    CHILDPORT
-1     tcp      127.0.0.1    8000                     8000
-2     tcp      0.0.0.0      9000                     3000
-";
-        let live = parse_list_ports(stdout);
+    fn json_list_ports_is_parsed() {
+        let out = concat!(
+            r#"{"id":16,"spec":{"proto":"tcp","parentIP":"127.0.0.1","parentPort":19777,"childPort":8000}}"#,
+            "\n",
+            r#"{"id":17,"spec":{"proto":"tcp","parentIP":"0.0.0.0","parentPort":9000,"childIP":"10.99.0.2","childPort":3000}}"#,
+            "\n"
+        );
+        let live = parse_list_ports_json(out);
         assert_eq!(live.len(), 2);
-        assert_eq!(live[0].id, 1);
-        assert_eq!(live[0].host_port, 8000);
+        assert_eq!(live[0].id, 16);
+        assert_eq!(live[0].host_port, 19777);
         assert_eq!(
             live[0].container_port, 8000,
-            "container port must come from the last column, not a fixed index"
+            "an ABSENT childIP must not shift the container port — the defect \
+             the table parser had"
         );
-        assert_eq!(live[1].host_ip, "0.0.0.0");
+        assert_eq!(live[0].container_ip, None);
+        assert_eq!(live[1].container_ip.as_deref(), Some("10.99.0.2"));
         assert_eq!(live[1].container_port, 3000);
+    }
+
+    /// An unparseable line is skipped, not silently misread as something else.
+    #[test]
+    fn json_garbage_is_skipped_not_misread() {
+        let out = "not json at all\n{\"id\":1,\"spec\":{\"proto\":\"tcp\",\"parentIP\":\"127.0.0.1\",\"parentPort\":1,\"childPort\":2}}\n";
+        let live = parse_list_ports_json(out);
+        assert_eq!(
+            live.len(),
+            1,
+            "the good line survives, the bad one is dropped"
+        );
+        assert_eq!(live[0].host_port, 1);
     }
 
     #[test]
     fn an_empty_port_table_yields_nothing() {
-        assert!(parse_list_ports("ID PROTO PARENTIP PARENTPORT CHILDIP CHILDPORT\n").is_empty());
-        assert!(parse_list_ports("").is_empty());
+        assert!(parse_list_ports_json("").is_empty());
+        assert!(parse_list_ports_json("\n\n").is_empty());
     }
 
-    /// The two collisions need different remedies, so they must stay apart all
+    /// The two collisions need different remedies    /// The two collisions need different remedies, so they must stay apart all
     /// the way to the user. These are rootlesskit's real message shapes,
     /// captured from live runs.
     #[test]
@@ -573,6 +617,7 @@ ID    PROTO    PARENTIP     PARENTPORT    CHILDIP    CHILDPORT
             id,
             host_ip: host_ip.into(),
             host_port,
+            container_ip: None,
             container_port,
         }
     }
