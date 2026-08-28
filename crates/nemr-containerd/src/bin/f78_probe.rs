@@ -81,6 +81,7 @@ async fn main() {
         let id = format!("nemr-{name}");
 
         let spec = ContainerSpec {
+            own_network_namespace: true,
             id: id.clone(),
             image: std::env::var("NEMR_F78_IMAGE")
                 .unwrap_or_else(|_| "ghcr.io/gnrain/nemr-base:0.2.0".to_string()),

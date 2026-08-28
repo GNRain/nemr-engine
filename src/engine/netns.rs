@@ -246,6 +246,25 @@ fn rootlesskit_child_pid() -> Result<String> {
     Ok(pid.trim().to_string())
 }
 
+/// Does this task share rootlesskit's network namespace instead of having its
+/// own?
+///
+/// The control on every NET-02 assumption. A container's OCI spec is frozen at
+/// create time, so a project created before NET-02 asks for no network
+/// namespace and its task joins rootlesskit's — and wiring a session network
+/// into the SHARED namespace puts the session's addresses on rootlesskit's own
+/// interfaces and collides with rootlesskit's own default route. Comparing the
+/// `net:` inodes is how NET-01 was established twice and how NET-02 is asserted;
+/// it is cheap, and it turns a silent misconfiguration into a refusal.
+pub fn shares_rootlesskit_namespace(container_pid: u32) -> Result<bool> {
+    let child = rootlesskit_child_pid()?;
+    let read = |pid: &str| {
+        std::fs::read_link(format!("/proc/{pid}/ns/net"))
+            .with_context(|| format!("reading /proc/{pid}/ns/net"))
+    };
+    Ok(read(&container_pid.to_string())? == read(&child)?)
+}
+
 /// Run a command inside rootlesskit's user + network namespaces.
 ///
 /// The host PID namespace is deliberately NOT entered: the container is
@@ -329,15 +348,22 @@ trap 'ip link del {link} >/dev/null 2>&1 || true' EXIT
 
 ip link add {link} type veth peer name {peer}
 ip link set {peer} netns {container_pid}
-ip addr add {gw}/24 dev {link}
+# `replace`, not `add`, throughout: every step states the declared state and
+# reconciles to it, so a second run is a no-op rather than "File exists". `add`
+# made this path work from clean and fail on the next run, which is the shape
+# this project keeps hitting — volumes and port forwards already reconcile.
+ip addr replace {gw}/24 dev {link}
 ip link set {link} up
 # Inside the session it is `ceth0`: conventional, and the per-session name only
-# needs to be unique while the end is still in the shared namespace.
+# needs to be unique while the end is still in the shared namespace. A stale
+# ceth0 from a previous incarnation of this namespace is removed rather than
+# collided with.
+nsenter -t {container_pid} -n -- sh -c 'ip link show ceth0 >/dev/null 2>&1 && ip link del ceth0 || true'
 nsenter -t {container_pid} -n -- ip link set {peer} name ceth0
-nsenter -t {container_pid} -n -- ip addr add {ip}/24 dev ceth0
+nsenter -t {container_pid} -n -- ip addr replace {ip}/24 dev ceth0
 nsenter -t {container_pid} -n -- ip link set ceth0 up
 nsenter -t {container_pid} -n -- ip link set lo up
-nsenter -t {container_pid} -n -- ip route add default via {gw}
+nsenter -t {container_pid} -n -- ip route replace default via {gw}
 # Egress. Without this the session has an address and no way out — which is
 # how Claude Code loses the API, so it is part of connecting, not an extra.
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
