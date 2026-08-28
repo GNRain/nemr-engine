@@ -51,15 +51,40 @@ pub struct PortForward {
     pub host_ip: String,
     pub host_port: u16,
     pub container_port: u16,
+    /// The session's own address inside rootlesskit's namespace (NET-02).
+    /// Derived at apply time from the project's allocation, never persisted:
+    /// the declaration is about ports, and the address is a property of the
+    /// session's current network.
+    pub session_ip: Option<String>,
 }
 
 impl PortForward {
-    /// The rootlesskit spec form: `127.0.0.1:8000:8000/tcp`.
+    /// The rootlesskit spec form.
+    ///
+    /// Without a session address: `127.0.0.1:8000:8000/tcp`, forwarding into
+    /// rootlesskit's own namespace (the pre-NET-02 shape).
+    ///
+    /// With one: `127.0.0.1:8000:10.99.3.2:8000/tcp` — rootlesskit's port API
+    /// takes a **child IP**, so a host port reaches a session that has its own
+    /// namespace in ONE hop. That was the NET-02 spike's decisive finding: the
+    /// forwarding path does not gain a second hop.
     pub fn spec(&self) -> String {
-        format!(
-            "{}:{}:{}/tcp",
-            self.host_ip, self.host_port, self.container_port
-        )
+        match &self.session_ip {
+            Some(ip) => format!(
+                "{}:{}:{}:{}/tcp",
+                self.host_ip, self.host_port, ip, self.container_port
+            ),
+            None => format!(
+                "{}:{}:{}/tcp",
+                self.host_ip, self.host_port, self.container_port
+            ),
+        }
+    }
+
+    /// Point this forward at a session's own address (NET-02).
+    pub fn via_session(mut self, session_ip: &str) -> Self {
+        self.session_ip = Some(session_ip.to_string());
+        self
     }
 
     /// What a user should open. The whole point of the feature is answering
@@ -142,6 +167,7 @@ pub fn parse_port_arg(arg: &str, expose: bool) -> Result<PortForward> {
         host_ip: parsed.to_string(),
         host_port,
         container_port,
+        session_ip: None,
     })
 }
 

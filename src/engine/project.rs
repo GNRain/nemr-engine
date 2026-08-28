@@ -80,6 +80,9 @@ pub const LABEL_AGENT: &str = "nemr.agent";
 /// Declared port forwards, comma-separated rootlesskit specs. The project's
 /// authoritative record; the live forward set is derived from it (WP-M).
 pub const LABEL_PORTS: &str = "nemr.ports";
+/// The session's network index: `10.99.<index>.0/24` (NET-02). Recorded so the
+/// same addresses are reapplied on every start and no two sessions collide.
+pub const LABEL_NETNS: &str = "nemr.netns";
 
 /// Labels written onto a project's container record.
 ///
@@ -92,12 +95,16 @@ pub fn project_labels(
     volume_path: &str,
     size: VolumeSize,
     agent: Agent,
+    network: Option<netns::Allocation>,
 ) -> HashMap<String, String> {
     let mut labels = HashMap::new();
     labels.insert(LABEL_PROJECT.to_string(), name.to_string());
     labels.insert(LABEL_VOLUME.to_string(), volume_path.to_string());
     labels.insert(LABEL_SIZE.to_string(), size.to_string());
     labels.insert(LABEL_AGENT.to_string(), agent.id().to_string());
+    if let Some(alloc) = network {
+        labels.insert(LABEL_NETNS.to_string(), netns::encode_allocation(alloc));
+    }
     labels
 }
 
@@ -218,7 +225,19 @@ async fn create_with_auth(
             .with_context(|| format!("failed to create session-state dir {}", dir.display()))?;
     }
 
-    let labels = project_labels(name, &mount_point.to_string_lossy(), size, agent);
+    // NET-02: allocate this session's network now, so it is recorded once and
+    // reapplied verbatim at every start. Refuse before creating anything if the
+    // host already routes our range — allocating into a conflict does not
+    // error, it silently misroutes, which is the worst failure in this area.
+    netns::check_range_is_free()?;
+    let network = netns::allocate_index(&allocated_indices(client).await)?;
+    let labels = project_labels(
+        name,
+        &mount_point.to_string_lossy(),
+        size,
+        agent,
+        Some(network),
+    );
 
     let mut mounts = vec![
         // The project volume becomes the container's working directory.
@@ -318,7 +337,16 @@ mod tests {
     /// and release its mount (F-58). Proven to fail when the labels are dropped.
     #[test]
     fn create_writes_the_labels_list_and_reconcile_depend_on() {
-        let labels = project_labels("demo", "/mnt/demo", VolumeSize::Medium, Agent::ClaudeCode);
+        let labels = project_labels(
+            "demo",
+            "/mnt/demo",
+            VolumeSize::Medium,
+            Agent::ClaudeCode,
+            Some(netns::Allocation { index: 3 }),
+        );
+        // NET-02: the session's network is recorded on the container, like
+        // every other piece of project state.
+        assert_eq!(labels.get(LABEL_NETNS).map(String::as_str), Some("3"));
 
         assert_eq!(labels.get(LABEL_PROJECT).map(String::as_str), Some("demo"));
         assert_eq!(
@@ -385,6 +413,26 @@ pub async fn start(client: &ContainerdClient, name: &str) -> Result<u32> {
 
     let pid = client.start_task(&container_id).await?;
 
+    // NET-02: the task now has its own empty network namespace. Wire it before
+    // anything else touches the network — a session with an address and no
+    // route is a session where Claude Code cannot reach the API, and the
+    // failure would surface much later as an authentication error.
+    if let Some(alloc) = find_container(client, name)
+        .await
+        .ok()
+        .and_then(|c| allocation_from_labels(&c.labels))
+    {
+        if let Err(e) = netns::connect_session(pid, alloc) {
+            // Tear the task down rather than leave a session that looks started
+            // and has no network: a half-connected session is worse than a
+            // refusal, because the user only finds out when something fails.
+            let _ = client.stop_task(&container_id).await;
+            return Err(e.context(format!(
+                "starting {name:?}: its network could not be configured, so the task was stopped"
+            )));
+        }
+    }
+
     // Re-apply declared forwards (WP-M). They are derived state: torn down on
     // stop, and gone entirely after a rootlesskit restart, so the declaration
     // is applied rather than assumed live. A port that cannot be bound is
@@ -426,7 +474,20 @@ pub async fn stop(client: &ContainerdClient, name: &str) -> Result<StopOutcome> 
     // belongs to it across runs.
     withdraw_declared_ports(client, name).await;
 
-    client.stop_task(&container_id).await
+    let outcome = client.stop_task(&container_id).await;
+
+    // NET-02: the session's namespace dies with the task, taking the container
+    // end of the veth with it; this removes our end and the NAT rule. After the
+    // task, so nothing is torn down while it might still be serving.
+    if let Some(alloc) = find_container(client, name)
+        .await
+        .ok()
+        .and_then(|c| allocation_from_labels(&c.labels))
+    {
+        netns::disconnect_session(alloc);
+    }
+
+    outcome
 }
 
 /// Remove FIFO directories left behind by attach processes that are gone.
@@ -1719,8 +1780,21 @@ pub async fn delete(client: &ContainerdClient, name: &str) -> Result<()> {
     // and a collision message that would name a project the user cannot find.
     withdraw_declared_ports(client, name).await;
 
+    // NET-02: and the session network. delete calls stop_task directly rather
+    // than going through stop(), so it needs its own teardown — without this
+    // the veth and the NAT rule outlived every deleted project, which the
+    // cleanup check caught.
+    let session_network = find_container(client, name)
+        .await
+        .ok()
+        .and_then(|c| allocation_from_labels(&c.labels));
+
     // 1. Stop the task. Idempotent: stop_task returns NoTask if none is running.
     client.stop_task(&container_id).await?;
+
+    if let Some(alloc) = session_network {
+        netns::disconnect_session(alloc);
+    }
 
     // 2. Release the volume (unmount + detach) BEFORE the record, so a failure
     //    here leaves the project still listable and this delete retryable.
@@ -2078,7 +2152,32 @@ pub async fn resolve_base_image(
 
 // --- port forwarding (WP-M) -------------------------------------------------
 
+use crate::engine::netns;
 use crate::engine::ports;
+
+/// The session network a project was allocated, from its label.
+pub fn allocation_from_labels(
+    labels: &std::collections::HashMap<String, String>,
+) -> Option<netns::Allocation> {
+    labels
+        .get(LABEL_NETNS)
+        .and_then(|r| netns::decode_allocation(r))
+}
+
+/// Every session network index currently spoken for.
+async fn allocated_indices(client: &ContainerdClient) -> Vec<u8> {
+    client
+        .list_containers()
+        .await
+        .map(|cs| {
+            cs.iter()
+                .filter(|c| c.labels.contains_key(LABEL_PROJECT))
+                .filter_map(|c| allocation_from_labels(&c.labels))
+                .map(|a| a.index)
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// The container record for a project, or NoSuchProject.
 async fn find_container(
@@ -2194,7 +2293,13 @@ pub async fn add_port(
         .map_err(Error::Internal)?
         .is_running();
     if running {
-        apply_one(&port).map_err(|detail| Error::PortRefused { detail })?;
+        // NET-02: forward to the session's own address, not into rootlesskit's
+        // namespace — the session no longer lives there.
+        let live_target = match allocation_from_labels(&container.labels) {
+            Some(alloc) => port.clone().via_session(&alloc.session_ip()),
+            None => port.clone(),
+        };
+        apply_one(&live_target).map_err(|detail| Error::PortRefused { detail })?;
     } else if let Err(detail) = ports::host_port_is_free(&port.host_ip, port.host_port) {
         // The project is stopped, so nothing is bound yet — but accepting a
         // declaration that cannot work would defer the bad news to `start`,
@@ -2310,11 +2415,16 @@ pub async fn apply_declared_ports(client: &ContainerdClient, name: &str) -> Vec<
         return problems;
     }
     let live = ports::list_live().unwrap_or_default();
+    let alloc = allocation_from_labels(&container.labels);
     for port in declared {
         if live.iter().any(|f| f.host_port == port.host_port) {
             continue; // already bound; re-adding would collide with ourselves
         }
-        if let Err(detail) = apply_one(&port) {
+        let target = match &alloc {
+            Some(a) => port.clone().via_session(&a.session_ip()),
+            None => port.clone(),
+        };
+        if let Err(detail) = apply_one(&target) {
             problems.push(detail);
         }
     }

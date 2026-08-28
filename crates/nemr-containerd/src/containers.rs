@@ -484,7 +484,15 @@ fn oci_spec(spec: &ContainerSpec, image_config: &ImageConfig) -> serde_json::Val
             ),
             "namespaces": [
                 { "type": "pid" }, { "type": "ipc" }, { "type": "uts" },
-                { "type": "mount" }
+                { "type": "mount" },
+                // NET-02: each session gets its OWN network namespace, so two
+                // sessions can both bind port 8000 internally — the normal
+                // expectation, and what Docker does. A fresh netns has only a
+                // down loopback; the engine wires a veth pair and NAT into it
+                // immediately after start (engine::netns). Before NET-02 this
+                // entry was absent, so sessions shared rootlesskit's namespace
+                // (NET-01) and the second bind of any port simply failed.
+                { "type": "network" }
             ],
             "maskedPaths": [
                 "/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys",

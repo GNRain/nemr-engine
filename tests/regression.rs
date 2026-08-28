@@ -2855,3 +2855,60 @@ fn wpk_an_unknown_subcommand_without_an_extension_fails_helpfully() {
         "not-found must fail fast, never wait on a daemon"
     );
 }
+
+/// NET-02: a started session has its OWN network namespace.
+///
+/// This test exists because its opposite was true until 2026-08-28 and nothing
+/// asserted it. NET-01 read "project containers shall share rootlesskit's
+/// network namespace" — true, verified twice by hand with inode comparison, and
+/// covered by no test at all, which is exactly how a property gets quietly
+/// falsified. The requirement was retired deliberately (one namespace meant two
+/// sessions could not both bind port 8000, and the loser's own dev server
+/// reported `EADDRINUSE` without ever naming nemr). The inverse is now pinned.
+#[test]
+fn net02_a_session_has_its_own_network_namespace() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "net02ns", VolumeSize::Small).await;
+        let pid = project::start(&client, &project.name).await.expect("start");
+
+        let netns_of = |pid: u32| {
+            std::fs::read_link(format!("/proc/{pid}/ns/net"))
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR");
+        let rk_pid: u32 =
+            std::fs::read_to_string(format!("{runtime_dir}/containerd-rootless/child_pid"))
+                .expect("rootlesskit child_pid")
+                .trim()
+                .parse()
+                .expect("a pid");
+
+        let session_ns = netns_of(pid);
+        let rootlesskit_ns = netns_of(rk_pid);
+
+        // Control: both reads must have produced something, or "they differ"
+        // would be true for the uninteresting reason that neither was readable.
+        assert!(
+            session_ns.starts_with("net:[") && rootlesskit_ns.starts_with("net:["),
+            "could not read both namespaces (session={session_ns:?}, \
+             rootlesskit={rootlesskit_ns:?}); this test would otherwise pass by \
+             failing to look"
+        );
+        assert_ne!(
+            session_ns, rootlesskit_ns,
+            "NET-02: the session must have its own network namespace"
+        );
+
+        let _ = project::stop(&client, &project.name).await;
+    });
+}
