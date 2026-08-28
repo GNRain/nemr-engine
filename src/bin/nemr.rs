@@ -172,6 +172,23 @@ enum PortAction {
     Ls { name: String },
 }
 
+/// Is this bind address loopback? Mirrors the engine's rule (F-98): exposure is
+/// "not loopback", never a comparison against one literal.
+fn is_loopback(host_ip: &str) -> bool {
+    host_ip
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// The host port the user's argument resolves to, for matching the response
+/// row. Parsing is the engine's job; this only needs the number.
+fn parsed_host_port(arg: &str, expose: bool) -> u32 {
+    nemr_engine::engine::ports::parse_port_arg(arg, expose)
+        .map(|p| p.host_port as u32)
+        .unwrap_or(0)
+}
+
 /// Parse `--size`, reusing the engine's own preset parsing so the CLI cannot
 /// drift from what the engine and the privileged helper accept.
 /// The human label for an agent id coming back over the wire.
@@ -1028,15 +1045,7 @@ async fn main() -> Result<()> {
             let mut session = daemon::connect().await?;
             let (name, resp) = match action {
                 PortAction::Add { name, port, expose } => {
-                    if expose {
-                        // Say it at the moment it becomes true, not in a manual.
-                        // No prompt: there is a sensible default and this is the
-                        // deliberate departure from it.
-                        eprintln!(
-                            "[nemr] --expose: this port will be reachable by anything that can \
-                             reach this machine, not just you."
-                        );
-                    }
+                    let want_host_port = parsed_host_port(&port, expose);
                     let request = session.req(proto::PortAddRequest {
                         name: name.clone(),
                         port,
@@ -1048,6 +1057,20 @@ async fn main() -> Result<()> {
                         .await
                         .map_err(status_err)?
                         .into_inner();
+                    // Warn on the bind that actually resulted, and only once it
+                    // has succeeded (F-98). Gating on the flag warned for adds
+                    // that then failed, and stayed silent for the other way to
+                    // opt out — writing a non-loopback address into the spec,
+                    // which the parser documents as beating the flag.
+                    if let Some(added) = r.ports.iter().find(|p| p.host_port == want_host_port) {
+                        if !is_loopback(&added.host_ip) {
+                            eprintln!(
+                                "[nemr] {} is reachable by anything that can reach this machine, \
+                                 not just you.",
+                                added.host_ip
+                            );
+                        }
+                    }
                     (name, r)
                 }
                 PortAction::Rm { name, host_port } => {

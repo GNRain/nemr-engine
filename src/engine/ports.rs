@@ -74,8 +74,19 @@ impl PortForward {
         format!("http://{host}:{}", self.host_port)
     }
 
+    /// Is this forward reachable from anywhere but this machine?
+    ///
+    /// Defined as **not loopback**, not as "equals 0.0.0.0" (F-98). The old
+    /// string test meant an explicit `10.0.2.15:9000:8000` — a real NIC, and so
+    /// LAN-reachable — reported itself as unexposed, and every surface told the
+    /// user it was private. An address that will not parse is treated as
+    /// exposed: the safe direction for a warning.
     pub fn exposed(&self) -> bool {
-        self.host_ip == ALL_INTERFACES
+        !self
+            .host_ip
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
     }
 }
 
@@ -107,10 +118,28 @@ pub fn parse_port_arg(arg: &str, expose: bool) -> Result<PortForward> {
         ),
     };
 
+    // The bind address decides who can reach the session, so it is validated
+    // rather than passed through (F-98). Unvalidated, an empty slot bound every
+    // interface, "localhost" and "0" were stored and then refused by rootlesskit
+    // forever, and a NIC address exposed the port to the LAN — none of them
+    // warned, because exposure was a string comparison against "0.0.0.0".
+    //
+    // A malformed address also shifts rootlessctl's output columns, which made
+    // the live forward unparseable and therefore untearable-down.
+    let parsed: std::net::IpAddr = ip.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "{ip:?} is not an IP address to bind. Use {LOOPBACK} (the default), \
+             {ALL_INTERFACES} for every interface, or a specific address of this \
+             host. Names like \"localhost\" are not accepted — the address is \
+             passed to the network layer verbatim."
+        )
+    })?;
+
     let host_port = parse_one(host_s, "host")?;
     let container_port = parse_one(container_s, "container")?;
     Ok(PortForward {
-        host_ip: ip,
+        // Normalised, so the label and rootlesskit see one canonical spelling.
+        host_ip: parsed.to_string(),
         host_port,
         container_port,
     })
@@ -129,6 +158,18 @@ fn parse_one(value: &str, which: &str) -> Result<u16> {
     // Below 1024 the host bind needs privilege we deliberately do not have
     // (PRIV-01). Saying so beats an opaque permission error from rootlesskit.
     Ok(n as u16)
+}
+
+/// A neighbouring host port to suggest when one is taken.
+///
+/// Saturating, and never 0: `host_port + 1` panicked in debug on 65535 and
+/// wrapped to an unusable 0 in release, so the remedy the error printed was
+/// itself invalid at the top of the range.
+pub fn suggest_alternative(host_port: u16) -> u16 {
+    match host_port.checked_add(1) {
+        Some(p) => p,
+        None => host_port - 1,
+    }
 }
 
 /// Serialise a project's forwards for the container label.
@@ -237,7 +278,10 @@ pub fn host_port_is_free(host_ip: &str, host_port: u16) -> std::result::Result<(
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            Err(format!("{host_ip}:{host_port} is already in use"))
+            // Marked so the caller can say "by something else on this machine"
+            // ONLY for a genuine conflict, and not append it to a permission
+            // failure, which is a different problem with a different remedy.
+            Err(format!("IN_USE:{host_ip}:{host_port} is already in use"))
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(format!(
             "binding {host_ip}:{host_port} was refused: {e}. Ports below 1024 \
@@ -530,6 +574,78 @@ ID    PROTO    PARENTIP     PARENTPORT    CHILDIP    CHILDPORT
             host_ip: host_ip.into(),
             host_port,
             container_port,
+        }
+    }
+
+    /// THE F-98 GUARD. An unvalidated bind address let `:9000:8000` through as
+    /// an empty host_ip, which rootlesskit binds as `*:9000` — EVERY interface
+    /// — with no --expose and no warning. Verified on this host before the fix.
+    #[test]
+    fn an_empty_or_bogus_bind_address_is_refused() {
+        for bad in [
+            ":9000:8000",
+            "localhost:9000:8000",
+            "0:9000:8000",
+            "nope:1:2",
+        ] {
+            let r = parse_port_arg(bad, false);
+            assert!(
+                r.is_err(),
+                "{bad:?} must be refused: an unvalidated address binds interfaces \
+                 the user never asked for, and silently"
+            );
+        }
+        let msg = format!("{:#}", parse_port_arg(":9000:8000", false).unwrap_err());
+        assert!(
+            msg.contains("127.0.0.1") && msg.contains("0.0.0.0"),
+            "the refusal must name the accepted forms: {msg}"
+        );
+    }
+
+    /// Exposure is "not loopback", not "equals 0.0.0.0". A real NIC address is
+    /// LAN-reachable and must say so — before F-98 it reported itself private.
+    #[test]
+    fn a_specific_nic_address_counts_as_exposed() {
+        let lan = parse_port_arg("10.0.2.15:9000:8000", false).unwrap();
+        assert!(
+            lan.exposed(),
+            "a bind to a routable NIC address is reachable off this machine"
+        );
+        let wild = parse_port_arg("0.0.0.0:9000:8000", false).unwrap();
+        assert!(wild.exposed());
+        let local = parse_port_arg("127.0.0.1:9000:8000", false).unwrap();
+        assert!(!local.exposed(), "loopback is not exposed");
+        // Any loopback address, not just the canonical one.
+        let local2 = parse_port_arg("127.0.0.5:9000:8000", false).unwrap();
+        assert!(!local2.exposed(), "127.0.0.0/8 is all loopback");
+    }
+
+    /// Leading-zero octets are REFUSED, not silently reinterpreted.
+    ///
+    /// `127.000.000.001` is ambiguous — historically octal — and accepting it
+    /// is a well-worn way to smuggle one address past a check that reads
+    /// another. Rust's parser refuses it and we keep that refusal rather than
+    /// normalising it into something the user did not write.
+    #[test]
+    fn ambiguous_leading_zero_addresses_are_refused() {
+        assert!(parse_port_arg("127.000.000.001:9000:8000", false).is_err());
+    }
+
+    /// Addresses are normalised to one spelling, so the label, rootlesskit and
+    /// the live-forward match cannot disagree over cosmetics.
+    #[test]
+    fn bind_addresses_are_normalised() {
+        let p = parse_port_arg("0:0:0:0:0:0:0:1:9000:8000", false);
+        // An IPv6 literal without brackets is genuinely ambiguous against the
+        // colon-separated spec, so it is refused rather than guessed at.
+        assert!(
+            p.is_err(),
+            "an unbracketed IPv6 literal cannot be disambiguated"
+        );
+        // The forms we do accept round-trip unchanged.
+        for good in ["127.0.0.1", "0.0.0.0", "10.0.2.15"] {
+            let p = parse_port_arg(&format!("{good}:9000:8000"), false).unwrap();
+            assert_eq!(p.host_ip, good);
         }
     }
 

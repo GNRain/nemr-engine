@@ -103,6 +103,9 @@ message PortSpec {
   uint32 host_port = 2;
   uint32 container_port = 3;
   string url = 4;
+  // Whether a forward for this declaration is actually bound right now. A
+  // declared-but-unbound port must not be shown as a working URL (F-98).
+  bool live = 5;
 }
 message PortAddRequest {
   string name = 1;
@@ -228,4 +231,8 @@ message AuditEvent {
   // True for a privileged (helper) operation — the event a user must see by
   // default. Non-privileged trace lines are shown only under --verbose.
   bool privileged = 3;
+  // True for a warning the user must see even though nothing elevated — e.g. a
+  // declared port that could not be forwarded (F-98). Without this such
+  // failures were logged where only the daemon could see them.
+  bool warning = 4;
 }

@@ -391,7 +391,13 @@ pub async fn start(client: &ContainerdClient, name: &str) -> Result<u32> {
     // reported by the caller and skipped — one unavailable port must not stop a
     // session from starting, and silently dropping it would be worse.
     for problem in apply_declared_ports(client, name).await {
-        tracing::warn!("[nemr] port not forwarded: {problem}");
+        // Tagged so the audit stream carries it to the USER (F-98). An untagged
+        // warn goes only to the daemon log, so a port that silently failed to
+        // forward looked like a working session until someone opened a browser.
+        tracing::warn!(
+            nemr_audit = "warning",
+            "[nemr] port NOT forwarded: {problem}"
+        );
     }
 
     Ok(pid)
@@ -2173,7 +2179,7 @@ pub async fn add_port(
                  Choose another host port (e.g. nemr port add {name} {}:{}), \
                  or free it: nemr port rm {other} {}",
                 port.host_port,
-                port.host_port + 1,
+                ports::suggest_alternative(port.host_port),
                 port.container_port,
                 port.host_port
             ),
@@ -2193,15 +2199,22 @@ pub async fn add_port(
         // The project is stopped, so nothing is bound yet — but accepting a
         // declaration that cannot work would defer the bad news to `start`,
         // where it is a warning the user may never read. Say it now.
-        return Err(Error::PortRefused {
-            detail: format!(
-                "{detail} by something else on this machine (not a nemr project).\n\
+        //
+        // Only a genuine conflict gets the "something else on this machine"
+        // framing: appending it to a permission failure (a port below 1024,
+        // PRIV-01) described the wrong problem and sent the user hunting for a
+        // process that does not exist (F-98).
+        let detail = match detail.strip_prefix("IN_USE:") {
+            Some(conflict) => format!(
+                "{conflict} by something else on this machine (not a nemr project).\n\
                  Choose another host port — e.g. nemr port add {name} {}:{} — \
                  or stop whatever holds it.",
-                port.host_port + 1,
+                ports::suggest_alternative(port.host_port),
                 port.container_port
             ),
-        });
+            None => detail,
+        };
+        return Err(Error::PortRefused { detail });
     }
 
     declared.push(port.clone());
@@ -2226,9 +2239,10 @@ fn apply_one(port: &ports::PortForward) -> std::result::Result<(), String> {
             port.host_port
         )),
         Err(ports::AddFailure::HeldByAForward { detail }) => Err(format!(
-            "host port {} is already forwarded. If no project claims it, a \
-             stale forward may have outlived its project; `nemr reconcile` \
-             clears those.\n  rootlesskit said: {detail}",
+            "host port {} is already forwarded inside this engine.\n  \
+             `nemr port ls <project>` shows which project declares it; \
+             `nemr reconcile` reports (but never removes) forwards no project \
+             claims.\n  rootlesskit said: {detail}",
             port.host_port
         )),
         Err(other) => Err(format!("could not forward port: {other}")),

@@ -231,10 +231,16 @@ impl Nemr for NemrService {
         let ports = crate::engine::project::list_ports(&self.client, &name)
             .await
             .unwrap_or_default();
+        let live_set = crate::engine::ports::list_live().unwrap_or_default();
         Ok(Response::new(StatusResponse {
             ports: ports
                 .into_iter()
                 .map(|p| PortSpec {
+                    live: live_set.iter().any(|f| {
+                        f.host_ip == p.host_ip
+                            && f.host_port == p.host_port
+                            && f.container_port == p.container_port
+                    }),
                     host_ip: p.host_ip.clone(),
                     host_port: p.host_port as u32,
                     container_port: p.container_port as u32,
@@ -398,6 +404,7 @@ impl Nemr for NemrService {
         // Ready first: the client waits for this before running its command, so
         // it cannot race the events that command produces.
         let _ = out_tx.send(Ok(AuditEvent {
+            warning: false,
             ready: true,
             message: String::new(),
             privileged: false,
@@ -450,10 +457,16 @@ impl NemrService {
         let ports = crate::engine::project::list_ports(&self.client, name)
             .await
             .map_err(status_from_typed)?;
+        let live_set = crate::engine::ports::list_live().unwrap_or_default();
         Ok(Response::new(PortListResponse {
             ports: ports
                 .into_iter()
                 .map(|p| PortSpec {
+                    live: live_set.iter().any(|f| {
+                        f.host_ip == p.host_ip
+                            && f.host_port == p.host_port
+                            && f.container_port == p.container_port
+                    }),
                     host_ip: p.host_ip.clone(),
                     host_port: p.host_port as u32,
                     container_port: p.container_port as u32,
