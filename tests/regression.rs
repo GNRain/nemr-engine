@@ -2912,3 +2912,315 @@ fn net02_a_session_has_its_own_network_namespace() {
         let _ = project::stop(&client, &project.name).await;
     });
 }
+
+// --- NET-02: the wiring itself, not only the isolation ----------------------
+
+/// Run a script inside rootlesskit's namespaces, the way the engine does.
+///
+/// Tests observe the session from OUTSIDE it, through the same door the engine
+/// uses, rather than asking the session about itself.
+fn in_rootlesskit(script: &str) -> std::process::Output {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR");
+    let child = std::fs::read_to_string(format!("{runtime_dir}/containerd-rootless/child_pid"))
+        .expect("rootlesskit child_pid — is rootless containerd running?");
+    std::process::Command::new("nsenter")
+        .args([
+            "-t",
+            child.trim(),
+            "-U",
+            "-n",
+            "--preserve-credentials",
+            "--",
+            "bash",
+            "-c",
+            script,
+        ])
+        .output()
+        .expect("nsenter")
+}
+
+/// The session network recorded on a project, or None if it has none.
+async fn recorded_allocation(
+    client: &ContainerdClient,
+    name: &str,
+) -> Option<nemr_engine::engine::netns::Allocation> {
+    let id = nemr_engine::config::container_id(name);
+    client
+        .list_containers()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|c| c.id == id)
+        .and_then(|c| project::allocation_from_labels(&c.labels))
+}
+
+/// Assert a running session's namespace really carries its address and route.
+///
+/// Read from inside the session's own namespace. The control comes first: if
+/// the read produced nothing, the assertions below would pass or fail for
+/// reasons that have nothing to do with the wiring.
+fn assert_session_is_wired(pid: u32, alloc: nemr_engine::engine::netns::Allocation) {
+    let out = in_rootlesskit(&format!(
+        "nsenter -t {pid} -n -- ip -4 addr show; echo '--- routes ---'; \
+         nsenter -t {pid} -n -- ip -4 route show"
+    ));
+    let seen = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        seen.contains("lo:"),
+        "could not read the session's network namespace, so nothing below would mean \
+         anything.\n  stdout: {seen}\n  stderr: {err}"
+    );
+    assert!(
+        seen.contains(&format!("inet {}/24", alloc.session_ip())),
+        "the session has no address on ceth0; it is isolated and unreachable, which is a \
+         started session that cannot work.\n{seen}"
+    );
+    assert!(
+        seen.contains(&format!("default via {}", alloc.gateway())),
+        "the session has no default route, so it has an address and no way out — the \
+         shape in which Claude Code loses the API.\n{seen}"
+    );
+}
+
+/// NET-02: a started session is WIRED, not merely isolated.
+///
+/// The namespace test beside this one passes on the OCI spec alone: delete
+/// every line of `engine::netns` and a session still gets its own namespace,
+/// still differs from rootlesskit's, and still has no way to reach anything.
+/// Isolation was never the deliverable — a session that works while isolated
+/// is — so this asserts the address and the route that make it one.
+#[test]
+fn net02_a_started_session_is_wired_not_merely_isolated() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "net02wire", VolumeSize::Small).await;
+        let pid = project::start(&client, &project.name).await.expect("start");
+
+        let alloc = recorded_allocation(&client, &project.name)
+            .await
+            .expect("create must record a session network");
+        assert_session_is_wired(pid, alloc);
+
+        let _ = project::stop(&client, &project.name).await;
+    });
+}
+
+/// NET-02: a project that predates the feature is allocated a network on its
+/// first start, rather than starting into an empty namespace in silence.
+///
+/// Every project created before this pass carries no `nemr.netns` label. Its
+/// task now gets its own network namespace regardless — that comes from the OCI
+/// spec — so "no label" cannot mean "no networking wanted"; it means "not
+/// allocated yet". The first version read the label with `.ok().and_then(...)`
+/// and skipped wiring when it found none, which upgraded every existing project
+/// into one that starts, reports success and cannot reach anything.
+#[test]
+fn net02_a_project_with_no_recorded_network_is_allocated_one_on_first_start() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "net02old", VolumeSize::Small).await;
+
+        // Make it look like a project created before NET-02.
+        let id = nemr_engine::config::container_id(&project.name);
+        let container = client
+            .list_containers()
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|c| c.id == id)
+            .expect("the project's container record");
+        let mut labels = container.labels.clone();
+        labels.remove("nemr.netns");
+        client
+            .update_container_labels(&id, labels)
+            .await
+            .expect("strip the allocation label");
+
+        // Control: the state under test really is the state we think it is.
+        assert!(
+            recorded_allocation(&client, &project.name).await.is_none(),
+            "the label was not actually removed, so this test would prove nothing"
+        );
+
+        let pid = project::start(&client, &project.name)
+            .await
+            .expect("a project with no recorded network must still start");
+
+        let alloc = recorded_allocation(&client, &project.name)
+            .await
+            .expect("start must ALLOCATE and RECORD a network, not skip the wiring");
+        assert_session_is_wired(pid, alloc);
+
+        let _ = project::stop(&client, &project.name).await;
+    });
+}
+
+/// NET-02: a restore allocates a session network HERE; it never inherits one.
+///
+/// The question a bundle raises: does import take the network the source
+/// machine used, or choose one locally? It must choose locally — the index is a
+/// fact about one host's free space, and a bundle carried from another machine
+/// would name a `/24` that is already in use here. A duplicate index does not
+/// error: the two projects derive the same addresses and the same link name,
+/// one session ends up with no network, and the other's host ports serve it.
+///
+/// Proven by making the source project's index be taken by something else
+/// before the bundle is imported. The bundle records no network at all (there
+/// is no such field in the manifest), and this is what pins that it stays that
+/// way.
+#[test]
+fn net02_a_restore_allocates_a_network_here_rather_than_inheriting_one() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let bundle =
+            std::env::temp_dir().join(format!("net02-restore-{}.nemr", std::process::id()));
+        let _ = std::fs::remove_file(&bundle);
+
+        let source = TestProject::create(&client, "net02src", VolumeSize::Small).await;
+        let source_index = recorded_allocation(&client, &source.name)
+            .await
+            .expect("the source must have an allocation")
+            .index;
+
+        project::export(
+            &client,
+            &source.name,
+            &bundle,
+            nemr_engine::bundle::policy::Policy::default(),
+        )
+        .await
+        .expect("export");
+
+        let source_name = source.name.clone();
+        project::delete(&client, &source_name)
+            .await
+            .expect("delete");
+        std::mem::forget(source); // deleted already; nothing left to clean up
+
+        // Something else takes the index the source used to hold. Allocation
+        // reuses the lowest free index, so this is deterministic.
+        let squatter = TestProject::create(&client, "net02sq", VolumeSize::Small).await;
+        let squatter_index = recorded_allocation(&client, &squatter.name)
+            .await
+            .expect("the squatter must have an allocation")
+            .index;
+        assert_eq!(
+            squatter_index, source_index,
+            "the freed index must be reused, or this test does not set up the conflict \
+             it means to"
+        );
+
+        let (restored_name, _) = project::import_creating(&client, &bundle, None, None)
+            .await
+            .expect("import");
+        let restored = TestProject::adopt(restored_name.clone());
+        let restored_index = recorded_allocation(&client, &restored_name)
+            .await
+            .expect("a restored project must be allocated a session network")
+            .index;
+
+        assert_ne!(
+            restored_index, squatter_index,
+            "the restore was given a /24 that is already in use on this machine; nothing \
+             would error, one project's forwards would simply serve the other's session"
+        );
+
+        drop(restored);
+        drop(squatter);
+        let _ = std::fs::remove_file(&bundle);
+    });
+}
+
+/// F-109: the CLI must not panic when its reader goes away.
+///
+/// Rust sets `SIGPIPE` to `SIG_IGN` before `main`, so a write to a closed pipe
+/// returns `EPIPE` and `println!` panics. `nemr list | head -1` therefore
+/// printed a Rust panic and exited 101 in roughly one run in five. The same
+/// race is what turned a SUCCESSFUL `nemr list | grep -q <project>` into a
+/// failed pipeline, which is how an acceptance reported "pulled project not in
+/// nemr list" about a project that was listed — and, because the panic went to
+/// a discarded stderr, left no trace of why.
+///
+/// Asserted against the INSTALLED binary and repeated, because the failure is a
+/// race: one green run proves nothing. The exit status is deliberately not
+/// pinned to a single value — dying of SIGPIPE (141) and finishing before the
+/// reader leaves (0) are both correct — but a panic never is.
+#[test]
+fn f109_the_cli_does_not_panic_when_its_reader_closes_the_pipe() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    // nemr's STDOUT goes into a reader that closes after one line; its STDERR
+    // is captured to a file and echoed back, because that is where the panic
+    // would appear and piping it would defeat the point.
+    const PROBE: &str = r#"
+        err=$(mktemp)
+        nemr list 2>"$err" | head -1 >/dev/null
+        status=${PIPESTATUS[0]}
+        cat "$err"; rm -f "$err"
+        echo "STATUS=$status"
+    "#;
+
+    let mut panics = 0;
+    let mut observed = String::new();
+    let mut statuses = std::collections::BTreeSet::new();
+    for _ in 0..40 {
+        let out = std::process::Command::new("bash")
+            .args(["-c", PROBE])
+            .output()
+            .expect("run nemr list into a closing reader");
+        let seen = String::from_utf8_lossy(&out.stdout).into_owned();
+        for line in seen.lines() {
+            if let Some(status) = line.strip_prefix("STATUS=") {
+                statuses.insert(status.to_string());
+            }
+        }
+        if seen.contains("panicked") {
+            panics += 1;
+            observed = seen;
+        }
+    }
+
+    // Control: the probe must actually have run the binary. A `nemr` that could
+    // not start at all never panics either, and would pass this silently.
+    assert!(
+        !statuses.is_empty() && !statuses.contains("127"),
+        "the probe never ran nemr (statuses seen: {statuses:?}); this test would \
+         otherwise pass by failing to look"
+    );
+    assert_eq!(
+        panics, 0,
+        "the CLI panicked on a closed stdout in {panics} of 40 runs. \
+         A tool that is piped into `head`, `grep -q` or `less` must exit quietly \
+         like every other one.\nexit statuses seen: {statuses:?}\nlast panic:\n{observed}"
+    );
+}

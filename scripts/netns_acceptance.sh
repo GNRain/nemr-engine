@@ -27,13 +27,28 @@ step() { STEP=$((STEP+1)); printf '\n%s== %d. %s%s\n' "$BLUE" "$STEP" "$1" "$RES
 pass() { ASSERTS=$((ASSERTS+1)); printf '   %sok%s %s\n' "$GREEN" "$RESET" "$1"; }
 fail() { printf '   %sFAIL%s %s\n' "$RED" "$RESET" "$1" >&2; exit 1; }
 
+# Like every other script here: `ctr` below must reach the SAME containerd the
+# engine uses, and inheriting it from whatever the caller happened to export is
+# how a script ends up interrogating the wrong daemon and reporting on nothing.
+export CONTAINERD_ADDRESS="${CONTAINERD_ADDRESS:-${XDG_RUNTIME_DIR}/containerd/containerd.sock}"
+
 A="netns-acc-a-$$"; B="netns-acc-b-$$"
 PORT_A="${NEMR_TEST_PORT_A:-18211}"; PORT_B="${NEMR_TEST_PORT_B:-18212}"
 SKIP_API="${NEMR_SKIP_API:-0}"
 RK_SOCK="${XDG_RUNTIME_DIR}/containerd-rootless/api.sock"
 
+# On success, tidy up. On FAILURE, keep the sessions: the two things worth
+# looking at after this script fails are the namespaces it built and what is
+# left in rootlesskit's, and deleting them on the way out destroys exactly that.
+# NEMR_KEEP=1 keeps them either way.
 cleanup() {
+    local status=$?
     set +e
+    if (( status != 0 )) || [[ -n "${NEMR_KEEP:-}" ]]; then
+        printf '\n   sessions %s and %s were LEFT IN PLACE for inspection.\n' "$A" "$B" >&2
+        printf '   remove them with: nemr delete %s --yes && nemr delete %s --yes\n' "$A" "$B" >&2
+        return
+    fi
     nemr delete "$A" --yes >/dev/null 2>&1
     nemr delete "$B" --yes >/dev/null 2>&1
 }
@@ -173,15 +188,39 @@ step "Teardown releases everything"
 # ---------------------------------------------------------------------------
 nemr delete "$A" --yes >/dev/null
 nemr delete "$B" --yes >/dev/null
-left_veth=$(nsenter -t "$RK" -U -n --preserve-credentials -- \
-    bash -c 'ip -brief link show | grep -c "^nemr" || true')
-left_nat=$(nsenter -t "$RK" -U -n --preserve-credentials -- \
-    bash -c 'iptables -t nat -S POSTROUTING | grep -c "10\.99\." || true')
-[[ "$left_veth" == "0" ]] || fail "$left_veth veth interface(s) survived delete"
-[[ "$left_nat" == "0" ]] || fail "$left_nat NAT rule(s) survived delete"
+
+# Read the state FIRST, and prove the read worked before counting anything.
+# `ip ... | grep -c "^nemr" || true` yields a clean "0" when `ip` itself fails,
+# so this assertion used to pass by failing to look — the same shape as an
+# assertion that counts zero because it never ran. rootlesskit's namespace
+# always has lo and tap0, and the nat table always prints its POSTROUTING
+# policy line, so an absence of those means the instrument is broken.
+links=$(nsenter -t "$RK" -U -n --preserve-credentials -- ip -brief link show 2>&1) \
+    || fail "could not read rootlesskit's links, so 'no veth survived' would be unproven:
+$links"
+grep -q '^lo ' <<<"$links" || fail "rootlesskit's link list contains no loopback, so it is not
+        a trustworthy reading; 'no veth survived' would be an artefact:
+$links"
+nat=$(nsenter -t "$RK" -U -n --preserve-credentials -- iptables -w 5 -t nat -S POSTROUTING 2>&1) \
+    || fail "could not read the nat table, so 'no NAT rule survived' would be unproven:
+$nat"
+grep -q '^-P POSTROUTING' <<<"$nat" || fail "the nat table reading has no POSTROUTING policy line,
+        so it is not trustworthy:
+$nat"
+host_sockets=$(ss -tln 2>&1) || fail "could not read the host's listening sockets:
+$host_sockets"
+pass "CONTROL: links, NAT table and host sockets were actually read"
+
+# Both ends of the pair are nemr-prefixed, so a leak of either is visible here.
+left_veth=$(grep -cE '^nemrc?[0-9]+[@ ]' <<<"$links" || true)
+left_nat=$(grep -c '10\.99\.' <<<"$nat" || true)
+[[ "$left_veth" == "0" ]] || fail "$left_veth veth interface(s) survived delete:
+$(grep -E '^nemrc?[0-9]+[@ ]' <<<"$links")"
+[[ "$left_nat" == "0" ]] || fail "$left_nat NAT rule(s) survived delete:
+$(grep '10\.99\.' <<<"$nat")"
 pass "no veth interfaces and no NAT rules survived delete"
 for p in "$PORT_A" "$PORT_B"; do
-    ! ss -tln 2>/dev/null | grep -q ":$p " || fail "host port $p still bound after delete"
+    ! grep -q ":$p " <<<"$host_sockets" || fail "host port $p still bound after delete"
 done
 pass "both host ports released"
 
