@@ -313,6 +313,48 @@ fn run_checked(script: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// The one rule that isolates sessions from each other (NET-05).
+///
+/// Session traffic is ROUTED between namespaces inside rootlesskit's, so every
+/// session could reach every other session's address and ports — measured, both
+/// directions, before this existed. One `FORWARD` drop over the whole range
+/// closes it; a per-session bridge would not, because the sessions would still
+/// be routed to one another.
+///
+/// Range-wide rather than per session, and therefore NOT removed when a session
+/// stops: it is policy over `10.99.0.0/16`, not state belonging to any one
+/// project. It is re-asserted on every start instead, because rootlesskit's
+/// network namespace is destroyed when rootless containerd restarts and takes
+/// every rule with it — so "install it once" would silently stop being true.
+/// Re-asserting also heals a table someone else flushed.
+///
+/// Inserted at the head of the chain: appending would sit behind whatever
+/// ACCEPT rules another tool has already added.
+fn isolation_rule() -> String {
+    format!(
+        "iptables -w 5 -C FORWARD -s {SUBNET_PREFIX}.0.0/16 -d {SUBNET_PREFIX}.0.0/16 -j DROP 2>/dev/null \
+  || iptables -w 5 -I FORWARD 1 -s {SUBNET_PREFIX}.0.0/16 -d {SUBNET_PREFIX}.0.0/16 -j DROP"
+    )
+}
+
+/// Is session-to-session traffic currently blocked? Reads, never repairs.
+pub fn isolation_is_active() -> Result<bool> {
+    let out = in_rootlesskit("iptables -w 5 -S FORWARD")?;
+    if !out.status.success() {
+        bail!(
+            "could not read the FORWARD chain to check session isolation: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let rules = String::from_utf8_lossy(&out.stdout);
+    Ok(rules.lines().any(|l| {
+        l.starts_with("-A FORWARD")
+            && l.contains(&format!("-s {SUBNET_PREFIX}.0.0/16"))
+            && l.contains(&format!("-d {SUBNET_PREFIX}.0.0/16"))
+            && l.contains("-j DROP")
+    }))
+}
+
 /// Wire a freshly started session into the network.
 ///
 /// Idempotent per session: re-running for a live session is a no-op rather than
@@ -324,6 +366,7 @@ pub fn connect_session(container_pid: u32, alloc: Allocation) -> Result<()> {
     let gw = alloc.gateway();
     let ip = alloc.session_ip();
     let cidr = alloc.cidr();
+    let isolation = isolation_rule();
 
     // One script, `set -e`, and a cleanup trap: a failure between steps removes
     // the pair rather than leaving it for the next start to misread.
@@ -375,6 +418,10 @@ sysctl -w net.ipv4.ip_forward=1 >/dev/null
 # person stops trusting the comments.
 iptables -w 5 -t nat -C POSTROUTING -s {cidr} -o tap0 -j MASQUERADE 2>/dev/null \
   || iptables -w 5 -t nat -A POSTROUTING -s {cidr} -o tap0 -j MASQUERADE
+
+# NET-05: sessions reach the world, not each other. Re-asserted on every start —
+# see isolation_rule for why this is not installed once.
+{isolation}
 
 # Read the result back from inside the session before calling it wired. Every
 # command above can succeed and still leave a namespace that reaches nothing;
@@ -657,6 +704,27 @@ broadcast 127.255.255.255 dev lo table local proto kernel scope link src 127.0.0
         // change that put them on the host would make every create refuse.
         let ours = format!("{clean}10.99.3.0/24 dev nemr3 proto kernel scope link\n");
         assert!(conflicting_route(&ours).is_some());
+    }
+
+    /// NET-05. The rule must name the WHOLE range on both sides — a rule that
+    /// named only one session's /24 would isolate that session and leave every
+    /// other pair reachable — and it must be shaped to be re-applied on every
+    /// start without stacking duplicates.
+    #[test]
+    fn the_isolation_rule_covers_the_whole_range_in_both_directions() {
+        let rule = isolation_rule();
+        assert!(
+            rule.contains("-s 10.99.0.0/16") && rule.contains("-d 10.99.0.0/16"),
+            "source AND destination must be the whole range: {rule}"
+        );
+        assert!(rule.contains("-j DROP"), "{rule}");
+        assert!(
+            rule.contains("-C FORWARD") && rule.contains("||") && rule.contains("-I FORWARD 1"),
+            "must check-then-insert, or every start stacks another copy: {rule}"
+        );
+        // At the HEAD of the chain: appended, it would sit behind any ACCEPT
+        // another tool has already put there.
+        assert!(rule.contains("-I FORWARD 1"), "{rule}");
     }
 
     /// The two halves together: a type-prefixed summarised route is the case

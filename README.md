@@ -203,9 +203,15 @@ commands can never trip over each other. If it isn't running, the next command
 starts it — you never have to.
 
 **On the isolation:** a project can only see its own disk — no other project's
-files are attached to it. This is ordinary container separation, good for
-keeping work tidy and independent. It has **not** been hardened or reviewed as a
-security boundary, so don't rely on it to contain untrusted code (see
+files are attached to it — and it has its own network. Sessions reach the
+internet and the ports you forward; **they cannot reach each other.** Two
+sessions can both run a dev server on port 8000 without colliding, and neither
+can call the other's. (A port you publish with `--expose` is published to the
+network, and that includes other sessions — which is what publishing means.)
+
+This is ordinary container separation, good for keeping work tidy and
+independent. It has **not** been hardened or reviewed as a security boundary, so
+don't rely on it to contain untrusted code (see
 [limitations](#known-limitations)).
 
 ---
