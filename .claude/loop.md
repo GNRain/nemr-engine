@@ -50,6 +50,32 @@ control.** Before trusting a negative:
 Absence-because-correct and absence-because-you-looked-in-the-wrong-place are
 indistinguishable without the control. This recurs on every negative assertion.
 
+## Tooling: two one-liners that misfired three times each, in one session
+
+Not product findings. Recorded because three occurrences is where a rule stops
+being something to remember and becomes something to write down — the same
+argument that turned the wait discipline into `wait_for_service`.
+
+**A pattern must not match the process running it.** `pkill -f "until grep -qE"`
+killed its own shell. `pkill -f "sleep 45"` did it again. `pgrep -f "cargo test"`
+matched the very script asking the question and aborted a mutation check with
+"cargo is already running" — a **wrong reason that reads as a real one**, which
+is the failure class this project keeps fixing in the product. Use `pgrep -x
+<exe>`, or a pattern that cannot appear in the invoking command line. If you must
+match loosely, exclude `$$` and the parent.
+
+**Check the flag exists before putting it in a loop.** `gh run list --branch`,
+`gh run list --json displayTitle` and `gh pr checks --json` were all invented —
+each one plausible, none supported by this `gh`. The third sat inside a CI
+watcher whose fallback was `|| echo '[]'`, so the failure was invisible and the
+loop ran silently for fifteen minutes past the result. Run the command bare once
+before building anything on it, and never wrap an unverified command in a
+fallback that makes its failure indistinguishable from a negative answer.
+
+The shape both share: reaching for a plausible one-liner instead of checking what
+the tool actually supports, then discovering it only when the failure is silent
+or destructive.
+
 ## Three ways a control fails, and three different remedies
 
 They keep getting filed under one heading. They are not one problem, and the fix
