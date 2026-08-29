@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
     let chain_id = client
         .image_chain_id(
             &std::env::var("NEMR_PROBE_IMAGE")
-                .unwrap_or_else(|_| "ghcr.io/gnrain/nemr-base:0.2.0".into()),
+                .unwrap_or_else(|_| "ghcr.io/gnrain/nemr-base:0.3.0".into()),
         )
         .await
         .context("the base image must be present; build and import it first")?;

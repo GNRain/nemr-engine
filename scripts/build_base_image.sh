@@ -14,7 +14,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-IMAGE="${NEMR_BASE_IMAGE:-ghcr.io/gnrain/nemr-base:0.2.0}"
+IMAGE="${NEMR_BASE_IMAGE:-ghcr.io/gnrain/nemr-base:0.3.0}"
 
 # Reproducibility (F-74). Both halves are load-bearing, measured rather than
 # assumed: three cold builds with these flags produced one digest, and two cold
@@ -69,13 +69,72 @@ if [[ ! -S "${BUILDKIT_HOST#unix://}" ]]; then
     }
 fi
 
+# --no-cache by DEFAULT, because this script's output is a digest that gets
+# recorded in image/digests/ and trusted for ever afterwards (F-85).
+#
+# The Dockerfile's apt line is unpinned by design (see its own comment on the
+# snapshot trade-off), so a cached layer holds whatever the archive served on the
+# day it was built. Reusing it produces a digest that a fresh builder — CI, or
+# anyone else — cannot reproduce, and the failure surfaces later as
+# check_base_image_reproducible.sh reporting a mismatch on an image that is not
+# actually irreproducible. A confusing failure a long way from its cause.
+#
+# This costs nothing in CI, which has no cache on a fresh runner. It costs a full
+# rebuild locally, so NEMR_BUILD_CACHE=1 opts out for iteration — and says so, so
+# a surprising digest is attributable rather than mysterious.
+CACHE_FLAG="--no-cache"
+if [[ -n "${NEMR_BUILD_CACHE:-}" ]]; then
+    CACHE_FLAG=""
+    echo "==> NEMR_BUILD_CACHE=1: reusing cached layers."
+    echo "    The resulting digest may not be reproducible on a clean builder."
+    echo "    Do NOT record it in image/digests/ — rebuild without this first."
+fi
+
 echo "==> Building $IMAGE with BuildKit (no Docker daemon)"
+BUILD_LOG="$(mktemp)"
+trap 'rm -f "$BUILD_LOG"' EXIT
+set -o pipefail
 buildctl build \
     --frontend dockerfile.v0 \
     --local context=image \
     --local dockerfile=image \
+    ${CACHE_FLAG} \
     --opt "build-arg:SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" \
-    --output "type=oci,dest=${OUT},name=${IMAGE},rewrite-timestamp=true"
+    --output "type=oci,dest=${OUT},name=${IMAGE},rewrite-timestamp=true" 2>&1 | tee "$BUILD_LOG"
+
+# CONTROL: prove --no-cache actually did something.
+#
+# Asking for it and getting cached layers anyway is silent, and it makes every
+# downstream claim worthless: two "cold" builds agree trivially, the digest that
+# goes into image/digests/ was produced by whatever the archive served on some
+# earlier day, and nothing says so. That happened — caught only by noticing one
+# build took half as long as another, which is not a mechanism.
+#
+# The pinned FROM blob is legitimately reused (--no-cache does not re-download a
+# digest-pinned base), so only RUN steps are checked.
+if [[ -z "${NEMR_BUILD_CACHE:-}" ]]; then
+    cached_runs="$(python3 - "$BUILD_LOG" <<'EOF'
+import re, sys
+steps, cached = {}, set()
+for line in open(sys.argv[1], errors="replace"):
+    m = re.match(r"#(\d+)\s+\[[\d/]+\]\s+(.*)", line)
+    if m:
+        steps[m.group(1)] = m.group(2).strip()
+    m = re.match(r"#(\d+)\s+CACHED", line)
+    if m:
+        cached.add(m.group(1))
+print("\n".join(steps[n] for n in sorted(cached) if steps.get(n, "").startswith("RUN")))
+EOF
+)"
+    if [[ -n "$cached_runs" ]]; then
+        echo "--no-cache was requested and BuildKit reused cached RUN steps anyway:" >&2
+        sed 's/^/    /' <<<"$cached_runs" >&2
+        echo "The resulting digest reflects an earlier build's inputs. Refusing to" >&2
+        echo "report it as though it were freshly built." >&2
+        exit 1
+    fi
+    echo "    control: no RUN step was cached — this build really ran"
+fi
 
 echo "==> Importing into containerd"
 ctr images import "$OUT"

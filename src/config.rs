@@ -32,18 +32,29 @@
 /// from and can only be restored where that exact image is available.
 ///
 /// `0.1.0` was the single-agent image (`sha256:2be53736…`); `0.2.0` added Codex
-/// (`sha256:39c5ade9…`). Reusing `0.1.0` for the two-agent image — which an
+/// (`sha256:39c5ade9…`); `0.3.0` added `curl` and `iproute2`
+/// (`sha256:749c092d…`), so a session can diagnose its own network from inside. Reusing `0.1.0` for the two-agent image — which an
 /// earlier pass did — left bundles referencing the old digest unrecoverable
 /// while the D-08 error's pull advice fetched the wrong bytes: a success signal
 /// over the wrong artifact. Every published version's digest is recorded under
 /// `image/digests/<version>`, and the build refuses to produce a digest that
 /// disagrees with the recorded one for its version.
-pub const BASE_IMAGE: &str = "ghcr.io/gnrain/nemr-base:0.2.0";
+pub const BASE_IMAGE: &str = "ghcr.io/gnrain/nemr-base:0.3.0";
 
 /// The version tag of [`BASE_IMAGE`] — the part after the last `:`.
 ///
-/// Derived from the one authoritative string so the version lives in exactly
-/// one place.
+/// Derived from the one authoritative string — but **the version does not yet
+/// live in exactly one place**, which is what this comment used to claim.
+/// `build_base_image.sh`, `publish_base_image.sh` and
+/// `check_base_image_reproducible.sh` each hardcode it independently, so a bump
+/// is a six-file change and they can disagree. `check_base_image_versioning.sh`
+/// is the only consumer that treats this file as authoritative, and it is the
+/// right pattern; collapsing the rest onto it is a separate pass, deliberately
+/// not folded into a version bump where the ledger gate is already circular.
+///
+/// The old wording described the world this function was written to create as
+/// though it already existed — an intention recorded as a fact, which is how a
+/// comment ends up making the next reader confident about something untrue.
 pub fn base_image_version() -> &'static str {
     BASE_IMAGE.rsplit(':').next().unwrap_or(BASE_IMAGE)
 }
