@@ -27,16 +27,20 @@ bad() { printf '%sFAIL%s      %s\n' "$RED" "$RESET" "$1"; fail=1; }
 
 DIGESTS_DIR="image/digests"
 
-# The authoritative version: the tag on BASE_IMAGE in src/config.rs.
-base_image_line=$(grep -E 'pub const BASE_IMAGE' src/config.rs | head -1)
-version="${base_image_line##*:}"
-version="${version%\"*}"
-
-# CONTROL: we must have actually extracted a version, or every check below
-# passes vacuously. A version looks like N.N.N.
-if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    bad "control: could not parse a version from src/config.rs BASE_IMAGE (got ${version:-empty}); \
+# The authoritative version, through the ONE shared extraction (F-124) — this
+# check used to carry its own private parser, which worked partly by luck of
+# the constant's quoting. The helper controls its own extraction (loud failure
+# on a mangled constant, never an empty string), and the shape check here is
+# the belt to that braces.
+. "scripts/lib/base_image.sh"
+version="$(nemr_base_version)" || {
+    bad "control: the shared extraction could not read a version from src/config.rs; \
 this check would otherwise verify nothing"
+    printf '\n%sFAIL%s\n' "$RED" "$RESET"
+    exit 1
+}
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    bad "control: extracted version is not N.N.N (got ${version:-empty})"
     printf '\n%sFAIL%s\n' "$RED" "$RESET"
     exit 1
 fi
@@ -68,6 +72,34 @@ two versions for identical bytes is a needless second version"
     fi
     ok "version ${name}: ${d}"
 done
+
+# 4. THE DRIFT GUARD (F-124): no production consumer hardcodes the version.
+#
+# The version lives in src/config.rs and everything else reads it through
+# scripts/lib/base_image.sh. A literal `nemr-base:<digits>` reappearing in a
+# script or a probe binary is the six-file bump coming back — config.rs and a
+# consumer disagreeing means the host suite builds one image and tests
+# another. Scope: scripts/ and the probe binaries; src/ is not scanned because
+# test fixtures legitimately use arbitrary example references.
+drift=$(grep -rn "nemr-base:[0-9]" scripts/ crates/*/src/bin/ 2>/dev/null | grep -v "check_base_image_versioning.sh" || true)
+if [[ -n "$drift" ]]; then
+    bad "a production consumer hardcodes the base image version — the six-file
+          bump is back. The version lives in src/config.rs; read it through
+          scripts/lib/base_image.sh:
+$drift"
+else
+    ok "no script or probe hardcodes the version (all read src/config.rs)"
+fi
+
+# CONTROL: the same pattern must match the one place the version DOES live,
+# or the guard above passes because the grep is broken, not because the tree
+# is clean.
+if [[ "$(grep -c 'nemr-base:[0-9]' src/config.rs)" -ge 1 ]]; then
+    ok "control: the drift pattern matches src/config.rs itself — the grep works"
+else
+    bad "control: the drift pattern matches NOTHING in src/config.rs, so the
+          clean result above is a broken instrument, not a clean tree"
+fi
 
 echo
 if [[ "$fail" -ne 0 ]]; then

@@ -23,6 +23,10 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# The version lives in src/config.rs; this reads it (F-124).
+. "scripts/lib/base_image.sh"
+IMAGE="$(nemr_base_image)"
+
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export BUILDKIT_HOST="${BUILDKIT_HOST:-unix://${XDG_RUNTIME_DIR}/buildkit/buildkitd.sock}"
 export PATH="$HOME/.local/bin:$PATH"
@@ -47,7 +51,7 @@ build_to() {
         --local dockerfile=image \
         --no-cache \
         --opt "build-arg:SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" \
-        --output "type=oci,dest=$1,name=ghcr.io/gnrain/nemr-base:0.3.0,rewrite-timestamp=true"
+        --output "type=oci,dest=$1,name=${IMAGE},rewrite-timestamp=true"
 }
 
 echo "==> Build 1 of 2 (cold)"

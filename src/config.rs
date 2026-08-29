@@ -43,18 +43,19 @@ pub const BASE_IMAGE: &str = "ghcr.io/gnrain/nemr-base:0.3.0";
 
 /// The version tag of [`BASE_IMAGE`] — the part after the last `:`.
 ///
-/// Derived from the one authoritative string — but **the version does not yet
-/// live in exactly one place**, which is what this comment used to claim.
-/// `build_base_image.sh`, `publish_base_image.sh` and
-/// `check_base_image_reproducible.sh` each hardcode it independently, so a bump
-/// is a six-file change and they can disagree. `check_base_image_versioning.sh`
-/// is the only consumer that treats this file as authoritative, and it is the
-/// right pattern; collapsing the rest onto it is a separate pass, deliberately
-/// not folded into a version bump where the ledger gate is already circular.
+/// The version now lives in exactly one place: the constant above. Every shell
+/// consumer reads it through `scripts/lib/base_image.sh`, the probe binaries
+/// take it by env var from the same helper, and the drift guard in
+/// `check_base_image_versioning.sh` goes red if a `nemr-base:<digits>` literal
+/// reappears in a script or probe — proven by leaving one consumer hardcoded
+/// (F-124). A bump edits this file; everything moves.
 ///
-/// The old wording described the world this function was written to create as
-/// though it already existed — an intention recorded as a fact, which is how a
-/// comment ends up making the next reader confident about something untrue.
+/// This sentence was false for the first two weeks this function existed: it
+/// described the world the function was written to create, while five files
+/// hardcoded the version independently and this function had no callers — an
+/// intention recorded as a fact (F-124's ledger note). It became true and the
+/// comment changed in the SAME commit as the reality, which is the only way a
+/// comment like this stays honest: prose has no mutation test.
 pub fn base_image_version() -> &'static str {
     BASE_IMAGE.rsplit(':').next().unwrap_or(BASE_IMAGE)
 }
