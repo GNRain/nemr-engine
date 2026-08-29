@@ -264,6 +264,15 @@ jobs:
         run: |
           export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
           NEMR_SKIP_API=1 ./scripts/netns_acceptance.sh
+      - name: Packages acceptance — a session's tools travel with it (F-118)
+        # Install jq in a session, export, import CLEAN, prove jq absent (the
+        # pristine-import control), provision, prove jq runs. Sessions have
+        # egress in CI (NET-02's NAT, proven by the netns acceptance), so the
+        # apt install is real here, not mocked.
+        run: |
+          export CONTAINERD_ADDRESS="$XDG_RUNTIME_DIR/containerd/containerd.sock"
+          ./scripts/packages_acceptance.sh
+
       - name: Sync acceptance — the product flow (WP-K)
         # Engine + server, together: register, create, work, push, DELETE THE
         # PROJECT, pull, continue. NEMR_SKIP_API asserts transcript

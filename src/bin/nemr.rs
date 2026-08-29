@@ -104,6 +104,13 @@ enum Command {
     ///   nemr import session.nemr              name and quota from the bundle
     ///   nemr import newname session.nemr      restore under a different name
     ///   nemr import session.nemr --size 2GB   override the recorded quota
+    /// Install this project's declared packages (carried in its bundle).
+    ///
+    /// Explicit by design: import suggests it and never runs it, because import
+    /// works offline and provisioning needs the network. Verifies each package
+    /// is actually installed afterwards rather than trusting apt's exit status.
+    Provision { name: String },
+
     Import {
         /// The bundle to read — or, when a second argument is given, the
         /// destination project name.
@@ -676,6 +683,43 @@ async fn main() -> Result<()> {
             }
         }
 
+        Command::Provision { name } => {
+            let mut session = daemon::connect().await?;
+            let __req = session.req(proto::ProvisionRequest { name: name.clone() });
+            let resp = session
+                .client()
+                .provision(__req)
+                .await
+                .map_err(status_err)?
+                .into_inner();
+
+            if resp.installed.is_empty() && resp.failed.is_empty() {
+                println!("nothing to provision: {name:?} declares no packages.");
+                return Ok(());
+            }
+            if !resp.installed.is_empty() {
+                // One line by default; the names are short and ARE the report
+                // here — this command was asked for explicitly.
+                println!(
+                    "provisioned {}: {}",
+                    resp.installed.len(),
+                    resp.installed.join(", ")
+                );
+            }
+            if !resp.failed.is_empty() {
+                for f in &resp.failed {
+                    eprintln!("FAILED {}: {}", f.package, f.reason);
+                }
+                eprintln!(
+                    "{} of {} packages could not be installed. The session is usable; \
+                     re-run after fixing the cause: nemr provision {name}",
+                    resp.failed.len(),
+                    resp.failed.len() + resp.installed.len(),
+                );
+                std::process::exit(1);
+            }
+        }
+
         Command::Delete { name, yes } => {
             let mut session = daemon::connect().await?;
 
@@ -1001,6 +1045,17 @@ async fn main() -> Result<()> {
             );
             println!("\nThe bundle carried no credential, and never does (D-02).");
             println!("Authenticate on this host, then: nemr start {name} && nemr attach {name}");
+            // Suggested, never run (F-118): import works offline and
+            // provisioning needs the network — the same seam as authentication
+            // above. The same shape as every other next-step line this CLI
+            // prints: say what is needed and the exact command, do nothing.
+            if resp.declared_packages > 0 {
+                println!(
+                    "This session declares {} package(s) not in the base image. After starting: \
+                     nemr provision {name}",
+                    resp.declared_packages
+                );
+            }
         }
 
         Command::Export {

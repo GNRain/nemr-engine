@@ -148,6 +148,23 @@ impl Nemr for NemrService {
         }))
     }
 
+    async fn provision(
+        &self,
+        request: Request<ProvisionRequest>,
+    ) -> Result<Response<ProvisionResponse>, Status> {
+        let report = crate::engine::project::provision(&self.client, &request.into_inner().name)
+            .await
+            .map_err(status_from_anyhow)?;
+        Ok(Response::new(ProvisionResponse {
+            installed: report.installed,
+            failed: report
+                .failed
+                .into_iter()
+                .map(|(package, reason)| ProvisionFailure { package, reason })
+                .collect(),
+        }))
+    }
+
     async fn delete(
         &self,
         request: Request<DeleteRequest>,
@@ -340,10 +357,24 @@ impl Nemr for NemrService {
         )
         .await
         .map_err(status_from_typed)?;
+        // How many packages the bundle declared, for the CLI's suggestion.
+        // Read-only, and a failure to read is zero rather than a failed import:
+        // the import already succeeded, and the suggestion is advice, not state.
+        let declared_packages = crate::engine::volume::VolumePaths::from_env()
+            .ok()
+            .map(|paths| paths.mount_point(&name))
+            .and_then(|mount| {
+                crate::engine::packages::read_declared(&mount)
+                    .ok()
+                    .flatten()
+            })
+            .map(|list| list.packages.len() as u64)
+            .unwrap_or(0);
         Ok(Response::new(ImportResponse {
             name,
             members: summary.members as u64,
             bytes: summary.bytes,
+            declared_packages,
         }))
     }
 

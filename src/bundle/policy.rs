@@ -585,4 +585,33 @@ mod tests {
         );
         assert_eq!(filter_claude_json(&json!(null)), FieldFilter::default());
     }
+
+    /// `.nemr-state/packages.json` travels because `decide()` FALLS THROUGH to
+    /// session-critical — nobody wrote a rule including it, and no rule
+    /// excludes it (F-118).
+    ///
+    /// READ THIS BEFORE DELETING: this assertion looks like belt-and-braces
+    /// and is not. The declared-packages feature depends on an invariant that
+    /// exists only by default — anything not excluded is included. Add
+    /// `.nemr-state` to an exclusion list, or flip the default, and the first
+    /// symptom is a session arriving on another machine WITHOUT ITS TOOLS,
+    /// with nothing failing anywhere: export succeeds, import succeeds, and
+    /// the list simply is not there. This test is the only thing standing
+    /// between that change and that outcome.
+    #[test]
+    fn the_declared_packages_file_travels_by_the_include_default() {
+        let policy = Policy::default();
+        assert!(
+            matches!(
+                policy.decide(crate::engine::packages::DeclaredPackages::VOLUME_PATH),
+                Decision::Include {
+                    class: Class::SessionCritical
+                }
+            ),
+            "packages.json no longer travels as session-critical. If an exclusion \
+             was added deliberately, the declared-packages feature (F-118) must be \
+             reworked in the same change — silently dropping the file strands every \
+             imported session without its tools."
+        );
+    }
 }

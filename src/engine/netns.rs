@@ -237,6 +237,13 @@ pub fn overlaps_our_range(dest: &str) -> bool {
 
 /// rootlesskit's child PID — the process whose user and network namespaces own
 /// everything below.
+/// The same locator, for callers outside this module that need to enter
+/// rootlesskit's namespaces read-only (the package detector reads snapshot
+/// files through its MOUNT namespace). One way to find the pid, not two.
+pub fn rootlesskit_child_pid_for_reads() -> Result<String> {
+    rootlesskit_child_pid()
+}
+
 fn rootlesskit_child_pid() -> Result<String> {
     let runtime = std::env::var("XDG_RUNTIME_DIR")
         .context("XDG_RUNTIME_DIR is not set, so rootlesskit's state cannot be located")?;
