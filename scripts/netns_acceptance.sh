@@ -184,6 +184,40 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+step "Sessions cannot reach each other (NET-05), with the control that proves it"
+# ---------------------------------------------------------------------------
+# Same shape as the MASQUERADE control above: show the block, then remove the
+# rule and show the SAME request succeeds. Without the second half, a probe that
+# could never have worked would pass this step.
+IP_B="10.99.$(ctr -n default containers info "nemr-$B" 2>/dev/null \
+    | python3 -c "import sys,json;print(json.load(sys.stdin)['Labels'].get('nemr.netns','?'))").2"
+
+reach_b() { in_session "$A" "node -e \"require('http').get({host:'$IP_B',port:8000,timeout:4000},r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>{console.log('GOT:'+d);process.exit(0)})}).on('error',()=>{console.log('GOT:BLOCKED');process.exit(0)}).on('timeout',()=>{console.log('GOT:BLOCKED');process.exit(0)})\"" | grep -o 'GOT:.*' | head -1; }
+
+rules=$(nsenter -t "$RK" -U -n --preserve-credentials -- iptables -w 5 -S FORWARD 2>&1) \
+    || fail "could not read the FORWARD chain, so nothing below would mean anything:
+$rules"
+grep -q -- "-s 10.99.0.0/16 -d 10.99.0.0/16 -j DROP" <<<"$rules" \
+    || fail "start did not assert the isolation rule; this step would prove nothing:
+$rules"
+pass "CONTROL: the isolation rule is in the FORWARD chain"
+
+[[ "$(reach_b)" == "GOT:BLOCKED" ]] \
+    || fail "session A reached session B at $IP_B:8000 — sessions are NOT isolated"
+pass "session A cannot reach session B"
+
+nsenter -t "$RK" -U -n --preserve-credentials -- \
+    iptables -w 5 -D FORWARD -s 10.99.0.0/16 -d 10.99.0.0/16 -j DROP
+got_unblocked=$(reach_b)
+# Restore before asserting, so a failure here does not leave the host open.
+nsenter -t "$RK" -U -n --preserve-credentials -- \
+    iptables -w 5 -I FORWARD 1 -s 10.99.0.0/16 -d 10.99.0.0/16 -j DROP
+[[ "$got_unblocked" == "GOT:SESSION-B" ]] \
+    || fail "CONTROL: with the rule removed A still could not reach B (got '$got_unblocked'),
+        so the refusal above says nothing about isolation"
+pass "CONTROL: removing the rule lets the SAME request through — the rule is what isolates"
+
+# ---------------------------------------------------------------------------
 step "Teardown releases everything"
 # ---------------------------------------------------------------------------
 nemr delete "$A" --yes >/dev/null
@@ -219,6 +253,18 @@ $(grep -E '^nemrc?[0-9]+[@ ]' <<<"$links")"
 [[ "$left_nat" == "0" ]] || fail "$left_nat NAT rule(s) survived delete:
 $(grep '10\.99\.' <<<"$nat")"
 pass "no veth interfaces and no NAT rules survived delete"
+
+# The isolation rule is range-wide policy, not per-session state, so it must
+# still be there. Asserting this stops a future reader from "fixing" a leak that
+# is not one — and it would catch a teardown that removed it by accident.
+forward=$(nsenter -t "$RK" -U -n --preserve-credentials -- iptables -w 5 -S FORWARD 2>&1) \
+    || fail "could not read the FORWARD chain after teardown:
+$forward"
+grep -q -- "-s 10.99.0.0/16 -d 10.99.0.0/16 -j DROP" <<<"$forward" \
+    || fail "teardown removed the isolation rule; it is policy over the range, not
+        state belonging to a session:
+$forward"
+pass "the isolation rule survives teardown (it is policy, not per-session state)"
 for p in "$PORT_A" "$PORT_B"; do
     ! grep -q ":$p " <<<"$host_sockets" || fail "host port $p still bound after delete"
 done
