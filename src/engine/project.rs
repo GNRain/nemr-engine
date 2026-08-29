@@ -1883,7 +1883,6 @@ pub async fn export(
     policy: crate::bundle::policy::Policy,
 ) -> crate::error::Result<crate::bundle::export::ExportSummary> {
     use crate::bundle::export::{export as write_bundle, ExportRequest};
-    use crate::bundle::manifest::BaseImageRef;
     use crate::error::Error;
 
     let container_id = config::container_id(name);
@@ -1932,9 +1931,9 @@ pub async fn export(
         .unwrap_or_default();
     let agent = agent_from_labels(&labels);
 
-    // The base image is referenced by digest, never carried (D-06).
-    let digest = client
-        .image_target_digest(config::BASE_IMAGE)
+    // The base image is referenced by digest, never carried (D-06) — and its
+    // identity comes from the CONTAINER, not from this engine's constant.
+    let base_image = base_image_identity(client, &container_id)
         .await
         .map_err(Error::Internal)?;
 
@@ -1943,10 +1942,7 @@ pub async fn export(
         agent: agent.id(),
         quota: &quota,
         source_root: &mount_point,
-        base_image: BaseImageRef {
-            reference: config::BASE_IMAGE.to_string(),
-            digest,
-        },
+        base_image,
         policy,
     };
     write_bundle(&request, destination)
@@ -2113,6 +2109,7 @@ pub async fn import(
         client,
         bundle.base_image_digest(),
         bundle.base_image_reference(),
+        bundle.base_image_chain_id(),
     )
     .await;
     bundle.check(&ImportChecks {
@@ -2140,13 +2137,95 @@ pub async fn import(
 /// Only after both miss does the registry become relevant. Each attempt is
 /// recorded so the error can say where it looked rather than just that it
 /// failed; see `Error::BaseImageUnresolved`.
+/// What this project actually runs on (F-115).
+///
+/// Every field used to come from `config::BASE_IMAGE`, so a bundle recorded what
+/// the EXPORTING ENGINE builds today rather than what the project was built on.
+/// Usually the same, and silently wrong when it differs — which is precisely the
+/// substitution the manifest calls "a silent-wrong-result defect" and claims to
+/// prevent. On the developer host three of four projects name an image their
+/// rootfs is not, and one names a registry namespace nobody owns (F-25).
+///
+/// The chain id is read from the snapshot and is always true. The reference and
+/// digest are filled from the image that chain id identifies; when no local
+/// image does, the digest is left EMPTY rather than guessed — an unproven
+/// identity recorded as a fact is the bug being fixed — and the reference falls
+/// back to this engine's own constant purely as a hint, never to the container's
+/// recorded reference, which may name a namespace we do not own.
+async fn base_image_identity(
+    client: &ContainerdClient,
+    container_id: &str,
+) -> anyhow::Result<crate::bundle::manifest::BaseImageRef> {
+    use crate::bundle::manifest::BaseImageRef;
+
+    // The snapshot key IS the container id: create_container prepares it that
+    // way, which is why the parent equals the image's chain id.
+    let chain_id = client.snapshot_parent(container_id).await?;
+
+    match client.image_with_chain_id(&chain_id).await? {
+        Some(image) => Ok(BaseImageRef {
+            reference: image.name,
+            digest: image.digest,
+            rootfs_chain_id: chain_id,
+        }),
+        None => Ok(BaseImageRef {
+            reference: config::BASE_IMAGE.to_string(),
+            digest: String::new(),
+            rootfs_chain_id: chain_id,
+        }),
+    }
+}
+
 pub async fn resolve_base_image(
     client: &ContainerdClient,
     wanted_digest: &str,
     wanted_reference: &str,
+    wanted_chain_id: &str,
 ) -> crate::bundle::import::BaseImageResolution {
     use crate::bundle::import::BaseImageResolution;
     let mut where_looked = Vec::new();
+
+    // The chain id, when the bundle carries one, is the whole answer: it names
+    // the rootfs itself rather than a tag or a manifest digest that a retag can
+    // move. Deliberately NOT falling through to the digest checks when it fails
+    // to match — a digest match on a different rootfs is exactly the
+    // substitution this refuses to make.
+    if !wanted_chain_id.is_empty() {
+        match client.image_with_chain_id(wanted_chain_id).await {
+            Ok(Some(image)) => {
+                return BaseImageResolution::Present {
+                    reference: image.name,
+                }
+            }
+            Ok(None) => where_looked.push(format!(
+                "local containerd, by rootfs chain id {wanted_chain_id}: no local image \
+                 builds that rootfs"
+            )),
+            Err(error) => where_looked.push(format!(
+                "local containerd, by rootfs chain id {wanted_chain_id}: the query failed \
+                 ({error})"
+            )),
+        }
+        where_looked
+            .push("no registry: nemr does not fetch images itself (D-08 part 1)".to_string());
+        return BaseImageResolution::Unresolved {
+            where_looked,
+            advice: format!(
+                "This bundle records the rootfs it was built on, and no image here builds \
+                 it. Pull the base image this bundle names into the same rootless \
+                 containerd:\n\n    \
+                 CONTAINERD_ADDRESS={socket} \\\n      \
+                 ctr --namespace {namespace} images pull {reference}\n\n\
+                 If that image is not the right one, its rootfs will not match and the \
+                 import will still refuse — which is the point.",
+                socket = ContainerdClient::default_socket_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| "$XDG_RUNTIME_DIR/containerd/containerd.sock".to_string()),
+                namespace = client.namespace(),
+                reference = wanted_reference,
+            ),
+        };
+    }
 
     match client.image_target_digest(config::BASE_IMAGE).await {
         Ok(digest) if digest == wanted_digest => {

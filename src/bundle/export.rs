@@ -355,6 +355,7 @@ mod tests {
             base_image: BaseImageRef {
                 reference: "ghcr.io/gnrain/nemr-base:0.2.0".into(),
                 digest: "sha256:deadbeef".into(),
+                rootfs_chain_id: String::new(),
             },
             policy: Policy::default(),
         }

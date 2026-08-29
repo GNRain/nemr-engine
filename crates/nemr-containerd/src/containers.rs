@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use containerd_client::services::v1::snapshots::{
     ListSnapshotsRequest, MountsRequest, PrepareSnapshotRequest, RemoveSnapshotRequest,
+    StatSnapshotRequest,
 };
 use containerd_client::services::v1::{
     container::Runtime, CloseIoRequest, Container, CreateContainerRequest, CreateTaskRequest,
@@ -557,6 +558,33 @@ impl ContainerdClient {
             .context("the OCI spec has no linux.namespaces array")?
             .iter()
             .any(|n| n.get("type").and_then(|t| t.as_str()) == Some("network")))
+    }
+
+    /// The parent of a container's rootfs snapshot — the CHAIN ID of the image
+    /// it was actually built from.
+    ///
+    /// This is the only durable answer to "what does this project run on".
+    /// `container.image` is a reference that may have been retagged, may name an
+    /// image that is no longer present, and on this project's own history names
+    /// a squattable registry namespace (F-25). The chain id is fixed when the
+    /// snapshot is prepared at create time — `create_container` passes exactly
+    /// this value to `prepare_snapshot` — and it stays readable long after the
+    /// image itself has been removed.
+    pub async fn snapshot_parent(&self, key: &str) -> Result<String> {
+        let request = StatSnapshotRequest {
+            snapshotter: self.snapshotter().to_string(),
+            key: key.to_string(),
+        };
+        let info = self
+            .raw()
+            .snapshots()
+            .stat(with_namespace!(request, self.namespace()))
+            .await
+            .with_context(|| format!("containerd Snapshots.Stat failed for {key:?}"))?
+            .into_inner()
+            .info
+            .with_context(|| format!("snapshot {key:?} exists but carries no info"))?;
+        Ok(info.parent)
     }
 
     /// Delete a container record and its rootfs snapshot.

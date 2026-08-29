@@ -114,8 +114,9 @@ not the layout, the manifest shape, or the reader.
   },
 
   "base_image": {
-    "reference": "ghcr.io/gnrain/nemr-base:0.2.0",
-    "digest": "sha256:2c4127a5…"   // authoritative; the reference is a hint
+    "reference": "ghcr.io/gnrain/nemr-base:0.2.0",  // a hint; tags move
+    "digest": "sha256:2c4127a5…",                   // the image, when provable
+    "rootfs_chain_id": "sha256:9326c0f8…"           // what it ACTUALLY runs on
   },
 
   "chunks": [
@@ -258,3 +259,25 @@ content-addressed chunk naming (`chunks/<sha256>.zst`) if identical chunks are t
 be stored once inside a single file. Cross-version dedup more likely lives in
 object storage, where a bundle is a manifest plus chunk references — the
 commercial side of E-11, requiring no change to the local file at all.
+
+## Base image identity (v1, added 2026-08-29)
+
+Three fields, and they answer different questions.
+
+| field | meaning | when absent |
+|---|---|---|
+| `reference` | A **hint** for a human or for the pull advice. Tags move; this is never authoritative. | always present |
+| `digest` | The image the project was built from, **when a local image could be shown to build its rootfs**. | empty string — the writer could not prove it, and a plausible guess is worse than nothing |
+| `rootfs_chain_id` | The rootfs the project is **actually** built on, read from its snapshot. Always knowable. | absent in bundles written before 2026-08-29 |
+
+A reader prefers `rootfs_chain_id`: it identifies the layers themselves rather
+than a tag or a manifest digest, so a retagged version cannot move it and a
+removed image cannot erase it. **A chain-id mismatch is refused outright and the
+digest is not consulted as a second chance** — a digest match on a different
+rootfs is precisely the substitution being refused.
+
+`rootfs_chain_id` is `#[serde(default)]`, so v1 in both directions: an older
+reader ignores it, and a newer reader treats its absence as "this bundle predates
+the field" and falls back to the digest check. **That older reader therefore gets
+the weaker guarantee.** It is a real limit, not a rounding error: it cannot
+enforce an identity it cannot see.

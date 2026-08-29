@@ -191,6 +191,12 @@ impl Bundle {
         &self.manifest.base_image.reference
     }
 
+    /// The rootfs chain id the bundle records, or `""` for a bundle written
+    /// before the field existed (F-115).
+    pub fn base_image_chain_id(&self) -> &str {
+        &self.manifest.base_image.rootfs_chain_id
+    }
+
     pub fn check(&self, checks: &ImportChecks<'_>) -> Result<()> {
         // Base image: the digest is authoritative, the reference is a hint.
         // Substituting a different image would restore a session onto a rootfs
@@ -425,6 +431,7 @@ mod tests {
             base_image: BaseImageRef {
                 reference: "ghcr.io/gnrain/nemr-base:0.2.0".into(),
                 digest: DIGEST.into(),
+                rootfs_chain_id: String::new(),
             },
             chunks,
             members,
@@ -449,6 +456,7 @@ mod tests {
                 base_image: BaseImageRef {
                     reference: "ghcr.io/gnrain/nemr-base:0.2.0".into(),
                     digest: DIGEST.into(),
+                    rootfs_chain_id: String::new(),
                 },
                 policy: Policy::default(),
             },
