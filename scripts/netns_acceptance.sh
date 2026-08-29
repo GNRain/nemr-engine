@@ -45,8 +45,17 @@ cleanup() {
     local status=$?
     set +e
     if (( status != 0 )) || [[ -n "${NEMR_KEEP:-}" ]]; then
-        printf '\n   sessions %s and %s were LEFT IN PLACE for inspection.\n' "$A" "$B" >&2
-        printf '   remove them with: nemr delete %s --yes && nemr delete %s --yes\n' "$A" "$B" >&2
+        # Say what is TRUE: after the teardown step has run, the sessions are
+        # already deleted and this message would name evidence that no longer
+        # exists — while the real evidence (a leaked link or rule) is in
+        # rootlesskit's namespace. Check rather than assert.
+        for p in "$A" "$B"; do
+            if ctr -n default containers info "nemr-$p" >/dev/null 2>&1; then
+                printf '\n   session %s LEFT IN PLACE for inspection (remove: nemr delete %s --yes)\n' "$p" "$p" >&2
+            fi
+        done
+        printf '   inspect rootlesskit'"'"'s namespace for leaked links/rules:\n' >&2
+        printf '     nsenter -t "$(cat $XDG_RUNTIME_DIR/containerd-rootless/child_pid)" -U -n --preserve-credentials -- ip -brief link show\n' >&2
         return
     fi
     nemr delete "$A" --yes >/dev/null 2>&1
@@ -55,6 +64,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 rk_child() { cat "${XDG_RUNTIME_DIR}/containerd-rootless/child_pid"; }
+RK_PID_EARLY=$(rk_child)
 task_pid() { ctr -n default tasks ls 2>/dev/null | awk -v n="nemr-$1" '$1==n{print $2}'; }
 netns_of() { readlink "/proc/$1/ns/net" 2>/dev/null; }
 in_session() { echo "$2" | timeout 180 nemr attach "$1" 2>/dev/null | tr -d '\r'; }
@@ -75,6 +85,14 @@ for p in "$PORT_A" "$PORT_B"; do
     fi
 done
 pass "host ports $PORT_A and $PORT_B are free (so a later success is ours)"
+
+# Baseline BEFORE creating anything: an unrelated project may legitimately be
+# RUNNING on this host, holding its own nemrN link and NAT rule. Asserting
+# "zero links survive teardown" failed on exactly that (F-123) — and the false
+# positive then walked a cleanup into deleting a running project's live
+# network. Teardown must return to THIS baseline, not to zero.
+BASE_LINKS=$(nsenter -t "$RK_PID_EARLY" -U -n --preserve-credentials -- ip -brief link show 2>/dev/null | grep -E '^nemrc?[0-9]+[@ ]' | sort || true)
+BASE_NAT=$(nsenter -t "$RK_PID_EARLY" -U -n --preserve-credentials -- iptables -w 5 -t nat -S POSTROUTING 2>/dev/null | grep '10\.99\.' | sort || true)
 
 # ---------------------------------------------------------------------------
 step "Two sessions, each with its OWN network namespace"
@@ -246,13 +264,18 @@ $host_sockets"
 pass "CONTROL: links, NAT table and host sockets were actually read"
 
 # Both ends of the pair are nemr-prefixed, so a leak of either is visible here.
-left_veth=$(grep -cE '^nemrc?[0-9]+[@ ]' <<<"$links" || true)
-left_nat=$(grep -c '10\.99\.' <<<"$nat" || true)
-[[ "$left_veth" == "0" ]] || fail "$left_veth veth interface(s) survived delete:
-$(grep -E '^nemrc?[0-9]+[@ ]' <<<"$links")"
-[[ "$left_nat" == "0" ]] || fail "$left_nat NAT rule(s) survived delete:
-$(grep '10\.99\.' <<<"$nat")"
-pass "no veth interfaces and no NAT rules survived delete"
+# BASELINE-RELATIVE (F-123): what existed before this script ran is not ours to
+# assert about — an unrelated running project legitimately holds its link and
+# rule. Only what THIS run added and failed to remove is a leak.
+now_links=$(grep -E '^nemrc?[0-9]+[@ ]' <<<"$links" | sort || true)
+now_nat=$(grep '10\.99\.' <<<"$nat" | sort || true)
+new_links=$(comm -13 <(printf '%s\n' "$BASE_LINKS") <(printf '%s\n' "$now_links") | grep -v '^$' || true)
+new_nat=$(comm -13 <(printf '%s\n' "$BASE_NAT") <(printf '%s\n' "$now_nat") | grep -v '^$' || true)
+[[ -z "$new_links" ]] || fail "veth interface(s) this run created survived delete:
+$new_links"
+[[ -z "$new_nat" ]] || fail "NAT rule(s) this run created survived delete:
+$new_nat"
+pass "teardown returned to the pre-run baseline (nothing this run created survives)"
 
 # The isolation rule is range-wide policy, not per-session state, so it must
 # still be there. Asserting this stops a future reader from "fixing" a leak that
