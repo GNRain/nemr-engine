@@ -161,5 +161,40 @@ fi
 echo "==> Build and import the base image (BuildKit, daemonless — no Docker)"
 ./scripts/build_base_image.sh
 
+# A PRIOR published base version, so the F-115 export test has a project whose
+# rootfs is provably not this engine's constant (F-116).
+#
+# Every project the suite creates is built FROM the constant, so without this
+# there is no subject that can exhibit the defect and the guard cannot bite —
+# which is exactly what was measured before this existed. F-85 keeps every
+# published version pullable for ever and forbids reusing a tag, so the ledger
+# under image/digests/ is a permanent supply of divergent rootfs.
+#
+# Pulled here rather than skipped in the test: a test that quietly does not run
+# is the failure this project keeps finding.
+current="$(grep -oP 'pub const BASE_IMAGE: &str = "\K[^"]+' src/config.rs)"
+current_version="${current##*:}"
+prior=""
+for f in image/digests/*; do
+    v="$(basename "$f")"
+    [[ "$v" == "README.md" || "$v" == "$current_version" ]] && continue
+    prior="$v"
+    break
+done
+if [[ -n "$prior" ]]; then
+    echo "==> Pull a prior base version for the F-115 divergent-subject test: $prior"
+    ctr -n default images pull --platform linux/amd64 \
+        "ghcr.io/gnrain/nemr-base:${prior}" >/dev/null
+    ctr -n default images ls | grep -q "nemr-base:${prior}" || {
+        echo "pull reported success but ${prior} is not listed" >&2
+        exit 1
+    }
+    echo "    ${prior}: present"
+else
+    echo "no prior published version in image/digests/ — the F-115 export test" >&2
+    echo "cannot build a divergent subject and will fail, by design (F-116)." >&2
+    exit 1
+fi
+
 echo
 echo "Host provisioned. Verify with: ./scripts/verify_wp_a.sh"

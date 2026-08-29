@@ -263,7 +263,13 @@ async fn create_with_auth(
         // sets it.
         own_network_namespace: std::env::var_os("NEMR_TEST_PRE_NET02").is_none(),
         id: container_id.clone(),
-        image: config::BASE_IMAGE.to_string(),
+        // Test seam, alongside NEMR_TEST_PRE_NET02 above: creates the project
+        // from an OLDER published base image, which is the only way to obtain a
+        // project whose rootfs differs from this engine's constant. F-116
+        // recorded that as impossible; it is not, because F-85 keeps every
+        // published version pullable for ever. Production never sets it.
+        image: std::env::var("NEMR_TEST_BASE_IMAGE")
+            .unwrap_or_else(|_| config::BASE_IMAGE.to_string()),
         mounts,
         working_dir: Some(config::CONTAINER_WORKDIR.to_string()),
         extra_env: vec![],
