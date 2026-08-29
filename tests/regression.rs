@@ -1494,7 +1494,7 @@ fn d08_the_unresolved_base_image_error_is_honest_about_not_fetching() {
         // (F-85) — pulling the current version fetches different bytes.
         let bundle_reference = "ghcr.io/gnrain/nemr-base:0.1.0";
 
-        let resolution = project::resolve_base_image(&client, absent, bundle_reference).await;
+        let resolution = project::resolve_base_image(&client, absent, bundle_reference, "").await;
         let (where_looked, advice) = match resolution {
             nemr_engine::bundle::import::BaseImageResolution::Unresolved {
                 where_looked,
@@ -2449,7 +2449,7 @@ fn a_bundle_survives_a_rename_of_the_base_image() {
         // 3. Resolve. Everything after this must run even on failure, or the
         //    host is left without its base image.
         let resolution = if removed.is_ok() {
-            Some(project::resolve_base_image(&client, &digest, canonical).await)
+            Some(project::resolve_base_image(&client, &digest, canonical, "").await)
         } else {
             None
         };
@@ -3501,5 +3501,192 @@ fn net05_a_session_cannot_reach_another_session() {
 
         let _ = project::stop(&client, &a.name).await;
         let _ = project::stop(&client, &b.name).await;
+    });
+}
+
+/// F-115: a bundle records the base image the container ACTUALLY runs on.
+///
+/// Both fields used to come from `config::BASE_IMAGE`, so a bundle recorded what
+/// the exporting engine builds today rather than what the project was built on.
+/// Usually identical, and silently wrong when it differs — which is exactly the
+/// substitution `manifest.rs` calls "a silent-wrong-result defect" and claims to
+/// refuse. On the developer host three of four projects name an image their
+/// rootfs is not.
+///
+/// The chain id is the assertion that bites: it comes from the snapshot and
+/// there is no way to produce it from a constant.
+#[test]
+fn f115_a_bundle_records_the_base_image_the_container_actually_runs_on() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "f115", VolumeSize::Small).await;
+        let id = nemr_engine::config::container_id(&project.name);
+
+        // The truth, read from the snapshot rather than from any constant.
+        let real_chain_id = client
+            .snapshot_parent(&id)
+            .await
+            .expect("a project's snapshot has a parent");
+        assert!(
+            real_chain_id.starts_with("sha256:"),
+            "control: the snapshot parent must be readable, or nothing below means anything \
+             (got {real_chain_id:?})"
+        );
+
+        let bundle = std::env::temp_dir().join(format!("f115-{}.nemr", std::process::id()));
+        let _ = std::fs::remove_file(&bundle);
+        project::export(
+            &client,
+            &project.name,
+            &bundle,
+            nemr_engine::bundle::policy::Policy::default(),
+        )
+        .await
+        .expect("export");
+
+        let opened = nemr_engine::bundle::import::open(&bundle).expect("open bundle");
+        assert_eq!(
+            opened.manifest.base_image.rootfs_chain_id, real_chain_id,
+            "the bundle must record the rootfs the container is actually built on"
+        );
+
+        // And where the image IS identifiable, the reference and digest must
+        // name an image that really builds that rootfs — not merely a plausible
+        // one. This is the half a constant can satisfy by luck, so it is
+        // asserted against the chain id rather than against the constant.
+        let recorded_digest = opened.manifest.base_image.digest.clone();
+        if !recorded_digest.is_empty() {
+            let named = &opened.manifest.base_image.reference;
+            let its_chain = client
+                .image_chain_id(named)
+                .await
+                .expect("the recorded reference must resolve to a local image");
+            assert_eq!(
+                its_chain, real_chain_id,
+                "the bundle names {named} but that image does not build this project's rootfs"
+            );
+        }
+
+        let _ = std::fs::remove_file(&bundle);
+    });
+}
+
+/// F-115: a bundle naming a rootfs this host cannot build is REFUSED, and the
+/// digest is not consulted as a second chance.
+///
+/// The digest can match while the rootfs differs — a tag reused for different
+/// bytes does exactly that, and F-85 records it happening on this project. So a
+/// chain-id miss must end the resolution rather than fall through, or the
+/// stronger check would be silently downgraded to the weaker one.
+#[test]
+fn f115_a_chain_id_miss_is_not_rescued_by_a_matching_digest() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let base = nemr_engine::config::BASE_IMAGE;
+        let real_chain = client
+            .image_chain_id(base)
+            .await
+            .expect("the base image must be present on a provisioned host");
+        let real_digest = client
+            .image_target_digest(base)
+            .await
+            .expect("and must have a digest");
+
+        // Control: the real chain id resolves. Without this the refusal below
+        // could be a resolver that never resolves anything.
+        match project::resolve_base_image(&client, &real_digest, base, &real_chain).await {
+            nemr_engine::bundle::import::BaseImageResolution::Present { .. } => {}
+            other => panic!("control failed: the real chain id must resolve, got {other:?}"),
+        }
+
+        // A rootfs this host does not have, paired with a digest that DOES
+        // resolve. Falling through would answer Present on the wrong rootfs.
+        let bogus_chain = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        match project::resolve_base_image(&client, &real_digest, base, bogus_chain).await {
+            nemr_engine::bundle::import::BaseImageResolution::Unresolved {
+                where_looked, ..
+            } => {
+                assert!(
+                    where_looked.iter().any(|l| l.contains(bogus_chain)),
+                    "the refusal must name the rootfs it could not find: {where_looked:?}"
+                );
+            }
+            nemr_engine::bundle::import::BaseImageResolution::Present { reference } => panic!(
+                "resolved to {reference} on a matching DIGEST despite a chain-id miss — the \
+                 stronger check was downgraded to the weaker one, which is the substitution \
+                 this refuses to make"
+            ),
+        }
+    });
+}
+
+/// F-115: an image is found by the rootfs it BUILDS, not by name or by being
+/// the only candidate.
+///
+/// `image_with_chain_id` is the mechanism the whole identity fix rests on — it
+/// is what turns "this project's snapshot parent" into "this is the image it was
+/// built from". Both directions are asserted: a real chain id must find its
+/// image, and an unknown one must return `None` rather than falling back to
+/// whatever image happens to be present. The second half is the one that bites:
+/// a lookup that returned the first image regardless would satisfy the first.
+#[test]
+fn f115_an_image_is_found_by_the_rootfs_it_builds() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let base = nemr_engine::config::BASE_IMAGE;
+        let real_chain = client
+            .image_chain_id(base)
+            .await
+            .expect("the base image must be present on a provisioned host");
+
+        let found = client
+            .image_with_chain_id(&real_chain)
+            .await
+            .expect("the lookup must not error")
+            .expect("the base image's own chain id must find the base image");
+        assert_eq!(
+            found.name, base,
+            "found {} for the chain id that belongs to {base}",
+            found.name
+        );
+
+        // A rootfs no local image builds. `None` means "cannot prove it", which
+        // the caller records as an empty digest rather than a guess — the whole
+        // distinction F-115 exists to make.
+        let bogus = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let missing = client
+            .image_with_chain_id(bogus)
+            .await
+            .expect("an unknown chain id is not an error");
+        assert!(
+            missing.is_none(),
+            "an unknown rootfs resolved to {:?} — a lookup that answers with whatever image \
+             is present would let export record a confident, wrong identity",
+            missing.map(|i| i.name)
+        );
     });
 }
