@@ -76,6 +76,42 @@ The shape both share: reaching for a plausible one-liner instead of checking wha
 the tool actually supports, then discovering it only when the failure is silent
 or destructive.
 
+## Check the current branch before committing
+
+Sixth slip of one session, and this one bypassed review: a commit intended
+for a feature branch landed directly on `main` and was pushed, because the
+working directory's branch had changed underneath the session — the Product
+Owner's closure flow legitimately checks out `main` on this shared machine.
+Twice before, branches were cut from `main` while the work they depended on
+sat unmerged, caught only by anchor-not-found errors downstream.
+
+**Before every `git commit`: read `git branch --show-current` in the same
+breath, and refuse to commit on `main`.** The branch at the START of a turn is
+not the branch NOW — nothing about this working directory is private. A wip
+commit on the wrong branch is recoverable; a push from it is not.
+
+The same argument as every rule here: three-plus occurrences means it is not
+held under load, so it stops being remembered and becomes checked.
+
+## Verified by executing the result, not by the edit reporting success
+
+The more important rule of the two, because it is the fifth "a check that
+reads success without proving it" of the same session, in this session's own
+tooling. A proc.sh edit silently failed (its anchor had been mangled by an
+earlier write); the traceback was the FIRST LINE of the output and was read
+past; three scripts were then wired to a function that did not exist; and the
+wiring was "verified" with `bash -n` — which checks syntax, not existence — so
+everything reported green until the script was actually run and died on
+`command not found`. The failure's exit code was then misread as 0 through a
+tail pipe, which is F-109's own lesson ignored at the shell.
+
+**After a mechanical edit, execute the result:** source the library and `type`
+the function; run the test file; run the script against a disposable subject.
+`bash -n`, a printed "ok" from the edit script, and a green from a suite that
+never calls the new code are all the same thing: a success signal over
+something other than the claim. The edit's own report is never the evidence —
+five variants of that mistake in one day, one of them destructive.
+
 ## Commit or stash before any destructive git operation
 
 Fourth destructive slip in one session, at the shell, so this becomes a rule
