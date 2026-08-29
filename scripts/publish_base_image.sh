@@ -23,7 +23,9 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-IMAGE="${NEMR_BASE_IMAGE:-ghcr.io/gnrain/nemr-base:0.3.0}"
+# The version lives in src/config.rs; this reads it (F-124).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/base_image.sh"
+IMAGE="${NEMR_BASE_IMAGE:-$(nemr_base_image)}"
 # F-85: digests are recorded per version, one file each, never a single
 # shared value.
 VERSION="${IMAGE##*:}"

@@ -172,8 +172,8 @@ echo "==> Build and import the base image (BuildKit, daemonless — no Docker)"
 #
 # Pulled here rather than skipped in the test: a test that quietly does not run
 # is the failure this project keeps finding.
-current="$(grep -oP 'pub const BASE_IMAGE: &str = "\K[^"]+' src/config.rs)"
-current_version="${current##*:}"
+. "scripts/lib/base_image.sh"
+current_version="$(nemr_base_version)"
 prior=""
 for f in image/digests/*; do
     v="$(basename "$f")"

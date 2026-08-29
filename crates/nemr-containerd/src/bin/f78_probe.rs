@@ -83,8 +83,13 @@ async fn main() {
         let spec = ContainerSpec {
             own_network_namespace: true,
             id: id.clone(),
-            image: std::env::var("NEMR_F78_IMAGE")
-                .unwrap_or_else(|_| "ghcr.io/gnrain/nemr-base:0.3.0".to_string()),
+            // No hardcoded fallback (F-124) — see gc_probe. The caller says:
+            //   NEMR_F78_IMAGE="$(scripts/lib/base_image.sh)" cargo run --bin f78_probe
+            // expect, not ?: this main returns (), and a diagnostic probe
+            // dying loudly with the exact command to run is the point.
+            image: std::env::var("NEMR_F78_IMAGE").expect(
+                "set NEMR_F78_IMAGE to the image to probe (scripts/lib/base_image.sh prints the engine's)",
+            ),
             mounts: vec![],
             working_dir: None,
             extra_env: vec![],

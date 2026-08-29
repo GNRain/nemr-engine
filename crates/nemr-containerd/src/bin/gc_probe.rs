@@ -17,13 +17,17 @@ const PROBE: &str = "f63-gc-probe-unreferenced";
 #[tokio::main]
 async fn main() -> Result<()> {
     let client = ContainerdClient::connect().await.context("connect")?;
+    // No hardcoded fallback (F-124): this crate is product-agnostic and must
+    // not know the engine's base image, and a literal here was one of the five
+    // places a version bump had to remember. The caller says which image.
+    let image = std::env::var("NEMR_PROBE_IMAGE").context(
+        "set NEMR_PROBE_IMAGE to the image to probe. For the engine's base image:\n    \
+         NEMR_PROBE_IMAGE=\"$(scripts/lib/base_image.sh)\" cargo run --bin gc_probe",
+    )?;
     let chain_id = client
-        .image_chain_id(
-            &std::env::var("NEMR_PROBE_IMAGE")
-                .unwrap_or_else(|_| "ghcr.io/gnrain/nemr-base:0.3.0".into()),
-        )
+        .image_chain_id(&image)
         .await
-        .context("the base image must be present; build and import it first")?;
+        .context("the image must be present; build and import it first")?;
 
     // Clean any residue from a previous probe run.
     let _ = client.remove_snapshot(PROBE).await;

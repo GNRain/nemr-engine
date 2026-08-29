@@ -14,7 +14,10 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-IMAGE="${NEMR_BASE_IMAGE:-ghcr.io/gnrain/nemr-base:0.3.0}"
+# The version lives in src/config.rs; this reads it (F-124). NEMR_BASE_IMAGE
+# still overrides, for building a NEW version before the constant moves.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/base_image.sh"
+IMAGE="${NEMR_BASE_IMAGE:-$(nemr_base_image)}"
 
 # Reproducibility (F-74). Both halves are load-bearing, measured rather than
 # assumed: three cold builds with these flags produced one digest, and two cold
