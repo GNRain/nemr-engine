@@ -3389,3 +3389,117 @@ fn net02_wiring_a_live_session_again_reconciles_rather_than_colliding() {
         let _ = project::stop(&client, &project.name).await;
     });
 }
+
+/// Reach `host:port` from inside a session's network namespace, using the
+/// HOST's node rather than anything in the image.
+///
+/// Entering only the network namespace is deliberate: it measures reachability
+/// without depending on what the base image happens to ship, and without
+/// asking the session's own tooling to report on itself.
+fn reach_from_session(pid: u32, host: &str, port: u16) -> String {
+    let probe = format!(
+        "node -e \"require('http').get({{host:'{host}',port:{port},timeout:4000}},r=>{{\
+         let d='';r.on('data',c=>d+=c);r.on('end',()=>{{console.log('GOT:'+d);process.exit(0)}})}})\
+         .on('error',()=>{{console.log('GOT:REFUSED');process.exit(0)}})\
+         .on('timeout',()=>{{console.log('GOT:TIMEOUT');process.exit(0)}})\""
+    );
+    let out = in_rootlesskit(&format!("nsenter -t {pid} -n -- {probe}"));
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("GOT:").map(|s| s.to_string()))
+        .unwrap_or_else(|| {
+            format!(
+                "PROBE-FAILED(stdout={:?} stderr={:?})",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+}
+
+/// Serve a fixed body on port 8000 inside a session's namespace, from the host.
+fn serve_in_session(pid: u32, body: &str) {
+    let script = format!(
+        "setsid nsenter -t {pid} -n -- node -e \
+         \"require('http').createServer((q,s)=>s.end('{body}')).listen(8000,'0.0.0.0')\" \
+         >/dev/null 2>&1 </dev/null & sleep 2"
+    );
+    let _ = in_rootlesskit(&script);
+}
+
+/// NET-05: a session cannot reach another session.
+///
+/// F-108. Sessions are routed to one another inside rootlesskit's namespace, so
+/// "its own network namespace" delivered port-space separation and nothing else
+/// — every session could reach every other session's address and ports. That
+/// reads as a security boundary and was not one, and someone would eventually
+/// put two clients' work in two sessions on that assumption.
+///
+/// The control is the shape the MASQUERADE control established: remove the rule
+/// and the SAME request must succeed, so the test cannot pass because the
+/// request was broken for some other reason.
+#[test]
+fn net05_a_session_cannot_reach_another_session() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let a = TestProject::create(&client, "net05a", VolumeSize::Small).await;
+        let b = TestProject::create(&client, "net05b", VolumeSize::Small).await;
+        let pid_a = project::start(&client, &a.name).await.expect("start A");
+        let pid_b = project::start(&client, &b.name).await.expect("start B");
+
+        let alloc_b = recorded_allocation(&client, &b.name)
+            .await
+            .expect("B has an allocation");
+        let ip_b = alloc_b.session_ip();
+
+        serve_in_session(pid_b, "SESSION-B");
+
+        // Control 1: the isolation rule is actually in place. Reading, not
+        // repairing — if it is absent the refusal below would prove nothing.
+        assert!(
+            nemr_engine::engine::netns::isolation_is_active().expect("read the FORWARD chain"),
+            "start must have asserted the isolation rule; without it this test is vacuous"
+        );
+
+        let blocked = reach_from_session(pid_a, &ip_b, 8000);
+        assert!(
+            blocked == "REFUSED" || blocked == "TIMEOUT",
+            "session A reached session B at {ip_b}:8000 — sessions are not isolated (got {blocked:?})"
+        );
+
+        // Control 2: the SAME request succeeds with the rule removed. Without
+        // this, a probe that could never work would pass this test.
+        let drop_rule = in_rootlesskit(
+            "iptables -w 5 -D FORWARD -s 10.99.0.0/16 -d 10.99.0.0/16 -j DROP",
+        );
+        assert!(
+            drop_rule.status.success(),
+            "could not remove the rule for the control: {}",
+            String::from_utf8_lossy(&drop_rule.stderr)
+        );
+        let reachable = reach_from_session(pid_a, &ip_b, 8000);
+
+        // Put it back before asserting, so a failure here does not leave the
+        // host without isolation.
+        let _ = in_rootlesskit(
+            "iptables -w 5 -C FORWARD -s 10.99.0.0/16 -d 10.99.0.0/16 -j DROP 2>/dev/null \
+             || iptables -w 5 -I FORWARD 1 -s 10.99.0.0/16 -d 10.99.0.0/16 -j DROP",
+        );
+
+        assert_eq!(
+            reachable, "SESSION-B",
+            "CONTROL FAILED: with the rule removed the request still did not reach B, so the \
+             refusal above says nothing about isolation"
+        );
+
+        let _ = project::stop(&client, &a.name).await;
+        let _ = project::stop(&client, &b.name).await;
+    });
+}
