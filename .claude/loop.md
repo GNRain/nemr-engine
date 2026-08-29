@@ -76,6 +76,29 @@ The shape both share: reaching for a plausible one-liner instead of checking wha
 the tool actually supports, then discovering it only when the failure is silent
 or destructive.
 
+## Commit or stash before any destructive git operation
+
+Fourth destructive slip in one session, at the shell, so this becomes a rule
+rather than an acknowledgement — the same three-strikes argument that produced
+`wait_for_service` and the pgrep rule above, one occurrence past it.
+
+`git reset --hard origin/main` ran with four uncommitted CONFORMANCE entries in
+the tree and deleted them. Mixed reset would have kept them; `--hard` was chosen
+without looking at `git status` first. The same session also cleaned a working
+tree with `git checkout -- .` and lost a saved-but-unapplied patch for long
+enough to ship a circular verification on top of the gap.
+
+**Before `reset --hard`, `checkout -- .`, `clean`, `rebase` or branch deletion:
+run `git status --porcelain`, and commit or stash anything it shows.** A wip
+commit costs nothing and reverts cleanly; there is no situation where losing the
+tree is better.
+
+The asymmetry is the reason the rule exists: the lost entries were recoverable
+only because they had just been composed and could be rewritten from memory.
+Code would not have been. **The rule exists for the case not yet hit** — the
+one where the uncommitted work is hours of implementation rather than minutes of
+prose.
+
 ## Three ways a control fails, and three different remedies
 
 They keep getting filed under one heading. They are not one problem, and the fix
