@@ -3690,3 +3690,120 @@ fn f115_an_image_is_found_by_the_rootfs_it_builds() {
         );
     });
 }
+
+/// The oldest published base image other than the one this engine builds.
+///
+/// F-85 keeps every published version pullable for ever and forbids reusing a
+/// tag, so the ledger under `image/digests/` is a permanent supply of images
+/// whose rootfs is provably NOT this engine's constant. That discipline exists
+/// for bundle recoverability; it turns out to be the only way to construct a
+/// subject for F-115's export test.
+fn a_published_version_other_than_the_current_one() -> Option<String> {
+    let current = nemr_engine::config::base_image_version();
+    let mut versions: Vec<String> = std::fs::read_dir("image/digests")
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|name| name != "README.md" && name != current)
+        .collect();
+    versions.sort();
+    versions
+        .first()
+        .map(|v| format!("ghcr.io/gnrain/nemr-base:{v}"))
+}
+
+/// F-115/F-116: export reads the CONTAINER, not this engine's constant.
+///
+/// This is the test F-116 recorded as impossible. The claim was that no subject
+/// could exhibit the defect, because a freshly created project's snapshot parent
+/// IS the constant's chain id, byte for byte. That was true of every project the
+/// suite could create — and wrong about what was available, because F-85 keeps
+/// every published base version pullable for ever. Creating a project from an
+/// older one gives a rootfs that is provably not the constant's.
+///
+/// The control comes first and is the whole reason this test means anything: the
+/// two chain ids must actually differ. If they were equal, the assertion below
+/// would pass under either derivation and prove nothing — which is exactly the
+/// state F-116 described.
+#[test]
+fn f115_export_reads_the_container_not_the_engine_constant() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let older = a_published_version_other_than_the_current_one()
+        .expect("image/digests must list a published version other than the current one");
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+
+        let older_chain = client.image_chain_id(&older).await.unwrap_or_else(|e| {
+            panic!(
+                "{older} is not in this containerd, so the divergent subject cannot be built \
+                 ({e:#}).\n     fix: ctr -n {ns} images pull --platform linux/amd64 {older}",
+                ns = client.namespace()
+            )
+        });
+        let constant_chain = client
+            .image_chain_id(nemr_engine::config::BASE_IMAGE)
+            .await
+            .expect("the current base image must be present");
+
+        // THE CONTROL. Without a genuine divergence this test is vacuous, and
+        // saying so out loud is what F-116 was missing.
+        assert_ne!(
+            older_chain, constant_chain,
+            "{older} and the current constant build the SAME rootfs, so this test cannot \
+             distinguish reading the container from reading the constant"
+        );
+
+        std::env::set_var("NEMR_TEST_BASE_IMAGE", &older);
+        let project = TestProject::create(&client, "f115old", VolumeSize::Small).await;
+        std::env::remove_var("NEMR_TEST_BASE_IMAGE");
+
+        let id = nemr_engine::config::container_id(&project.name);
+        let parent = client.snapshot_parent(&id).await.expect("snapshot parent");
+        assert_eq!(
+            parent, older_chain,
+            "the subject was not built on the older image, so it is not divergent after all"
+        );
+
+        let bundle = std::env::temp_dir().join(format!("f115old-{}.nemr", std::process::id()));
+        let _ = std::fs::remove_file(&bundle);
+        project::export(
+            &client,
+            &project.name,
+            &bundle,
+            nemr_engine::bundle::policy::Policy::default(),
+        )
+        .await
+        .expect("export");
+
+        let opened = nemr_engine::bundle::import::open(&bundle).expect("open bundle");
+        let recorded = &opened.manifest.base_image;
+
+        assert_eq!(
+            recorded.rootfs_chain_id, older_chain,
+            "the bundle recorded {} but the project is built on {older_chain} — export read \
+             the engine's constant instead of the container",
+            recorded.rootfs_chain_id
+        );
+        assert_ne!(
+            recorded.rootfs_chain_id, constant_chain,
+            "the bundle recorded the CONSTANT's rootfs for a project that does not run on it"
+        );
+        assert_eq!(
+            recorded.reference,
+            older,
+            "the bundle must name the image it was actually built from, not {}",
+            nemr_engine::config::BASE_IMAGE
+        );
+
+        let _ = std::fs::remove_file(&bundle);
+    });
+}
