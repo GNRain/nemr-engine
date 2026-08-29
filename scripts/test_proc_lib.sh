@@ -142,6 +142,35 @@ check "it prints the command's stderr"        "$out" "boom"
 output_has "^z" -- printf 'a\nb\n' || true
 check "output_has leaves the output for the caller to print" "$_LAST_OUTPUT" "b"
 
+# --- delete_disposable (the protected-subject guard, F-123) ------------------
+# Proven with a STUB nemr, so the refusal is shown to happen BEFORE any real
+# command would run — and so this test needs no host and cannot touch anything.
+# The stub records its calls in a FILE, because the assertions run the guard
+# inside $(...) subshells and a variable set there never reaches this shell —
+# the first version of this test failed on its own instrumentation.
+STUB_LOG="$WORK/nemr-stub-calls"
+: > "$STUB_LOG"
+nemr() { echo "$*" >> "$STUB_LOG"; }
+
+out=$(delete_disposable "scratch-123" 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok "delete_disposable deletes a disposable project" || bad "should have deleted"
+grep -q "delete scratch-123" "$STUB_LOG" && ok "  ...by actually invoking the engine" || bad "the engine was never invoked"
+
+: > "$STUB_LOG"
+out=$(delete_disposable "htmltest" 2>&1); rc=$?
+[[ $rc -ne 0 ]] && ok "delete_disposable REFUSES the protected subject" || bad "htmltest was not refused"
+check "the refusal names the rule" "$out" "protected subject"
+[[ ! -s "$STUB_LOG" ]] \
+    && ok "  ...and the engine was NEVER invoked — refusal precedes any command" \
+    || bad "the engine was invoked for a protected name: $(cat "$STUB_LOG")"
+unset -f nemr
+
+# refuse_protected alone — the flow-step guard. Both directions.
+out=$(refuse_protected "scratch-1" 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok "refuse_protected passes a disposable name" || bad "refused a disposable name"
+out=$(refuse_protected "htmltest" 2>&1); rc=$?
+[[ $rc -ne 0 ]] && ok "refuse_protected refuses the protected subject" || bad "did not refuse"
+
 printf '\n'
 if [[ $FAIL -eq 0 ]]; then
     printf '%sPASS%s — %d assertions.\n' "$GREEN" "$RESET" "$PASS"; exit 0

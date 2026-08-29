@@ -31,8 +31,8 @@ cleanup() {
     if (( status != 0 )) || [[ -n "${NEMR_KEEP:-}" ]]; then
         printf '\n   projects %s and %s LEFT IN PLACE for inspection.\n' "$SRC" "$DST" >&2
     else
-        nemr delete "$SRC" --yes >/dev/null 2>&1
-        nemr delete "$DST" --yes >/dev/null 2>&1
+        delete_disposable "$SRC"
+        delete_disposable "$DST"
     fi
     rm -rf "$WORK"
 }

@@ -30,7 +30,7 @@ SOCK="${XDG_RUNTIME_DIR}/containerd-rootless/api.sock"
 
 cleanup() {
     set +e
-    nemr delete "$PROJECT" --yes >/dev/null 2>&1
+    delete_disposable "$PROJECT"
     # Belt and braces: if delete failed, do not leave a host port bound.
     for id in $(rootlessctl --socket="$SOCK" list-ports 2>/dev/null \
                 | awk -v p="$HOST_PORT" 'NR>1 && $4==p {print $1}'); do
@@ -111,7 +111,7 @@ pass "start re-applied it without being asked"
 # ---------------------------------------------------------------------------
 step "Delete releases the port"
 # ---------------------------------------------------------------------------
-nemr delete "$PROJECT" --yes >/dev/null
+delete_disposable "$PROJECT" || fail "delete refused (protected-subject guard?)"
 if ss -tlnp 2>/dev/null | grep -q ":${HOST_PORT} "; then
     fail "delete left host port ${HOST_PORT} bound to a project that no longer exists"
 fi

@@ -50,7 +50,7 @@ SERVER_PID=""
 cleanup() {
     set +e
     "$REPO/target/release/nemr-cloud" release "$PROJECT" >/dev/null 2>&1
-    nemr delete "$PROJECT" --yes >/dev/null 2>&1
+    delete_disposable "$PROJECT"
     # The throwaway account's local state must not outlive the run.
     "$REPO/target/release/nemr-cloud" logout >/dev/null 2>&1
     [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" >/dev/null 2>&1
@@ -177,6 +177,7 @@ pass "the stored object is ciphertext ($(stat -c%s "$STORED") bytes)"
 # ---------------------------------------------------------------------------
 step "Delete the local project entirely"
 # ---------------------------------------------------------------------------
+refuse_protected "$PROJECT" || fail "refusing the delete step on a protected name"
 nemr delete "$PROJECT" --yes
 # output_has, not `nemr list | grep -q`: a listing that FAILED must not read as
 # "the project is gone" (F-109). This assertion is the negative one, where that

@@ -58,8 +58,8 @@ cleanup() {
         printf '     nsenter -t "$(cat $XDG_RUNTIME_DIR/containerd-rootless/child_pid)" -U -n --preserve-credentials -- ip -brief link show\n' >&2
         return
     fi
-    nemr delete "$A" --yes >/dev/null 2>&1
-    nemr delete "$B" --yes >/dev/null 2>&1
+    delete_disposable "$A"
+    delete_disposable "$B"
 }
 trap cleanup EXIT INT TERM
 
@@ -238,8 +238,8 @@ pass "CONTROL: removing the rule lets the SAME request through — the rule is w
 # ---------------------------------------------------------------------------
 step "Teardown releases everything"
 # ---------------------------------------------------------------------------
-nemr delete "$A" --yes >/dev/null
-nemr delete "$B" --yes >/dev/null
+delete_disposable "$A" || fail "could not delete $A (protected-subject guard fired?)"
+delete_disposable "$B" || fail "could not delete $B (protected-subject guard fired?)"
 
 # Read the state FIRST, and prove the read worked before counting anything.
 # `ip ... | grep -c "^nemr" || true` yields a clean "0" when `ip` itself fails,

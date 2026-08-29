@@ -3807,3 +3807,70 @@ fn f115_export_reads_the_container_not_the_engine_constant() {
         let _ = std::fs::remove_file(&bundle);
     });
 }
+
+/// F-123: the test harness's own teardown refuses protected subjects.
+///
+/// Proven against a DISPOSABLE project temporarily marked protected — the
+/// refusal cannot be proven against htmltest itself, because demonstrating
+/// destructiveness against the thing being protected is the incident this
+/// guard exists to prevent. The control is the same purge, same project,
+/// protection lifted: it must then actually destroy, or the "refusal" above
+/// proves nothing about purge and everything about a purge that never works.
+#[test]
+fn f123_purge_refuses_a_protected_subject_and_destroys_without_protection() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "f123prot", VolumeSize::Small).await;
+        let name = project.name.clone();
+        let id = nemr_engine::config::container_id(&name);
+
+        // Protect it, then purge. The project must SURVIVE.
+        std::env::set_var("NEMR_TEST_EXTRA_PROTECTED", &name);
+        common::purge(&name);
+        assert!(
+            client.container_exists(&id).await.expect("query"),
+            "purge destroyed a PROTECTED subject — the guard does not bite"
+        );
+
+        // Control: lift the protection and the SAME purge must destroy —
+        // otherwise the survival above says nothing about the guard.
+        std::env::remove_var("NEMR_TEST_EXTRA_PROTECTED");
+        common::purge(&name);
+        assert!(
+            !client.container_exists(&id).await.expect("query"),
+            "CONTROL FAILED: purge without protection did not destroy, so the refusal \
+             above proves nothing about the guard"
+        );
+
+        std::mem::forget(project); // already purged; Drop would double-purge
+    });
+}
+
+/// F-123: the shell and Rust protected lists must agree — one rule, two
+/// enforcement points, zero drift.
+#[test]
+fn f123_the_shell_and_rust_protected_lists_agree() {
+    let shell = std::fs::read_to_string("scripts/lib/proc.sh").expect("read proc.sh");
+    let line = shell
+        .lines()
+        .find(|l| l.starts_with("NEMR_PROTECTED_SUBJECTS="))
+        .expect("proc.sh must define NEMR_PROTECTED_SUBJECTS");
+    let shell_list: Vec<&str> = line
+        .trim_start_matches("NEMR_PROTECTED_SUBJECTS=")
+        .trim_matches('"')
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        shell_list,
+        common::PROTECTED_SUBJECTS,
+        "the shell guard and the Rust guard protect different sets — the rule has forked"
+    );
+}

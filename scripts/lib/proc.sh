@@ -170,6 +170,45 @@ require_tcp() {
     return 1
 }
 
+# --- protected subjects ------------------------------------------------------
+
+# Projects no automated path may EVER delete, regardless of what any check
+# concludes (F-123). "Experiments use disposable subjects" was a convention,
+# and convention failed: a teardown check counted a running project's link as
+# a leak, and the cleanup that followed acted on a hardcoded echo printed
+# directly beneath a task listing that said RUNNING — against the one project
+# designated irreplaceable. A protected subject must not depend on every
+# future check being correct.
+#
+# The Rust harness carries the same list (tests/common/mod.rs), and a unit
+# test asserts the two agree — one rule, two enforcement points, no drift.
+NEMR_PROTECTED_SUBJECTS="htmltest"
+
+# The name check alone, for FLOW steps that run `nemr delete` with visible
+# output as part of what they test: guard first, then run the real command.
+refuse_protected() {
+    local name="${1:?refuse_protected: project name required}"
+    local protected
+    for protected in $NEMR_PROTECTED_SUBJECTS; do
+        if [[ "$name" == "$protected" ]]; then
+            printf '   REFUSED: %s is a protected subject; no automated path may delete it (F-123).\n' "$name" >&2
+            printf '   The calling script has a bug: it computed a protected name where a\n' >&2
+            printf '   disposable one belongs.\n' >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Delete a DISPOSABLE project from a cleanup path. Refuses protected names
+# BEFORE any command runs, loudly — a cleanup that skips silently would hide
+# the bug that tried.
+delete_disposable() {
+    local name="${1:?delete_disposable: project name required}"
+    refuse_protected "$name" || return 1
+    nemr delete "$name" --yes >/dev/null 2>&1
+}
+
 # --- asking a question of a command's output --------------------------------
 
 # `cmd | grep -q PATTERN` answers "no" in three different ways: the pattern was

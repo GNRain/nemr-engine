@@ -77,7 +77,11 @@ cleanup() {
     local exit_code=$?
     if $NEMR list 2>/dev/null | grep -q "^${PROJECT} "; then
         printf '\n     cleaning up %s\n' "$PROJECT"
-        $NEMR delete "$PROJECT" --yes >/dev/null 2>&1 || true
+        # Protected-subject guard (F-123): check the name before deleting, so a
+        # future bug that computes a protected name here cannot destroy it.
+        if refuse_protected "$PROJECT"; then
+            $NEMR delete "$PROJECT" --yes >/dev/null 2>&1 || true
+        fi
     fi
     # Belt and braces: release anything the engine may have left behind.
     sudo -n "$HELPER" unmount "$PROJECT" >/dev/null 2>&1 || true
@@ -340,6 +344,7 @@ assert "usage agrees with df (list ${list_percent}%, df ${df_percent}%)" \
 
 step "delete — and zero residue"
 
+refuse_protected "$PROJECT"
 $NEMR delete "$PROJECT" --yes >/dev/null
 assert_eq "container record removed" "0" "$(ctr containers list 2>/dev/null | grep -c "nemr-${PROJECT}" || true)"
 assert_eq "snapshot removed" "0" "$(ctr snapshots list 2>/dev/null | grep -c "nemr-${PROJECT}" || true)"

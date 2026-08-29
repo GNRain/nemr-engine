@@ -692,7 +692,45 @@ impl Drop for TestProject {
 /// Deliberately does not go through `project::delete`: this runs on the
 /// failure path, where the engine's own delete may be the thing under test or
 /// may itself be broken. It goes straight at the host.
+/// Projects no automated path may EVER delete (F-123). Mirrors
+/// `NEMR_PROTECTED_SUBJECTS` in scripts/lib/proc.sh — one rule, two enforcement
+/// points, and a test asserts the lists agree so they cannot drift.
+///
+/// "Experiments use disposable subjects" was a convention, and convention
+/// failed: a teardown check counted a running project's link as a leak, and
+/// the cleanup acted on a hardcoded echo printed beneath a task listing that
+/// said RUNNING — against the one project designated irreplaceable. A
+/// protected subject must not depend on every future check being correct.
+pub const PROTECTED_SUBJECTS: &[&str] = &["htmltest"];
+
+/// Is this name protected from automated teardown?
+///
+/// `NEMR_TEST_EXTRA_PROTECTED` adds one name for the guard's own test: the
+/// refusal cannot be proven against the REAL protected subject — proving
+/// destructiveness against the thing being protected is the incident again —
+/// so the test protects a disposable name and shows purge spares it.
+pub fn is_protected(name: &str) -> bool {
+    if PROTECTED_SUBJECTS.contains(&name) {
+        return true;
+    }
+    std::env::var("NEMR_TEST_EXTRA_PROTECTED").is_ok_and(|extra| extra == name)
+}
+
 pub fn purge(name: &str) {
+    // The guard runs FIRST, before any handle to containerd or the helper is
+    // even acquired. Loud, not silent: a purge that reaches this line has a
+    // bug upstream — it computed a protected name where a disposable one
+    // belongs — and hiding that would defer the bug to a worse moment. Not a
+    // panic, because purge runs in Drop and a panic during unwind aborts the
+    // whole test binary, taking every other test's cleanup with it.
+    if is_protected(name) {
+        eprintln!(
+            "[nemr:test] REFUSED to purge {name:?}: protected subject (F-123). \
+             The calling test has a bug — it passed a protected name to a teardown path."
+        );
+        return;
+    }
+
     // Run the containerd cleanup on a dedicated thread with its own runtime.
     // `purge` is called from inside `TestProject::create`, which is itself
     // driven by a runtime, and nesting `Runtime::new().block_on` inside a live

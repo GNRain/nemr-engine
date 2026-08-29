@@ -99,6 +99,28 @@ Code would not have been. **The rule exists for the case not yet hit** — the
 one where the uncommitted work is hours of implementation rather than minutes of
 prose.
 
+## Protected subjects are enforced by name, not by convention
+
+`htmltest` is irreplaceable, and "experiments use disposable subjects" was a
+convention — which failed (F-123): a teardown check counted the running
+project's link as a leak, and the cleanup that followed acted on a hardcoded
+echo printed directly beneath a task listing that said RUNNING. The
+contradicting evidence was on screen.
+
+Now structural, in both harnesses, with a drift test tying them together:
+
+- `NEMR_PROTECTED_SUBJECTS` in `scripts/lib/proc.sh` — every cleanup trap
+  deletes through `delete_disposable`, and flow steps that run `nemr delete`
+  visibly guard with `refuse_protected` first. The refusal happens BEFORE any
+  command runs and is loud, because a silent skip would hide the bug that
+  tried.
+- `PROTECTED_SUBJECTS` in `tests/common/mod.rs` — `purge` refuses first,
+  before acquiring any handle. Proven with a control: a disposable project
+  temporarily marked protected survives purge; the same purge with protection
+  lifted destroys it.
+
+A protected subject must not depend on every future check being correct.
+
 ## Three ways a control fails, and three different remedies
 
 They keep getting filed under one heading. They are not one problem, and the fix
