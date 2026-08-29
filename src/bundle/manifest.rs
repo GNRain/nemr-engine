@@ -84,6 +84,27 @@ pub struct BaseImageRef {
     /// substituting a different rootfs — a session restored onto the wrong base
     /// image is a silent-wrong-result defect.
     pub digest: String,
+    /// The rootfs CHAIN ID this project was actually built on (F-115).
+    ///
+    /// `reference` and `digest` above were, until this field existed, both taken
+    /// from the engine's `BASE_IMAGE` constant rather than from the container —
+    /// so they recorded what the exporting engine builds *today*, not what the
+    /// project runs on. Usually the same; silently wrong when they differ, which
+    /// is the one failure class this field exists to prevent.
+    ///
+    /// The chain id is the only identity that always survives. A reference can
+    /// be retagged (F-85 reused a tag on this project's own history), an image
+    /// can be removed, and a stale reference can name a squattable namespace
+    /// (F-25). The chain id is fixed when the snapshot is prepared at create
+    /// time and stays readable afterwards regardless.
+    ///
+    /// `#[serde(default)]` makes it v1-compatible in both directions, the same
+    /// way `agent` above is: an old reader ignores it, and this reader treats
+    /// its absence as "the bundle predates this field", falling back to the
+    /// digest check. **A v1 reader therefore gets the older, weaker guarantee —
+    /// that is a real limit, not a rounding error.**
+    #[serde(default)]
+    pub rootfs_chain_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -221,6 +242,68 @@ mod tests {
         assert_eq!(old.name, "new");
     }
 
+    /// The `rootfs_chain_id` field is v1-compatible in BOTH directions (F-115).
+    ///
+    /// Forward: a bundle written before the field existed reads back with an
+    /// EMPTY chain id, which import treats as "this bundle cannot tell me what
+    /// it ran on" and falls back to the digest check — the guarantee those
+    /// bundles were written under. Backward: a manifest carrying it round-trips,
+    /// and a reader that does not know the field ignores it.
+    ///
+    /// The limit, asserted rather than implied: an old reader silently gets the
+    /// WEAKER check. It cannot enforce a rootfs identity it cannot see.
+    #[test]
+    fn the_rootfs_chain_id_field_is_v1_compatible_both_ways() {
+        // Forward: a genuine pre-field base_image object.
+        let without = r#"{"reference":"ghcr.io/gnrain/nemr-base:0.2.0","digest":"sha256:aaa"}"#;
+        let old_ref: BaseImageRef =
+            serde_json::from_str(without).expect("a pre-field manifest must still parse");
+        assert_eq!(
+            old_ref.rootfs_chain_id, "",
+            "a bundle predating the field must read back with no chain id, so import falls \
+             back to the digest check rather than refusing"
+        );
+
+        // Backward: round-trips unchanged.
+        let with = BaseImageRef {
+            reference: "ghcr.io/gnrain/nemr-base:0.2.0".into(),
+            digest: "sha256:39c5ade9".into(),
+            rootfs_chain_id: "sha256:9326c0f8".into(),
+        };
+        let json = serde_json::to_string(&with).expect("serialize");
+        let back: BaseImageRef = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, with);
+
+        // An OLD reader ignores it rather than rejecting.
+        #[derive(serde::Deserialize)]
+        struct OldBaseImageRef {
+            reference: String,
+            digest: String,
+        }
+        let old: OldBaseImageRef =
+            serde_json::from_str(&json).expect("an old reader must accept the new field");
+        assert_eq!(old.digest, "sha256:39c5ade9");
+        assert_eq!(old.reference, "ghcr.io/gnrain/nemr-base:0.2.0");
+    }
+
+    /// An unidentifiable base image records NO digest rather than a plausible
+    /// one. Recording the engine's current constant as though it were the
+    /// project's identity is the defect F-115 fixes, and an empty digest is what
+    /// makes "I could not prove this" distinguishable from "I proved this".
+    #[test]
+    fn an_unproven_base_image_records_no_digest() {
+        let unproven = BaseImageRef {
+            reference: "ghcr.io/gnrain/nemr-base:0.2.0".into(),
+            digest: String::new(),
+            rootfs_chain_id: "sha256:66ba6d20".into(),
+        };
+        assert!(
+            unproven.digest.is_empty() && !unproven.rootfs_chain_id.is_empty(),
+            "the chain id is always knowable; the digest is only knowable when a local \
+             image builds that rootfs"
+        );
+    }
+
     fn manifest_with_version(schema_version: u32) -> Manifest {
         Manifest {
             schema_version,
@@ -235,6 +318,7 @@ mod tests {
             base_image: BaseImageRef {
                 reference: "ghcr.io/gnrain/nemr-base:0.2.0".into(),
                 digest: "sha256:abc".into(),
+                rootfs_chain_id: String::new(),
             },
             chunks: vec![],
             members: vec![],

@@ -50,6 +50,42 @@ control.** Before trusting a negative:
 Absence-because-correct and absence-because-you-looked-in-the-wrong-place are
 indistinguishable without the control. This recurs on every negative assertion.
 
+## Three ways a control fails, and three different remedies
+
+They keep getting filed under one heading. They are not one problem, and the fix
+for each is different.
+
+**1. The assertion is written wrong.** It reads a value the defect also produces,
+so it passes either way. *Remedy: fix the assertion.* Example: an "X is absent"
+check that searched the system containerd path, which is empty under rootless for
+an unrelated reason — the rule above.
+
+**2. The control MUTATES what it observes.** It establishes its precondition by
+calling something that repairs the state, so the code under test is handed an
+already-correct subject and the guard stays green with the guarded code deleted.
+*Remedy: make the control READ.* Example (F-112): an upgrade test established
+"this container has no network namespace" by calling
+`ensure_own_network_namespace`, which added one. `has_own_network_namespace`
+exists solely so the control reads instead of repairs.
+
+**3. The SUBJECT cannot exhibit the defect.** The assertion is right and the
+control is honest, but no available subject differs from the correct case, so the
+mutation passes and the test proves nothing. *Remedy: find or construct a subject
+that can fail — and if you cannot, say so in the ledger rather than shipping a
+guard that cannot bite.* Example (F-115/F-116): distinguishing "export reads the
+container" from "export reads the engine constant" needs a project whose rootfs
+differs from the constant, and every project the suite can create is built FROM
+the constant, byte for byte.
+
+**On #3, look harder before recording the gap.** F-116 was written as
+unfalsifiable and was wrong: the missing ingredient was an older published base
+image, kept permanently pullable by F-85 — a versioning discipline adopted for
+bundle recoverability, which turned out to supply the fixture for an unrelated
+test gap. The question to ask is not "can I construct this from what I am
+holding" but "does anything this project already guarantees give me a subject
+that differs". Recording an honest gap is a fine outcome; recording one that a
+different part of the system already solves is a miss.
+
 ## The guard-test rule (a green signal over the *wrong* thing)
 
 The negative-assertion rule is about a green signal over *nothing*. This one is

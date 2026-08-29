@@ -360,6 +360,29 @@ impl ContainerdClient {
     /// The engine builds its runtime spec from this rather than hardcoding the
     /// base image's values, so a change to `image/Dockerfile` does not silently
     /// desynchronise from the caller.
+    /// The local image whose rootfs chain id is `chain_id`, if any.
+    ///
+    /// Answers "which image is this container actually built from" from the one
+    /// fact that survives: the snapshot parent. Returns `None` when no local
+    /// image matches, which is a real and expected state — an image can be
+    /// removed or renamed long after the projects built from it were created,
+    /// and on this project's own history exactly that happened when the base
+    /// moved from Docker Hub to GHCR. `None` therefore means "cannot prove it",
+    /// never "wrong": the caller must not substitute a guess.
+    pub async fn image_with_chain_id(&self, chain_id: &str) -> Result<Option<ImageSummary>> {
+        for image in self.list_images().await? {
+            // An index, a partially-pulled image or anything else unreadable is
+            // skipped rather than fatal: one bad image in the store must not
+            // stop the others being searched.
+            if let Ok(candidate) = self.image_chain_id(&image.name).await {
+                if candidate == chain_id {
+                    return Ok(Some(image));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub async fn image_config(&self, name: &str) -> Result<ImageConfig> {
         let manifest_digest = self.image_target_digest(name).await?;
         let manifest: serde_json::Value =
