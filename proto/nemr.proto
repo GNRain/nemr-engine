@@ -23,6 +23,9 @@ service Nemr {
   rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
   rpc Import(ImportRequest) returns (ImportResponse);
   rpc Export(ExportRequest) returns (ExportResponse);
+  // Install a project's declared packages (F-118). Explicit only — never run
+  // by Start or Import, which sit inside tested no-network guarantees.
+  rpc Provision(ProvisionRequest) returns (ProvisionResponse);
 
   // Daemon->client audit event stream (E-09/NFR-04). A client opens this with
   // its own request id BEFORE running a command; the daemon streams the audit
@@ -75,6 +78,18 @@ message StopResponse {
   // "graceful" | "killed" | "no_task" | "wedged" (F-78: a task in
   // uninterruptible sleep that SIGKILL could not reap within the window).
   string outcome = 1;
+}
+
+message ProvisionRequest { string name = 1; }
+message ProvisionResponse {
+  // Verified present after the run (dpkg state, not apt's exit status; F-122).
+  repeated string installed = 1;
+  // Per-package failures, each with the reason in apt/dpkg's own words.
+  repeated ProvisionFailure failed = 2;
+}
+message ProvisionFailure {
+  string package = 1;
+  string reason = 2;
 }
 
 message DeleteRequest { string name = 1; }
@@ -168,6 +183,10 @@ message ImportResponse {
   string name = 1;
   uint64 members = 2;
   uint64 bytes = 3;
+  // Packages the bundle declares (F-118), so the CLI can suggest provisioning.
+  // Zero for bundles that predate the feature or projects that installed
+  // nothing — proto3 default, so old daemons need no change.
+  uint64 declared_packages = 4;
 }
 
 message ExportRequest {

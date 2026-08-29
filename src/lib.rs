@@ -15,7 +15,10 @@ pub mod proto {
     /// The wire protocol version. Bump on ANY incompatible change to the
     /// service. The daemon refuses a client whose version differs (the
     /// hash-gate lesson applied to the protocol).
-    pub const PROTOCOL_VERSION: u32 = 1;
+    // v2: adds Provision (F-118). Bumped so a new CLI against an old daemon —
+    // or the reverse — refuses with the reinstall advice instead of failing
+    // with an unimplemented-RPC error that names nothing.
+    pub const PROTOCOL_VERSION: u32 = 2;
 }
 
 pub mod auth;
