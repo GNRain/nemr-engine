@@ -196,7 +196,10 @@ mod tests {
     fn base_packages_are_never_declared() {
         let got = declared(&container_status(), &base_status(), EXTENDED_STATES);
         for p in ["ca-certificates", "git", "less", "libonig-base"] {
-            assert!(!got.contains(p), "{p} is in the base and must not be declared");
+            assert!(
+                !got.contains(p),
+                "{p} is in the base and must not be declared"
+            );
         }
     }
 
@@ -240,8 +243,18 @@ mod tests {
     /// at the source.
     #[test]
     fn serialisation_is_byte_stable_and_sorted() {
-        let a = DeclaredPackages::new(["zsh", "jq", "ripgrep"].iter().map(|s| s.to_string()).collect());
-        let b = DeclaredPackages::new(["ripgrep", "zsh", "jq"].iter().map(|s| s.to_string()).collect());
+        let a = DeclaredPackages::new(
+            ["zsh", "jq", "ripgrep"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let b = DeclaredPackages::new(
+            ["ripgrep", "zsh", "jq"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
         let ja = to_json(&a).unwrap();
         let jb = to_json(&b).unwrap();
         assert_eq!(ja, jb, "insertion order must not leak into the bytes");
@@ -264,5 +277,260 @@ mod tests {
         let list = DeclaredPackages::new(["jq"].iter().map(|s| s.to_string()).collect());
         let back = from_json(&to_json(&list).unwrap()).unwrap();
         assert_eq!(back, list);
+    }
+}
+
+// --- reading the snapshot from the host -------------------------------------
+
+/// The three files the detector needs, read from a STOPPED project's snapshot.
+///
+/// The overlay paths live in rootlesskit's mount namespace, so every read goes
+/// through `nsenter` into it — the same hop `netns.rs` makes for the network
+/// namespace, for the same reason: the daemon runs on the host and the state
+/// does not. Reading the paths directly from the host is the classic wrong-place
+/// negative (loop.md's first rule): "no such file" there means nothing.
+pub struct SnapshotPackageFiles {
+    pub container_status: String,
+    pub base_status: String,
+    pub container_extended_states: String,
+}
+
+/// Read one file out of rootlesskit's mount namespace. Ok(None) = genuinely
+/// absent THERE (checked, not assumed); Err = could not look.
+fn read_in_rootlesskit(pid: &str, path: &str) -> Result<Option<String>> {
+    let out = std::process::Command::new("nsenter")
+        .args(["-t", pid, "-U", "-m", "--preserve-credentials", "--"])
+        .args(["sh", "-c"])
+        .arg(format!(
+            "if [ -f '{path}' ]; then cat '{path}'; else echo NEMR_ABSENT >&2; exit 3; fi"
+        ))
+        .output()
+        .context("entering rootlesskit's mount namespace")?;
+    if out.status.code() == Some(3) && String::from_utf8_lossy(&out.stderr).contains("NEMR_ABSENT")
+    {
+        return Ok(None);
+    }
+    if !out.status.success() {
+        anyhow::bail!(
+            "reading {path} in rootlesskit's mount namespace failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+/// Locate and read the detector's inputs for a snapshot.
+///
+/// `lowers` must be in overlay order. The base status is the FIRST lowerdir
+/// that HAS the file — measured on this machine it sat three layers deep, and
+/// taking layer zero would report the entire base as user-installed. A missing
+/// base status in EVERY layer is an error, not an empty set: it means we are
+/// not looking at an image with dpkg at all, and diffing against nothing would
+/// declare the whole container.
+pub fn read_snapshot_package_files(
+    rootlesskit_pid: &str,
+    upper: &str,
+    lowers: &[String],
+) -> Result<SnapshotPackageFiles> {
+    const STATUS: &str = "var/lib/dpkg/status";
+    const EXTENDED: &str = "var/lib/apt/extended_states";
+
+    // The container's status: the upperdir copy when dpkg ran in the session
+    // (overlayfs copies-up on write), else the base's — an untouched container
+    // IS the base, and the diff is correctly empty.
+    let container_status = read_in_rootlesskit(rootlesskit_pid, &format!("{upper}/{STATUS}"))?;
+
+    let mut base_status = None;
+    for lower in lowers {
+        if let Some(found) = read_in_rootlesskit(rootlesskit_pid, &format!("{lower}/{STATUS}"))? {
+            base_status = Some(found);
+            break;
+        }
+    }
+    let base_status = base_status.with_context(|| {
+        format!(
+            "no dpkg status in any of the {} lower layers — this snapshot is not built on \\
+             an image that has dpkg, so a package diff would be meaningless",
+            lowers.len()
+        )
+    })?;
+
+    let container_status = match container_status {
+        Some(s) => s,
+        None => base_status.clone(),
+    };
+
+    let container_extended_states =
+        read_in_rootlesskit(rootlesskit_pid, &format!("{upper}/{EXTENDED}"))?.unwrap_or_default();
+
+    Ok(SnapshotPackageFiles {
+        container_status,
+        base_status,
+        container_extended_states,
+    })
+}
+
+// --- provisioning ------------------------------------------------------------
+
+/// The result of provisioning, verified by OUTCOME rather than exit status.
+#[derive(Debug)]
+pub struct ProvisionReport {
+    /// Packages that are now present (verified individually).
+    pub installed: Vec<String>,
+    /// Packages that could not be installed, with apt's own words.
+    pub failed: Vec<(String, String)>,
+}
+
+/// The declared list for a project, read from its volume. Ok(None) = no file,
+/// which is the common case and means "nothing to provision".
+pub fn read_declared(mount_point: &std::path::Path) -> Result<Option<DeclaredPackages>> {
+    let path = mount_point.join(DeclaredPackages::VOLUME_PATH);
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => Ok(Some(from_json(&raw)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// The shell script provision runs inside the session, for one package.
+///
+/// F-122: `apt-get update` exits 0 when EVERY repository is unreachable
+/// (measured; only `APT::Update::Error-Mode=any` changes that). So no exit
+/// status in this pipeline is trusted for the thing that matters. The script's
+/// last line is a VERDICT read from the system itself: dpkg-query for the
+/// installed state, which is the outcome, not the report of the tool that was
+/// supposed to produce it.
+///
+/// `dpkg --audit` afterwards is the half-install control: a package left `iU`
+/// is invisible now and misattributes the NEXT failure, so it is checked
+/// explicitly rather than inferred from apt's status.
+pub fn provision_script(package: &str) -> String {
+    format!(
+        r#"export DEBIAN_FRONTEND=noninteractive
+apt-get -o APT::Update::Error-Mode=any update >/tmp/nemr-apt.log 2>&1 \
+  || {{ echo "NEMR_VERDICT:UPDATE_FAILED"; tail -5 /tmp/nemr-apt.log; exit 0; }}
+apt-get install -y --no-install-recommends '{package}' >>/tmp/nemr-apt.log 2>&1
+# The verdict comes from dpkg, not from apt's exit status.
+if dpkg-query -W -f '${{Status}}' '{package}' 2>/dev/null | grep -q 'install ok installed'; then
+  if [ -n "$(dpkg --audit 2>/dev/null)" ]; then
+    echo "NEMR_VERDICT:AUDIT_DIRTY"; dpkg --audit 2>/dev/null | head -5
+  else
+    echo "NEMR_VERDICT:INSTALLED"
+  fi
+else
+  echo "NEMR_VERDICT:NOT_INSTALLED"; tail -5 /tmp/nemr-apt.log
+fi
+exit 0
+"#
+    )
+}
+
+/// Interpret one provision run's output. Pure, so the verdict logic is
+/// unit-tested against the exact strings the script emits.
+pub fn parse_verdict(output: &str) -> (bool, String) {
+    for line in output.lines() {
+        if let Some(v) = line.trim().strip_prefix("NEMR_VERDICT:") {
+            return match v {
+                "INSTALLED" => (true, String::new()),
+                "UPDATE_FAILED" => (
+                    false,
+                    format!(
+                        "the package index could not be refreshed — check this session's \
+                         network. Detail:\n{}",
+                        tail_after_verdict(output)
+                    ),
+                ),
+                "AUDIT_DIRTY" => (
+                    false,
+                    format!(
+                        "installed, but dpkg reports a package left half-configured — the \
+                         database must not be left inconsistent (it would misattribute the \
+                         next failure). Detail:\n{}",
+                        tail_after_verdict(output)
+                    ),
+                ),
+                _ => (
+                    false,
+                    format!(
+                        "apt could not install it. Detail:\n{}",
+                        tail_after_verdict(output)
+                    ),
+                ),
+            };
+        }
+    }
+    (
+        false,
+        "the provision script produced no verdict — the session may have died mid-install"
+            .to_string(),
+    )
+}
+
+fn tail_after_verdict(output: &str) -> String {
+    output
+        .lines()
+        .skip_while(|l| !l.trim().starts_with("NEMR_VERDICT:"))
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod provision_tests {
+    use super::*;
+
+    #[test]
+    fn an_installed_verdict_is_success() {
+        let (ok, _) = parse_verdict("NEMR_VERDICT:INSTALLED\n");
+        assert!(ok);
+    }
+
+    /// F-122's core: apt-get update exiting 0 with every repository down must
+    /// not read as success. The script forces Error-Mode=any and the verdict
+    /// names the failure class.
+    #[test]
+    fn an_unreachable_index_is_failure_with_the_reason() {
+        let (ok, why) = parse_verdict("NEMR_VERDICT:UPDATE_FAILED\nW: Failed to fetch http://x\n");
+        assert!(!ok);
+        assert!(why.contains("index could not be refreshed"), "{why}");
+        assert!(why.contains("Failed to fetch"), "the detail travels: {why}");
+    }
+
+    /// A half-configured database is a failure even when the target package
+    /// installed — the iU entry would misattribute the next failure.
+    #[test]
+    fn a_dirty_dpkg_audit_is_failure() {
+        let (ok, why) = parse_verdict("NEMR_VERDICT:AUDIT_DIRTY\nThe following packages...\n");
+        assert!(!ok);
+        assert!(why.contains("half-configured"), "{why}");
+    }
+
+    /// No verdict at all is a failure with its own explanation, never a silent
+    /// success — a session dying mid-install must not read as installed.
+    #[test]
+    fn a_missing_verdict_is_failure_not_silence() {
+        let (ok, why) = parse_verdict("some unrelated output\n");
+        assert!(!ok);
+        assert!(why.contains("no verdict"), "{why}");
+    }
+
+    /// The script asks apt for the update to FAIL loudly (Error-Mode=any) and
+    /// derives the final verdict from dpkg-query, not from apt's exit status.
+    #[test]
+    fn the_script_verifies_outcome_not_status() {
+        let s = provision_script("jq");
+        assert!(
+            s.contains("APT::Update::Error-Mode=any"),
+            "F-122: the exit-0 default is overridden"
+        );
+        assert!(
+            s.contains("dpkg-query"),
+            "the verdict is the system's state, not apt's report"
+        );
+        assert!(
+            s.contains("dpkg --audit"),
+            "the half-install control is present"
+        );
     }
 }

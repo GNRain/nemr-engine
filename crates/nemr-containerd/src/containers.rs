@@ -873,6 +873,40 @@ impl ContainerdClient {
     ///
     /// Task creation needs these: containerd does not infer them from the
     /// container's snapshot key, the client supplies them.
+    /// The overlay directories of a snapshot: (upperdir, lowerdirs in overlay
+    /// order).
+    ///
+    /// Derived from the same Snapshots.Mounts call `start_task` uses, so it
+    /// describes exactly the filesystem a task of this container would see.
+    /// The paths are relative to the MOUNT NAMESPACE containerd runs in — under
+    /// rootless containerd that is rootlesskit's, not the host's — so a caller
+    /// on the host must read them through `nsenter`, never directly. `nemrd`
+    /// runs in the host mount namespace; forgetting the hop yields "permission
+    /// denied" or, worse, an EMPTY directory that reads as a clean negative.
+    pub async fn snapshot_overlay_dirs(&self, key: &str) -> Result<(String, Vec<String>)> {
+        let mounts = self.snapshot_mounts(key).await?;
+        let mount = mounts
+            .first()
+            .with_context(|| format!("snapshot {key:?} has no mounts"))?;
+        let mut upper = None;
+        let mut lowers = Vec::new();
+        for option in &mount.options {
+            if let Some(dir) = option.strip_prefix("upperdir=") {
+                upper = Some(dir.to_string());
+            } else if let Some(dirs) = option.strip_prefix("lowerdir=") {
+                lowers = dirs.split(':').map(str::to_string).collect();
+            }
+        }
+        let upper = upper.with_context(|| {
+            format!(
+                "snapshot {key:?} has no upperdir — its mount type is {:?}, not overlay. \
+                 The overlayfs snapshotter is the only one this engine configures.",
+                mount.r#type
+            )
+        })?;
+        Ok((upper, lowers))
+    }
+
     async fn snapshot_mounts(&self, key: &str) -> Result<Vec<containerd_client::types::Mount>> {
         let request = MountsRequest {
             snapshotter: self.snapshotter().to_string(),

@@ -486,6 +486,30 @@ pub async fn start(client: &ContainerdClient, name: &str) -> Result<u32> {
         )));
     }
 
+    // Declared packages the session does not have (F-118): a rare signal now
+    // that packages survive stop/start, so it carries information when it
+    // fires — after an import, or after a failed provision. One line, tagged
+    // to reach the user (F-98); the names live behind provision itself. Never
+    // fails the start, and "could not tell" is reported as itself rather than
+    // read as "none missing".
+    match missing_declared_packages(client, name).await {
+        Ok(missing) if !missing.is_empty() => {
+            tracing::warn!(
+                nemr_audit = "warning",
+                "[nemr] {name}: {} declared package(s) not installed in this session — run: \
+                 nemr provision {name}",
+                missing.len()
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                nemr_audit = "warning",
+                "[nemr] {name}: could not check declared packages ({error:#})"
+            );
+        }
+    }
+
     // Re-apply declared forwards (WP-M). They are derived state: torn down on
     // stop, and gone entirely after a rootlesskit restart, so the declaration
     // is applied rather than assumed live. A port that cannot be bound is
@@ -1943,6 +1967,29 @@ pub async fn export(
         .await
         .map_err(Error::Internal)?;
 
+    // Declared packages (F-118): detect what the owner installed and write the
+    // list onto the volume BEFORE the walk, so it travels like any other
+    // session state. Detection reads the stopped container's snapshot — the
+    // project is stopped (checked above) and the read is 0.01–0.04s.
+    //
+    // Failure here is a WARNING, not a refusal: the export's job is carrying
+    // the session, and a session without its package list is degraded, while a
+    // session that cannot leave the machine is lost. The warning is tagged so
+    // it reaches the user (F-98), and the acceptance covers the happy path.
+    match refresh_declared_packages(client, &container_id, &mount_point).await {
+        Ok(Some(count)) => {
+            tracing::info!("[nemr] {name}: {count} declared package(s) recorded in the bundle");
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                nemr_audit = "warning",
+                "[nemr] {name}: could not record declared packages; the bundle will carry \
+                 the previous list if one exists ({error:#})"
+            );
+        }
+    }
+
     let request = ExportRequest {
         project: name,
         agent: agent.id(),
@@ -2449,6 +2496,151 @@ async fn find_container(
         .ok_or_else(|| crate::error::Error::NoSuchProject {
             name: name.to_string(),
         })
+}
+
+/// Install a project's declared packages (F-118), verifying outcomes.
+///
+/// Explicit and on demand — never run by `start` or `import` (Product Owner
+/// ruling: nothing in this CLI does work you did not ask for, and both those
+/// paths sit inside tested no-network guarantees this must not spend). The
+/// project must be RUNNING: installation happens inside the session, where the
+/// network and the dpkg database are the session's own.
+///
+/// Per package, not one apt invocation: a batch install fails as a unit, and
+/// "7 of 8 installed, xsv is gone from the archive" is a report the owner can
+/// act on, while "the batch failed" is not. Each verdict is read from dpkg's
+/// state, never from apt's exit status (F-122).
+pub async fn provision(
+    client: &ContainerdClient,
+    name: &str,
+) -> Result<crate::engine::packages::ProvisionReport> {
+    use crate::engine::packages;
+
+    let paths = VolumePaths::from_env()?;
+    ensure_volume_mounted(name)?;
+    let mount_point = paths.mount_point(name);
+
+    let declared = packages::read_declared(&mount_point)?
+        .map(|list| list.packages)
+        .unwrap_or_default();
+    if declared.is_empty() {
+        return Ok(packages::ProvisionReport {
+            installed: Vec::new(),
+            failed: Vec::new(),
+        });
+    }
+
+    let mut report = packages::ProvisionReport {
+        installed: Vec::new(),
+        failed: Vec::new(),
+    };
+    for package in &declared {
+        let script = packages::provision_script(package);
+        let (_, output) = exec_capture(client, name, &["/bin/sh", "-c", &script]).await?;
+        let (ok, why) = packages::parse_verdict(&output);
+        if ok {
+            report.installed.push(package.clone());
+        } else {
+            report.failed.push((package.clone(), why));
+        }
+    }
+    Ok(report)
+}
+
+/// The declared packages a running project is missing, for `start`'s warning.
+///
+/// Read from inside the session (dpkg-query), because the question is what the
+/// SESSION has, and it must never fail the start: any error reads as "cannot
+/// tell", reported as such by the caller rather than swallowed into "none
+/// missing" — a broken check must not look like a healthy session (F-109).
+pub async fn missing_declared_packages(
+    client: &ContainerdClient,
+    name: &str,
+) -> Result<Vec<String>> {
+    use crate::engine::packages;
+
+    let paths = VolumePaths::from_env()?;
+    let mount_point = paths.mount_point(name);
+    let declared = match packages::read_declared(&mount_point)? {
+        Some(list) if !list.packages.is_empty() => list.packages,
+        _ => return Ok(Vec::new()),
+    };
+
+    let names: Vec<&str> = declared.iter().map(String::as_str).collect();
+    let mut argv = vec!["dpkg-query", "-W", "-f", "${Package} ${Status}\n"];
+    argv.extend(names.iter());
+    // dpkg-query exits non-zero when ANY name is unknown, which for a fresh
+    // import is all of them — so the exit status is expected noise and the
+    // OUTPUT is the evidence.
+    let (_, output) = exec_capture(client, name, &argv).await?;
+
+    let present: std::collections::BTreeSet<&str> = output
+        .lines()
+        .filter(|l| l.ends_with("install ok installed"))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    Ok(declared
+        .iter()
+        .filter(|p| !present.contains(p.as_str()))
+        .cloned()
+        .collect())
+}
+
+/// Detect the owner's installed packages and write `.nemr-state/packages.json`.
+///
+/// Returns Ok(Some(n)) with the count when the list was (re)written, Ok(None)
+/// when there is nothing to declare AND no stale file to correct. The file is
+/// byte-stable for identical content (see `packages::to_json`), so re-running
+/// export on an unchanged project rewrites identical bytes and bundle
+/// determinism holds.
+async fn refresh_declared_packages(
+    client: &ContainerdClient,
+    container_id: &str,
+    mount_point: &std::path::Path,
+) -> Result<Option<usize>> {
+    use crate::engine::packages;
+
+    let (upper, lowers) = client.snapshot_overlay_dirs(container_id).await?;
+    let pid = netns_rootlesskit_pid()?;
+    let files = tokio::task::spawn_blocking(move || {
+        packages::read_snapshot_package_files(&pid, &upper, &lowers)
+    })
+    .await
+    .context("the snapshot read could not be scheduled")??;
+
+    let declared = packages::declared(
+        &files.container_status,
+        &files.base_status,
+        &files.container_extended_states,
+    );
+
+    let target = mount_point.join(packages::DeclaredPackages::VOLUME_PATH);
+    if declared.is_empty() {
+        // No declaration — but a STALE file from before packages were removed
+        // must not travel and resurrect them on the destination. Remove rather
+        // than leave, and absence-with-no-file is the common case: no write.
+        if target.exists() {
+            std::fs::remove_file(&target)
+                .with_context(|| format!("removing the stale {}", target.display()))?;
+            return Ok(Some(0));
+        }
+        return Ok(None);
+    }
+
+    let count = declared.len();
+    let json = packages::to_json(&packages::DeclaredPackages::new(declared))?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(&target, json).with_context(|| format!("writing {}", target.display()))?;
+    Ok(Some(count))
+}
+
+/// rootlesskit's child pid, for entering its mount namespace. Re-exported from
+/// the netns module's locator so there is exactly one way to find it.
+fn netns_rootlesskit_pid() -> Result<String> {
+    crate::engine::netns::rootlesskit_child_pid_for_reads()
 }
 
 /// The container record for a project by its container id.
