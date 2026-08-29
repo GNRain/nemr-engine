@@ -30,6 +30,19 @@ FROM node:22-slim@${NODE_DIGEST}
 #                     Installing the distro build and pointing Claude Code at
 #                     it avoids depending on the vendored copy.
 #   less            — pager used for long output.
+#   curl            — a session must be able to diagnose its own network from
+#                     inside. Costs ZERO new source packages: libcurl is already
+#                     here via git, so this adds only the CLI to a source set the
+#                     image already carries.
+#   iproute2        — `ip addr` / `ip route`, so "what address am I on" is
+#                     answerable in the container whose networking is the newest
+#                     and least-exercised part of the system (NET-02..06). NOT
+#                     free, and said plainly: it brings iptables, libbpf,
+#                     elfutils, libbsd, libtirpc, libmnl and libcap2, widening
+#                     this layer's source-package surface by ~42% and therefore
+#                     the apt drift recorded below. Judged worth it; if
+#                     reproducibility proves fragile because of it, that is a
+#                     measurement and it justifies a reversal.
 # --no-install-recommends keeps the layer minimal; the apt lists are removed
 # in the same layer so they do not persist in the image.
 #
@@ -42,7 +55,9 @@ FROM node:22-slim@${NODE_DIGEST}
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         git \
+        iproute2 \
         ripgrep \
         less \
     && rm -rf /var/lib/apt/lists/* \

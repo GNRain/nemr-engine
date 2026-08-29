@@ -47,7 +47,7 @@ build_to() {
         --local dockerfile=image \
         --no-cache \
         --opt "build-arg:SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" \
-        --output "type=oci,dest=$1,name=ghcr.io/gnrain/nemr-base:0.2.0,rewrite-timestamp=true"
+        --output "type=oci,dest=$1,name=ghcr.io/gnrain/nemr-base:0.3.0,rewrite-timestamp=true"
 }
 
 echo "==> Build 1 of 2 (cold)"

@@ -23,7 +23,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-IMAGE="${NEMR_BASE_IMAGE:-ghcr.io/gnrain/nemr-base:0.2.0}"
+IMAGE="${NEMR_BASE_IMAGE:-ghcr.io/gnrain/nemr-base:0.3.0}"
 # F-85: digests are recorded per version, one file each, never a single
 # shared value.
 VERSION="${IMAGE##*:}"

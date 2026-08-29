@@ -84,7 +84,7 @@ async fn main() {
             own_network_namespace: true,
             id: id.clone(),
             image: std::env::var("NEMR_F78_IMAGE")
-                .unwrap_or_else(|_| "ghcr.io/gnrain/nemr-base:0.2.0".to_string()),
+                .unwrap_or_else(|_| "ghcr.io/gnrain/nemr-base:0.3.0".to_string()),
             mounts: vec![],
             working_dir: None,
             extra_env: vec![],
