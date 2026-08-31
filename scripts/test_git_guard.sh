@@ -36,6 +36,8 @@ mkrepo "$T/collide"; ( cd "$T/collide" && git branch foo && echo foo-file > foo 
 mkdir -p "$T/M/a"; mkrepo "$T/M/a/b"; echo change >> "$T/M/a/b/f.txt"
 # worktree with a dirty side worktree removable by basename (finding 21)
 mkrepo "$T/wt-main"; ( cd "$T/wt-main" && git worktree add -q ../wt-side >/dev/null 2>&1 && echo change >> ../wt-side/f.txt )
+# a tracked, dirty file literally named "2" (round-3: fd-digit vs argument)
+mkrepo "$T/digitfile"; ( cd "$T/digitfile" && echo x > 2 && git add 2 && git commit -qm two && echo y >> 2 )
 
 payload() { python3 -c "import json,sys; print(json.dumps({'tool_name':'Bash','tool_input':{'command':sys.argv[1]},'cwd':sys.argv[2]}))" "$1" "$2"; }
 
@@ -117,6 +119,20 @@ run 2 "git stash -q drop (flag before action)"           "git stash -q drop"
 run 2 "subshell (cd dirty && reset)"                     "(cd $T/dirty && git reset --hard)" "$T/clean"
 run 2 "subshell pop then reset in dirty cwd"             "(cd $T/clean); git reset --hard"
 
+# --- round three: data-vs-operator, reserved words, stuck values ---------
+run 2 "quoted angle brackets are data, not redirection"  "echo \"<html>\"; git reset --hard"
+run 2 "printf >>> then stash drop (always-set holds)"    "$(printf 'printf ">>>abc\n"; git stash drop')"
+run 2 "herestring as final token still flushes"          "git reset --hard <<< foo"
+run 2 "if git reset --hard; then ... (idiom)"            "if git reset --hard; then echo done; fi"
+run 2 "brace group { git reset --hard; ... }"            "{ git reset --hard; git status; }"
+run 2 "for x in 1; do git reset --hard; done"            "for x in 1; do git reset --hard; done"
+run 2 "function def + call (refused at definition)"      "f() { git reset --hard; }; f"
+run 2 "if true; then git checkout -- f.txt; fi"          "if true; then git checkout -- f.txt; fi"
+run 2 "checkout of tracked file named 2 (spaced redir)"  "git checkout 2 > /dev/null" "$T/digitfile"
+run 2 "checkout --pathspec-from-file"                    "git checkout --pathspec-from-file=paths.txt"
+run 2 "restore -sSTABLE (stuck --source value, not -S)"  "git restore -sSTABLE f.txt"
+run 2 "env -S 'git reset --hard' (split-string form)"    "env -S 'git reset --hard'"
+
 # --- stash drop/clear: always refused (they destroy the remedy's product) -
 run 2 "git stash drop (clean tree)"                      "git stash drop" "$T/clean"
 run 2 "git stash clear (clean tree)"                     "git stash clear" "$T/clean"
@@ -134,6 +150,10 @@ run 0 "git add -A && git commit"                         "git add -A && git comm
 run 0 "git status / log / diff"                          "git status; git log --oneline; git diff"
 run 0 "git checkout -b branch"                           "git checkout -b wp-x"
 run 0 "git checkout -bfix (stuck value, not -f)"         "git checkout -bfix"
+run 0 "git switch -cfix (stuck value, not -f)"           "git switch -cfix"
+run 0 "git switch -cfeature main"                        "git switch -cfeature main"
+run 0 "checkout 2 where no file 2 exists"                "git checkout 2 > /dev/null"
+run 0 "angle-bracket data with only reads"               "git status; echo \"<html>\""
 run 0 "git checkout nonexistent-branch"                  "git checkout nonexistent-branch"
 run 0 "checkout of branch colliding with a file"         "git checkout foo" "$T/collide"
 run 0 "git restore --staged f.txt"                       "git restore --staged f.txt"

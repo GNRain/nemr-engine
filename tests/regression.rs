@@ -4013,6 +4013,12 @@ fn f125_git_guard_refuses_destructive_git_on_a_dirty_tree_and_nothing_stricter()
         "cd /nonexistent-dir-xyz; git reset --hard".to_string(), // failed cd, `;` chain
         "git switch -fq b2".to_string(),              // combined shorts
         "git reset --har".to_string(),                // git's option abbreviation
+        // round-three review shapes:
+        "echo \"<html>\"; git reset --hard".to_string(), // quoted <> is data
+        "if git reset --hard; then echo done; fi".to_string(), // reserved word
+        "git restore -sSTABLE f.txt".to_string(),        // stuck --source value
+        "env -S 'git reset --hard'".to_string(),         // split-string wrapper
+        "git checkout --pathspec-from-file=paths.txt".to_string(),
     ];
     for cmd in &refused {
         let (code, err) = f125_run_guard(&guard, cmd, &fx.dir, None);
@@ -4039,6 +4045,7 @@ fn f125_git_guard_refuses_destructive_git_on_a_dirty_tree_and_nothing_stricter()
         "git checkout -bfix",              // stuck -b value, not -f
         "git reset --help",                // an abbreviation of nothing destructive
         "git reset -- --hard",             // a FILE named --hard
+        "git switch -cfix",                // stuck -c value, not -f
     ];
     for cmd in &allowed {
         let (code, err) = f125_run_guard(&guard, cmd, &fx.dir, None);

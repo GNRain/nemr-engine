@@ -129,6 +129,16 @@ def sanitize(src):
             while i < n and src[i] != "\n":
                 i += 1
             continue
+        if c.isdigit() and at_word_start:
+            # a bash fd number is a digit IMMEDIATELY before <,> (2>/dev/null);
+            # with a space it is a real argument. shlex loses adjacency, so
+            # the distinction must be made here, where it still exists.
+            j = i
+            while j < n and src[j].isdigit():
+                j += 1
+            if j < n and src[j] in "<>":
+                i = j  # drop the fd number; the operator is handled next
+                continue
         if src.startswith("<<", i) and not src.startswith("<<<", i):
             j = i + 2
             if j < n and src[j] == "-":
@@ -196,7 +206,11 @@ def is_sep(t):
 
 
 def is_redir(t):
-    return any(c in "<>" for c in t)
+    # A real redirection token from shlex is a pure punctuation run; a
+    # DEQUOTED data token like "<html>" contains word characters and must
+    # stay an ordinary word (round three: any() here swallowed the following
+    # separator and hid the next command).
+    return bool(t) and all(c in ";&|()<>" for c in t) and any(c in "<>" for c in t)
 
 
 def resolve(base, p):
@@ -269,7 +283,7 @@ def flush_and_parens(sep_chars):
             cur = parens.pop() if parens else cur
 
 
-for t in tokens + [";"]:
+for t in tokens:
     if skip_next:
         skip_next = False
         continue
@@ -283,20 +297,27 @@ for t in tokens + [";"]:
             # must not be swallowed as a redirection filename.
             flush_and_parens(t)
             continue
-        # plain redirection: drop a preceding bare fd digit (2>/dev/null)
-        # and the following filename.
-        if acc and acc[-1].isdigit():
-            acc.pop()
+        # plain redirection: skip the filename that follows (fd numbers were
+        # already stripped by sanitize, where adjacency still existed).
         skip_next = True
         continue
     acc.append(t)
+flush_and_parens(";")  # unconditional: a trailing redirection must not eat the flush
 
 ASSIGN_OK = "NEMR_GIT_DESTRUCTIVE_OK=1"
 WRAPPERS = {"command", "exec", "env", "nohup", "sudo", "time", "nice",
             "stdbuf", "ionice", "timeout"}
+# Shell reserved words at command position hide the command they prefix
+# ("if git reset --hard; then" — branching on a command's exit is idiomatic).
+# Stripped like wrappers. Consequence, accepted and documented: a function
+# DEFINITION whose body opens with destructive git refuses too — the call
+# site ("f") is invisible to any static guard, so the definition is the only
+# enforceable point; the override covers a deliberate one.
+RESERVED = {"if", "then", "elif", "else", "fi", "while", "until", "do",
+            "done", "for", "case", "esac", "{", "}", "!", "[[", "]]"}
 VALUE_FLAGS = {
     "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U"},
-    "env": {"-u", "-C", "-S"},
+    "env": {"-u", "-C"},
     "timeout": {"-k", "--kill-after", "-s", "--signal"},
     "nice": {"-n"},
     "ionice": {"-c", "-n", "-p"},
@@ -338,6 +359,9 @@ for toks, base in simples:
                 override = True
             i += 1
             continue
+        if t in RESERVED:
+            i += 1
+            continue
         if t in WRAPPERS:
             saw_wrapper = True
             w = t
@@ -345,6 +369,16 @@ for toks, base in simples:
             while i < len(toks) and toks[i].startswith("-"):
                 flag = toks[i]
                 i += 1
+                if w == "env" and flag == "-S" and i < len(toks):
+                    # env -S SPLITS its value and runs it as the command:
+                    # re-lex the string in place so its git is a git.
+                    try:
+                        toks[i:i] = shlex.split(toks.pop(i))
+                    except ValueError:
+                        if "git" in toks[i]:
+                            targets.append((None, "env -S with an unparseable command string"))
+                        i += 1
+                    continue
                 if flag in VALUE_FLAGS.get(w, set()) and i < len(toks):
                     i += 1
             if w == "timeout" and i < len(toks):
@@ -450,8 +484,12 @@ for toks, base in simples:
     if sub == "reset" and has_long("--hard", "--merge"):
         why = "git reset --hard/--merge"
     elif sub == "checkout":
-        if ddash or has_long("--force") or flags("f", exclude=("-b", "-B")):
-            why = "git checkout with -- / --force"
+        if (
+            ddash
+            or has_long("--force", "--pathspec-from-file")
+            or flags("f", exclude=("-b", "-B"))
+        ):
+            why = "git checkout with -- / --force / --pathspec-from-file"
         else:
             for a in positional(skip_value_of=("-b", "-B", "--orphan")):
                 if tgt is None:
@@ -462,10 +500,12 @@ for toks, base in simples:
                 if git_ok(tgt, "ls-files", "--error-unmatch", "--", a):
                     why = "git checkout <tracked path> (overwrites the worktree copy)"
                     break
-    elif sub == "switch" and (has_long("--force", "--discard-changes") or flags("f")):
+    elif sub == "switch" and (
+        has_long("--force", "--discard-changes") or flags("f", exclude=("-c", "-C"))
+    ):
         why = "git switch --force/--discard-changes"
     elif sub == "restore":
-        staged = has_long("--staged") or flags("S")
+        staged = has_long("--staged") or flags("S", exclude=("-s",))
         worktree = has_long("--worktree") or flags("W")
         if worktree or not staged:
             why = "git restore reaching the worktree"
