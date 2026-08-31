@@ -4004,6 +4004,15 @@ fn f125_git_guard_refuses_destructive_git_on_a_dirty_tree_and_nothing_stricter()
         "git \\\nreset --hard".to_string(),         // line continuation
         // an override mentioned INSIDE a string vouches for nothing:
         "git commit -m 'NEMR_GIT_DESTRUCTIVE_OK=1 noted' && git reset --hard".to_string(),
+        // round-two review shapes:
+        "git status  # check first\ngit reset --hard".to_string(), // comment keeps the newline
+        "env -i git reset --hard".to_string(),                     // wrapper flags
+        "time git reset --hard".to_string(),
+        "git --work-tree . reset --hard".to_string(), // space-separated form
+        "echo `git reset --hard`".to_string(),        // backtick substitution
+        "cd /nonexistent-dir-xyz; git reset --hard".to_string(), // failed cd, `;` chain
+        "git switch -fq b2".to_string(),              // combined shorts
+        "git reset --har".to_string(),                // git's option abbreviation
     ];
     for cmd in &refused {
         let (code, err) = f125_run_guard(&guard, cmd, &fx.dir, None);
@@ -4026,6 +4035,10 @@ fn f125_git_guard_refuses_destructive_git_on_a_dirty_tree_and_nothing_stricter()
         "git clean -n",                    // dry run
         "cargo test --lib",                // not git at all
         "NEMR_GIT_DESTRUCTIVE_OK=1 git checkout -- f.txt", // declared destruction
+        "git status  # check first",       // a comment is not a refusal
+        "git checkout -bfix",              // stuck -b value, not -f
+        "git reset --help",                // an abbreviation of nothing destructive
+        "git reset -- --hard",             // a FILE named --hard
     ];
     for cmd in &allowed {
         let (code, err) = f125_run_guard(&guard, cmd, &fx.dir, None);
@@ -4233,5 +4246,26 @@ fn f125_git_guard_goes_red_when_disabled_and_the_wiring_cannot_drift() {
     assert!(
         real.starts_with("#!/usr/bin/env bash"),
         "the guard script lost its shebang — the hook would error instead of guarding"
+    );
+}
+
+/// F-125: the full acceptance suite — every reproducing input from BOTH
+/// adversarial review rounds (19 confirmed breaks against the regex draft,
+/// 23 against the first parser), the wrong-refusals those rounds confirmed,
+/// and the suite's own two controls (neutered guard, F-109 branch on a clean
+/// tree). A vector that stops passing changed the guard's contract.
+#[test]
+fn f125_git_guard_acceptance_suite_passes() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = std::process::Command::new("bash")
+        .arg(root.join("scripts/test_git_guard.sh"))
+        .output()
+        .expect("run the guard acceptance suite");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("0 red") && stdout.ends_with("PASS\n"),
+        "the guard acceptance suite failed:\n{}\n{}",
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
     );
 }
