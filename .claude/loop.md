@@ -135,6 +135,18 @@ Code would not have been. **The rule exists for the case not yet hit** — the
 one where the uncommitted work is hours of implementation rather than minutes of
 prose.
 
+Since F-125 this rule is enforced mechanically: a PreToolUse hook
+(`scripts/hooks/git_destructive_guard.sh`, armed by `.claude/settings.json`)
+parses each command and refuses destructive git whose target tree has
+uncommitted work (`git stash drop|clear` refuses always — a stash holds
+exactly the work this rule protects) — because the written rule was ignored a
+second time (slip seven), inside the mutation proof of a different rule. When
+destroying uncommitted state IS the intent (restoring a deliberate mutation,
+say), declare it on that one invocation:
+`NEMR_GIT_DESTRUCTIVE_OK=1 <command>`. The override is the record of the
+decision; a guard that over-claims would teach reaching for it reflexively,
+which is why `git restore --staged` (unstages, destroys nothing) passes.
+
 ## Protected subjects are enforced by name, not by convention
 
 `htmltest` is irreplaceable, and "experiments use disposable subjects" was a
