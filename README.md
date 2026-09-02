@@ -334,6 +334,11 @@ cargo test --test regression -- --test-threads=1    # full suite (needs a set-up
 
 The base image is pushed to `ghcr.io/gnrain/nemr-base:0.2.0`. It builds
 reproducibly — the same source produces the same image, byte for byte, given the
-same package snapshots. It is **not yet anonymously pullable** (the GHCR package
+same package snapshots — and that condition is load-bearing: the apt layer is
+deliberately not snapshotted, so a rebuild after the Debian archive moves yields
+a different digest by design (measured across two kernels on the same day:
+identical digests, both differing from the recorded one — F-127). The published
+digest, not a local rebuild, is the authoritative artifact; provisioning pulls
+it and builds only as a fallback (F-126). It is **not yet anonymously pullable** (the GHCR package
 is private pending a one-time visibility change); `scripts/check_base_image_published.sh`
 checks and explains.
