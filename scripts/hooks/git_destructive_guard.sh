@@ -7,8 +7,8 @@
 # whether or not the session remembers the rule — the refuse_protected
 # property, applied to git.
 #
-# DESIGN, earned the hard way across two adversarial review rounds (19 and 23
-# confirmed breaks, every one a plainly-typed command):
+# DESIGN, earned the hard way across four adversarial review rounds (19, 23,
+# 7 and 5 confirmed breaks, every one a plainly-typed command):
 #   - the command is PARSED, never regex-matched: a quote-aware pre-scan
 #     strips bash comments and heredoc BODIES (data, not code), then POSIX
 #     shlex tokenizes with newline/backtick as command separators and bash's
@@ -284,19 +284,20 @@ def flush_and_parens(sep_chars):
 
 
 for t in tokens:
+    if is_sep(t) or (is_redir(t) and ("(" in t or ")" in t)):
+        # A separator, or a process substitution <(...) / >(...): its content
+        # is a real command bash runs — a command boundary, and its first word
+        # must not be swallowed as a redirection filename. Checked BEFORE the
+        # skip_next consumption: in the idiomatic space-separated spellings
+        # ("> >(cmd)", "done < <(cmd)") the substitution token arrives as the
+        # 'filename' of a plain redirection (review round four fail-open).
+        skip_next = False
+        flush_and_parens(t)
+        continue
     if skip_next:
         skip_next = False
         continue
-    if is_sep(t):
-        flush_and_parens(t)
-        continue
     if is_redir(t):
-        if "(" in t or ")" in t:
-            # process substitution <(...) / >(...): its content is a real
-            # command bash runs — a command boundary, and its first word
-            # must not be swallowed as a redirection filename.
-            flush_and_parens(t)
-            continue
         # plain redirection: skip the filename that follows (fd numbers were
         # already stripped by sanitize, where adjacency still existed).
         skip_next = True
@@ -362,6 +363,25 @@ for toks, base in simples:
         if t in RESERVED:
             i += 1
             continue
+        if t == "function" and i + 1 < len(toks):
+            # 'function NAME { body }': the NAME is data, the body's commands
+            # follow (the '{' is RESERVED and strips next). Round four: only
+            # the 'f()' spelling refused, and only incidentally — '()' lexes
+            # as a separator putting '{' at command position.
+            i += 2
+            continue
+        if t == "coproc":
+            # 'coproc cmd' runs cmd as a coprocess; 'coproc NAME { ... }'
+            # names it only when a compound command follows the name.
+            if (
+                i + 2 < len(toks)
+                and toks[i + 1] not in RESERVED
+                and toks[i + 2] == "{"
+            ):
+                i += 2
+            else:
+                i += 1
+            continue
         if t in WRAPPERS:
             saw_wrapper = True
             w = t
@@ -369,16 +389,34 @@ for toks, base in simples:
             while i < len(toks) and toks[i].startswith("-"):
                 flag = toks[i]
                 i += 1
-                if w == "env" and flag == "-S" and i < len(toks):
+                if w == "env":
                     # env -S SPLITS its value and runs it as the command:
-                    # re-lex the string in place so its git is a git.
-                    try:
-                        toks[i:i] = shlex.split(toks.pop(i))
-                    except ValueError:
-                        if "git" in toks[i]:
-                            targets.append((None, "env -S with an unparseable command string"))
-                        i += 1
-                    continue
+                    # re-lex the string in place so its git is a git. All
+                    # four GNU spellings carry the same value (round four —
+                    # only the detached short form was recognized): -S VAL,
+                    # -SVAL (the shebang spelling, also combined as -vSVAL),
+                    # --split-string=VAL, --split-string VAL (getopt_long
+                    # also accepts unambiguous abbreviations: --split-str).
+                    val = None
+                    stem = flag.split("=", 1)[0]
+                    if flag == "-S" and i < len(toks):
+                        val = toks.pop(i)
+                    elif not flag.startswith("--") and "S" in flag[1:]:
+                        k = flag.index("S", 1)
+                        if all(c in "i0v" for c in flag[1:k]) and k + 1 < len(flag):
+                            val = flag[k + 1:]
+                    elif len(stem) > 2 and "--split-string".startswith(stem):
+                        if "=" in flag:
+                            val = flag.split("=", 1)[1]
+                        elif i < len(toks):
+                            val = toks.pop(i)
+                    if val is not None:
+                        try:
+                            toks[i:i] = shlex.split(val)
+                        except ValueError:
+                            if "git" in val:
+                                targets.append((None, "env -S with an unparseable command string"))
+                        continue
                 if flag in VALUE_FLAGS.get(w, set()) and i < len(toks):
                     i += 1
             if w == "timeout" and i < len(toks):

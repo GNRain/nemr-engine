@@ -2,10 +2,10 @@
 # Acceptance suite for scripts/hooks/git_destructive_guard.sh — every vector
 # drives the REAL hook script with the REAL PreToolUse payload shape. The
 # refused set includes the reproducing input of every confirmed finding from
-# both adversarial review rounds (19 against the regex draft, 23 against the
-# first parser); the allowed set includes every wrong-refusal those rounds
-# confirmed. A vector that stops failing here has changed the guard's
-# contract, not its implementation.
+# all four adversarial review rounds (19 against the regex draft, 23 against
+# the first parser, 7 and 5 against its fixes); the allowed set includes
+# every wrong-refusal those rounds confirmed. A vector that stops failing
+# here has changed the guard's contract, not its implementation.
 #
 # Controls at the end: a neutered copy (the single refuse() exit flipped to
 # allow) must let slip seven's vector through — proving the suite goes red
@@ -133,6 +133,19 @@ run 2 "checkout --pathspec-from-file"                    "git checkout --pathspe
 run 2 "restore -sSTABLE (stuck --source value, not -S)"  "git restore -sSTABLE f.txt"
 run 2 "env -S 'git reset --hard' (split-string form)"    "env -S 'git reset --hard'"
 
+# --- round four: redirection boundaries, command-position words, env -S ---
+run 2 "space-separated procsub after > (idiomatic)"      "cat /dev/null > >(git reset --hard)"
+run 2 "space-separated procsub after < (required space)" "wc -l < <(git reset --hard)"
+run 2 "while ...; done < <(...) shape"                   "while read -r l; do :; done < <(git reset --hard)"
+run 2 "function keyword spelling (refused at definition)" "function f { git reset --hard; }; f"
+run 2 "coproc git reset --hard"                          "coproc git reset --hard"
+run 2 "coproc NAME { ... } (named coprocess)"            "coproc f { git reset --hard; }"
+run 2 "env --split-string= (long, equals)"               "env --split-string='git reset --hard'"
+run 2 "env --split-string VAL (long, detached)"          "env --split-string 'git reset --hard'"
+run 2 "env -S with stuck value (shebang spelling)"       "env -S'git reset --hard'"
+run 2 "env -vS stuck (combined shorts before S)"         "env -vS'git reset --hard'"
+run 2 "env --split-str= (getopt_long abbreviation)"      "env --split-str='git reset --hard'"
+
 # --- stash drop/clear: always refused (they destroy the remedy's product) -
 run 2 "git stash drop (clean tree)"                      "git stash drop" "$T/clean"
 run 2 "git stash clear (clean tree)"                     "git stash clear" "$T/clean"
@@ -168,6 +181,13 @@ run 0 "digit trap"                                       "echo digital"
 run 0 "2=x is not an assignment bash accepts"            "2=x git reset --hard"
 run 0 "redirection then non-git"                         "git status > /dev/null; echo done"
 run 0 "quoted newline stays one token"                   "$(printf "git commit -m 'line1\nline2 git reset --hard'")"
+run 0 "procsub carrying only a read"                     "cat /dev/null > >(git status)"
+run 0 "plain redirection then non-git still allowed"     "echo x > out.txt; git status"
+run 0 "function whose body only reads"                   "function f { git status; }; f"
+run 0 "coproc carrying only a read"                      "coproc git status"
+run 0 "env -S stuck value carrying only a read"          "env -S'git status'"
+run 0 "env --split-string= carrying only a read"         "env --split-string='git log --oneline'"
+run 0 "env -uPATH stuck unset value is not -S"           "env -uPATH git status"
 
 # --- declared destruction: env prefix of the invocation ------------------
 run 0 "override on checkout --"                          "NEMR_GIT_DESTRUCTIVE_OK=1 git checkout -- f.txt"

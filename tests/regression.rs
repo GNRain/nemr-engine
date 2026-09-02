@@ -4019,6 +4019,14 @@ fn f125_git_guard_refuses_destructive_git_on_a_dirty_tree_and_nothing_stricter()
         "git restore -sSTABLE f.txt".to_string(),        // stuck --source value
         "env -S 'git reset --hard'".to_string(),         // split-string wrapper
         "git checkout --pathspec-from-file=paths.txt".to_string(),
+        // round-four review shapes:
+        "cat /dev/null > >(git reset --hard)".to_string(), // spaced procsub
+        "wc -l < <(git reset --hard)".to_string(),         // `<` form needs the space
+        "function f { git reset --hard; }; f".to_string(), // function-keyword spelling
+        "coproc git reset --hard".to_string(),             // coprocess prefix
+        "env --split-string='git reset --hard'".to_string(), // -S long form
+        "env -S'git reset --hard'".to_string(),            // stuck -S value
+        "env -vS'git reset --hard'".to_string(),           // combined shorts before S
     ];
     for cmd in &refused {
         let (code, err) = f125_run_guard(&guard, cmd, &fx.dir, None);
@@ -4046,6 +4054,11 @@ fn f125_git_guard_refuses_destructive_git_on_a_dirty_tree_and_nothing_stricter()
         "git reset --help",                // an abbreviation of nothing destructive
         "git reset -- --hard",             // a FILE named --hard
         "git switch -cfix",                // stuck -c value, not -f
+        "cat /dev/null > >(git status)",   // procsub carrying only a read
+        "function f { git status; }; f",   // function body that only reads
+        "coproc git status",               // coprocess carrying only a read
+        "env -S'git status'",              // stuck -S value, read-only command
+        "env -uPATH git status",           // stuck -u value is not -S
     ];
     for cmd in &allowed {
         let (code, err) = f125_run_guard(&guard, cmd, &fx.dir, None);
