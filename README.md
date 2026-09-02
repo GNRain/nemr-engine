@@ -168,8 +168,14 @@ The file remembers the project's name and size, so you don't have to.
 ## What you need
 
 - **Recent Ubuntu Linux** — 22.04 or newer. Not sure? The setup script checks
-  for you and explains if anything's missing. Nemr does **not** run on macOS or
-  Windows.
+  for you and explains if anything's missing.
+  - **On Windows, Nemr's answer is WSL2** — you install Ubuntu under WSL2, run
+    setup inside it, and work from that terminal. There is **no native Windows
+    `.exe` and none planned**; that is a deliberate platform decision, the same
+    one Docker Desktop and Podman Desktop made. Fair warning: Nemr has not yet
+    been verified inside WSL2 — that work is in progress, so today the tested
+    claim is a real Linux install only.
+  - **No macOS**, and no current plan date for it.
 - **Your password (sudo) for setup only** — to install system pieces and one
   small helper. Day-to-day use doesn't need it.
 - **Claude Code installed, and a subscription** — you log in on each machine you
@@ -250,7 +256,9 @@ them here.
 - **No external security review yet.** Setup installs a passwordless `sudo` rule
   for one small root-owned helper. The project separation above is not a security
   boundary — don't run code you don't trust inside a project.
-- **Linux only.** No macOS, no Windows.
+- **Linux only, today.** No macOS. On Windows the intended path is WSL2 —
+  Nemr inside a WSL2 Ubuntu, no native binary, none planned — but that has not
+  been verified yet, so don't rely on it until this list says otherwise.
 - **One machine at a time.** In the one case observed, logging in to Claude Code
   on a second machine revoked the login on the first. We don't yet know how
   general that is; treat a project as living on one machine at a time.
