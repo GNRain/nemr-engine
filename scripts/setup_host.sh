@@ -56,6 +56,10 @@ step() { printf '\n%s==> %s%s\n' "$BLUE" "$1" "$RESET"; }
 ok()   { printf '    %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
 warn() { printf '    %swarn%s %s\n' "$YELLOW" "$RESET" "$1"; }
 
+# WSL2 is a second supported host (E-10): a Windows user runs this inside WSL2.
+# A few steps below are WSL2-specific and inert elsewhere; this is how they know.
+is_wsl2() { grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; }
+
 PREFLIGHT_FAILURES=()
 fail_check() {
     # name / what was found / how to fix — all three, every time. A preflight
@@ -182,6 +186,31 @@ if systemctl is-enabled --quiet containerd.service 2>/dev/null ||
     ok "disabled containerd.service"
 else
     ok "containerd.service already disabled"
+fi
+
+step "Mount propagation (F-128 — WSL2 only; a no-op on a standard host)"
+# WSL2's /init leaves / a PRIVATE mount where a standard systemd host makes it
+# rshared. Without shared propagation, the privileged helper's volume mount
+# never reaches rootlesskit's namespace and every project fails to start with an
+# opaque "no such file or directory" (F-128). Two halves: persist it for every
+# future boot (the unit, ordered before the rootless stack — the ordering the
+# WSL2 spike proved necessary), and make it live now so this run's own
+# verification passes without waiting for a reboot.
+if is_wsl2; then
+    PROP_UNIT_SRC="deploy/systemd/nemr-mount-propagation.service"
+    PROP_UNIT_DEST="/etc/systemd/system/nemr-mount-propagation.service"
+    if [[ -e "$PROP_UNIT_DEST" ]] && cmp -s "$PROP_UNIT_SRC" "$PROP_UNIT_DEST"; then
+        ok "nemr-mount-propagation.service already installed"
+    else
+        sudo install -D -m 0644 "$PROP_UNIT_SRC" "$PROP_UNIT_DEST"
+        sudo systemctl daemon-reload
+        ok "installed $PROP_UNIT_DEST"
+    fi
+    sudo systemctl enable nemr-mount-propagation.service
+    sudo mount --make-rshared /
+    ok "/ is now shared (live), and set to be made shared on every boot"
+else
+    ok "not WSL2 — a standard systemd host makes / rshared at boot; nothing to do"
 fi
 
 step "subuid/subgid ranges for $USER_NAME"
@@ -315,6 +344,52 @@ if [[ ! -S "$bksock" ]]; then
     exit 1
 fi
 ok "buildkitd answering at $bksock"
+
+if is_wsl2; then
+    step "WSL2: restart the rootless stack so it snapshots the shared mount (F-128)"
+    # `enable --now` does not restart an already-running daemon, and rootlesskit's
+    # mount namespace is a snapshot from when it started — so a containerd that
+    # came up at boot (lingering) BEFORE / was made shared cannot see the shared
+    # propagation until it restarts. The WSL2 spike proved exactly this: making /
+    # rshared did nothing until the rootless stack was restarted.
+    systemctl --user restart containerd-rootless.service
+    for _ in $(seq 1 30); do [[ -S "$sock" ]] && break; sleep 1; done
+    if [[ ! -S "$sock" ]]; then
+        echo "${RED}containerd did not come back after the restart.${RESET}" >&2
+        journalctl --user -u containerd-rootless.service -n 50 --no-pager >&2 || true
+        exit 1
+    fi
+    if systemctl --user restart nemrd.service 2>/dev/null; then
+        ok "rootless stack restarted; the shared mount is live in its namespace"
+    else
+        warn "containerd restarted; nemrd will restart on demand"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 7b. Shell environment — so manual commands find the rootless socket
+# ---------------------------------------------------------------------------
+# Divergence 6 of the WSL2 spike (class: onboarding-path-untested, not WSL2):
+# `nemr` resolves the socket itself, but a bare `ctr` — and the base-image
+# remedies below — need CONTAINERD_ADDRESS in the interactive shell, which setup
+# only ever set inside its own process. Persist it, idempotently, in a
+# clearly-marked managed block. ~/.local/bin goes on PATH here too, which is the
+# warning section 6 could only print.
+step "Shell environment (CONTAINERD_ADDRESS, ~/.local/bin) for interactive use"
+PROFILE="$HOME/.bashrc"
+PROFILE_MARKER="# >>> nemr environment (managed by setup_host.sh) >>>"
+if [[ -f "$PROFILE" ]] && grep -qF "$PROFILE_MARKER" "$PROFILE"; then
+    ok "$PROFILE already has the nemr environment block"
+else
+    {
+        printf '\n%s\n' "$PROFILE_MARKER"
+        echo 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"'
+        echo 'export CONTAINERD_ADDRESS="${CONTAINERD_ADDRESS:-$XDG_RUNTIME_DIR/containerd/containerd.sock}"'
+        echo 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
+        echo '# <<< nemr environment <<<'
+    } >> "$PROFILE"
+    ok "added CONTAINERD_ADDRESS and ~/.local/bin to $PROFILE (open a new shell, or source it)"
+fi
 
 # ---------------------------------------------------------------------------
 # 8. Nemr's own artifacts
