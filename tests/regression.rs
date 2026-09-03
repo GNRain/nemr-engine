@@ -3874,3 +3874,418 @@ fn f123_the_shell_and_rust_protected_lists_agree() {
         "the shell guard and the Rust guard protect different sets — the rule has forked"
     );
 }
+
+// F-125: the destructive-git rule is enforced mechanically, not by memory.
+//
+// Both loop.md rules ("commit or stash before any destructive git operation")
+// existed when slip seven ignored them inside the mutation proof of a
+// different rule. The PreToolUse hook in scripts/hooks/git_destructive_guard.sh
+// is the structural form: it PARSES each command (POSIX shlex — an earlier
+// regex draft was broken 19 ways by an adversarial review, all with
+// plainly-typed commands), resolves each git invocation's target tree, reads
+// `git status` there, and refuses. These tests drive the ACTUAL hook script
+// with the ACTUAL payload shape the harness sends.
+// ---------------------------------------------------------------------------
+
+/// A disposable git repo with one commit. `dirty()` adds an uncommitted
+/// change. The directory is created by this fixture and destroyed by it —
+/// nothing outside it is ever touched.
+struct F125Fixture {
+    dir: std::path::PathBuf,
+}
+
+impl F125Fixture {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("nemr-f125-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("run git in fixture");
+            assert!(out.status.success(), "git {:?} failed in fixture", args);
+        };
+        git(&["init", "-q", "."]);
+        git(&["config", "user.email", "f125@test"]);
+        git(&["config", "user.name", "f125"]);
+        std::fs::write(dir.join("f.txt"), "base\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        F125Fixture { dir }
+    }
+
+    fn dirty(tag: &str) -> Self {
+        let fx = Self::new(tag);
+        std::fs::write(fx.dir.join("f.txt"), "base\nuncommitted\n").expect("dirty");
+        fx
+    }
+}
+
+impl Drop for F125Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn f125_guard_script() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hooks/git_destructive_guard.sh")
+}
+
+/// Run a guard script against a synthesized PreToolUse payload; return its
+/// exit code and captured stderr — the REASON for a refusal is part of the
+/// contract, not just the exit code. `prepend_path` lets a test interpose a
+/// fake `git`.
+fn f125_run_guard(
+    script: &std::path::Path,
+    cmd: &str,
+    cwd: &std::path::Path,
+    prepend_path: Option<&std::path::Path>,
+) -> (i32, String) {
+    use std::io::Write;
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": cmd },
+        "cwd": cwd,
+    })
+    .to_string();
+    let mut c = std::process::Command::new("bash");
+    c.arg(script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if let Some(p) = prepend_path {
+        let path = std::env::var("PATH").unwrap_or_default();
+        c.env("PATH", format!("{}:{}", p.display(), path));
+    }
+    let mut child = c.spawn().expect("spawn guard");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write payload");
+    let out = child.wait_with_output().expect("wait guard");
+    (
+        out.status.code().expect("guard exit code"),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// F-125: the guard refuses exactly the rule's precondition — destructive git
+/// whose TARGET TREE has uncommitted work — and nothing stricter. Includes
+/// the shapes that broke the regex draft: `&` joins, quoted/-C paths,
+/// multi-line commands, cd tracking, and an override quoted inside a string
+/// (which must NOT vouch — declared per invocation means an env prefix of
+/// the invocation itself).
+#[test]
+fn f125_git_guard_refuses_destructive_git_on_a_dirty_tree_and_nothing_stricter() {
+    let fx = F125Fixture::dirty("main");
+    let guard = f125_guard_script();
+    let dirty = fx.dir.to_str().unwrap();
+    let refused = [
+        "git checkout -- f.txt".to_string(), // slip seven's shape
+        "git reset --hard".to_string(),      // slip three's shape
+        "git reset -q --hard HEAD~1".to_string(),
+        "git checkout .".to_string(),
+        "git checkout f.txt".to_string(), // pathspec checkout, no `--`
+        "git clean -fd".to_string(),
+        "git switch -f b2".to_string(),
+        "git switch --discard-changes b2".to_string(),
+        "git rm -f f.txt".to_string(),
+        "git merge --abort".to_string(),
+        "git rebase --abort".to_string(),
+        format!("cd {} && git reset --hard", dirty), // cd tracked
+        "git restore --staged f.txt & git restore f.txt".to_string(), // `&` join
+        "git -C . reset --hard".to_string(),
+        format!("git -C '{}' reset --hard", dirty), // quoted -C
+        "git status\ngit reset --hard".to_string(), // newline separator
+        "git \\\nreset --hard".to_string(),         // line continuation
+        // an override mentioned INSIDE a string vouches for nothing:
+        "git commit -m 'NEMR_GIT_DESTRUCTIVE_OK=1 noted' && git reset --hard".to_string(),
+        // round-two review shapes:
+        "git status  # check first\ngit reset --hard".to_string(), // comment keeps the newline
+        "env -i git reset --hard".to_string(),                     // wrapper flags
+        "time git reset --hard".to_string(),
+        "git --work-tree . reset --hard".to_string(), // space-separated form
+        "echo `git reset --hard`".to_string(),        // backtick substitution
+        "cd /nonexistent-dir-xyz; git reset --hard".to_string(), // failed cd, `;` chain
+        "git switch -fq b2".to_string(),              // combined shorts
+        "git reset --har".to_string(),                // git's option abbreviation
+        // round-three review shapes:
+        "echo \"<html>\"; git reset --hard".to_string(), // quoted <> is data
+        "if git reset --hard; then echo done; fi".to_string(), // reserved word
+        "git restore -sSTABLE f.txt".to_string(),        // stuck --source value
+        "env -S 'git reset --hard'".to_string(),         // split-string wrapper
+        "git checkout --pathspec-from-file=paths.txt".to_string(),
+        // round-four review shapes:
+        "cat /dev/null > >(git reset --hard)".to_string(), // spaced procsub
+        "wc -l < <(git reset --hard)".to_string(),         // `<` form needs the space
+        "function f { git reset --hard; }; f".to_string(), // function-keyword spelling
+        "coproc git reset --hard".to_string(),             // coprocess prefix
+        "env --split-string='git reset --hard'".to_string(), // -S long form
+        "env -S'git reset --hard'".to_string(),            // stuck -S value
+        "env -vS'git reset --hard'".to_string(),           // combined shorts before S
+    ];
+    for cmd in &refused {
+        let (code, err) = f125_run_guard(&guard, cmd, &fx.dir, None);
+        assert_eq!(
+            code, 2,
+            "`{}` on a DIRTY tree must refuse (exit 2) — this is the rule's precondition\nstderr: {}",
+            cmd, err
+        );
+    }
+    let allowed = [
+        "git stash", // the remedy itself must never be blocked
+        "git commit -am wip",
+        "git commit -am 'never run git reset --hard again'", // mention, not invocation
+        "git add -A",
+        "git status",
+        "git checkout -b wp-x",
+        "git checkout nonexistent-branch", // branch switch, not a pathspec
+        "git rebase --continue",           // the conflict-resolution flow itself
+        "git rm --cached f.txt",           // index-only
+        "git clean -n",                    // dry run
+        "cargo test --lib",                // not git at all
+        "NEMR_GIT_DESTRUCTIVE_OK=1 git checkout -- f.txt", // declared destruction
+        "git status  # check first",       // a comment is not a refusal
+        "git checkout -bfix",              // stuck -b value, not -f
+        "git reset --help",                // an abbreviation of nothing destructive
+        "git reset -- --hard",             // a FILE named --hard
+        "git switch -cfix",                // stuck -c value, not -f
+        "cat /dev/null > >(git status)",   // procsub carrying only a read
+        "function f { git status; }; f",   // function body that only reads
+        "coproc git status",               // coprocess carrying only a read
+        "env -S'git status'",              // stuck -S value, read-only command
+        "env -uPATH git status",           // stuck -u value is not -S
+    ];
+    for cmd in &allowed {
+        let (code, err) = f125_run_guard(&guard, cmd, &fx.dir, None);
+        assert_eq!(
+            code, 0,
+            "`{}` must pass on a dirty tree — a guard stricter than the rule teaches \
+             reaching for the override, and then the override stops carrying information\nstderr: {}",
+            cmd, err
+        );
+    }
+    // Clean tree: commit the change and the same destructive commands pass,
+    // because "commit or stash first" is precisely what makes the tree clean.
+    let out = std::process::Command::new("git")
+        .args(["commit", "-aqm", "clean"])
+        .current_dir(&fx.dir)
+        .output()
+        .expect("commit");
+    assert!(out.status.success());
+    for cmd in &["git checkout -- f.txt", "git reset --hard", "git clean -fd"] {
+        let (code, err) = f125_run_guard(&guard, cmd, &fx.dir, None);
+        assert_eq!(
+            code, 0,
+            "`{}` on a CLEAN tree must pass — the precondition is satisfied\nstderr: {}",
+            cmd, err
+        );
+    }
+    // Except stash drop/clear, which destroy the rule's own remedy and
+    // refuse regardless of tree state (override excepted).
+    for cmd in &["git stash drop", "git stash clear"] {
+        let (code, _) = f125_run_guard(&guard, cmd, &fx.dir, None);
+        assert_eq!(
+            code, 2,
+            "`{}` must refuse even on a clean tree — a stash holds exactly the work \
+             the rule protects, one command after it was stashed",
+            cmd
+        );
+    }
+    let (code, _) = f125_run_guard(
+        &guard,
+        "NEMR_GIT_DESTRUCTIVE_OK=1 git stash clear",
+        &fx.dir,
+        None,
+    );
+    assert_eq!(
+        code, 0,
+        "the declared override must clear stash refusals too"
+    );
+}
+
+/// F-125: the `git restore --staged` carve-out is exact. Staged-only restore
+/// unstages without touching the worktree, so it passes even dirty; any form
+/// that reaches the worktree (bare, --worktree, -W, or a staged-only restore
+/// sharing a command with a bare one — via `&&`, `;`, or `&`) refuses.
+#[test]
+fn f125_git_guard_staged_restore_carveout_is_exact() {
+    let fx = F125Fixture::dirty("restore");
+    let guard = f125_guard_script();
+    for cmd in &["git restore --staged f.txt", "git restore -S f.txt"] {
+        let (code, err) = f125_run_guard(&guard, cmd, &fx.dir, None);
+        assert_eq!(
+            code, 0,
+            "`{}` destroys nothing (it only unstages) and must pass\nstderr: {}",
+            cmd, err
+        );
+    }
+    for cmd in &[
+        "git restore f.txt",
+        "git restore --staged --worktree f.txt",
+        "git restore -SW f.txt",
+        "git restore --staged f.txt && git restore f.txt",
+        "git restore --staged f.txt & git restore f.txt",
+    ] {
+        let (code, _) = f125_run_guard(&guard, cmd, &fx.dir, None);
+        assert_eq!(
+            code, 2,
+            "`{}` reaches the worktree and must refuse on a dirty tree",
+            cmd
+        );
+    }
+}
+
+/// F-125 / F-109: when the guard cannot verify the tree's state, it refuses
+/// FOR THAT REASON. The fixture is CLEAN, so exit 2 is unreachable through
+/// the dirty-tree branch — only the read-failure branch can produce it — and
+/// the stderr wording is asserted so a refusal for the wrong reason fails.
+/// Covers both unreadable-status and an unresolvable target ($VAR in -C).
+#[test]
+fn f125_git_guard_refuses_when_state_cannot_be_verified() {
+    let fx = F125Fixture::new("f109"); // clean on purpose
+    let guard = f125_guard_script();
+    let shim_dir = fx.dir.join("shim");
+    std::fs::create_dir_all(&shim_dir).expect("shim dir");
+    std::fs::write(
+        shim_dir.join("git"),
+        "#!/usr/bin/env bash\ncase \"$*\" in *rev-parse*) echo true; exit 0;; \
+         *status*) echo 'fatal: index file corrupt' >&2; exit 128;; \
+         *) exec /usr/bin/git \"$@\";; esac\n",
+    )
+    .expect("write shim");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(shim_dir.join("git"))
+        .expect("meta")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(shim_dir.join("git"), perms).expect("chmod");
+    let (code, err) = f125_run_guard(&guard, "git reset --hard", &fx.dir, Some(&shim_dir));
+    assert_eq!(
+        code, 2,
+        "an unreadable tree state must REFUSE, not pass as clean (F-109)"
+    );
+    assert!(
+        err.contains("could not read"),
+        "the refusal must NAME the read failure — a refusal for any other reason \
+         means the F-109 branch never ran\nstderr: {}",
+        err
+    );
+    let (code, err) = f125_run_guard(&guard, "git -C \"$REPO\" reset --hard", &fx.dir, None);
+    assert_eq!(
+        code, 2,
+        "an unresolvable target must refuse, not pass as clean"
+    );
+    assert!(
+        err.contains("cannot determine"),
+        "the refusal must name the unresolved target\nstderr: {}",
+        err
+    );
+}
+
+/// F-125 guard-of-the-guard: (a) a neutered copy of the script (refusals
+/// turned into allows) lets the slip-seven vector through, proving the tests
+/// above go red when the guarded code is disabled; (b) the settings wiring
+/// cannot silently drift OR be silently disarmed — the hook must be wired on
+/// PreToolUse/Bash with no `if` pre-filter (an `if` on "Bash(git *)" would
+/// skip exactly the compound `cd x && git ...` forms), disableAllHooks must
+/// not be set, and the wired script must exist, be executable, and start
+/// with a bash shebang.
+#[test]
+fn f125_git_guard_goes_red_when_disabled_and_the_wiring_cannot_drift() {
+    let fx = F125Fixture::dirty("control");
+    let guard = f125_guard_script();
+
+    // (a) The disabled-guard control. Every refusal path exits through
+    // sys.exit(2); flipping those to 0 must let the slip-seven vector pass.
+    let real = std::fs::read_to_string(&guard).expect("read guard");
+    assert!(
+        real.contains("def refuse") && real.matches("sys.exit(2)").count() >= 1,
+        "the guard's refusal path no longer exits via refuse()/sys.exit(2) — the \
+         neutered-copy control below would neuter nothing"
+    );
+    let neutered_path = fx.dir.join("neutered.sh");
+    std::fs::write(&neutered_path, real.replace("sys.exit(2)", "sys.exit(0)"))
+        .expect("write neutered");
+    let (code, _) = f125_run_guard(&neutered_path, "git checkout -- f.txt", &fx.dir, None);
+    assert_eq!(
+        code, 0,
+        "CONTROL FAILED: the neutered guard still refused, so the refusal tests \
+         above cannot be attributed to the guard"
+    );
+    let (code, _) = f125_run_guard(&guard, "git checkout -- f.txt", &fx.dir, None);
+    assert_eq!(
+        code, 2,
+        "the real guard must refuse the vector the neutered one allowed"
+    );
+
+    // (b) The wiring drift check.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(".claude/settings.json"))
+            .expect(".claude/settings.json must exist — it is what arms the guard"),
+    )
+    .expect(".claude/settings.json must be valid JSON — a broken settings file silently disables ALL of it");
+    assert_ne!(
+        settings["disableAllHooks"],
+        serde_json::Value::Bool(true),
+        "disableAllHooks would disarm a correctly-wired guard"
+    );
+    let pre = settings["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("settings must define hooks.PreToolUse");
+    let wired = pre.iter().any(|m| {
+        m["matcher"].as_str() == Some("Bash")
+            && m.get("if").is_none()
+            && m["hooks"].as_array().is_some_and(|hs| {
+                hs.iter().any(|h| {
+                    h["type"].as_str() == Some("command")
+                        && h.get("if").is_none()
+                        && h["command"]
+                            .as_str()
+                            .is_some_and(|c| c.ends_with("/scripts/hooks/git_destructive_guard.sh"))
+                })
+            })
+    });
+    assert!(
+        wired,
+        "settings.json no longer arms git_destructive_guard.sh on PreToolUse/Bash \
+         (unfiltered, command ending in the script path) — the guard exists but \
+         nothing runs it"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(&guard).expect("the wired guard script must exist");
+    assert!(
+        meta.permissions().mode() & 0o111 != 0,
+        "the guard script is not executable — the hook would error instead of guarding"
+    );
+    assert!(
+        real.starts_with("#!/usr/bin/env bash"),
+        "the guard script lost its shebang — the hook would error instead of guarding"
+    );
+}
+
+/// F-125: the full acceptance suite — every reproducing input from BOTH
+/// adversarial review rounds (19 confirmed breaks against the regex draft,
+/// 23 against the first parser), the wrong-refusals those rounds confirmed,
+/// and the suite's own two controls (neutered guard, F-109 branch on a clean
+/// tree). A vector that stops passing changed the guard's contract.
+#[test]
+fn f125_git_guard_acceptance_suite_passes() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = std::process::Command::new("bash")
+        .arg(root.join("scripts/test_git_guard.sh"))
+        .output()
+        .expect("run the guard acceptance suite");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("0 red") && stdout.ends_with("PASS\n"),
+        "the guard acceptance suite failed:\n{}\n{}",
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
