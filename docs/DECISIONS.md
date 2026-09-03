@@ -361,8 +361,9 @@ not an Open item: Open means unresolved.
 
 ### E-10 — Non-Linux hosts
 
-**Status:** **Deferred with direction** (2026-08-22). Was Open since the first
-brief.
+**Status:** **Windows half resolved — WSL2** (2026-09-02); macOS stays
+deferred; remote-engine fallback stays rejected. Was Deferred with direction
+(2026-08-22), Open since the first brief.
 **Ruled by:** Rain · **Escalated by:** D-01 · **Relates to:** E-11
 
 Ship Linux first. Validate that the sync product is what people actually want.
@@ -389,6 +390,45 @@ contradiction rather than a deferred concern*. That framing is superseded, not
 deleted: the contradiction is real and is accepted for now as a sequencing
 choice with a known resolution, rather than an unresolved gap. Anything that
 assumes cross-platform support today is assuming wrongly.
+
+**Partial resolution — Windows means WSL2 (2026-09-02, Rain).** A deliberate
+platform decision, recorded rather than made by accident.
+
+Windows support is Nemr running **inside WSL2** — not a native Windows binary,
+not a bundled VM. The stack (rootless containerd, loopback ext4, user
+namespaces, veth and NAT) is Linux kernel features, and WSL2 is Microsoft's own
+Linux kernel with filesystem, network and (later) GPU integration already
+solved. Docker Desktop, Podman Desktop and Rancher Desktop all arrived at the
+same answer for the same reason. The product claim: a Windows user installs
+WSL2, runs `setup_host.sh` inside it, and works from that terminal — stated
+plainly in the README so nobody expects a `.exe`. Explicitly out of scope:
+macOS (still deferred), GPU (a separate future pass, dependent on this one
+succeeding — one unknown at a time), and any Windows-native code.
+
+**Why the sequencing changed** — recorded so the chain is visible rather than
+reconstructed later: Rain needs a GPU test host; the only NVIDIA card available
+is in a Windows machine; VirtualBox cannot pass it through; there is no disk to
+spare for dual-boot. WSL2 on that machine is the path to a GPU host, and the
+Windows half of E-10 comes with it.
+
+**Execution — establish, then support, strictly in order.** Half 1 is a spike:
+`setup_host.sh` and `verify_wp_a.sh` on a fresh WSL2 Ubuntu, every divergence
+from the Ubuntu-VM baseline recorded, no code adapted before knowing what
+actually breaks (see `docs/wsl2-spike.md`). Half 2 fixes only what the spike
+proved broken, narrowly — WSL2 detection where the path genuinely differs, not
+a fork of every script. Acceptance mirrors the cross-VM run: export a session
+on a Linux box, import on WSL2, attach, and continue the conversation with
+history intact; then the reverse. Plus the two checks only a person can make: a
+dev server inside a session reachable from a Windows browser, and
+`verify_wp_a.sh` green on WSL2 against installed binaries.
+
+**Accepted cost — decided rather than discovered.** WSL2 becomes a second
+supported host: `setup_host.sh` grows WSL2 awareness, PREREQUISITES.md gains a
+section, and every host-backed test acquires a "does it hold on WSL2?"
+question. GitHub's hosted runners cannot run WSL2, so WSL2 verification is
+manual, by Rain, until something better is found. **That permanent maintenance
+cost is exactly what deferring E-10 was avoiding, and it is accepted knowingly,
+not unnoticed.**
 
 ---
 
@@ -1111,3 +1151,4 @@ is overstating what has been demonstrated.
 | 2026-08-22 | D-10 | Opened — registry pull out of D-08 scope; tracked as a GUI prerequisite, Transfer service, 3–5 day estimate (Claude Code) |
 | 2026-08-22 | D-08 | Part 1 scoped down (Rain): nemr does not pull; error states the limit and gives the exact `ctr` command |
 | 2026-08-22 | E-10 | **Deferred with direction** — Linux first, then WSL2, then a bundled VM on macOS; remote-engine fallback rejected. Moved out of Open (Rain) |
+| 2026-09-02 | E-10 | **Windows half resolved — WSL2** (no native binary, no bundled VM); macOS stays deferred, remote fallback stays rejected. Sequencing reopened for a GPU test host; permanent manual-verification cost accepted (Rain) |

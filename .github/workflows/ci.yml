@@ -44,6 +44,8 @@ jobs:
         run: ./scripts/check_wait_discipline.sh
       - name: The wait helpers behave as documented
         run: ./scripts/test_proc_lib.sh
+      - name: Base-image provisioning pulls first and fails closed (F-126)
+        run: ./scripts/test_fetch_base_image.sh
 
   lint:
     name: clippy (warnings denied) + fmt

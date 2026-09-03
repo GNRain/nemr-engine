@@ -326,8 +326,8 @@ step "Install the privileged helper (needs root — PRIV-02/03)"
 (cd deploy/nemr-volume && cargo build --release)
 sudo ./scripts/setup_test_host.sh
 
-step "Build and import the base image"
-./scripts/build_base_image.sh
+step "Obtain the base image (pull the published bytes; build only as fallback — F-126)"
+./scripts/fetch_base_image.sh
 
 # ---------------------------------------------------------------------------
 # 9. Credential
