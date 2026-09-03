@@ -405,6 +405,33 @@ step "Obtain the base image (pull the published bytes; build only as fallback �
 ./scripts/fetch_base_image.sh
 
 # ---------------------------------------------------------------------------
+# 8b. Claude Code CLI — a prerequisite we detect, never install (D-13)
+# ---------------------------------------------------------------------------
+# nemr runs Claude Code inside each project; the CLI and its Node runtime are a
+# stated prerequisite, not something this script installs. That mirrors how the
+# GPU/CUDA host is treated (E-10) and follows NFR-01's spirit one layer out: nemr
+# does not reach outside the distribution archive, and adding a third-party apt
+# repo (NodeSource) to a user's system, or running a global `npm` install for
+# them, is exactly that. The WSL2 spike hit this as divergence 3 (Node and Claude
+# Code absent, `npm -g` EACCES). Detect and instruct; never install. Non-fatal:
+# the engine and its suite provision fully without it (fixtures + placeholder
+# credential); it is `nemr create` that needs a real Claude Code + credential.
+step "Claude Code CLI (a prerequisite — detected, never installed — D-13)"
+if command -v claude >/dev/null 2>&1; then
+    ok "claude present ($(command -v claude))"
+elif command -v node >/dev/null 2>&1; then
+    warn "node is installed but 'claude' is not on PATH. Install the CLI from its
+        official instructions (npm: '@anthropic-ai/claude-code', or the native
+        installer) — nemr does not install it for you (D-13). See PREREQUISITES.md."
+else
+    warn "Claude Code and its Node runtime are not installed — a prerequisite (D-13).
+        Install Node from nodejs.org or your platform's own packaging (NOT a
+        third-party apt repo added by nemr), then Claude Code per its official
+        instructions. nemr states this prerequisite; it does not reach outside the
+        archive to satisfy it (NFR-01). See PREREQUISITES.md."
+fi
+
+# ---------------------------------------------------------------------------
 # 9. Credential
 # ---------------------------------------------------------------------------
 step "Claude Code credential (AUTH-01/02/03)"
