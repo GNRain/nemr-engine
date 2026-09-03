@@ -353,6 +353,47 @@ structural rather than conventional.
 
 ---
 
+### D-13 — Node.js and Claude Code are prerequisites, not things nemr installs
+
+**Status:** Resolved · 2026-09-03
+**Raised by:** the WSL2 spike (divergence 3) · **Decided by:** Product Owner ·
+**Relates to:** NFR-01, E-17, E-10
+
+**Question.** `setup_host.sh` provisions the engine, then expects `claude` to
+exist for the credential step. The WSL2 spike ran on a host where Claude Code and
+its Node runtime were absent, and a global `npm install -g` failed with EACCES.
+So: should `setup_host.sh` install Node and Claude Code — via NodeSource's apt
+repo, say — or only detect their absence and instruct?
+
+**Ruling (Product Owner).** Detect and instruct. nemr does **not** add a
+third-party apt repository (NodeSource) and does **not** install Node or Claude
+Code. They are stated prerequisites the user provides, exactly as the GPU/CUDA
+host is treated (E-10) — the project names what it needs rather than reaching
+outside the distribution archive to conjure it.
+
+**Rationale.** This is NFR-01 applied one layer out. NFR-01 forbids depending on
+Docker anywhere we build, ship, script or **request** (E-17); the same principle
+forbids `setup_host.sh` silently wiring a user's system to a third-party apt repo
+and running a global `npm` install as a side effect of "provision the engine". A
+prerequisite the user installs deliberately, from a source they chose, is honest;
+a provisioner that reaches out to NodeSource on their behalf is the quiet
+supply-chain expansion NFR-01 exists to prevent. It also keeps the failure
+legible: "Claude Code is not installed, here is how" beats an opaque `npm EACCES`
+mid-provision.
+
+**Consequences.**
+- `setup_host.sh` gains a detect-and-instruct step before the credential step: it
+  reports whether `claude` (and `node`) are present and, if not, points at the
+  install instructions — non-fatal, because the engine and its test suite
+  provision fully without them (they use fixtures and a placeholder credential).
+- PREREQUISITES.md records Node + Claude Code as prerequisites with the install
+  pointer, alongside the existing host prerequisites.
+- Not done, deliberately: no NodeSource repo, no `npm -g` run by the script, no
+  bundled Node. If a future installer (the D-01/E-09 product path) needs to ship
+  a runtime, that is its own decision, made explicitly — not inherited here.
+
+---
+
 ## Deferred (decided, with direction — not gaps)
 
 A deferred entry is a **decision to sequence work later**, with the direction
@@ -1152,3 +1193,4 @@ is overstating what has been demonstrated.
 | 2026-08-22 | D-08 | Part 1 scoped down (Rain): nemr does not pull; error states the limit and gives the exact `ctr` command |
 | 2026-08-22 | E-10 | **Deferred with direction** — Linux first, then WSL2, then a bundled VM on macOS; remote-engine fallback rejected. Moved out of Open (Rain) |
 | 2026-09-02 | E-10 | **Windows half resolved — WSL2** (no native binary, no bundled VM); macOS stays deferred, remote fallback stays rejected. Sequencing reopened for a GPU test host; permanent manual-verification cost accepted (Rain) |
+| 2026-09-03 | D-13 | **Resolved** — Node and Claude Code are prerequisites nemr detects and instructs for, never installs; no NodeSource apt repo, no `npm -g` by the script (NFR-01 one layer out; WSL2 spike divergence 3) (Rain) |

@@ -485,8 +485,39 @@ nemr port add myproject 8000        # then open http://127.0.0.1:8000
 nemr port ls myproject
 ```
 
+## Claude Code and Node — a prerequisite nemr detects, never installs (D-13)
+
+nemr runs **Claude Code** inside each project, so the Claude Code CLI and its
+**Node.js** runtime must be installed on the host. They are a prerequisite you
+provide, not something `setup_host.sh` installs — the same stance taken toward
+the GPU/CUDA host (E-10), and NFR-01 one layer out: the provisioner will not add
+a third-party apt repository (NodeSource) to your system or run a global `npm`
+install on your behalf.
+
+Install them yourself, from a source you choose:
+
+```bash
+# Node — from nodejs.org, or your platform's own packaging (nvm, apt from the
+# distribution, etc.). NOT a third-party apt repo added by nemr.
+node --version        # confirm it is on PATH
+
+# Claude Code — per its official instructions:
+npm install -g @anthropic-ai/claude-code   # or the native installer
+claude --version
+```
+
+`setup_host.sh` **detects** whether `claude` (and `node`) are present and, if
+not, prints this pointer — non-fatally. The engine and its test suite provision
+and pass fully without them (they use fixtures and a placeholder credential); it
+is `nemr create` and a real session that need Claude Code plus a logged-in
+credential (Step 4 / AUTH-03).
+
 ## Explicitly NOT prerequisites
 
 Docker Engine and Docker Desktop are prohibited by NFR-01. If any step here, or
 any tool selected later, turns out to require either, that is a release-blocking
 defect to be reported under Section 9, not worked around.
+
+Node and Claude Code are prerequisites you install (above), but nemr installing
+*them for you* — a NodeSource apt repo, a script-run `npm -g` — is likewise out
+of scope by decision (D-13), for the same NFR-01 reason.
