@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 const GRACE_PERIOD: Duration = nemr_engine::containerd::config::SIGTERM_GRACE;
 
 use common::{
-    extracted_plaintext, installed_helper_matches_built, require_host, run_offline, unit_only,
-    write_hostile_bundle, HostRequirements, TestProject,
+    ensure_base_image_present, extracted_plaintext, installed_helper_matches_built, require_host,
+    run_offline, unit_only, write_hostile_bundle, HostRequirements, TestProject,
 };
 use nemr_engine::containerd::client::ContainerdClient;
 use nemr_engine::containerd::containers::StopOutcome;
@@ -3737,6 +3737,10 @@ fn f115_export_reads_the_container_not_the_engine_constant() {
 
     let older = a_published_version_other_than_the_current_one()
         .expect("image/digests must list a published version other than the current one");
+    // The fixture is this test's responsibility, not the provisioner's:
+    // setup_host.sh pulls only the current version, and on such a host this
+    // test panicked at `image_chain_id` below (the WSL2 spike's f115 failure).
+    ensure_base_image_present(&older);
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
