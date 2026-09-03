@@ -1,0 +1,41 @@
+# Make `/` a shared mount before the rootless stack starts (F-128, E-10).
+#
+# Ships as a file, installed to /etc/systemd/system/nemr-mount-propagation.service
+# and enabled by scripts/setup_host.sh — but ONLY on WSL2, because it exists to
+# fix a WSL2-specific defect.
+#
+# WHY. nemr's privileged helper mounts each project volume in the host mount
+# namespace; runc runs inside rootlesskit's namespace, started
+# `--propagation=rslave`, which receives a host mount only if that mount is
+# `shared`. A standard systemd host makes `/` rshared very early in boot; WSL2's
+# `/init` does not, leaving `/` private. A mount made under a private `/` is
+# itself private, never propagates into rootlesskit, and the container's M8
+# session-state bind sources vanish — every project fails to start with an
+# opaque "no such file or directory" (F-128).
+#
+# ORDERING IS THE POINT. The WSL2 spike proved that `mount --make-rshared /` has
+# no effect on an already-running rootlesskit: its mount namespace is a snapshot
+# taken when it started, so the fix must be in place BEFORE it starts, on every
+# boot. Hence `Before=sysinit.target` with `DefaultDependencies=no` — this runs
+# in early boot, ahead of the user manager that starts containerd-rootless. It
+# also did not survive `wsl --shutdown`, which is why a persistent unit (not a
+# one-time live command) is the remedy.
+#
+# INERT OFF-WSL. `ConditionVirtualization=wsl` means systemd skips this entirely
+# on a normal host, where `/` is already rshared and there is nothing to do —
+# belt-and-suspenders behind setup_host only installing it on WSL2.
+
+[Unit]
+Description=Make / a shared mount for rootless containerd (nemr, F-128 / E-10 WSL2)
+DefaultDependencies=no
+ConditionVirtualization=wsl
+After=systemd-remount-fs.service
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/mount --make-rshared /
+
+[Install]
+WantedBy=sysinit.target

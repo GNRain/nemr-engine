@@ -417,6 +417,32 @@ pub async fn start(client: &ContainerdClient, name: &str) -> Result<u32> {
     // this check is what closes it.
     ensure_volume_mounted(name)?;
 
+    // F-128. The helper mounted the volume in the host namespace; runc runs in
+    // rootlesskit's rslave namespace and sees it only if it propagated in, which
+    // requires the host-side mount to be shared. On WSL2 `/` is private, so it
+    // does not — and the M8 session-state bind sources under it
+    // (`.nemr-state/{projects,sessions}`) then do not exist for runc, which
+    // fails start with an opaque "no such file or directory". Refuse here,
+    // before that riddle, naming the fix.
+    let mount_point = crate::engine::volume::VolumePaths::from_env()?.mount_point(name);
+    if crate::engine::volume::mount_propagation(&mount_point)
+        == crate::engine::volume::MountPropagation::Private
+    {
+        bail!(
+            "the project volume at {} is a private mount, so it does not \
+             propagate into the container runtime's namespace: the session-state \
+             mounts under it would be invisible and the task would fail to start \
+             with an opaque 'no such file or directory'.\n\
+             The host's root mount must be shared. A standard systemd host makes \
+             it so at boot; WSL2 does not (E-10). Fix it for this and every \
+             future boot by re-running ./scripts/setup_host.sh, which installs \
+             the propagation unit — or immediately, for the current session:\n\n    \
+             sudo mount --make-rshared /\n    \
+             systemctl --user restart containerd-rootless.service nemrd.service",
+            mount_point.display()
+        );
+    }
+
     // AC-5.3: starting an already-running project is a clear error, not a
     // second task or a silent no-op.
     match client.task_state(&container_id).await? {
