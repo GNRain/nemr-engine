@@ -158,8 +158,18 @@ else
     unshare -rmn true || true
 fi
 
-echo "==> Build and import the base image (BuildKit, daemonless — no Docker)"
-./scripts/build_base_image.sh
+echo "==> Obtain the base image (pull the published bytes; build only as fallback — F-126/F-127)"
+# F-127 (Product Owner ruling): pull first here too, not build. The apt layer is
+# unpinned by design, so once the Debian archive moves past a recorded build's
+# inputs a fresh build produces a DIFFERENT digest — and building on every CI run
+# turned that inevitability into a red F-85 gate on changes that touched nothing
+# about the image. That red measured Debian's movement, not our code, and would
+# have trained us to ignore the gate. fetch_base_image.sh pulls the recorded
+# bytes (the common path now that D-08 publishes them) and only falls back to a
+# build when the registry is unreachable — failing closed if that build cannot
+# reproduce the recorded digest. build_base_image.sh stays the deliberate publish
+# path; drift detection, if wanted, belongs in a scheduled job, not on every PR.
+./scripts/fetch_base_image.sh
 
 # A PRIOR published base version, so the F-115 export test has a project whose
 # rootfs is provably not this engine's constant (F-116).
