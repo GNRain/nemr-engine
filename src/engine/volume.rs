@@ -470,6 +470,79 @@ pub fn backing_device(mount_point: &Path) -> Option<String> {
     mountinfo_device_for(&table, mount_point)
 }
 
+/// How a mount's propagation bears on whether a mount made at that point is
+/// visible to the rootless container runtime (F-128).
+///
+/// runc runs inside rootlesskit's mount namespace, which is started
+/// `--propagation=rslave` — a slave of the host's mounts. A mount the privileged
+/// helper makes in the host namespace reaches runc only if it *propagates* into
+/// that slave, and it propagates only if the host-side mount is `shared` (part
+/// of a peer group the slave receives from). If it is private, the mount is
+/// invisible inside the container: the M8 session-state bind sources
+/// (`.nemr-state/{projects,sessions}`) do not exist for runc, and the task fails
+/// to start with an opaque `open …/.nemr-state/projects: no such file or
+/// directory`. This was the WSL2 spike's dominant failure (E-10): WSL2's `/init`
+/// leaves `/` private where a standard systemd host makes it rshared, so twelve
+/// project-starting tests died at the mount step before any of their real
+/// behaviour ran. The engine depends on `/` (hence its mounts) being rshared;
+/// this makes that dependency legible instead of a runc riddle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountPropagation {
+    /// `shared:` — the mount reaches the rslave container namespace. Required.
+    Shared,
+    /// No `shared:` tag — a mount here does NOT reach the container; runc will
+    /// not see the bind sources under it. The WSL2 failure.
+    Private,
+    /// No mountinfo line for the target — the mount is absent, nothing to judge.
+    /// Not a failure: `ensure_volume_mounted` checks presence; this judges only
+    /// a mount that is present.
+    Unknown,
+}
+
+/// The propagation of the mount at `mount_point`, read from this process's mount
+/// namespace — the same namespace the privileged helper mounts into and the one
+/// runc's is slaved to, so the answer is the one that governs visibility into
+/// the container.
+pub fn mount_propagation(mount_point: &Path) -> MountPropagation {
+    match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(table) => mountinfo_propagation(&table, mount_point),
+        Err(_) => MountPropagation::Unknown,
+    }
+}
+
+/// Propagation of a mount target, parsed from a mountinfo table (F-128).
+///
+/// The propagation tags (`shared:N`, `master:N`, `propagate_from:N`,
+/// `unbindable`) are *optional fields*: they sit after field 6 (mount options)
+/// and before the ` - ` separator, in any number including zero. Only a
+/// `shared:` tag means events propagate to the peer group runc's namespace is
+/// slaved to; `master:` alone is a slave that receives but does not re-emit, so
+/// it does not carry a mount onward to a further slave. Split out to be
+/// unit-testable without a live `/proc` — the WSL2 case (a private `/`) cannot
+/// be reproduced on a host whose `/` is already rshared.
+fn mountinfo_propagation(table: &str, mount_point: &Path) -> MountPropagation {
+    let wanted = mount_point.as_os_str().as_bytes();
+    for line in table.lines() {
+        let Some((left, _)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mut fields = left.split(' ');
+        // Field 5 (index 4) is the mount point.
+        if fields.nth(4).map(unescape_octal).as_deref() != Some(wanted) {
+            continue;
+        }
+        // What remains is field 6 (options) then the optional tags; skip the
+        // options and look for a `shared:` among the tags.
+        let shared = fields.skip(1).any(|tag| tag.starts_with("shared:"));
+        return if shared {
+            MountPropagation::Shared
+        } else {
+            MountPropagation::Private
+        };
+    }
+    MountPropagation::Unknown
+}
+
 /// Source device for a mount target, parsed from a mountinfo table.
 ///
 /// Split out for unit-testing without a live `/proc`. The source field sits
@@ -1095,6 +1168,73 @@ mod tests {
         assert_eq!(unescape_octal(r"a\011b"), b"a\tb");
         assert_eq!(unescape_octal(r"a\012b"), b"a\nb");
         assert_eq!(unescape_octal(r"a\134b"), b"a\\b");
+    }
+
+    /// F-128 — the propagation guard that turns the WSL2 mount failure from an
+    /// opaque runc error into a named refusal. The parser *is* the guard; these
+    /// cases go red if it misreads the optional-fields section, which is exactly
+    /// where the `shared:` tag lives.
+    #[test]
+    fn mountinfo_propagation_reads_the_shared_tag_at_any_optional_count() {
+        let mp = "/home/u/.local/share/nemr/mounts/p";
+        // Shared: the invariant a standard systemd host provides and nemr needs.
+        let shared = format!("301 29 7:19 / {mp} rw,relatime shared:277 - ext4 /dev/loop7 rw\n");
+        assert_eq!(
+            mountinfo_propagation(&shared, Path::new(mp)),
+            MountPropagation::Shared
+        );
+        // Shared with a trailing master tag (a shared mount that also receives).
+        let shared_master =
+            format!("301 29 7:19 / {mp} rw,relatime shared:277 master:2 - ext4 /dev/loop7 rw\n");
+        assert_eq!(
+            mountinfo_propagation(&shared_master, Path::new(mp)),
+            MountPropagation::Shared
+        );
+        // The WSL2 case: no optional tags at all. A mount made here does not
+        // reach rootlesskit's rslave namespace, so runc cannot see the M8 bind
+        // sources — the exact twelve-test failure the spike found.
+        let private = format!("301 29 7:19 / {mp} rw,relatime - ext4 /dev/loop7 rw\n");
+        assert_eq!(
+            mountinfo_propagation(&private, Path::new(mp)),
+            MountPropagation::Private
+        );
+        // `master:` alone is a slave, not shared — it receives but does not
+        // re-emit, so it does not carry a mount onward to a further slave.
+        let slave = format!("301 29 7:19 / {mp} rw,relatime master:2 - ext4 /dev/loop7 rw\n");
+        assert_eq!(
+            mountinfo_propagation(&slave, Path::new(mp)),
+            MountPropagation::Private
+        );
+        // Absent target: nothing to judge.
+        assert_eq!(
+            mountinfo_propagation(&shared, Path::new("/home/u/.local/share/nemr/mounts/other")),
+            MountPropagation::Unknown
+        );
+    }
+
+    /// Octal-escaped mount points must decode before propagation is read, or a
+    /// `$HOME` with a space reads the wrong line — the same defect the F-58/F-28
+    /// parsers fixed, here for propagation.
+    #[test]
+    fn mountinfo_propagation_decodes_escaped_mount_points() {
+        let table =
+            "301 29 7:19 / /home/john\\040doe/mounts/p rw,relatime shared:277 - ext4 /dev/loop7 rw\n";
+        assert_eq!(
+            mountinfo_propagation(table, Path::new("/home/john doe/mounts/p")),
+            MountPropagation::Shared
+        );
+    }
+
+    /// Control: the parser must agree with this host's real mount namespace.
+    /// `/` always has a mountinfo line, so a decisive (non-`Unknown`) answer
+    /// proves the live `/proc` read path works. A shared `/` here is *why* the
+    /// twelve tests pass on the reference host and failed on WSL2.
+    #[test]
+    fn mount_propagation_is_decisive_for_this_host_root() {
+        if std::fs::read_to_string("/proc/self/mountinfo").is_err() {
+            return;
+        }
+        assert_ne!(mount_propagation(Path::new("/")), MountPropagation::Unknown);
     }
 
     #[test]

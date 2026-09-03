@@ -87,7 +87,7 @@ elif [[ -n "$have" ]]; then
         present locally:      ${have}
     A version tag must name one set of bytes (F-85). Something put different
     bytes under this tag — find out what before removing it:
-        ctr -n default images rm ${IMAGE}
+        CONTAINERD_ADDRESS=${CONTAINERD_ADDRESS} ctr -n default images rm ${IMAGE}
     then re-run this script."
 fi
 
