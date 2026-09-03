@@ -590,6 +590,60 @@ fn sha256_of(path: &Path) -> std::io::Result<String> {
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Ensure a published base-image `reference` is present in containerd, pulling
+/// it if not — so a test that needs a prior version as a fixture provisions its
+/// own, rather than depending on which host script happened to run last.
+///
+/// `setup_host.sh` pulls only the current version; `ci_provision_host.sh` also
+/// pulls a prior one. The F-115 export test needs the prior one as a divergent
+/// subject, and on a host provisioned by `setup_host.sh` it panicked on exactly
+/// that gap (the WSL2 spike's f115 failure). A test's fixture is the test's
+/// responsibility, not the provisioner's.
+///
+/// nemr itself never pulls (D-08 part 1); this is TEST provisioning, the same
+/// `ctr images pull` `ci_provision_host.sh` runs, which is why it shells to
+/// `ctr` rather than asking the engine client for something it refuses to do.
+/// F-85 guarantees a published tag names one set of bytes for ever, so the
+/// pulled fixture is the recorded one, not "whatever the registry has today".
+pub fn ensure_base_image_present(reference: &str) {
+    // Already there? Read, don't repair — the same presence check the suite
+    // uses for the current image.
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let present = runtime.block_on(async {
+        let Ok(client) = ContainerdClient::connect().await else {
+            return false;
+        };
+        client
+            .list_images()
+            .await
+            .map(|images| images.iter().any(|image| image.name == reference))
+            .unwrap_or(false)
+    });
+    if present {
+        return;
+    }
+
+    eprintln!("    fixture {reference} is not in containerd; pulling it (test provisioning)");
+    let status = Command::new("ctr")
+        .args([
+            "-n",
+            "default",
+            "images",
+            "pull",
+            "--platform",
+            "linux/amd64",
+            reference,
+        ])
+        .status()
+        .unwrap_or_else(|e| panic!("could not run `ctr` to pull the fixture {reference}: {e}"));
+    assert!(
+        status.success(),
+        "failed to pull the base-image fixture {reference}. It is needed as a divergent \
+         subject (F-115/F-116) and setup_host.sh pulls only the current version. \
+         Manually: ctr -n default images pull --platform linux/amd64 {reference}"
+    );
+}
+
 fn base_image_present() -> bool {
     let Ok(runtime) = tokio::runtime::Runtime::new() else {
         return false;

@@ -58,6 +58,30 @@ then from PowerShell: `wsl --shutdown`, reopen the terminal, re-verify.
 **The WSL2 spelling of "reboot" is `wsl --shutdown` from Windows.** Use it
 anywhere the sequence says reboot, including `setup_host.sh`'s reboot gate.
 
+**Recommended in the same file — keep the Windows PATH out of the VM:**
+
+```bash
+printf '[interop]\nappendWindowsPath=false\n' | sudo tee -a /etc/wsl.conf
+```
+
+then `wsl --shutdown` and reopen. By default WSL2 appends the entire Windows
+`PATH` — ~30 `/mnt/c/...` entries — to every Linux process's `PATH`, and each of
+those is a 9p-mounted Windows drive that is traversed on every command lookup.
+Two reasons to turn it off, one proven and one a hypothesis:
+
+- **Proven:** it puts Docker Desktop's `bin` directory on the Linux `PATH`,
+  which is not an NFR-01 violation (nothing we build or request depends on it)
+  but is exactly what a Docker-freeness checker will trip over. Better absent
+  than explained.
+- **Hypothesis, deliberately not coded against (f109):** in the Half-2 run,
+  `f109_the_cli_does_not_panic_when_its_reader_closes_the_pipe` was intermittent
+  under suite load — some of its 40 `bash -c` spawns exited **127** (command
+  not found) — yet passed in isolation. The suspected cause is command lookup
+  crawling ~30 9p path entries under load. This setting removes them; if f109
+  stops flaking with it on, the hypothesis is confirmed and the fix is this
+  line. If it keeps flaking, the cause is elsewhere and it becomes its own
+  investigation. Either way the test is left honest rather than papered over.
+
 ## Part 2 — the probe battery (before running anything of ours)
 
 This is the divergence baseline. Run each line and record all output —
@@ -205,3 +229,30 @@ class:     WSL2 semantics | script bug | docs gap | blocker (best guess)
 A step that passed but needed unwritten knowledge gets an entry too, class
 `docs gap`. The spike report is the full list plus the two `tee` logs, and
 Half 2's scope is derived from it — nothing else.
+
+---
+
+## Verdict — written after Half 2 closed (2026-09-03)
+
+All eight predictions now have empirical answers, and the two that mattered
+went the **other way** from expectation:
+
+- **#1, cgroup hybrid — predicted the most likely blocker — never fired.** The
+  host booted pure `cgroup2fs` with every controller present.
+- **Mount propagation — not predicted at all — was the entire cause of all 12
+  failures.** WSL2's `/init` leaves `/` a private mount, so the helper's volume
+  mount never reached rootlesskit's rslave namespace and every project-starting
+  test died at the same `start_task` step (F-128; fixed by a boot-ordered
+  systemd unit, since a live `make-rshared` did not survive `wsl --shutdown`).
+- **#8, VM idle-stop — recovers cleanly.** After the VM idle-stopped with a
+  running project, `nemr list`/`status` reported *stopped, volume unmounted,
+  loop device none* — the truth, not a stale "running" — and start/attach/
+  stop/delete left no orphans and needed no reconcile. That is VOL-06 absorbing
+  a crash shape nobody designed it for.
+
+The lesson worth keeping is not that the predictions were right; the ones that
+mattered were wrong. It is that the **divergence template above was ready when
+the unpredicted thing appeared**, so the 12 failures were recorded as observables
+first and diagnosed second — two independent investigations that converged on
+one cause, rather than a guess that happened to fit. Keep the template; hold the
+predictions loosely.
