@@ -229,3 +229,30 @@ class:     WSL2 semantics | script bug | docs gap | blocker (best guess)
 A step that passed but needed unwritten knowledge gets an entry too, class
 `docs gap`. The spike report is the full list plus the two `tee` logs, and
 Half 2's scope is derived from it — nothing else.
+
+---
+
+## Verdict — written after Half 2 closed (2026-09-03)
+
+All eight predictions now have empirical answers, and the two that mattered
+went the **other way** from expectation:
+
+- **#1, cgroup hybrid — predicted the most likely blocker — never fired.** The
+  host booted pure `cgroup2fs` with every controller present.
+- **Mount propagation — not predicted at all — was the entire cause of all 12
+  failures.** WSL2's `/init` leaves `/` a private mount, so the helper's volume
+  mount never reached rootlesskit's rslave namespace and every project-starting
+  test died at the same `start_task` step (F-128; fixed by a boot-ordered
+  systemd unit, since a live `make-rshared` did not survive `wsl --shutdown`).
+- **#8, VM idle-stop — recovers cleanly.** After the VM idle-stopped with a
+  running project, `nemr list`/`status` reported *stopped, volume unmounted,
+  loop device none* — the truth, not a stale "running" — and start/attach/
+  stop/delete left no orphans and needed no reconcile. That is VOL-06 absorbing
+  a crash shape nobody designed it for.
+
+The lesson worth keeping is not that the predictions were right; the ones that
+mattered were wrong. It is that the **divergence template above was ready when
+the unpredicted thing appeared**, so the 12 failures were recorded as observables
+first and diagnosed second — two independent investigations that converged on
+one cause, rather than a guess that happened to fit. Keep the template; hold the
+predictions loosely.
