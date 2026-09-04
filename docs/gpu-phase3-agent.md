@@ -169,18 +169,17 @@ rm -rf ~/gpu-spike/work-a && mkdir -p ~/gpu-spike/work-a ~/gpu-spike/prompts   #
 # prompt argument — Phase 3 measured `claude -p` waiting 3 s then failing with
 # "Input must be provided". `< /dev/null` is not enough; a file is.
 printf '%s\n' "Create a file named hello.py in the current directory containing a Python program that prints exactly: hello from ollama. Use your file-writing tool, then stop." > ~/gpu-spike/prompts/task1.txt
+# The agent command and its environment come from gpu-env.sh (CLAUDE_TASK, AGENT_ENV) so
+# every arm runs the SAME shape; only the base URL is spelled here, because it is the one
+# thing that differs per arm. `--bare` (found in the Phase 3 run): skips hooks and
+# prefetches — including the count_tokens call Ollama 404s on — and forces
+# ANTHROPIC_API_KEY auth, which is also the cheapest guard against prediction 4.
 CTRUN agent-a --rm --net-host \
   --mount "type=bind,src=$HOME/gpu-spike/work-a,dst=/work,options=rbind:rw" \
   --mount "type=bind,src=$HOME/gpu-spike/prompts,dst=/prompts,options=rbind:ro" \
-  --env ANTHROPIC_BASE_URL=http://127.0.0.1:11434 \
-  --env ANTHROPIC_API_KEY=ollama \
-  --env ANTHROPIC_MODEL="$MODEL" --env ANTHROPIC_SMALL_FAST_MODEL="$MODEL" \
-  --env DISABLE_TELEMETRY=1 --env DISABLE_AUTOUPDATER=1 --env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-  "$BASE" agent-a sh -c 'cd /work && claude --bare -p --output-format json --allowedTools "Write,Read,Bash" < /prompts/task1.txt' \
+  "${AGENT_ENV[@]/#/--env=}" --env=ANTHROPIC_BASE_URL=http://127.0.0.1:11434 \
+  "$BASE" agent-a sh -c "$(CLAUDE_TASK /work /prompts/task1.txt)" \
   2>&1 | tee ~/gpu-spike/phase3-arm-a.json
-# `--bare` (found in the Phase 3 run): skips hooks and prefetches — including the
-# count_tokens call Ollama 404s on — and forces ANTHROPIC_API_KEY auth, which is also
-# the cheapest guard against prediction 4.
 ```
 
 Flag names are Claude Code's; **check `claude --help` in this image** before
@@ -236,10 +235,21 @@ isolation rule is a `FORWARD` drop between sessions; delivery to the gateway
 address is `INPUT`.)
 
 ```bash
+# Every prompt in this arm goes in as a FILE, the same shape as Arm A (CLAUDE_TASK reads
+# it from stdin). Write the three prompts into the session first, outside /workspace so
+# the workspace's contents stay the evidence:
+printf '%s\n' "Reply with OK." > ~/gpu-spike/prompts/ok.txt
+printf '%s\n' "Which model are you, and who made you? One line." > ~/gpu-spike/prompts/who.txt
+for f in ok who task1; do
+  CTR task exec --exec-id "p-$f" "$SESS" sh -c "mkdir -p /tmp/prompts && cat > /tmp/prompts/$f.txt" < ~/gpu-spike/prompts/$f.txt
+done
+
 # 3b. the NEGATIVE control first: a base URL that cannot answer. This MUST fail.
-CTR task exec --exec-id neg -t "$SESS" env \
-  ANTHROPIC_BASE_URL="http://$GW:1" ANTHROPIC_API_KEY=ollama ANTHROPIC_MODEL="$MODEL" \
-  claude -p "Reply with OK." ; echo "exit=$?"
+CTR task exec --exec-id neg -t "$SESS" env "${AGENT_ENV[@]}" ANTHROPIC_BASE_URL="http://$GW:1" \
+  sh -c "$(CLAUDE_TASK /workspace /tmp/prompts/ok.txt)" ; echo "exit=$?"
+# Expect ~3 minutes before it fails: Claude Code retries a refused connection with
+# backoff (180 s, `ConnectionRefused`, exit 1, measured on the reference host with this
+# exact shape). That wait is the control working, not hanging.
 ```
 
 If the negative control **succeeds**, Claude Code ignored the base URL and
@@ -249,19 +259,13 @@ record it, class `agent gap`, and see prediction 4 for what it means.
 
 ```bash
 # 3c. the real run — into the session's /workspace (the project volume), through the gateway.
-#     The prompt goes in via stdin from a file (see Arm A for why); write it into the
-#     session first, in a place outside /workspace so the workspace's contents stay the evidence.
-CTR task exec --exec-id prompt "$SESS" sh -c 'mkdir -p /tmp/prompts && cat > /tmp/prompts/task1.txt' < ~/gpu-spike/prompts/task1.txt
-CTR task exec --exec-id agent -t "$SESS" env \
-  ANTHROPIC_BASE_URL="http://$GW:11434" ANTHROPIC_API_KEY=ollama \
-  ANTHROPIC_MODEL="$MODEL" ANTHROPIC_SMALL_FAST_MODEL="$MODEL" \
-  DISABLE_TELEMETRY=1 DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-  sh -c 'cd /workspace && claude --bare -p --output-format json --allowedTools "Write,Read,Bash" < /tmp/prompts/task1.txt' \
+CTR task exec --exec-id agent -t "$SESS" env "${AGENT_ENV[@]}" ANTHROPIC_BASE_URL="http://$GW:11434" \
+  sh -c "$(CLAUDE_TASK /workspace /tmp/prompts/task1.txt)" \
   2>&1 | tee ~/gpu-spike/phase3-arm-b.json
 
 # 3d. which model answered — ask it, and watch the card
-CTR task exec --exec-id who -t "$SESS" env ANTHROPIC_BASE_URL="http://$GW:11434" ANTHROPIC_API_KEY=ollama ANTHROPIC_MODEL="$MODEL" \
-  claude -p "Which model are you, and who made you? One line."
+CTR task exec --exec-id who -t "$SESS" env "${AGENT_ENV[@]}" ANTHROPIC_BASE_URL="http://$GW:11434" \
+  sh -c "$(CLAUDE_TASK /workspace /tmp/prompts/who.txt)"
 /usr/lib/wsl/lib/nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv   # during/just after a turn
 grep -E '"POST /v1/messages' ~/gpu-spike/phase3-serve.log | tail -3
 ```
@@ -318,7 +322,10 @@ which Ollama has served for longer than the Anthropic one. Two things to
 establish, not assume: `codex --help` for how `--oss` locates the server (in
 Arm A it is `127.0.0.1:11434`; in Arm B it must be pointed at `$GW`, and
 whether it *can* be is the question), and the same fresh-directory,
-file-exists, file-runs pass criterion. Codex's own auth is a separate open
+file-exists, file-runs pass criterion. The command is `CODEX_TASK` from
+`gpu-env.sh` — prompt from a file via stdin, `--skip-git-repo-check` carried
+(divergence 4: with an argument prompt outside a repo Codex hangs silently) —
+run exactly as Arm A with `sh -c "$(CODEX_TASK /work /prompts/task1.txt)"`. Codex's own auth is a separate open
 item; `--oss` should need none — if it demands a login, record it and stop.
 Why Claude Code first regardless: it is the product's agent, its session
 model (D-02, M8) is built around it, and `ANTHROPIC_BASE_URL` is a documented
@@ -407,8 +414,8 @@ request, same model, `count_tokens` included (Ollama 404s it; this should
 not take and nothing below can pass.
 
 **7d — the decisive one.** Arm A exactly as Step 2 — fresh empty `work-a`,
-prompt from the file via stdin, `--bare` — with **only the base URL changed**
-to `http://127.0.0.1:8080`. Full toolset. Then the host verification: does
+`CLAUDE_TASK` with the prompt from the file, `AGENT_ENV` — with **only the
+base URL changed** to `--env=ANTHROPIC_BASE_URL=http://127.0.0.1:8080`. Full toolset. Then the host verification: does
 `hello.py` exist, does it run, does the JSON show a `tool_use`, does the
 llama-server log show the `/v1/messages` requests. If it passes, run Step 4's
 read-edit-run task against it too, and `codex exec --oss` against

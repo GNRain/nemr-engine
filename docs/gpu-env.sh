@@ -53,6 +53,32 @@ BASE=ghcr.io/gnrain/nemr-base:0.3.0
 MODEL="${MODEL:-llama3.1:8b}"
 MODELS_DIR="$HOME/gpu-spike/ollama-models"
 
+# The agent commands — ONE shape for both agents, and the prompt ALWAYS comes from a
+# FILE via stdin. Phase 3 divergence 1: `ctr run` attaches no stdin, so `claude -p` waits
+# 3 s and fails with "Input must be provided"; `< /dev/null` is not enough, and nested
+# quoting eats a prompt argument. Divergence 4: Codex hangs silently with an argument
+# prompt outside a repo and fails fast from stdin. Each function PRINTS the command that
+# runs inside the container — hand it to `sh -c`. The prompt file must already be
+# visible in the container: Arm A binds ~/gpu-spike/prompts at /prompts read-only, Arm B
+# copies it in with `task exec … cat > /tmp/prompts/…`.
+#   sh -c "$(CLAUDE_TASK /work /prompts/task1.txt)"
+#   sh -c "$(CODEX_TASK  /work /prompts/task1.txt)"
+CLAUDE_TASK() { printf 'cd %q && claude --bare -p --output-format json --allowedTools "Write,Read,Bash" < %q' "$1" "$2"; }
+CODEX_TASK()  { printf 'cd %q && codex exec --oss --skip-git-repo-check --local-provider ollama -m %q < %q' "$1" "$MODEL" "$2"; }
+
+# Everything Claude Code needs to be pointed at a local server EXCEPT the base URL — the
+# one value that differs per arm (127.0.0.1:11434 in Arm A, $GW:11434 in Arm B, :8080 for
+# llama-server), so it is passed next to these, never inside them. `--bare` forces
+# ANTHROPIC_API_KEY auth and skips the count_tokens prefetch Ollama 404s on. Two
+# spellings for the two entry points:
+#   ctr run:    "${AGENT_ENV[@]/#/--env=}" --env=ANTHROPIC_BASE_URL=http://127.0.0.1:11434
+#   task exec:  env "${AGENT_ENV[@]}" ANTHROPIC_BASE_URL="http://$GW:11434"
+# MODEL is read when this file is sourced — re-source after changing it.
+AGENT_ENV=(
+  ANTHROPIC_API_KEY=ollama ANTHROPIC_MODEL="$MODEL" ANTHROPIC_SMALL_FAST_MODEL="$MODEL"
+  DISABLE_TELEMETRY=1 DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+)
+
 # Self-check: every container run in the runbooks goes through CTRUN. This must print
 # NOTHING. It matches a run at command position (line start) only, so the CTRUN
 # definition and prose cannot false-positive; the `--help` probe is excluded (it mounts
