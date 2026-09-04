@@ -214,6 +214,24 @@ ctr version; runc --version                 # record; and: does THIS ctr know CD
 ctr run --help | grep -i cdi || echo "ctr has no CDI flag (expected: CDI is the client's job)"
 ```
 
+**Every `ctr run` below must run inside rootlesskit's namespaces.** A bare
+`ctr run` fails on the overlay mount — PREREQUISITES.md ("When nsenter IS
+required") already says so, and the first version of this runbook omitted it;
+that cost the Phase 1 run two cycles (a docs gap in this document, recorded in
+the Verdict). Define the wrapper once, and discover the driver store once:
+
+```bash
+CHILD_PID=$(cat "$XDG_RUNTIME_DIR/containerd-rootless/child_pid")
+CTR() { nsenter -U --preserve-credentials -m -n -t "$CHILD_PID" \
+          env CONTAINERD_ADDRESS=/run/containerd/containerd.sock ctr -n default "$@"; }
+
+# The NVIDIA driver store is a HASHED directory whose name changes on every
+# Windows driver update. Discover it — never hardcode it. (Phase 4 must do the
+# same: this is a precondition Phase 1 found, not a path to bake in.)
+DRV=$(ls -d /usr/lib/wsl/drivers/nv_dispi.inf_amd64_* | head -1); echo "driver store: $DRV"
+# nvidia-smi is NOT on PATH inside the CUDA image; it lives in the driver store.
+```
+
 The image ships the CUDA **runtime**, deliberately **not** the driver library:
 `libcuda.so` must come from the injected `/usr/lib/wsl/lib`, or the arm has
 proven nothing about the host GPU.
@@ -245,20 +263,22 @@ So apply, by hand, what Step 3's spec describes, in two forms that separate
 **B1 — as a device entry** (`linux.devices`, the mknod path):
 
 ```bash
-ctr -n default run --rm --device /dev/dxg \
+CTR run --rm --device /dev/dxg \
   --mount type=bind,src=/usr/lib/wsl/lib,dst=/usr/lib/wsl/lib,options=rbind:ro \
-  --env LD_LIBRARY_PATH=/usr/lib/wsl/lib \
-  "$IMG" gpu-b1 nvidia-smi
+  --mount type=bind,src="$DRV",dst="$DRV",options=rbind:ro \
+  --env LD_LIBRARY_PATH="/usr/lib/wsl/lib:$DRV" \
+  "$IMG" gpu-b1 "$DRV/nvidia-smi"
 ```
 
 **B2 — as a bind mount only** (what our `ContainerSpec` can express today):
 
 ```bash
-ctr -n default run --rm \
+CTR run --rm \
   --mount type=bind,src=/dev/dxg,dst=/dev/dxg,options=rbind:rw \
   --mount type=bind,src=/usr/lib/wsl/lib,dst=/usr/lib/wsl/lib,options=rbind:ro \
-  --env LD_LIBRARY_PATH=/usr/lib/wsl/lib \
-  "$IMG" gpu-b2 nvidia-smi
+  --mount type=bind,src="$DRV",dst="$DRV",options=rbind:ro \
+  --env LD_LIBRARY_PATH="/usr/lib/wsl/lib:$DRV" \
+  "$IMG" gpu-b2 "$DRV/nvidia-smi"
 ```
 
 Add any further `env:` entries Step 3's spec listed (record which). If
@@ -266,7 +286,7 @@ Add any further `env:` entries Step 3's spec listed (record which). If
 GPU:
 
 ```bash
-ctr -n default run --rm <same mounts/env> "$IMG" gpu-ld sh -c 'ldconfig -p | grep -E "libcuda|libnvidia-ml"; LD_DEBUG=libs nvidia-smi 2>&1 | head -20'
+CTR run --rm <same mounts/env> "$IMG" gpu-ld sh -c "ldconfig -p | grep -E 'libcuda|libnvidia-ml'; LD_DEBUG=libs $DRV/nvidia-smi 2>&1 | head -20"
 ```
 
 If the device is present but **opening it fails inside the container**
@@ -343,12 +363,13 @@ container**, first through the arm that worked in Step 4:
 ```bash
 DEV=docker.io/nvidia/cuda:<ver>-devel-ubuntu22.04
 ctr -n default images pull --platform linux/amd64 "$DEV"
-# Arm B2 form (substitute the arm that worked):
-ctr -n default run --rm \
+# Arm B2 form (substitute the arm that worked) — through the CTR wrapper, with the driver store:
+CTR run --rm \
   --mount type=bind,src=/dev/dxg,dst=/dev/dxg,options=rbind:rw \
   --mount type=bind,src=/usr/lib/wsl/lib,dst=/usr/lib/wsl/lib,options=rbind:ro \
-  --mount type=bind,src=$HOME/gpu-spike,dst=/work,options=rbind:ro \
-  --env LD_LIBRARY_PATH=/usr/lib/wsl/lib \
+  --mount type=bind,src="$DRV",dst="$DRV",options=rbind:ro \
+  --mount type=bind,src="$HOME/gpu-spike",dst=/work,options=rbind:ro \
+  --env LD_LIBRARY_PATH="/usr/lib/wsl/lib:$DRV" \
   "$DEV" gpu-compute sh -c 'nvcc -o /tmp/check /work/check.cu && /tmp/check'
 ```
 
@@ -506,3 +527,53 @@ one — is derived from it and nothing else.
 **Not in scope, on purpose:** any change to `setup_host.sh`, the engine, the
 base image or containerd's configuration; model choice; agent choice; how
 weights are stored or travel in a bundle; sharing one GPU across sessions.
+
+---
+
+## Verdict — Phase 1: FEASIBLE (2026-09-04, Product Owner, on the WSL2 box)
+
+**Arm B2 works — bind mounts and env only.** `CUDA COMPUTE PASS (n=1048576,
+device=NVIDIA GeForce RTX 3070)`, managed memory included, in a rootless
+container on our own containerd, through our own path. **The exact delta (Arm
+C), and nothing else:**
+
+```
+bind  /dev/dxg                                          rw
+bind  /usr/lib/wsl/lib                                  ro
+bind  /usr/lib/wsl/drivers/nv_dispi.inf_amd64_<hash>    ro
+env   LD_LIBRARY_PATH=/usr/lib/wsl/lib:<that driver-store path>
+```
+
+No device entries, no hooks, no cgroup rules. That is entirely within what
+`ContainerSpec` expresses today — Phase 4, if it comes, is small.
+
+**Predictions, scored.** #1 confirmed (`ctr` has no CDI flag; CDI is the
+client's job). #2 moot — B2 sufficed; no device-cgroup refusal was observed.
+#3 benign — auto-detect chose `wsl`, the forced-mode spec was byte-identical.
+#4 fired in the spec (two `createContainer` hooks) **but did not matter** —
+`LD_LIBRARY_PATH` substituted for them successfully. #5 dead — `/dev/dxg` is
+mode 666 and opens inside rootlesskit. #6 did not fire. #7 confirmed benign.
+#8 dead — `/usr/lib/wsl/lib` is not even a separate mount. #9 stands, and is
+**sharpened** below.
+
+**Unpredicted — two docs gaps in this document itself, each costing a cycle,
+both fixed above in the same commit as this verdict:**
+
+1. Arm B's commands ran bare `ctr run`, which fails on the overlay mount;
+   PREREQUISITES.md documents the `nsenter` wrapper, and the runbook omitted
+   it. Now defined once as `CTR` at the top of Step 4.
+2. `nvidia-smi` is not on `PATH` inside the CUDA image — it lives in the driver
+   store at the hashed path. Now invoked by full path, and the driver store is
+   a third bind the first draft did not have.
+
+**New precondition, the sharpened #9:** the driver-store directory name
+carries a **hash that changes on every Windows driver update**. Phase 1 lives
+with `ls -d /usr/lib/wsl/drivers/nv_dispi.inf_amd64_*`. **Phase 4 must discover
+that path at start time — never hardcode it** — and the CDI-spec-goes-stale
+item from the preconditions list now has a concrete mechanism.
+
+**Not verified, stated:** a host-side CUDA compute control (needs the toolkit
+inside WSL2 — deliberately not installed). The two-arm comparison served as
+the control, as the doc said it would.
+
+Phase 2 — Ollama in a container, by hand — is `docs/gpu-phase2-ollama.md`.
