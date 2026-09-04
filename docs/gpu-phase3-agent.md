@@ -54,10 +54,17 @@ cd ~/gpu-spike; mkdir -p work-a
 
 ## The delta, verbatim — and the Phase 2 server, running
 
-The same definitions as Phase 2 (`CTR`, `CTRUN`, `NS`, `DRV`, `GPU`), unchanged
-— copy them from `docs/gpu-phase2-ollama.md`, including the self-check grep
-that must print nothing. Then the Phase 2 server, in terminal 1, with **one
-addition**, explained in Step 0:
+The definitions (`CTR`, `CTRUN`, `NS`, `DRV`, `GPU`, the image and model
+names) now live in **one sourceable file** — the Phase 3 run found each new
+terminal needed the whole block re-pasted, and `CTRUN` went missing from one.
+In **every** terminal, first:
+
+```bash
+source ~/src/nemr-engine/docs/gpu-env.sh     # prints the driver store; the self-check must print nothing else
+```
+
+Then the Phase 2 server, in terminal 1, with **one addition**, explained in
+Step 0:
 
 ```bash
 # terminal 1 — Phase 2's server command, plus a context length (Step 0 decides the number)
@@ -156,19 +163,24 @@ mounted — so the only way a task can complete is through Ollama. That makes it
 the control for "which model answered" *by construction*.
 
 ```bash
-BASE=ghcr.io/gnrain/nemr-base:0.3.0          # already in containerd; record the digest
-rm -rf ~/gpu-spike/work-a && mkdir -p ~/gpu-spike/work-a   # a FRESH, EMPTY workspace: a file appearing in it is proof a tool ran
+rm -rf ~/gpu-spike/work-a && mkdir -p ~/gpu-spike/work-a ~/gpu-spike/prompts   # work-a is FRESH and EMPTY: a file appearing in it is proof a tool ran
+# The prompt goes in through STDIN FROM A FILE, on its own read-only bind so the
+# workspace stays empty. `ctr run` does not attach stdin and nested quoting eats a
+# prompt argument — Phase 3 measured `claude -p` waiting 3 s then failing with
+# "Input must be provided". `< /dev/null` is not enough; a file is.
+printf '%s\n' "Create a file named hello.py in the current directory containing a Python program that prints exactly: hello from ollama. Use your file-writing tool, then stop." > ~/gpu-spike/prompts/task1.txt
 CTRUN agent-a --rm --net-host \
   --mount "type=bind,src=$HOME/gpu-spike/work-a,dst=/work,options=rbind:rw" \
+  --mount "type=bind,src=$HOME/gpu-spike/prompts,dst=/prompts,options=rbind:ro" \
   --env ANTHROPIC_BASE_URL=http://127.0.0.1:11434 \
   --env ANTHROPIC_API_KEY=ollama \
   --env ANTHROPIC_MODEL="$MODEL" --env ANTHROPIC_SMALL_FAST_MODEL="$MODEL" \
   --env DISABLE_TELEMETRY=1 --env DISABLE_AUTOUPDATER=1 --env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-  --cwd /work \
-  "$BASE" agent-a claude -p --output-format json \
-    --allowedTools "Write,Read,Bash" \
-    "Create a file named hello.py in the current directory containing a Python program that prints exactly: hello from ollama. Use your file-writing tool, then stop." \
+  "$BASE" agent-a sh -c 'cd /work && claude --bare -p --output-format json --allowedTools "Write,Read,Bash" < /prompts/task1.txt' \
   2>&1 | tee ~/gpu-spike/phase3-arm-a.json
+# `--bare` (found in the Phase 3 run): skips hooks and prefetches — including the
+# count_tokens call Ollama 404s on — and forces ANTHROPIC_API_KEY auth, which is also
+# the cheapest guard against prediction 4.
 ```
 
 Flag names are Claude Code's; **check `claude --help` in this image** before
@@ -236,13 +248,15 @@ that follows would prove nothing. That is a finding of the first order:
 record it, class `agent gap`, and see prediction 4 for what it means.
 
 ```bash
-# 3c. the real run — into the session's /workspace (the project volume), through the gateway
+# 3c. the real run — into the session's /workspace (the project volume), through the gateway.
+#     The prompt goes in via stdin from a file (see Arm A for why); write it into the
+#     session first, in a place outside /workspace so the workspace's contents stay the evidence.
+CTR task exec --exec-id prompt "$SESS" sh -c 'mkdir -p /tmp/prompts && cat > /tmp/prompts/task1.txt' < ~/gpu-spike/prompts/task1.txt
 CTR task exec --exec-id agent -t "$SESS" env \
   ANTHROPIC_BASE_URL="http://$GW:11434" ANTHROPIC_API_KEY=ollama \
   ANTHROPIC_MODEL="$MODEL" ANTHROPIC_SMALL_FAST_MODEL="$MODEL" \
   DISABLE_TELEMETRY=1 DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-  sh -c 'cd /workspace && claude -p --output-format json --allowedTools "Write,Read,Bash" \
-    "Create a file named hello.py in the current directory containing a Python program that prints exactly: hello from ollama. Use your file-writing tool, then stop."' \
+  sh -c 'cd /workspace && claude --bare -p --output-format json --allowedTools "Write,Read,Bash" < /tmp/prompts/task1.txt' \
   2>&1 | tee ~/gpu-spike/phase3-arm-b.json
 
 # 3d. which model answered — ask it, and watch the card
@@ -321,6 +335,105 @@ answer, record both. Two models that both fail at 1b make the finding "8B
 tool calling through this layer" rather than "this model".
 
 ---
+
+## Step 7 — the llama.cpp probe: grammar-constrained tool calling, no new code
+
+*Added after the Phase 3 run (see "Findings before the verdict", below). Run
+this before the verdict is written.*
+
+The run isolated the failure to **Ollama's tool translation under a real
+agent's schema set** — five combinations, three models, two agents, two API
+paths, one result — and the model was doing its part (Qwen3-Coder emitted its
+native tool XML correctly, with a `</tool_call>` marker leaking through
+unconverted). That is a known, reported Ollama defect
+([ollama/ollama#15529](https://github.com/ollama/ollama/issues/15529): closed
+without a linked fix, still reproducing on 0.33.3).
+
+Ollama wraps llama.cpp. llama.cpp's **own** server takes a different route:
+with `--jinja` it renders the tool schemas through the model's chat template
+and, per its docs, generates a grammar from them so that a call is emitted as
+a structured block rather than parsed out of free text afterwards
+([docs/function-calling.md](https://github.com/ggml-org/llama.cpp/blob/master/docs/function-calling.md);
+Llama 3.1 and Qwen 2.5 Coder are in its natively-supported list). And it
+speaks the **Anthropic Messages API natively** — `POST /v1/messages` with
+`tool_use`/`tool_result` blocks, SSE streaming, **and** `count_tokens`
+([announcement](https://huggingface.co/blog/ggml-org/anthropic-messages-api-in-llamacpp),
+[server README](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)).
+So Claude Code points at it directly. If this works, the feature arrives with
+**no new code and no proxy** — the outcome worth one more probe.
+
+One caveat carried from the docs: extreme KV-cache quantization degrades tool
+calling. The probe leaves KV at its default.
+
+**7a — the binary, and the blob.** Ollama's runner links llama.cpp as a
+*library*; the standalone `llama-server` is not expected in the Ollama image
+(its log line "starting llama server" names the runner, not a binary). Check,
+then use the official image — a registry pull by `ctr`, no Docker:
+
+```bash
+source ~/src/nemr-engine/docs/gpu-env.sh
+CTRUN chk --rm "$OLL" chk sh -c 'find / -name "llama-server*" -type f 2>/dev/null; echo "---"; ls /usr/lib/ollama /usr/local/bin 2>/dev/null'
+# expected: nothing found → the official server image:
+ctr -n default images pull --platform linux/amd64 "$LCPP"
+ctr -n default images ls | grep llama.cpp                     # record the digest
+CTRUN chk2 --rm "$LCPP" chk2 sh -c 'ls /app; /app/llama-server --version'   # where the binary is, and its version
+
+# the GGUF is Ollama's model-layer blob — find it via the manifest, don't guess
+MAN="$MODELS_DIR/models/manifests/registry.ollama.ai/library/${MODEL%%:*}/${MODEL##*:}"
+GGUF=$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print([l["digest"] for l in m["layers"] if l["mediaType"].endswith(".model")][0])' "$MAN" | sed 's/:/-/')
+ls -la "$MODELS_DIR/models/blobs/$GGUF"; head -c4 "$MODELS_DIR/models/blobs/$GGUF"; echo   # "GGUF" magic
+```
+
+**7b — the server.** Same GPU delta, the blob directory bound read-only,
+`--jinja`, all layers on the card, the measured context ceiling:
+
+```bash
+# terminal 1
+CTRUN lcpp --rm --net-host "${GPU[@]}" \
+  --mount "type=bind,src=$MODELS_DIR/models,dst=/models,options=rbind:ro" \
+  "$LCPP" llama-srv /app/llama-server -m "/models/blobs/$GGUF" \
+    --jinja -ngl 99 -c 8192 --host 0.0.0.0 --port 8080 \
+  2>&1 | tee ~/gpu-spike/phase3-llama-serve.log
+```
+
+Read the startup log: layers offloaded to CUDA (all of them), the context, and
+that `--jinja` took the model's template. If the extension-less blob is
+refused, symlink it as `<name>.gguf` in a scratch dir and bind that — record
+the divergence. Then, from terminal 2, `nvidia-smi` for residency.
+
+**7c — the baseline: the Step 1b trivial-tool probe, against port 8080.** Same
+request, same model, `count_tokens` included (Ollama 404s it; this should
+200). Expect a `tool_use` block; a text-only answer here means `--jinja` did
+not take and nothing below can pass.
+
+**7d — the decisive one.** Arm A exactly as Step 2 — fresh empty `work-a`,
+prompt from the file via stdin, `--bare` — with **only the base URL changed**
+to `http://127.0.0.1:8080`. Full toolset. Then the host verification: does
+`hello.py` exist, does it run, does the JSON show a `tool_use`, does the
+llama-server log show the `/v1/messages` requests. If it passes, run Step 4's
+read-edit-run task against it too, and `codex exec --oss` against
+`/v1/chat/completions` if `--local-provider` can be pointed at port 8080
+(probe `codex --help`; if it cannot, Claude Code alone decides — the Anthropic
+endpoint makes it the primary arm here).
+
+**What 7d can show, and what each outcome means:**
+
+| 7c | 7d | Meaning |
+|---|---|---|
+| tool_use | file on disk, runs | Grammar-constrained calling survives a real schema set. The feature needs **no new code**: Phase 4's inference server is llama-server, not Ollama, and the Arm C delta plus a `--jinja` flag is the whole contract. |
+| tool_use | text again | The break is above the grammar — the schema *set*, not the format. Record what the grammar produced (a refusal? an empty call?); this is the finding that would justify looking at vLLM's per-model parsers as a *dependency*, never our own parser. |
+| tool_use | error before the first message | An endpoint or shape mismatch at the Anthropic layer; verbatim, attributable. |
+| text | — | `--jinja` or the template did not take; fix that before reading 7d. |
+
+**The proxy question, answered by survey, not by building one.** Proxies that
+put Claude Code in front of Ollama exist — UniClaudeProxy, several
+`claude-code-proxy` variants, LiteLLM. The ones that *do* make text tool calls
+work do it by injecting `<tool_call>` XML into the system prompt and parsing it
+back out — a per-model text parser for undocumented formats, exactly the class
+this project has spent weeks eliminating. The translation-only ones do not fix
+a backend that emits text. So the survey's answer is: **no existing dependency
+solves this cleanly; the backend that never needs parsing is the fix**, and
+that is what 7d measures. A parser proxy stays a fallback on paper, not a plan.
 
 ## Predictions — what we expect to break, and why
 
@@ -442,3 +555,94 @@ after all — Phase 2 found none; Phase 3 is the last chance to.
 base image or containerd's configuration; fixing a networking or credential
 gap found here; model quality beyond the pass criterion; the product's agent
 choice; weights in bundles; GPU sharing.
+
+---
+
+## Findings before the verdict — the Phase 3 run (2026-09-04, Product Owner, on the WSL2 box)
+
+**The plumbing passes; tool calling fails; and it is not the agent.** The
+verdict waits on Step 7. What is established:
+
+**Step 0, measured.** `4096`: fully resident (5.27 GB). **`8192`: fully
+resident (5.81 GB; 6868 MiB used) — the ceiling on this card.** `16384`: 87%
+resident (size 7.26 GB, vram 6.31 GB), partial offload, 43.5 tok/s against
+74.5. Sixteen thousand works at ~40% throughput cost. Both numbers are
+Phase-4 inputs: a trade-off, not a wall.
+
+**Step 1.** Ollama speaks Messages correctly — envelope, `stop_reason`,
+`usage`. With **one trivial tool** it produced a perfect
+`tool_use` (`write_file`, `{"path":"hello.txt","content":"hi"}`,
+`stop_reason: tool_use`). `count_tokens` 404s (**prediction 3 fired**);
+`/v1/models` 200s. `claude --bare` skips the prefetch that hits it, and
+forces API-key auth — which also addresses prediction 4's risk.
+
+**Step 2, Arm A — five combinations, one failure.** With Claude Code's
+**full** toolset, every model emitted its tool call as **text**, never a
+structured block, and no file was written in any run:
+
+```
+llama3.1:8b        {"name": "write_file", "parameters": {"content": "print(", ...}}
+qwen2.5-coder:7b   {"name": "Write", "parameters": {"path": ..., "text": "print(", ...}}
+qwen3-coder:30b    <function=Edit><parameter=file_path>/work/hello.py</parameter>...</tool_call>
+```
+
+The third is the diagnostic one: Qwen3-Coder emitted **its own native XML,
+correctly**, with a chat-template `</tool_call>` marker leaking through
+unconverted — the model knew what to do; nothing converted it. Changing the
+agent (`codex exec --oss --local-provider ollama`, a different API path,
+`/v1/chat/completions`) gave the same failure, now markdown-fenced — the model
+*writing about* a tool call. `sandbox_mode=workspace-write` changed nothing.
+**Three models (7B dense to 30B MoE), two agents, two API paths: the variable
+is neither the agent nor the model.** Ollama's tool translation works with one
+tool and stops under a real agent's schema set. Ollama 0.33.3 — not a stale
+build. Class: `ollama gap`. Known upstream:
+[ollama/ollama#15529](https://github.com/ollama/ollama/issues/15529).
+
+**Prediction 2 — fired, but not where predicted.** Step 1b's clean `tool_use`
+made it look dead; it was the schema *set*, not tool calling as such, that
+broke it. Prediction 1 (context) was real and is now measured. Prediction 4
+is addressed by `--bare` pending Arm B's negative control.
+
+**Arm B — unrun, and it is ours rather than Ollama's.** Two Nemr questions
+that Phase 4 needs regardless of tool calling: can a session reach a
+rootlesskit-namespace service at its gateway (predicted yes; untested), and
+does the credential negative control hold (the sharpest control in this
+runbook; unexercised). Run both, even with tool calling broken.
+
+**Divergences recorded (Phase 3 run):**
+
+1. `ctr run` does not attach stdin, so `claude -p` waits 3 s and fails with
+   `Input must be provided`; `< /dev/null` is not enough and nested quoting
+   eats a prompt argument. **Fixed above:** the prompt comes from a file via
+   stdin, on its own read-only bind. Class `docs gap`.
+2. `CTRUN` was missing from Phase 2's definitions in a fresh terminal, and
+   every terminal needed the whole block re-pasted. **Fixed:** the definitions
+   now live in `docs/gpu-env.sh`, sourced once per terminal. Class `docs gap`.
+3. `--rm` does not clean up after `SIGKILL`: after Phase 2's kill test the
+   container record survived as `running` with a dead task; `container rm`
+   refused, then reported not-found on the next call. Ambiguous, and it
+   matters if Phase 4 ever manages GPU containers. Class `rootless semantics`;
+   **Phase-4 item** (lifecycle of a killed GPU container).
+4. Codex needs `--skip-git-repo-check` outside a repo, and hangs silently
+   without it when the prompt is an argument; it fails fast with a message
+   when the prompt comes from stdin. Class `agent gap`.
+5. `Model metadata not found` for both Qwen models under Codex; it falls back
+   to default context assumptions. Class `agent gap`.
+6. Claude Code reports `"contextWindow": 200000` regardless of the server's
+   actual 8192 — the agent does not know the ceiling it is running under.
+   Class `agent gap`; relevant to Phase 4's context budgeting.
+
+**The ceiling, as this runbook required:** whatever Step 7 shows, **8B on
+8 GB is a plumbing proof, not a usable assistant.** Even with perfect tool
+calling, models that fit this card are not coding agents. The feature is
+waiting on hardware as much as on software.
+
+## Verdict — pending Step 7
+
+Not written until the llama.cpp probe has run, and Arm B with it. What is
+already settled and will not change: the GPU contract (Phase 1's delta,
+unchanged through two more phases), the residency ceiling (8192), the
+attribution of the tool-calling failure (Ollama's translation under a real
+schema set — not the agent, not the model), and the ceiling sentence above.
+What Step 7 decides is whether the fix is *a different server and one flag* or
+*a dependency we would rather not own*.

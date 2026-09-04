@@ -45,6 +45,12 @@ mkdir -p ~/gpu-spike/ollama-models && cd ~/gpu-spike
 
 ## The delta from Phase 1, verbatim — define it once
 
+> **Superseded for running:** these definitions now live in
+> **`docs/gpu-env.sh`** — `source` it in every new terminal. The Phase 3 run
+> found that each terminal needed this whole block re-pasted and that `CTRUN`
+> went missing from one; a single sourceable file is the fix. The block below
+> stays as the record of what Phase 2 ran; the file is the authority.
+
 Phase 1's Arm C delta, plus the `nsenter` wrapper and the hashed driver-store
 discovery its verdict recorded. Two shell functions, used everywhere below:
 
