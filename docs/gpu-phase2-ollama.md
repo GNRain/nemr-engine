@@ -53,8 +53,17 @@ export CONTAINERD_ADDRESS="${XDG_RUNTIME_DIR}/containerd/containerd.sock"
 CHILD_PID=$(cat "$XDG_RUNTIME_DIR/containerd-rootless/child_pid")
 
 # ctr, inside rootlesskit's mount + network namespaces (bare ctr run fails on the overlay mount)
-CTR() { nsenter -U --preserve-credentials -m -n -t "$CHILD_PID" \
-          env CONTAINERD_ADDRESS=/run/containerd/containerd.sock ctr -n default "$@"; }
+CTR()   { nsenter -U --preserve-credentials -m -n -t "$CHILD_PID" \
+            env CONTAINERD_ADDRESS=/run/containerd/containerd.sock ctr -n default "$@"; }
+# EVERY container run: the same entry PLUS the rootless cgroup flags — rootless containerd
+# cannot create the default cgroup (`mkdir /sys/fs/cgroup/default: permission denied`,
+# docs/ENGINEERING.md); --runc-systemd-cgroup REQUIRES --cgroup. Tag = container id, so
+# the long-lived server and a concurrent diagnostic never share a scope.
+CTRUN() { local tag="$1"; shift; CTR run --runc-systemd-cgroup --cgroup "user.slice:nemr:gpu-$tag" "$@"; }
+# Self-check: every container run goes through CTRUN — this must print NOTHING. It
+# matches a run at command position (line start) only, so the CTRUN definition and
+# prose do not false-positive; the `--help` probe is excluded (it mounts nothing):
+grep -nE '^\s*(ctr( -n default)? |CTR )run ' docs/gpu-*.md | grep -v -- '--help'
 # a plain command inside rootlesskit's NETWORK namespace only (for curl-ing the server)
 NS()  { nsenter -U --preserve-credentials -n -t "$CHILD_PID" "$@"; }
 
@@ -106,7 +115,7 @@ exactly the namespace `NS` enters.
 
 ```bash
 # terminal 1
-CTR run --rm --net-host "${GPU[@]}" \
+CTRUN srv --rm --net-host "${GPU[@]}" \
   --mount "type=bind,src=$HOME/gpu-spike/ollama-models,dst=/root/.ollama,options=rbind:rw" \
   --env OLLAMA_HOST=0.0.0.0:11434 \
   "$OLL" ollama-srv ollama serve 2>&1 | tee ~/gpu-spike/phase2-serve.log
@@ -124,7 +133,7 @@ inference compute ... library=cpu ...                                           
 — or shows no compute line at all — **stop here and diagnose before pulling a
 5 GB model**: the server will still work, on the CPU, and every later step
 would pass for the wrong reason. Diagnose with Phase 1's tools: does
-`$DRV/nvidia-smi` work in *this* image with *these* flags (`CTR run --rm
+`$DRV/nvidia-smi` work in *this* image with *these* flags (`CTRUN chk --rm
 "${GPU[@]}" "$OLL" chk "$DRV/nvidia-smi"`)? Does Ollama's discovery honour
 `LD_LIBRARY_PATH`, or does it search its own list (`OLLAMA_DEBUG=1` makes it
 say which libraries it tried)? Record the answer as a divergence, class
@@ -212,8 +221,12 @@ Any disagreement is the finding — write down which signal dissented.
 
 ## Step 5 — a second request, and a longer one
 
-The first generation pays the load cost. Send the same prompt again (load
-should be ~0 ms, tok/s unchanged), then something that generates a few hundred
+**The first generation is warmup; the second is the measurement.** The first
+request pays the model load *and* a cold prompt-eval that Phase 2 measured at
+**58× slower** than warm (1.43 tok/s cold, 83.1 warm) — anyone measuring once
+would file a false finding about the paravirtualised path. Never record a
+throughput number from a single request. Send the same prompt again (load
+should be ~0 ms; that is the number to keep), then something that generates a few hundred
 tokens — `"Write a 200-word explanation of what a mount namespace is."` — and
 watch signal 3 during it. This is where a partial offload or a VRAM ceiling
 shows up as a stall or an OOM in terminal 1. Record tok/s for the long one too.
@@ -356,3 +369,72 @@ Phase 4 inherits it unchanged.
 base image or containerd's configuration; model quality; agent choice; weights
 in bundles; GPU sharing; reaching the server from the host or from another
 container (Phase 3).
+
+---
+
+## Verdict — Phase 2: PASSES on every gate (2026-09-04, Product Owner, on the WSL2 box)
+
+An 8B model runs on the GPU, in a rootless container, on our own containerd,
+**through Phase 1's delta unchanged**. No `our-path gap` was found: Ollama
+located the GPU through the bind mounts and `LD_LIBRARY_PATH` alone. **Phase
+1's Arm C delta is confirmed as the whole GPU contract.**
+
+**Step 2, the gate, verbatim:**
+
+```
+msg="inference compute" id=0 library=CUDA compute=8.6 name=CUDA0
+  description="NVIDIA GeForce RTX 3070" libdirs=ollama,cuda_v13 driver=13.3
+  type=discrete total="8.0 GiB" available="6.9 GiB"
+msg="vram-based default context" default_num_ctx=4096
+```
+
+`available="6.9 GiB"` — Windows holds ~1.1 GiB, so **6.9 GiB is the real
+budget**, and Ollama sized its default context from it.
+
+**Step 3:** pull succeeded from inside rootlesskit's namespace
+(`{"status":"success"}`) — egress and DNS both work there. `llama3.1:8b`,
+4,920,753,328 bytes, blobs on the host bind.
+
+**Step 4, all three signals, no dissent:** response `391`; `/api/ps`
+`size` = `size_vram` = 5271715839 (full residency); server log `offloaded
+33/33 layers to GPU`; `nvidia-smi` 6477 MiB used of 8192 (~5.3 GiB arrived
+against a ~1.1 GiB baseline). Cold: eval 123.7 tok/s, load 42.9 s, prompt
+eval 1.4 tok/s.
+
+**Step 5, warm — and it changes the picture:** load 4 ms, prompt 83.1 tok/s,
+**eval 74.5 tok/s**. GPU-class by any reading.
+
+**Step 6:** model present after restart without re-pull. SIGKILL: 6507 MiB
+before → 1304 MiB after. **VRAM is released on an unclean death** — no
+constraint on GPU sharing from that direction, measured now rather than at
+Phase 4.
+
+**Scorecard.** #1 (CPU fallback) dead. #2 (egress/DNS) dead. #3 as designed.
+#5 (paravirtualised cost) **wrong** — the path costs little. #9 (VRAM on
+SIGKILL) dead. Six of nine dead or benign; the two that fired were neither
+predicted nor GPU problems. The template earned its keep again; the
+predictions did not.
+
+**Two findings the predictions did not cover:**
+
+1. **`disabling mmap for llama-server load due to host memory pressure`** —
+   `system_total="7.7 GiB"`, `model_size="4.6 GiB"`, so the loader read the
+   whole file instead of mapping it: that is the 41-second cold load. A **host
+   RAM** finding, not a GPU one; WSL2's default memory allocation sets it and
+   `.wslconfig` `memory=` is the lever. Phase 4 should know cold start scales
+   with host RAM.
+2. **Cold vs warm prompt eval differ by 58×** (1.43 → 83.1 tok/s). A single
+   measurement files a false finding about the paravirtualised path. Folded
+   into Step 5 as a rule: the first generation is warmup; the second is the
+   measurement.
+
+**One divergence, in this runbook — class `docs gap`, fixed above:** the `CTR`
+wrapper carried Phase 1's `nsenter` fix but **not** `--runc-systemd-cgroup
+--cgroup`, so the first run failed with `mkdir /sys/fs/cgroup/default:
+permission denied` — the error docs/ENGINEERING.md documents. Same shape as
+Phase 1's two gaps: a fix known elsewhere in the repo, not carried into the
+runbook. Fixed structurally in both runbooks: every container run is `CTRUN`,
+which folds in both, and the self-check grep at the top verifies it
+mechanically rather than by eye.
+
+Phase 3 — a coding agent pointed at this server — is `docs/gpu-phase3-agent.md`.

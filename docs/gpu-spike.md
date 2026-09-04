@@ -222,8 +222,21 @@ the Verdict). Define the wrapper once, and discover the driver store once:
 
 ```bash
 CHILD_PID=$(cat "$XDG_RUNTIME_DIR/containerd-rootless/child_pid")
-CTR() { nsenter -U --preserve-credentials -m -n -t "$CHILD_PID" \
-          env CONTAINERD_ADDRESS=/run/containerd/containerd.sock ctr -n default "$@"; }
+# ctr inside rootlesskit's mount + network namespaces — for pulls, task ops, anything but `run`
+CTR()   { nsenter -U --preserve-credentials -m -n -t "$CHILD_PID" \
+            env CONTAINERD_ADDRESS=/run/containerd/containerd.sock ctr -n default "$@"; }
+# EVERY container run: the same entry PLUS the rootless cgroup flags. Rootless containerd
+# cannot create the default cgroup (`mkdir /sys/fs/cgroup/default: permission denied` —
+# docs/ENGINEERING.md), so runc must use the systemd driver with an explicit user.slice
+# path, and --runc-systemd-cgroup REQUIRES --cgroup. The tag names the scope: use the
+# container id, so concurrent runs never share one.   CTRUN <tag> [run flags] IMAGE ID [CMD]
+CTRUN() { local tag="$1"; shift; CTR run --runc-systemd-cgroup --cgroup "user.slice:nemr:gpu-$tag" "$@"; }
+
+# Self-check before running anything: every container run in these runbooks goes
+# through CTRUN. This must print NOTHING. It matches a run at COMMAND position (line
+# start) only, so the CTRUN definition and prose mentions do not false-positive; the
+# `--help` probe is excluded because it mounts nothing:
+grep -nE '^\s*(ctr( -n default)? |CTR )run ' docs/gpu-*.md | grep -v -- '--help'
 
 # The NVIDIA driver store is a HASHED directory whose name changes on every
 # Windows driver update. Discover it — never hardcode it. (Phase 4 must do the
@@ -263,7 +276,7 @@ So apply, by hand, what Step 3's spec describes, in two forms that separate
 **B1 — as a device entry** (`linux.devices`, the mknod path):
 
 ```bash
-CTR run --rm --device /dev/dxg \
+CTRUN b1 --rm --device /dev/dxg \
   --mount type=bind,src=/usr/lib/wsl/lib,dst=/usr/lib/wsl/lib,options=rbind:ro \
   --mount type=bind,src="$DRV",dst="$DRV",options=rbind:ro \
   --env LD_LIBRARY_PATH="/usr/lib/wsl/lib:$DRV" \
@@ -273,7 +286,7 @@ CTR run --rm --device /dev/dxg \
 **B2 — as a bind mount only** (what our `ContainerSpec` can express today):
 
 ```bash
-CTR run --rm \
+CTRUN b2 --rm \
   --mount type=bind,src=/dev/dxg,dst=/dev/dxg,options=rbind:rw \
   --mount type=bind,src=/usr/lib/wsl/lib,dst=/usr/lib/wsl/lib,options=rbind:ro \
   --mount type=bind,src="$DRV",dst="$DRV",options=rbind:ro \
@@ -286,7 +299,7 @@ Add any further `env:` entries Step 3's spec listed (record which). If
 GPU:
 
 ```bash
-CTR run --rm <same mounts/env> "$IMG" gpu-ld sh -c "ldconfig -p | grep -E 'libcuda|libnvidia-ml'; LD_DEBUG=libs $DRV/nvidia-smi 2>&1 | head -20"
+CTRUN ld --rm <same mounts/env> "$IMG" gpu-ld sh -c "ldconfig -p | grep -E 'libcuda|libnvidia-ml'; LD_DEBUG=libs $DRV/nvidia-smi 2>&1 | head -20"
 ```
 
 If the device is present but **opening it fails inside the container**
@@ -364,7 +377,7 @@ container**, first through the arm that worked in Step 4:
 DEV=docker.io/nvidia/cuda:<ver>-devel-ubuntu22.04
 ctr -n default images pull --platform linux/amd64 "$DEV"
 # Arm B2 form (substitute the arm that worked) — through the CTR wrapper, with the driver store:
-CTR run --rm \
+CTRUN compute --rm \
   --mount type=bind,src=/dev/dxg,dst=/dev/dxg,options=rbind:rw \
   --mount type=bind,src=/usr/lib/wsl/lib,dst=/usr/lib/wsl/lib,options=rbind:ro \
   --mount type=bind,src="$DRV",dst="$DRV",options=rbind:ro \
@@ -561,10 +574,20 @@ both fixed above in the same commit as this verdict:**
 
 1. Arm B's commands ran bare `ctr run`, which fails on the overlay mount;
    PREREQUISITES.md documents the `nsenter` wrapper, and the runbook omitted
-   it. Now defined once as `CTR` at the top of Step 4.
+   it. Now defined once at the top of Step 4 — `CTR`, and `CTRUN` for every
+   container run.
 2. `nvidia-smi` is not on `PATH` inside the CUDA image — it lives in the driver
    store at the hashed path. Now invoked by full path, and the driver store is
    a third bind the first draft did not have.
+3. *(found by Phase 2's first run, fixed here as well)* The `CTR` wrapper
+   carried the `nsenter` fix but **not** the rootless cgroup flags, so its first
+   run failed with `mkdir /sys/fs/cgroup/default: permission denied` — the
+   error docs/ENGINEERING.md documents, with the fix (`--runc-systemd-cgroup
+   --cgroup user.slice:…`). Every container run is now `CTRUN`, which folds
+   both in, and a self-check grep at the top of Step 4 verifies mechanically —
+   not by eye — that no run lacks them. Three docs gaps, one shape: a fix
+   known elsewhere in the repo, not carried into the runbook. The self-check
+   is the structural answer.
 
 **New precondition, the sharpened #9:** the driver-store directory name
 carries a **hash that changes on every Windows driver update**. Phase 1 lives
