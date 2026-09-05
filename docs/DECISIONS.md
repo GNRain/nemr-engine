@@ -473,6 +473,79 @@ not unnoticed.**
 
 ---
 
+### E-18 — A local LLM on the host GPU for a session's agent (Phase 4)
+
+**Status:** **Deferred, with direction** · 2026-09-05
+**Raised by:** Product Owner (2026-09-03), once E-10 made the only GPU host
+reachable · **Ruled by:** Product Owner · **Relates to:** E-10, D-02, D-13,
+NET-02/NET-05, NFR-01
+
+**Question.** Can a session's agent work against a model served from the
+host's GPU, with no API call leaving the machine — and what would the engine
+have to grow to do it?
+
+**What the spike established** (`docs/gpu-spike.md`,
+`docs/gpu-phase2-ollama.md`, `docs/gpu-phase3-agent.md`; three phases by hand,
+nothing built, no CI ever — hosted runners have no GPU). Phase 1: a rootless
+container on our containerd uses the RTX 3070 through **three bind mounts and
+one env var** (`/dev/dxg` rw, `/usr/lib/wsl/lib` ro, the hashed driver store
+ro, `LD_LIBRARY_PATH`) — no device entries, hooks, CDI or cgroup rules, so it
+fits today's `ContainerSpec`. Phase 2: an 8B model fully resident at 74 tok/s
+through that delta unchanged. Phase 3: Ollama's Anthropic-compatible API is
+correct and a real session reaches it at its gateway; **but tool calling under
+a real agent's toolset fails everywhere** — three models (7B dense to 30B
+MoE), two agents (Claude Code, Codex), two servers (Ollama 0.33.3, llama.cpp's
+own server), three endpoints, two GGUF sources, the parser forced. The models
+emit correct calls as text; no layer converts them. Known upstream for Ollama
+(ollama/ollama#15529, closed unfixed); reproduced on llama.cpp at the
+single-tool baseline. Both are drafted as upstream reports in
+`docs/gpu-upstream-issues.md`, evidence-first, for the Product Owner to file.
+And the ceiling the runbook fixed before its first run: **8B on 8 GB is a
+plumbing proof, not a usable assistant** — even with tool calling fixed, the
+models that fit this card are not coding agents.
+
+**Ruling (Product Owner, 2026-09-05).** Phase 4 — the engine work — is
+**deferred, not cancelled.** The delta is known and small. It reopens when
+either changes: the translation layer is fixed upstream, in a server we would
+run as a dependency (verified by re-running Step 7c then 7d of the Phase 3
+runbook — a trivial tool call, then a completed edit in an empty directory);
+or there is a card that runs a model that matters. The feature waits on
+hardware as much as on software. A translation proxy stays a fallback on
+paper, not a plan: the ones that make text tool calls work are per-model text
+parsers for undocumented formats, the class this project has eliminated
+(F-58's lesson, one layer up).
+
+**Settled Phase-4 inputs — measured, do not re-test:**
+
+1. **A session reaches a service in rootlesskit's namespace at its own
+   gateway** (`10.99.N.1`, from `ip route` inside the session), through
+   NET-02 with NET-05 intact — the isolation is a `FORWARD` drop, delivery
+   to the gateway is `INPUT`. No networking change is needed.
+2. **`ANTHROPIC_BASE_URL` wins over the mounted credential.** With the real
+   D-02 credential present and egress available, the negative control failed
+   to connect rather than reaching `api.anthropic.com`. A GPU session can
+   carry the user's credential and point at a local model without the two
+   colliding — the design question prediction 4 would have opened is closed.
+3. The GPU contract above, and the driver-store directory **discovered at
+   start** (`/usr/lib/wsl/drivers/nv_dispi.inf_amd64_<hash>` changes on every
+   Windows driver update), never hardcoded.
+4. Context: 8192 fully resident on this card; 16384 at 87% residency and
+   ~40% throughput cost. A trade-off to expose, not a wall.
+5. Lifecycle: `--rm` does not clean up a GPU container after SIGKILL; a model
+   cache belongs on a bind (llama-server's download otherwise lives in the
+   writable layer); `nemr status` should surface the session's gateway
+   address; `claude --bare` skips the `count_tokens` pre-flight; the agent
+   does not know its real context window.
+6. **Not needed:** `nvidia-container-toolkit`, any third-party apt repo, CDI,
+   `nerdctl`. The D-13-class question the Phase 1 runbook flagged never
+   arises.
+
+**Not done, deliberately:** no proxy or parser; no `setup_host.sh`, engine,
+base-image or containerd-config change; no upstream fix attempted; nothing
+with CI coverage, and nothing in this line ever will have it.
+
+---
+
 ## Open
 
 ### E-11 — Open-core seam
@@ -1194,3 +1267,4 @@ is overstating what has been demonstrated.
 | 2026-08-22 | E-10 | **Deferred with direction** — Linux first, then WSL2, then a bundled VM on macOS; remote-engine fallback rejected. Moved out of Open (Rain) |
 | 2026-09-02 | E-10 | **Windows half resolved — WSL2** (no native binary, no bundled VM); macOS stays deferred, remote fallback stays rejected. Sequencing reopened for a GPU test host; permanent manual-verification cost accepted (Rain) |
 | 2026-09-03 | D-13 | **Resolved** — Node and Claude Code are prerequisites nemr detects and instructs for, never installs; no NodeSource apt repo, no `npm -g` by the script (NFR-01 one layer out; WSL2 spike divergence 3) (Rain) |
+| 2026-09-05 | E-18 | **Deferred with direction** — a local LLM on the host GPU: the contract is three binds + one env var and a session reaches the server at its gateway with the credential override holding, but tool calling fails under a real toolset in every server/model/agent combination (upstream, drafted in `docs/gpu-upstream-issues.md`); 8B on 8 GB is a plumbing proof, not an assistant. Phase 4 reopens on an upstream fix or a card that matters; the two Arm B findings are settled inputs (Rain) |

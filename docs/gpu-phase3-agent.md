@@ -169,18 +169,17 @@ rm -rf ~/gpu-spike/work-a && mkdir -p ~/gpu-spike/work-a ~/gpu-spike/prompts   #
 # prompt argument — Phase 3 measured `claude -p` waiting 3 s then failing with
 # "Input must be provided". `< /dev/null` is not enough; a file is.
 printf '%s\n' "Create a file named hello.py in the current directory containing a Python program that prints exactly: hello from ollama. Use your file-writing tool, then stop." > ~/gpu-spike/prompts/task1.txt
+# The agent command and its environment come from gpu-env.sh (CLAUDE_TASK, AGENT_ENV) so
+# every arm runs the SAME shape; only the base URL is spelled here, because it is the one
+# thing that differs per arm. `--bare` (found in the Phase 3 run): skips hooks and
+# prefetches — including the count_tokens call Ollama 404s on — and forces
+# ANTHROPIC_API_KEY auth, which is also the cheapest guard against prediction 4.
 CTRUN agent-a --rm --net-host \
   --mount "type=bind,src=$HOME/gpu-spike/work-a,dst=/work,options=rbind:rw" \
   --mount "type=bind,src=$HOME/gpu-spike/prompts,dst=/prompts,options=rbind:ro" \
-  --env ANTHROPIC_BASE_URL=http://127.0.0.1:11434 \
-  --env ANTHROPIC_API_KEY=ollama \
-  --env ANTHROPIC_MODEL="$MODEL" --env ANTHROPIC_SMALL_FAST_MODEL="$MODEL" \
-  --env DISABLE_TELEMETRY=1 --env DISABLE_AUTOUPDATER=1 --env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-  "$BASE" agent-a sh -c 'cd /work && claude --bare -p --output-format json --allowedTools "Write,Read,Bash" < /prompts/task1.txt' \
+  "${AGENT_ENV[@]/#/--env=}" --env=ANTHROPIC_BASE_URL=http://127.0.0.1:11434 \
+  "$BASE" agent-a sh -c "$(CLAUDE_TASK /work /prompts/task1.txt)" \
   2>&1 | tee ~/gpu-spike/phase3-arm-a.json
-# `--bare` (found in the Phase 3 run): skips hooks and prefetches — including the
-# count_tokens call Ollama 404s on — and forces ANTHROPIC_API_KEY auth, which is also
-# the cheapest guard against prediction 4.
 ```
 
 Flag names are Claude Code's; **check `claude --help` in this image** before
@@ -236,10 +235,21 @@ isolation rule is a `FORWARD` drop between sessions; delivery to the gateway
 address is `INPUT`.)
 
 ```bash
+# Every prompt in this arm goes in as a FILE, the same shape as Arm A (CLAUDE_TASK reads
+# it from stdin). Write the three prompts into the session first, outside /workspace so
+# the workspace's contents stay the evidence:
+printf '%s\n' "Reply with OK." > ~/gpu-spike/prompts/ok.txt
+printf '%s\n' "Which model are you, and who made you? One line." > ~/gpu-spike/prompts/who.txt
+for f in ok who task1; do
+  CTR task exec --exec-id "p-$f" "$SESS" sh -c "mkdir -p /tmp/prompts && cat > /tmp/prompts/$f.txt" < ~/gpu-spike/prompts/$f.txt
+done
+
 # 3b. the NEGATIVE control first: a base URL that cannot answer. This MUST fail.
-CTR task exec --exec-id neg -t "$SESS" env \
-  ANTHROPIC_BASE_URL="http://$GW:1" ANTHROPIC_API_KEY=ollama ANTHROPIC_MODEL="$MODEL" \
-  claude -p "Reply with OK." ; echo "exit=$?"
+CTR task exec --exec-id neg -t "$SESS" env "${AGENT_ENV[@]}" ANTHROPIC_BASE_URL="http://$GW:1" \
+  sh -c "$(CLAUDE_TASK /workspace /tmp/prompts/ok.txt)" ; echo "exit=$?"
+# Expect ~3 minutes before it fails: Claude Code retries a refused connection with
+# backoff (180 s, `ConnectionRefused`, exit 1, measured on the reference host with this
+# exact shape). That wait is the control working, not hanging.
 ```
 
 If the negative control **succeeds**, Claude Code ignored the base URL and
@@ -249,19 +259,13 @@ record it, class `agent gap`, and see prediction 4 for what it means.
 
 ```bash
 # 3c. the real run — into the session's /workspace (the project volume), through the gateway.
-#     The prompt goes in via stdin from a file (see Arm A for why); write it into the
-#     session first, in a place outside /workspace so the workspace's contents stay the evidence.
-CTR task exec --exec-id prompt "$SESS" sh -c 'mkdir -p /tmp/prompts && cat > /tmp/prompts/task1.txt' < ~/gpu-spike/prompts/task1.txt
-CTR task exec --exec-id agent -t "$SESS" env \
-  ANTHROPIC_BASE_URL="http://$GW:11434" ANTHROPIC_API_KEY=ollama \
-  ANTHROPIC_MODEL="$MODEL" ANTHROPIC_SMALL_FAST_MODEL="$MODEL" \
-  DISABLE_TELEMETRY=1 DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-  sh -c 'cd /workspace && claude --bare -p --output-format json --allowedTools "Write,Read,Bash" < /tmp/prompts/task1.txt' \
+CTR task exec --exec-id agent -t "$SESS" env "${AGENT_ENV[@]}" ANTHROPIC_BASE_URL="http://$GW:11434" \
+  sh -c "$(CLAUDE_TASK /workspace /tmp/prompts/task1.txt)" \
   2>&1 | tee ~/gpu-spike/phase3-arm-b.json
 
 # 3d. which model answered — ask it, and watch the card
-CTR task exec --exec-id who -t "$SESS" env ANTHROPIC_BASE_URL="http://$GW:11434" ANTHROPIC_API_KEY=ollama ANTHROPIC_MODEL="$MODEL" \
-  claude -p "Which model are you, and who made you? One line."
+CTR task exec --exec-id who -t "$SESS" env "${AGENT_ENV[@]}" ANTHROPIC_BASE_URL="http://$GW:11434" \
+  sh -c "$(CLAUDE_TASK /workspace /tmp/prompts/who.txt)"
 /usr/lib/wsl/lib/nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv   # during/just after a turn
 grep -E '"POST /v1/messages' ~/gpu-spike/phase3-serve.log | tail -3
 ```
@@ -318,7 +322,10 @@ which Ollama has served for longer than the Anthropic one. Two things to
 establish, not assume: `codex --help` for how `--oss` locates the server (in
 Arm A it is `127.0.0.1:11434`; in Arm B it must be pointed at `$GW`, and
 whether it *can* be is the question), and the same fresh-directory,
-file-exists, file-runs pass criterion. Codex's own auth is a separate open
+file-exists, file-runs pass criterion. The command is `CODEX_TASK` from
+`gpu-env.sh` — prompt from a file via stdin, `--skip-git-repo-check` carried
+(divergence 4: with an argument prompt outside a repo Codex hangs silently) —
+run exactly as Arm A with `sh -c "$(CODEX_TASK /work /prompts/task1.txt)"`. Codex's own auth is a separate open
 item; `--oss` should need none — if it demands a login, record it and stop.
 Why Claude Code first regardless: it is the product's agent, its session
 model (D-02, M8) is built around it, and `ANTHROPIC_BASE_URL` is a documented
@@ -407,8 +414,8 @@ request, same model, `count_tokens` included (Ollama 404s it; this should
 not take and nothing below can pass.
 
 **7d — the decisive one.** Arm A exactly as Step 2 — fresh empty `work-a`,
-prompt from the file via stdin, `--bare` — with **only the base URL changed**
-to `http://127.0.0.1:8080`. Full toolset. Then the host verification: does
+`CLAUDE_TASK` with the prompt from the file, `AGENT_ENV` — with **only the
+base URL changed** to `--env=ANTHROPIC_BASE_URL=http://127.0.0.1:8080`. Full toolset. Then the host verification: does
 `hello.py` exist, does it run, does the JSON show a `tool_use`, does the
 llama-server log show the `/v1/messages` requests. If it passes, run Step 4's
 read-edit-run task against it too, and `codex exec --oss` against
@@ -560,8 +567,9 @@ choice; weights in bundles; GPU sharing.
 
 ## Findings before the verdict — the Phase 3 run (2026-09-04, Product Owner, on the WSL2 box)
 
-**The plumbing passes; tool calling fails; and it is not the agent.** The
-verdict waits on Step 7. What is established:
+**The plumbing passes; tool calling fails; and it is not the agent.** (Written
+before Step 7 and Arm B ran; their results and the verdict follow this
+section.) What was established:
 
 **Step 0, measured.** `4096`: fully resident (5.27 GB). **`8192`: fully
 resident (5.81 GB; 6868 MiB used) — the ceiling on this card.** `16384`: 87%
@@ -637,12 +645,216 @@ runbook; unexercised). Run both, even with tool calling broken.
 calling, models that fit this card are not coding agents. The feature is
 waiting on hardware as much as on software.
 
-## Verdict — pending Step 7
+## Step 7 and Arm B — run (2026-09-05, Product Owner, on the WSL2 box)
 
-Not written until the llama.cpp probe has run, and Arm B with it. What is
-already settled and will not change: the GPU contract (Phase 1's delta,
-unchanged through two more phases), the residency ceiling (8192), the
-attribution of the tool-calling failure (Ollama's translation under a real
-schema set — not the agent, not the model), and the ceiling sentence above.
-What Step 7 decides is whether the fix is *a different server and one flag* or
-*a dependency we would rather not own*.
+**7a.** `/usr/lib/ollama/llama-server` **is** in the Ollama image — the
+runbook's expectation was wrong: Ollama ships the standalone binary alongside
+its runner library. `XGRAMMAR_LICENSE` is there too, so the image carries
+grammar machinery it evidently does not use on this path. The GGUF was found
+through the manifest: 4.68 GB, `GGUF` magic.
+
+**7b.** The official image `ghcr.io/ggml-org/llama.cpp:server-cuda`, `-ngl 99
+-c 8192`: `offloaded 29/29 layers to GPU`, 4168 MiB model buffer on CUDA0.
+Fully resident — a third server image through the same three binds and one
+env var, the GPU contract unchanged again.
+
+**7c — fails at the trivial-tool baseline, on both endpoints.**
+
+```
+/v1/messages         → text, ```xml-fenced JSON, stop_reason: end_turn
+/v1/chat/completions → text, <function-call>...</function-call>, finish_reason: stop
+                       62.9 tok/s — GPU speed, so not a degraded model
+```
+
+This is the case Ollama handled correctly at Step 1b. llama.cpp is *worse* at
+the baseline, not better. `count_tokens` returns 200 — the runbook's
+prediction held, and it decides nothing.
+
+**Every confound eliminated, in order:**
+
+- *Template provenance.* The source GGUF pulled directly
+  (`bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M`) — Ollama's blob out of
+  the picture. The startup log: `tokenizer.chat_template = {%- if tools %}…`
+  — Qwen's real tool branch, loaded. Still text.
+- *Residency.* A two-server collision produced 0.16 tok/s on one run; fixed
+  and re-run at 62.9 tok/s. Still text.
+- *Parser forced.* `--no-skip-chat-parsing --chat-template-kwargs
+  '{"enable_thinking":false}'`. Still text — now `<function_call>` fenced as
+  xml.
+- *`--jinja`* was already the default in this build; passing it changed
+  nothing.
+
+**The diagnostic detail.** Qwen's native tool format is `<tool_call>`. It
+never appeared once. What appeared: `<function-call>`, `<function_call>`,
+fenced JSON, fenced XML — four different guesses at the wire format. The
+model knows it should make a tool call and is guessing at the format, with
+the template's tool branch present in the file. Recorded as the observation
+the upstream report carries (`docs/gpu-upstream-issues.md`), not explained
+here.
+
+**7d was gated on 7c, and 7c failed** — the outcome table's last row. Not run
+as a decisive step; nothing below a failed baseline can pass.
+
+**Space covered, in total:** three models (7B dense → 30B MoE), two agents,
+two servers, three endpoints, two GGUF sources, the parser forced. One result.
+It does not get stronger with more runs.
+
+**Arm B — both Nemr questions answered, both the right way.**
+
+*Gateway reachability — works, no Nemr change needed:*
+
+```
+root@Rain:/workspace# GW=$(ip route | awk '/default/{print $3}'); echo $GW
+10.99.0.1
+root@Rain:/workspace# curl -s http://$GW:11434/api/version
+{"version":"0.33.3"}
+```
+
+Prediction 5 dead, by the predicted mechanism: NET-05's isolation is a
+`FORWARD` drop; delivery to the gateway address is `INPUT`. A session reaches
+a service in rootlesskit's namespace at its own gateway, through NET-02, with
+the isolation intact.
+
+*The negative control held — the important one:*
+
+```
+ANTHROPIC_BASE_URL=http://127.0.0.1:1 … claude -p --bare …
+→ "is_error": true, "num_turns": 0
+  "Failed to connect to 127.0.0.1:1 after 0 ms: Couldn't connect to server"
+```
+
+With the real credential present (D-02) and egress available, Claude Code
+**did not fall back to `api.anthropic.com`**. The override wins. Prediction 4
+dead, and the Phase-4 design question it would have opened is closed: a GPU
+session can carry the user's credential and point at a local model without
+the two colliding.
+
+*Arm B proper:* routed correctly — `provider: firstParty`, `canonicalModel:
+qwen2.5-coder:7b`; the server log shows the request arriving from
+`10.99.0.2`, the session's address. Tool calling failed identically to Arm A
+(fenced JSON as text): consistent, expected, and attributable to the same
+layer.
+
+**Divergences (continued from 6):**
+
+7. `nemr status` shows only forwarded ports — not the session's gateway
+   address, the one address a session needs to reach a host-side service. It
+   was discovered with `ip route` inside the session instead. Class `docs
+   gap`; **Phase-4 item** (surface the gateway in `status`).
+8. llama-server's Hugging Face download (7.5 min) landed in the container's
+   writable layer: cached across restarts, gone on `delete`. Phase 4 puts a
+   model cache on a bind, next to the weights. Class `our-path` note — a
+   lifecycle choice, not a gap in the contract.
+9. Step 7a's expectation was wrong: `llama-server` ships in the Ollama image.
+   Class `docs gap`; harmless — the official image was used anyway, for a
+   known build.
+
+---
+
+## Scorecard — the nine predictions, and Step 7's own
+
+| # | Prediction | Outcome |
+|---|---|---|
+| 1 | Context is the wall — near-certain at 4096, likely still at 8192 | **Real, measured, and a trade-off rather than a wall.** 8192 fully resident (5.81 GB, 6868 MiB used); 16384 at 87% residency and ~40% throughput cost. Both numbers are Phase-4 inputs. |
+| 2 | Tool calling does not survive — the phase's central question | **Fired, but not where predicted.** Step 1b's clean `tool_use` looked like a pass; the break is the schema *set* on Ollama, and the trivial baseline itself on llama.cpp. Not the agent, not the model. |
+| 3 | Claude Code pre-flight endpoints 404 on Ollama | **Fired**: `count_tokens` 404. Sidestepped by `--bare`; llama-server returns 200. Either way it decides nothing. |
+| 4 | The base URL is not honoured when a real credential is present | **Dead — the sharpest control in the runbook held.** The override wins; the Phase-4 design question is closed. |
+| 5 | Session → gateway unreachable | **Dead.** `10.99.0.1:11434` answers from inside a session; `INPUT`, not `FORWARD`, as predicted. |
+| 6 | Permission prompts block the non-interactive run | **Not exercised.** No structured tool call ever reached the permission layer; `--allowedTools` was passed and never tested. |
+| 7 | Streaming / `max_tokens` / stop-sequence shape mismatches | **Dead.** Both servers produced a correct Messages envelope; no shape error in any run. |
+| 8 | The model completes the trivial task and nothing real | **Moot.** The trivial task itself never completed; the ceiling sentence stands regardless. |
+| 9 | The first agent turn is slow | **Unscored** — first- and second-turn wall times were not recorded separately. Nothing in the outcome depended on it. |
+| 7a | `llama-server` is not in the Ollama image | **Wrong.** It is (`/usr/lib/ollama/llama-server`). |
+| 7c | llama-server answers `count_tokens` with 200 | Held. |
+| 7c | llama-server with `--jinja` returns `tool_use` for one trivial tool | **Wrong** — text on both endpoints, with every confound removed. |
+| 7d | (gated on 7c) | Not reached. |
+
+Three real (1, 2, 3), three dead (4, 5, 7), three never exercised (6, 8, 9).
+Of Step 7's, one held and the two that mattered were wrong. Phase 2's pattern
+repeated: the ones that mattered went against expectation — the safe-looking
+baseline (7c) is where it broke, and the frightening ones (4, 5) were dead.
+
+---
+
+## Verdict — written after Step 7 and Arm B (2026-09-05)
+
+**Feasible with caveats. The caveat is precise, well-evidenced, and outside
+the project.**
+
+**Proven, by hand, on our containerd, rootless, nothing built:**
+
+- The GPU reaches a rootless container with three bind mounts and one env
+  var — Phase 1's Arm C delta, unchanged through Phase 2 (Ollama), Phase 3
+  (a session) and Step 7 (a third server image). That delta is the whole GPU
+  contract, and it fits today's `ContainerSpec` (mounts + env; no device
+  entries, hooks or cgroup rules).
+- An 8B model runs fully resident at 74 tok/s with 8192 context; 16384 is
+  available at 87% residency and ~40% throughput cost.
+- Both compatibility layers are reachable: Ollama's Anthropic Messages API
+  (correct envelope, one-tool `tool_use` correct) and llama-server's
+  (`count_tokens` 200).
+- A real Nemr session reaches the model at its gateway (`10.99.N.1`) with no
+  networking change, NET-05 intact.
+- `ANTHROPIC_BASE_URL` wins over the mounted credential: the negative control
+  failed to connect rather than reaching Anthropic. A GPU session can carry
+  the user's credential and use a local model without the two colliding.
+
+**Blocked:** tool calling under a real agent's toolset, across every
+combination available — three models (7B dense to 30B MoE), two agents, two
+servers, three endpoints, two GGUF sources, the parser forced. The models
+produce correct calls; no layer converts them into structured blocks. On
+Ollama this is documented upstream
+([ollama/ollama#15529](https://github.com/ollama/ollama/issues/15529), closed
+stale, unfixed on 0.33.3) and fires under a multi-tool schema set; on
+llama.cpp's own server it fires at the trivial single-tool baseline for this
+GGUF, with the template's tool branch loaded. Both are drafted as upstream
+reports in `docs/gpu-upstream-issues.md`, evidence-first, for the Product
+Owner to file. No pass criterion was met: no file ever appeared in an empty
+directory.
+
+**The ceiling, as this runbook required before the first run:** **8B on 8 GB
+is a plumbing proof, not a usable assistant.** Even with tool calling fixed,
+the models that fit this card are not coding agents. The feature waits on
+hardware as much as on software.
+
+**Phase 4 is deferred, not cancelled** — recorded as E-18 in
+`docs/DECISIONS.md` with the settled inputs listed so they are not re-tested.
+The delta is known and small. It reopens when tool calling works through a
+server we would run as a dependency, verified by re-running 7c then 7d of
+this runbook, and it is worth shipping when there is a card that runs a model
+that matters. The proxy stays a fallback on paper, not a plan: the ones that
+"fix" this are per-model text parsers, the class this project eliminates.
+
+**Not verified, listed not smoothed:**
+
+- Step 4 (read-edit-run) was never reached: no trivial edit completed.
+- Step 5 ran only against Ollama; Codex against llama-server (`:8080`) was
+  not attempted — 7c gated it.
+- 7d was not run as a decisive step (gated on 7c).
+- Arm B's stop/start persistence check could not be measured: no file was
+  ever written to persist.
+- Prediction 9's wall times were not recorded.
+- Two identifiers are absent from the run report and are placeholders in the
+  upstream drafts: the llama.cpp image digest / `llama-server --version`, and
+  the Claude Code version in the base image.
+
+**Preconditions, in force for any re-run:** everything from Phases 1 and 2
+(driver store discovered, never hardcoded; the Arm C delta; `CTRUN` for every
+run; the three-signal residency check; the warmup rule). Plus: Ollama 0.33.3;
+`ghcr.io/ggml-org/llama.cpp:server-cuda` (digest to record); models
+`llama3.1:8b`, `qwen2.5-coder:7b`, `qwen3-coder:30b`, and the source GGUF
+`bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M`; context 8192; `claude
+--bare -p` with `--allowedTools`; the prompt from a file via stdin; the
+session's gateway from `ip route` inside it; the negative control's ~3-minute
+retry before it fails.
+
+**What Phase 4 inherits, settled:** the GPU contract (three binds + one env);
+driver-store discovery at start; the 8192 / 16384 trade-off; the gateway as
+the session's route to a host-side service, and that `nemr status` should
+show it; the base-URL override holding with the credential present; the
+model cache on a bind; the lifecycle of a killed GPU container (`--rm` does
+not clean up after SIGKILL); `--bare` for the pre-flight; the agent not
+knowing its real context window. And what it does **not** need: no
+`nvidia-container-toolkit`, no third-party apt repo, no CDI — the D-13-class
+question the Phase 1 runbook flagged never arises, because bind mounts and
+env are the whole contract.
