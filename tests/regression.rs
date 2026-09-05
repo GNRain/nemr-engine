@@ -3407,6 +3407,91 @@ fn f12_a_fresh_project_mounts_the_credential_read_write() {
     });
 }
 
+/// F-12 dies: a host-side replacement of the credential (the rename the
+/// host's Claude Code performs on every refresh) reaches a RUNNING session
+/// without a restart. The replacement here keeps the content byte-identical
+/// — `cp -p` then `mv` — so the user's real login is untouched in substance;
+/// only the inode changes, which is exactly what F-12 is about.
+///
+/// Control first, read-only: after the rename the session is stale (the
+/// detector, not the repair, says so). Then the repair; then the session and
+/// the host agree, and the mount is still read-write.
+#[test]
+fn f12_dies_a_host_rename_reaches_a_running_session_without_restart() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    let host = nemr_engine::auth::host_credentials_path().expect("credential path");
+    if !host.exists() {
+        eprintln!("skipping: no host credential to re-bind");
+        return;
+    }
+
+    // The re-bind runs in a child of the DAEMON binary; in this process
+    // `current_exe()` is the test harness, so name the built daemon explicitly.
+    std::env::set_var(
+        "NEMR_REBIND_HELPER",
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/nemrd"),
+    );
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        use std::os::unix::fs::MetadataExt;
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "f12live", VolumeSize::Small).await;
+        let pid = project::start(&client, &project.name).await.expect("start");
+        let container = std::path::Path::new(nemr_engine::config::CONTAINER_CREDENTIALS);
+        let seen_by_task =
+            |pid: u32| std::fs::metadata(format!("/proc/{pid}/root{}", container.display())).map(|m| m.ino());
+
+        assert_eq!(
+            nemr_engine::auth::credential_is_stale(pid, container, &host),
+            Some(false),
+            "a session just started must see the host's current file"
+        );
+
+        // The host's pattern: a new inode under the same name, same bytes.
+        let tmp = host.with_extension("json.f12live");
+        std::fs::copy(&host, &tmp).expect("copy the credential");
+        std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("chmod 600");
+        std::fs::rename(&tmp, &host).expect("rename over the credential");
+        let host_ino = std::fs::metadata(&host).expect("stat host").ino();
+
+        // Control, read-only: stale now.
+        assert_eq!(
+            nemr_engine::auth::credential_is_stale(pid, container, &host),
+            Some(true),
+            "after the host rename the running session must read as STALE, or the repair proves nothing"
+        );
+        assert_ne!(seen_by_task(pid).expect("task view"), host_ino);
+
+        // The repair — no stop, no start, no recreate.
+        let rebound = project::rebind_credential(&client, &project.name)
+            .await
+            .expect("re-bind must not fail");
+        assert!(rebound, "a stale session must be re-bound");
+
+        assert_eq!(seen_by_task(pid).expect("task view"), host_ino, "the session now sees the host's file");
+        assert_eq!(
+            nemr_engine::auth::credential_is_stale(pid, container, &host),
+            Some(false)
+        );
+        assert_eq!(
+            mount_option(pid, nemr_engine::config::CONTAINER_CREDENTIALS).as_deref(),
+            Some("rw"),
+            "the re-bound mount must still be writable"
+        );
+        // Idempotent: a current session is left alone.
+        assert!(!project::rebind_credential(&client, &project.name).await.expect("second call"));
+
+        let _ = project::stop(&client, &project.name).await;
+    });
+}
+
 /// The first option (`ro`/`rw`) of the mount at `mount_point` in a task's
 /// mountinfo, read from the host through /proc — a read, never an exec.
 fn mount_option(pid: u32, mount_point: &str) -> Option<String> {

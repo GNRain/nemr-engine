@@ -20,20 +20,33 @@ use tonic::{Request, Response, Status};
 pub mod attach;
 pub mod audit;
 pub mod client;
+pub mod credential_watch;
 pub mod socket;
 
 /// The service implementation. One containerd connection, shared.
 pub struct NemrService {
     client: Arc<ContainerdClient>,
     audit: audit::AuditRegistry,
+    /// The last observed rewrite of the host credential (D-02 (f)).
+    last_credential_write: credential_watch::LastWrite,
 }
 
 impl NemrService {
-    pub fn new(client: ContainerdClient, audit: audit::AuditRegistry) -> Self {
+    pub fn new(
+        client: ContainerdClient,
+        audit: audit::AuditRegistry,
+        last_credential_write: credential_watch::LastWrite,
+    ) -> Self {
         Self {
             client: Arc::new(client),
             audit,
+            last_credential_write,
         }
+    }
+
+    /// The containerd connection, shared with the credential watcher.
+    pub fn client(&self) -> Arc<ContainerdClient> {
+        self.client.clone()
     }
 }
 
@@ -249,6 +262,11 @@ impl Nemr for NemrService {
             .await
             .unwrap_or_default();
         let live_set = crate::engine::ports::list_live().unwrap_or_default();
+        let last_write = self
+            .last_credential_write
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or(None);
         Ok(Response::new(StatusResponse {
             ports: ports
                 .into_iter()
@@ -303,6 +321,16 @@ impl Nemr for NemrService {
                 Some(false) => 0,
                 Some(true) => 1,
             },
+            credential_last_write_secs: last_write.as_ref().map(|w| w.at_unix).unwrap_or(0),
+            credential_last_write_by: last_write
+                .as_ref()
+                .map(|w| w.by.clone())
+                .unwrap_or_default(),
+            credential_last_write_verdict: last_write
+                .as_ref()
+                .map(|w| w.verdict.clone())
+                .unwrap_or_default(),
+            credential_last_write_valid: last_write.as_ref().map(|w| w.valid).unwrap_or(false),
             mount_check,
         }))
     }

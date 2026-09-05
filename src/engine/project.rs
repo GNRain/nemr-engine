@@ -1792,6 +1792,46 @@ pub async fn set_agent(
     Ok((previous, agent))
 }
 
+/// Re-bind the host's current credential into a running session if it is
+/// stale (F-12). Returns `Ok(true)` if a re-bind was performed, `Ok(false)` if
+/// the session already sees the host's file, is not running, or there is no
+/// host credential to bind. The check is a read (device + inode through
+/// `/proc/<pid>/root`); the repair runs in a single-threaded child of the
+/// daemon binary (`credential_bind`).
+pub async fn rebind_credential(client: &ContainerdClient, name: &str) -> Result<bool> {
+    let container_id = resolve(client, name).await?;
+    if !client.task_state(&container_id).await?.is_running() {
+        return Ok(false);
+    }
+    let Some(pid) = client.task_pid(&container_id).await? else {
+        return Ok(false);
+    };
+    let host = auth::host_credentials_path()?;
+    if !host.exists() {
+        return Ok(false);
+    }
+    let container = std::path::Path::new(config::CONTAINER_CREDENTIALS);
+    if auth::credential_is_stale(pid, container, &host) != Some(true) {
+        return Ok(false);
+    }
+    let host_for_child = host.clone();
+    let container_for_child = container.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::engine::credential_bind::rebind_in_child(pid, &host_for_child, &container_for_child)
+    })
+    .await
+    .context("re-bind task")??;
+    // Fail closed: the child's exit status is not the property. What the task
+    // sees is — read it again rather than trusting the report.
+    if auth::credential_is_stale(pid, container, &host) != Some(false) {
+        bail!(
+            "the re-bind reported success but the session still does not see the host's \
+             current credential (task {pid}); leave it to: nemr stop {name} && nemr start {name}"
+        );
+    }
+    Ok(true)
+}
+
 /// Gather everything `nemr status` reports.
 pub async fn status(client: &ContainerdClient, name: &str) -> crate::error::Result<ProjectDetail> {
     use crate::error::Error;

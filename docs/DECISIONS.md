@@ -126,20 +126,24 @@ record before the task exists (the NET-02 migration's shape, with the F-112
 lesson: a read-only control on the spec, a test seam for the old shape, and
 proof from the running task's `mountinfo`).
 
-> **Evidence against the mediator ruling's premise (2026-09-05, Claude Code —
-> measured before building, as the ruling required; `docs/e13-token-spike.md`
-> Part E).** The second diff, host and session, each with a control: **a
-> refresh does not touch `oauthAccount`** — the only key a refresh run changed
-> on the host was the same GrowthBook timestamp a plain run changes, and in
-> the session the refresh run changed nothing. A session populates
-> `oauthAccount` itself on first run from the token's profile; junk identity
-> with a valid token makes requests normally and is left alone; with the
-> fetch timestamp aged it is rewritten from the token. Claude Code re-reads
-> `.claude.json` continuously in an interactive run. So the identity/token
-> split the ruling was built to prevent does not arise from a refresh, and
-> when it arises from a login it is harmless for requests and self-healing.
-> Stopped before building the mediator; recommendation is none. Awaiting the
-> re-ruling.
+**The posture, stated plainly (2026-09-05, the Product Owner's condition;
+SPEC 1.103).** The container can refresh the credential. The container can
+overwrite it. The overwrite is observed. The mount cannot distinguish the two,
+and it cannot be made to without breaking the refresh, so what a session does
+to the host's login is made visible instead — the principle of the privileged
+helper's audit trail: anything with the power to break the host gets a record.
+The daemon watches the host file and records every rewrite — when, which
+sessions could have made it (by elimination, and it says so: an in-place
+write is a session's, a replacement is the host's), and whether the result
+parses as a credential or as junk — in its log as an audit line and on
+`nemr status` as `last rewrite`. It could not go through the per-request
+audit stream, which is correlated by request id; a session's write happens
+outside any request. And F-12 is dead rather than bounded: a host-side
+replacement is re-bound into every running session the moment it lands, and
+again before every attach, so a session left running past the eight-hour
+window keeps working whether it or the host refreshed first. Not prevented,
+still: a session can lock the host out of Claude Code by writing junk; the
+record names it, and the host logs in again.
 
 ---
 
@@ -1497,4 +1501,4 @@ is overstating what has been demonstrated.
 | 2026-09-05 | E-13 | **Experiment Part A run** — env-var token wins over the mounted file in every state incl. expired-present; F-130's mechanism confirmed in Claude Code's debug log; `--bare` ignores the env var; exposure measured (readable in-session like the file today; in the host container record). Part B (real token, 8 h, login elsewhere) is Rain's; ruling waits (Claude Code) |
 | 2026-09-05 | D-02 | **Mechanism revised — (f): the credential mount is read-write** so the session refreshes its own login; substance unchanged (per-device, never synced, never in a bundle). Enumeration: one file, not the directory; identity never in the mount. Exposure stated (read was already possible; write is new; same-user). F-12 bounded: in-place write from the session, rename on the host; stop/start is the remedy; STALE detected by inode. Existing records migrated at start (Rain; SPEC 1.102) |
 | 2026-09-05 | E-13 | **Ruled (f) over (e)**; refresh-token rotation observed directly (both tokens change on every refresh; the prior access token survives). Cross-machine mechanism stands as inferred; no longer a daily cost (Rain) |
-| 2026-09-05 | D-02 | **Mediator premise measured and not reproduced** — a refresh touches nothing in `.claude.json` (host and session, with controls); identity is populated and healed from the token; junk identity does not fail a request. Stopped before building; recommendation: no mediator (Claude Code) |
+| 2026-09-05 | D-02 | **Condition met — the overwrite is observed, F-12 dies.** Credential watcher in the daemon: every rewrite attributed and parsed, logged and on `status`; host-side replacements re-bound into running sessions live and before attach (SPEC 1.103) (Rain's condition; Claude Code) |
