@@ -8,9 +8,12 @@ The Product Owner's question, answered by a spike rather than a design:
 
 Same discipline as the other spikes: predictions first, then the smallest
 change that answers the question, then the measurement of that change. The
-code on this branch is the measurement — its diff *is* the answer — and is
-not proposed for merging as-is; the HTTP surface's real shape (the handshake,
-the routes, where it lives under E-11) comes after.
+code on the spike branch was the measurement — its diff *is* the answer. It
+was merged by accident in #64 (a title does not gate a merge button) and
+reverted in #66; `main` serves no HTTP. The measurement stands as recorded
+below. The HTTP surface's real shape — the handshake, the routes, where it
+lives under E-11 — is decided separately, and this spike's own
+recommendation is that it does not live in `nemrd`.
 
 ## Predictions
 
