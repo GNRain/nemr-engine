@@ -18,6 +18,7 @@ mod api;
 mod commands;
 mod engine_cli;
 mod keys;
+mod serve;
 mod state;
 
 #[derive(Parser)]
@@ -79,6 +80,18 @@ enum Command {
     /// Release the session's lease and stop the heartbeat holder.
     Release { name: String },
 
+    /// Start the UI: a loopback port that exists only while this runs, with
+    /// a single-use launch token in the URL. Prints the URL; opens it unless
+    /// --no-open. Ctrl-C stops the UI and closes the port.
+    Ui {
+        /// Port to bind on 127.0.0.1 (default: an ephemeral one).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Print the URL only; do not try to open a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
+
     /// INTERNAL: the detached lease-heartbeat holder. Spawned by push/pull;
     /// renews until it fails, then marks the lease lost and refuses to
     /// continue. Not for direct use.
@@ -125,6 +138,7 @@ fn main() -> Result<()> {
         } => commands::push(&name, release, take_over),
         Command::Pull { name, take_over } => commands::pull(&name, take_over),
         Command::Release { name } => commands::release(&name),
+        Command::Ui { port, no_open } => serve::run(port, !no_open),
         Command::Hold {
             name,
             holder,
