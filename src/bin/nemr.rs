@@ -345,6 +345,101 @@ fn human_duration(secs: i64) -> String {
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
+/// The credential line `status` prints and the warning `attach` prints, from
+/// the same facts — so they cannot disagree. The verdict is the engine's
+/// (`auth::CredentialFacts::verdict`), reconstructed from the daemon's fields.
+fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<String>) {
+    use nemr_engine::auth::{CredentialExpiry, CredentialFacts, CredentialVerdict};
+
+    if d.credential_path.is_empty() {
+        return (
+            "  credential:   ABSENT — `nemr start` will fail (AUTH-03).\n\
+             \x20               Authenticate on this host by running `claude`."
+                .to_string(),
+            None,
+        );
+    }
+    let at = |secs: i64| {
+        if secs == 0 {
+            CredentialExpiry::Unknown
+        } else {
+            CredentialExpiry::At(secs)
+        }
+    };
+    let facts = CredentialFacts {
+        access: at(d.credential_expires_at_secs),
+        refresh: at(d.credential_refresh_expires_at_secs),
+        blank: d.credential_blank,
+    };
+    let path = &d.credential_path;
+    let host_fix = format!(
+        "log in on this host (run `claude`), then restart the session so it mounts the new \
+         file: nemr stop {name} && nemr start {name}"
+    );
+    let (mut line, mut warning) = match facts.verdict(unix_now()) {
+        CredentialVerdict::NotOauth => (
+            format!("  credential:   present at {path} (no OAuth expiry to check — API-key auth or a placeholder)"),
+            None,
+        ),
+        CredentialVerdict::Fresh { access_left } => (
+            format!(
+                "  credential:   present at {path}, valid — access token expires in {}; the session refreshes it",
+                human_duration(access_left)
+            ),
+            None,
+        ),
+        CredentialVerdict::Refreshable { refresh_left } => (
+            format!(
+                "  credential:   present at {path} — access token spent; Claude Code refreshes it on next use{}",
+                match refresh_left {
+                    Some(left) => format!(" (refresh token valid for {})", human_duration(left)),
+                    None => String::new(),
+                }
+            ),
+            None,
+        ),
+        CredentialVerdict::RefreshExpired { since } => (
+            format!(
+                "  credential:   present at {path} — REFRESH TOKEN EXPIRED {} ago: nothing inside a session can recover it.\n\
+                 \x20               Fix: {host_fix}",
+                human_duration(since)
+            ),
+            Some(format!(
+                "[nemr] Claude Code's login on this host has EXPIRED (its refresh token ran out {} ago).\n\
+                 \x20      A `/login` inside the session cannot fix that. {host_fix}",
+                human_duration(since)
+            )),
+        ),
+        CredentialVerdict::Blank => (
+            format!(
+                "  credential:   present at {path} — BLANK: Claude Code cleared it after a dead refresh (revoked, or spent).\n\
+                 \x20               Fix: {host_fix}"
+            ),
+            Some(format!(
+                "[nemr] Claude Code's login on this host is BLANK: it was cleared after a dead refresh\n\
+                 \x20      (revoked elsewhere, or its refresh token spent). A `/login` inside the session\n\
+                 \x20      cannot fix that. {host_fix}"
+            )),
+        ),
+    };
+    // F-12 overlay: what the RUNNING session sees may not be what the host has.
+    if d.credential_stale == 1 {
+        line.push_str(&format!(
+            "\n  credential:   STALE in the running session — the host replaced the file after this session \
+             started (F-12);\n\
+             \x20               its copy holds a rotated-away refresh token and will fail on its next refresh.\n\
+             \x20               Fix: nemr stop {name} && nemr start {name}"
+        ));
+        warning = Some(format!(
+            "[nemr] This session holds a STALE credential: the host's login was refreshed after the session\n\
+             \x20      started, and a file mount keeps the old file (F-12). Its next refresh will fail.\n\
+             \x20      Fix: nemr stop {name} && nemr start {name}{}",
+            warning.map(|w| format!("\n{w}")).unwrap_or_default()
+        ));
+    }
+    (line, warning)
+}
+
 fn status_err(status: tonic::Status) -> anyhow::Error {
     anyhow::anyhow!("{}", status.message())
 }
@@ -968,42 +1063,12 @@ async fn main() -> Result<()> {
             // The expired-credential failure took three steps to identify; this
             // is the line that would have made it one. Then it happened again
             // with the line present, because it reported presence ("last
-            // written 0 days ago" — true) instead of validity (expired two days
-            // ago — the fact that mattered). Presence is not validity; the
-            // OAuth expiry is what decides whether `claude` will work.
-            if d.credential_path.is_empty() {
-                println!(
-                    "  credential:   ABSENT — `nemr start` will fail (AUTH-03).\n\
-                     \x20               Authenticate on this host by running `claude`."
-                );
-            } else if d.credential_expires_at_secs == 0 {
-                // Present, but nothing to check it against: an API-key
-                // credential or a placeholder carries no OAuth expiry. Say that
-                // rather than pretend to a verdict.
-                println!(
-                    "  credential:   present at {} (no OAuth expiry to check — API-key auth or a placeholder)",
-                    d.credential_path
-                );
-            } else {
-                let now = unix_now();
-                let remaining = d.credential_expires_at_secs - now;
-                if remaining <= 0 {
-                    println!(
-                        "  credential:   present at {} — EXPIRED {} ago.\n\
-                         \x20               Claude Code inside a session cannot refresh it (the mount is\n\
-                         \x20               read-only, D-02). Run `claude` on this host and log in, then\n\
-                         \x20               recreate the project so it mounts the new credential (F-12).",
-                        d.credential_path,
-                        human_duration(-remaining)
-                    );
-                } else {
-                    println!(
-                        "  credential:   present at {}, valid — expires in {}",
-                        d.credential_path,
-                        human_duration(remaining)
-                    );
-                }
-            }
+            // written 0 days ago" — true) instead of validity. Under D-02's (f)
+            // the session refreshes the access token itself, so what decides
+            // whether `claude` will work is the refresh token, a blanked file,
+            // or a stale mount (F-12) — one report, shared with `attach`.
+            let (line, _) = credential_report(&d, &name);
+            println!("{line}");
         }
 
         Command::SwitchAgent { name, agent } => {
@@ -1158,29 +1223,20 @@ async fn main() -> Result<()> {
 
         Command::Attach { name } => {
             // Say it BEFORE Claude Code's own login prompt does the wrong thing.
-            // The credential is mounted read-only (D-02/AUTH-02), so a `/login`
-            // inside the session validates in the browser, fails to persist —
-            // silently — and the next call reads the same dead token, with an
-            // error that blames revocation rather than the write. A user ran
-            // that loop three times. The fix is not a writable mount; it is to
-            // name the state here, once, where the remedy can be acted on.
-            // Non-fatal: the shell is still useful, and only an OAuth expiry
-            // we can read fires it — a placeholder or API key stays silent.
-            if let Ok(path) = nemr_engine::auth::host_credentials_path() {
-                if nemr_engine::auth::credential_expiry_at(&path).is_expired_at(unix_now()) {
-                    eprintln!(
-                        "[nemr] Claude Code's credential on this host is EXPIRED ({}).\n\
-                         \x20      Logging in from inside the session cannot fix it: the credential is\n\
-                         \x20      mounted read-only, so an in-container login validates in the browser\n\
-                         \x20      and then fails on the next call. Refresh it on the host instead:\n\
-                         \x20        1. run `claude` on the host and complete login\n\
-                         \x20        2. recreate this project so it mounts the new credential (F-12)\n\
-                         \x20      (`nemr status {name}` shows the expiry.)",
-                        path.display()
-                    );
+            // A `/login` inside a session cannot rescue a spent refresh token or
+            // a blanked file (the host must log in), and a stale mount (F-12)
+            // needs a stop/start — none of which Claude Code's error names. The
+            // facts come from the daemon's status, the same ones `nemr status`
+            // prints, so the two never disagree. Non-fatal: the shell stays
+            // useful. A routine access-token expiry is NOT warned about: the
+            // writable mount lets the session refresh it (D-02 (f)).
+            let mut session = daemon::connect().await?;
+            let status_req = session.req(proto::StatusRequest { name: name.clone() });
+            if let Ok(resp) = session.client().status(status_req).await {
+                if let (_, Some(warning)) = credential_report(&resp.into_inner(), &name) {
+                    eprintln!("{warning}");
                 }
             }
-            let mut session = daemon::connect().await?;
             let code = attach_client(session.client().clone(), &name).await?;
             drop(session);
             // The session's exit code becomes ours, so scripts can branch on

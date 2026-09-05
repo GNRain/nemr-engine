@@ -296,6 +296,13 @@ impl Nemr for NemrService {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             credential_expires_at_secs: d.credential_expires_at.unwrap_or(0),
+            credential_refresh_expires_at_secs: d.credential_refresh_expires_at.unwrap_or(0),
+            credential_blank: d.credential_blank,
+            credential_stale: match d.credential_stale {
+                None => -1,
+                Some(false) => 0,
+                Some(true) => 1,
+            },
             mount_check,
         }))
     }

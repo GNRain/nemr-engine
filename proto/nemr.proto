@@ -164,6 +164,15 @@ message StatusResponse {
   // is not validity — this is the field that turns "present, last written 0
   // days ago" into "expired 2 days ago".
   int64 credential_expires_at_secs = 21;
+  // D-02 (f): the credential is mounted read-write and Claude Code refreshes
+  // the access token in-session, so the field above alone no longer decides
+  // anything. What does: the refresh token's expiry (0 if undated), whether
+  // Claude Code has blanked the file after a dead refresh, and whether a
+  // running session still sees a file the host has since replaced (F-12):
+  // -1 = cannot tell (not running, or unreadable), 0 = current, 1 = stale.
+  int64 credential_refresh_expires_at_secs = 22;
+  bool credential_blank = 23;
+  int32 credential_stale = 24;
 }
 
 message SwitchAgentRequest { string name = 1; string agent = 2; }

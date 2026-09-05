@@ -245,10 +245,25 @@ async fn create_with_auth(
     let mut mounts = vec![
         // The project volume becomes the container's working directory.
         BindMount::read_write(&mount_point, config::CONTAINER_WORKDIR),
-        // AUTH-02: credentials read-only, and only the credentials file — no
-        // other host-side ~/.claude content. This stays a host bind mount and is
-        // NOT relocated onto the volume (D-02): the credential must never travel.
-        BindMount::read_only(&credentials, config::CONTAINER_CREDENTIALS),
+        // AUTH-02, as revised by D-02's (f): the credential file is bound
+        // READ-WRITE — so Claude Code can refresh the access token inside the
+        // session, which a read-only bind made impossible (it fails the write
+        // silently and then sends the dead token; F-130) — and it is still
+        // ONLY the credential file, nothing else from ~/.claude. It stays a host
+        // bind mount and is NOT relocated onto the volume: the credential must
+        // never travel. The write surface a session gains is exactly this one
+        // file, which every process in it could already read.
+        //
+        // NEMR_TEST_PRE_F12 is a test seam like NEMR_TEST_PRE_NET02 below: it
+        // creates the pre-(f) read-only shape, which no fresh container can
+        // otherwise have, so the migration every existing project takes at its
+        // next start is exercised end to end (F-112's lesson). Production never
+        // sets it.
+        if std::env::var_os("NEMR_TEST_PRE_F12").is_some() {
+            BindMount::read_only(&credentials, config::CONTAINER_CREDENTIALS)
+        } else {
+            BindMount::read_write(&credentials, config::CONTAINER_CREDENTIALS)
+        },
     ];
     // M8: bind the session-critical subtrees from the volume over their rootfs
     // locations, so history and session state live on the portable layer.
@@ -476,6 +491,23 @@ pub async fn start(client: &ContainerdClient, name: &str) -> Result<u32> {
         tracing::warn!(
             nemr_audit = "warning",
             "[nemr] {name}: gave this project its own network namespace (NET-02 migration)"
+        );
+    }
+
+    // D-02 (f) / F-12 migration, also BEFORE the task exists and for the same
+    // reason: the credential mount's `ro` is frozen in the record of every
+    // project created before the mount became writable, and a task started
+    // from that record cannot refresh its login. Additive and idempotent —
+    // it flips one option on one mount and reports the change once.
+    if client
+        .ensure_bind_writable(&container_id, config::CONTAINER_CREDENTIALS)
+        .await
+        .with_context(|| format!("migrating {name:?} to a writable credential mount"))?
+    {
+        tracing::warn!(
+            nemr_audit = "warning",
+            "[nemr] {name}: the credential mount is now read-write, so Claude Code can \
+             refresh its login inside the session (D-02 migration)"
         );
     }
 
@@ -1682,6 +1714,14 @@ pub struct ProjectDetail {
     /// motivated this was a *present*, read-only, *expired* credential, and
     /// "last written 0 days ago" was true and useless (the F-56 shape).
     pub credential_expires_at: Option<i64>,
+    /// The refresh token's expiry, if dated. Under D-02's (f) this, not the
+    /// access token, is what decides whether a session can recover.
+    pub credential_refresh_expires_at: Option<i64>,
+    /// Claude Code blanked the file after a dead refresh.
+    pub credential_blank: bool,
+    /// A running session still sees a file the host has since replaced
+    /// (F-12); `None` when not running or unreadable.
+    pub credential_stale: Option<bool>,
 }
 
 impl ProjectDetail {
@@ -1777,19 +1817,37 @@ pub async fn status(client: &ContainerdClient, name: &str) -> crate::error::Resu
         .as_ref()
         .and_then(|p| std::fs::metadata(p).ok())
         .and_then(|m| m.modified().ok());
-    let credential_expires_at = credential
+    let facts = credential
         .as_ref()
-        .map(|p| auth::credential_expiry_at(p))
-        .and_then(auth::CredentialExpiry::expires_at_secs);
+        .map(|p| auth::credential_facts_at(p))
+        .unwrap_or_else(|| auth::credential_facts(""));
+    let running = client
+        .task_state(&container_id)
+        .await
+        .map_err(Error::Internal)?
+        .is_running();
+    // F-12, read not repaired: what the running task sees versus what the host
+    // has now. Only meaningful while a task exists.
+    let credential_stale = match (&credential, running) {
+        (Some(host), true) => client
+            .task_pid(&container_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|pid| {
+                auth::credential_is_stale(
+                    pid,
+                    std::path::Path::new(config::CONTAINER_CREDENTIALS),
+                    host,
+                )
+            }),
+        _ => None,
+    };
 
     Ok(ProjectDetail {
         name: name.to_string(),
         agent: agent_from_labels(&container.labels),
-        running: client
-            .task_state(&container_id)
-            .await
-            .map_err(Error::Internal)?
-            .is_running(),
+        running,
         container_id,
         quota: container
             .labels
@@ -1811,7 +1869,10 @@ pub async fn status(client: &ContainerdClient, name: &str) -> crate::error::Resu
         mounted,
         credential,
         credential_modified,
-        credential_expires_at,
+        credential_expires_at: facts.access.expires_at_secs(),
+        credential_refresh_expires_at: facts.refresh.expires_at_secs(),
+        credential_blank: facts.blank,
+        credential_stale,
     })
 }
 
