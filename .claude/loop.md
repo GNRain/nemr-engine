@@ -357,6 +357,24 @@ merged from the button; that is the gate. Only the measurement doc goes in a
 mergeable PR. Same shape as the pre-push rule: what must not happen is made
 structurally impossible, not written down and remembered.
 
+## The phantom-report rule (a claim that cannot be found on origin gets a request for the reference)
+
+Twice in one day a message referred to work as landed — "#64 merged, F-137 is
+the extraction paying for itself", then "nemr-daemon-api is the seam, approved
+as landed" — and neither existed: no such PR, no such finding, no such crate on
+`main` or on any remote branch or in any other repository on the account. The
+`git log origin/<branch>` rule covers claims *I* make; it cannot cover claims
+made *to* me. What saved the day was refusing to record a lesson against a bug
+that could not be read, and building the handshake without the crate that was
+not there.
+
+**Standing rule: a referenced commit, PR, finding, crate or file that cannot
+be found on origin gets a request for the reference — not a workaround, not
+a reconstruction from the description, and never a ledger entry.** Look on
+`main`, every remote branch and the account's other repositories, say exactly
+what was searched, and ask. Building around a phantom is how a ledger records
+a bug nobody saw and a design rests on a seam nobody wrote.
+
 ## The pre-push rule (a check CI runs is a hook, not a memory)
 
 Twice in WP-J the same lapse shipped: code that was `cargo clippy`-checked but
@@ -407,3 +425,5 @@ to remember it harder — it is what would make forgetting impossible.**
   same reasoning, and it hides the VOL-05 ones.
 - Any cleanup path that destroys before verifying (F-79 class) — it hides both.
 - A regression whose only fix trades off against a Section-7 gate (E-01…E-11).
+- A referenced PR, finding, crate or file that cannot be found on origin
+  (the phantom-report rule) — ask for the reference; do not build around it.

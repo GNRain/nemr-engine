@@ -680,6 +680,19 @@ The **bundle format stays open and documented** — a proprietary format
 undermines the open-core story and makes the engine useless without the paid
 layer, which is the opposite of the intent.
 
+**Ruling — the HTTP surface (2026-09-06, Rain).** The UI's HTTP surface is
+served by the **commercial process, as a gRPC client of the daemon**. The
+daemon keeps its Unix socket and serves no HTTP; **no port opens unless the
+user starts the UI**. Decided on the spike (`docs/http-spike.md`: a second
+listener is routine wherever it lives) and on E-11's own test: the UI needs
+an account, so every route on it is commercial, and the open half loses
+nothing. The daemon-side seam the commercial process talks through — the
+proto and connect code as a small open crate — was referred to as
+`nemr-daemon-api`, "approved as landed"; **it is not on origin** (no such
+crate on `main`, any remote branch, or any other repository on the account,
+checked 2026-09-06); the reference has been requested, per the
+phantom-report rule, and the handshake was built without depending on it.
+
 **Ruling — what is commercial (2026-08-20, recorded in SPEC 1.31).** Engine +
 wrapper + volume layer + privileged helper + **bundle format spec** are open.
 Sync, lease, storage backends, identity, and the client-side encryption are
@@ -1077,8 +1090,13 @@ command that will host it; only what it can promise will change.
 
 ### E-13 — Authenticating on a second machine revoked the first one's credential
 
-**Status:** Open — **escalation, raised for understanding before design.**
-**Raised by:** Rain (cross-machine validation) · **Contradicts:** D-02
+**Status:** **Mechanism resolved** (2026-09-05, Rain, on E6) — refresh-token
+rotation, observed directly; the cross-machine revocation is the same
+mechanism seen from two machines holding copies of one refresh token. No
+longer a daily cost: a session shares the host's live file (D-02 (f)) and a
+host-side refresh reaches it through the watcher's re-bind. Was Open —
+escalation, raised for understanding before design.
+**Raised by:** Rain (cross-machine validation) · **Contradicted:** D-02's assumption
 **Blocks:** nothing yet; **invalidates** an assumption D-02 rests on
 
 **What was observed, precisely.** Authenticating Claude Code on the second
@@ -1502,3 +1520,6 @@ is overstating what has been demonstrated.
 | 2026-09-05 | D-02 | **Mechanism revised — (f): the credential mount is read-write** so the session refreshes its own login; substance unchanged (per-device, never synced, never in a bundle). Enumeration: one file, not the directory; identity never in the mount. Exposure stated (read was already possible; write is new; same-user). F-12 bounded: in-place write from the session, rename on the host; stop/start is the remedy; STALE detected by inode. Existing records migrated at start (Rain; SPEC 1.102) |
 | 2026-09-05 | E-13 | **Ruled (f) over (e)**; refresh-token rotation observed directly (both tokens change on every refresh; the prior access token survives). Cross-machine mechanism stands as inferred; no longer a daily cost (Rain) |
 | 2026-09-05 | D-02 | **Condition met — the overwrite is observed, F-12 dies.** Credential watcher in the daemon: every rewrite attributed and parsed, logged and on `status`; host-side replacements re-bound into running sessions live and before attach (SPEC 1.103) (Rain's condition; Claude Code) |
+| 2026-09-05 | F-12 | **Closed** on E6 — the 8-hour acceptance: a session left running past the window, host refresh by rename meanwhile, answers `claude -p`; re-bound by the watcher; one inode both sides (Rain) |
+| 2026-09-05 | E-13 | **Mechanism resolved** — refresh-token rotation, observed; cross-machine revocation is the same mechanism; no longer a daily cost under D-02 (f) (Rain, on E6) |
+| 2026-09-06 | E-11 | **HTTP surface ruled** — commercial process, gRPC client of the daemon; daemon keeps its socket; no port unless the user starts the UI. `nemr-daemon-api` referred to as landed: not on origin, reference requested (Rain; recorded by Claude Code) |
