@@ -1156,6 +1156,27 @@ machine can be authenticated" would be solving the wrong problem carefully.
 > "one event, unexplained" with a mechanism the evidence supports and a test
 > that would confirm or kill it.
 
+> **Experiment, Part A run (2026-09-05, Claude Code, reference host) —
+> `docs/e13-token-spike.md`.** Precedence is settled: with a fake env-var
+> token and a fake credential file bound read-only exactly as the engine binds
+> the real one, Claude Code 2.1.240 in the base image sent the **env-var
+> token** as its bearer in every file state — expired file present, valid
+> file present, no file — and its debug log never touched the file path in
+> those runs. The control without the env var reproduced F-130's mechanism
+> verbatim: `OAuth refresh failed (expected): 400` → `OAuth dead-token disk
+> clear: backend write failed` → the expired token sent anyway. `--bare` does
+> not read the env var (no request at all). Exposure measured and stated:
+> the env token is readable by every process in the session (`/proc/1/environ`,
+> `env`) and sits in the container record on the host — and the mounted file
+> is readable by the same processes today (root, mode 600). The change is the
+> secret's lifetime (one year versus eight hours plus a two-week refresh the
+> container cannot use) and its scopes (`user:inference` only). Part B — the
+> real token's issuance, acceptance, survival past eight hours and past a
+> login elsewhere — is the Product Owner's on the WSL2 box; the ruling waits
+> on it, and must also choose create-time versus attach-time injection
+> (exec-time injection needs no container-record change and is D-02's own
+> wording) and whether the file mount stays for the non-Claude agents.
+
 ---
 
 ### D-11 — No user-facing path moves a bundle through storage
@@ -1395,3 +1416,4 @@ is overstating what has been demonstrated.
 | 2026-09-05 | E-18 | **Deferred with direction** — a local LLM on the host GPU: the contract is three binds + one env var and a session reaches the server at its gateway with the credential override holding, but tool calling fails under a real toolset in every server/model/agent combination (upstream, drafted in `docs/gpu-upstream-issues.md`); 8B on 8 GB is a plumbing proof, not an assistant. Phase 4 reopens on an upstream fix or a card that matters; the two Arm B findings are settled inputs (Rain) |
 | 2026-09-05 | E-13 | **Investigated** — the token model measured (8 h access, ~2-week refresh); no documented device/session limit; the community record fits refresh-token rotation, not a policy; the read-only mount means a session cannot refresh at all (F-12, sharpened); option (e) `claude setup-token` as a per-device env var, with two experiments to settle it. Still Open (Claude Code) |
 | 2026-09-05 | F-131 | **Opened** — first-run onboarding repeats every session because preferences share the identity-bearing user config on the rootfs; three shapes tabled, (a) seed-from-allowlist recommended; raised for a ruling, not built (Claude Code) |
+| 2026-09-05 | E-13 | **Experiment Part A run** — env-var token wins over the mounted file in every state incl. expired-present; F-130's mechanism confirmed in Claude Code's debug log; `--bare` ignores the env var; exposure measured (readable in-session like the file today; in the host container record). Part B (real token, 8 h, login elsewhere) is Rain's; ruling waits (Claude Code) |
