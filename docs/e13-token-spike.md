@@ -250,6 +250,67 @@ is read-write; `start` repairs a pre-(f) record; `status`/`attach` report the
 three unrecoverable states — spent refresh token, blanked file, stale mount —
 and stay silent on a routine access expiry.
 
+## Part E — the mediator ruling's premise, measured (2026-09-05, reference host)
+
+The ruling of 2026-09-05 rests on "finding 2": that a refresh moves
+`oauthAccount` in `.claude.json` along with the credential, so a
+credential-only mount splits identity from token. The ruling asked for a
+second diff across a full refresh cycle before building. Run on the host
+(Claude Code 2.1.261) and inside a session (2.1.240), each with a control run
+so run-noise is separated from the refresh's effect.
+
+**E1 — host.** `.claude.json` top-level keys that changed:
+
+```
+plain run (no refresh):  additionalModelOptionsAnsweredAt, cachedExperimentData, cachedExperimentFeatures,
+                         cachedGrowthBookFeatures, cachedGrowthBookFeaturesAt, clientDataCacheSlots
+refresh run (token marked expired, refreshed: 8.0 h out):  cachedGrowthBookFeaturesAt
+plain run after:         cachedGrowthBookFeaturesAt
+```
+
+**E2 — session** (its own `.claude.json`, persisted across runs on a bound
+home; the real credential copy bound read-write):
+
+```
+first run:   creates .claude.json (12 keys); oauthAccount POPULATED from the token's profile —
+             accountUuid, emailAddress, organizationUuid, billingType, displayName, fullName, … (14 subkeys)
+plain run:   changed keys: []
+refresh run: changed keys: []            ← the refresh touched nothing; the bound credential is 8.0 h out
+```
+
+**The refresh does not touch `oauthAccount`, on either side.** Finding 2 is
+not reproduced. What does write it: the first run in a fresh home (a profile
+fetch from the token), and a login.
+
+**E3 — the drift test.** Every string in the session's `oauthAccount` replaced
+with junk, token valid: `claude -p` → `OK`, no error, and the junk was left in
+place. A wrong identity block does not fail a request; requests authenticate
+with the token.
+
+**E4 — self-heal.** The same junk with `profileFetchedAt` aged to 0: the next
+run re-fetched the profile from the token and rewrote nine identity fields to
+the real values (`emailAddress`, `accountUuid`, `organizationUuid`, …).
+Identity drift heals from the token on a timer; the token is the source of
+truth and `oauthAccount` is a cache of it.
+
+**E5 — mid-session re-reads.** strace of an interactive run under a pty:
+twenty `openat` reads of `.claude.json` in 75 seconds. Claude Code re-reads
+the file continuously; anything written into it is seen within seconds.
+
+**What this means for the mediator.** There is nothing to mediate: the block
+it would copy is not moved by a refresh, is not needed for a request, is
+populated by the session itself from the token, and heals from the token when
+stale. The two directions it would carry — host→session at start/attach,
+session→host at the next attach — would each copy a cache that the far side
+regenerates. The case that remains real is a *login* to a different account
+(host-side, or in-session now that the credential is writable): the token
+changes, and the other side's cache is stale until its timer — harmless for
+requests (E3), and healed (E4). Recommendation, pending the ruling: no
+mediator; keep the session's `.claude.json` its own (F-54 allowlist plus the
+F-131 preferences at create; `oauthAccount` needs no seeding), keep the
+writable credential with its observability. Not measured: an in-session
+`/login` end to end (it needs a browser), and the profile-refetch interval.
+
 ## The verdict
 
 **Part A settled precedence; Part B is superseded by the ruling for (f); Part C established (f) and it is built.** The original verdict text follows for the record.
