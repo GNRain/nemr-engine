@@ -159,6 +159,11 @@ message StatusResponse {
   int32 mount_check = 18;
   // Declared port forwards (WP-M): "what's my URL" is the question people ask.
   repeated PortSpec ports = 20;
+  // When the credential's OAuth token expires, unix secs; 0 if the file
+  // carries no expiry (API-key auth, a placeholder) or is absent. Presence
+  // is not validity — this is the field that turns "present, last written 0
+  // days ago" into "expired 2 days ago".
+  int64 credential_expires_at_secs = 21;
 }
 
 message SwitchAgentRequest { string name = 1; string agent = 2; }

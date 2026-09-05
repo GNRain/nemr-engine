@@ -295,6 +295,7 @@ impl Nemr for NemrService {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
+            credential_expires_at_secs: d.credential_expires_at.unwrap_or(0),
             mount_check,
         }))
     }
