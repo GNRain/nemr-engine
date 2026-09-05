@@ -211,8 +211,15 @@ assert "quota in force inside the container (${quota:-unknown} bytes < 524288000
 creds=$(echo 'test -r /root/.claude/.credentials.json && echo READABLE' | in_container | tr -d '\r' | grep -c READABLE || true)
 assert_eq "credentials mounted (AUTH-02)" "1" "$creds"
 
-readonly_creds=$(echo 'touch /root/.claude/.credentials.json 2>&1 | grep -c "Read-only"' | in_container | tr -dc '0-9\n' | grep -E '^[0-9]+$' | head -1 || true)
-assert_eq "credentials are read-only (AUTH-02)" "1" "$readonly_creds"
+# AUTH-02 as revised under D-02 (f), SPEC 1.102: the credential is bound
+# READ-WRITE so the session can refresh it. This guard asserted the old
+# posture ("touch fails with Read-only") for a day after the ruling changed —
+# a control asserting the world before the ruling. Two reads, no write: the
+# mount's own flag from the task's mountinfo, and `test -w` on the file.
+rw_creds=$(echo 'grep " /root/.claude/.credentials.json " /proc/self/mountinfo | awk "{print \$6}" | cut -d, -f1' | in_container | tr -d '\r' | grep -E '^(rw|ro)$' | head -1 || true)
+assert_eq "credential mount is read-write (AUTH-02, D-02 (f))" "rw" "$rw_creds"
+writable_creds=$(echo 'test -w /root/.claude/.credentials.json && echo WRITABLE' | in_container | tr -d '\r' | grep -c WRITABLE || true)
+assert_eq "credential file is writable by the session, so it can refresh its login" "1" "$writable_creds"
 
 # ---------------------------------------------------------------------------
 # 4. Scripted Claude Code invocation
