@@ -301,6 +301,37 @@ covers a replacement that landed while it did not.
 **What is not prevented:** a session can still write junk into the host's
 login. It is named, with the session, in the record; the host logs in again.
 
+**E6 — the 8-hour acceptance (2026-09-05, reference host, the #62 build).**
+A real session (`testing`) started at 13:38:58Z under a detached daemon,
+mounting the host's live credential (access token expiring 21:36:13Z);
+`claude -p` inside it answered `OK` at t0. Left running with no intervention.
+At 21:28Z the host's own Claude Code refreshed by rename; the daemon's
+watcher recorded it and re-bound the session:
+
+```
+[nemr] credential replaced by the host (a new file under the name — a login or a host-side refresh): the file is now a valid credential (access token good for 28796s)
+[nemr] testing: re-bound the host's current credential into the running session (F-12)
+```
+
+At 21:47:34Z, past the window: host access token 7.7 h out (the host had
+refreshed), host inode 4872359, session sees 4872359. The in-session
+`claude -p`: the first attempt printed nothing on stdout — the check script
+discarded stderr, so the cause is unrecorded; the immediate re-run with
+stderr visible returned `"result":"OK"`, `is_error: false`, exit 0
+(6.5 s API time, `claude-opus-5`, `provider: firstParty`). `nemr status`
+afterwards: `valid — access token expires in 7 hours; the session refreshes
+it`, `last rewrite: 19 minutes ago by the host … a valid credential`.
+
+So the acceptance as re-framed holds: a session left running past the
+eight-hour window still answers `claude -p` with no host intervention, the
+host-side refresh reached the running session through the watcher's
+re-bind, and both sides agree on the file. The `.claude.json` identity
+clause of the re-framed acceptance is moot by E1–E5 (nothing crosses; each
+side heals from the token). Not exercised: the session refreshing *first*
+(the host refreshed first here, the harder direction for F-12); the
+session-first direction is C2's in-place write, proven separately. The
+unexplained empty first attempt is recorded, not smoothed.
+
 ## The verdict
 
 **Part A settled precedence; Part B is superseded by the ruling for (f); Part C established (f) and it is built.** The original verdict text follows for the record.
