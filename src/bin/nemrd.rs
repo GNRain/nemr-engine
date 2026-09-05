@@ -133,6 +133,48 @@ async fn daemon_main() -> Result<()> {
     }
     let incoming = UnixListenerStream::new(listener);
 
+    // SPIKE (docs/http-spike.md): HTTP on a loopback port beside gRPC on the
+    // socket, on the same runtime, reaching the engine through the same
+    // containerd connection. Ephemeral port, reported; the real surface's port
+    // policy and handshake are the next step's design, not this measurement's.
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("binding the HTTP listener")?;
+    let http_port = http_listener.local_addr()?.port();
+    eprintln!(
+        "[nemrd {}] http: 127.0.0.1:{http_port} (spike)",
+        std::process::id()
+    );
+    let http_client = service.client();
+    let app = axum::Router::new()
+        .route("/health", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/v1/projects",
+            axum::routing::get(move || {
+                let client = http_client.clone();
+                async move {
+                    use axum::response::IntoResponse;
+                    match nemr_engine::engine::project::list(&client).await {
+                        Ok(projects) => axum::Json(serde_json::json!({
+                            "projects": projects
+                                .iter()
+                                .map(|p| serde_json::json!({
+                                    "name": p.name, "running": p.running, "quota": p.quota, "agent": p.agent
+                                }))
+                                .collect::<Vec<_>>()
+                        }))
+                        .into_response(),
+                        Err(e) => (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("{e:#}"),
+                        )
+                            .into_response(),
+                    }
+                }
+            }),
+        );
+    let http_task = tokio::spawn(async move { axum::serve(http_listener, app).await });
+
     // Shut down cleanly on SIGTERM/SIGINT so the socket file is removed and a
     // restart does not trip over a stale one.
     let shutdown = async {
@@ -155,6 +197,9 @@ async fn daemon_main() -> Result<()> {
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await
         .context("nemrd server error")?;
+    // One signal stops both: the gRPC server has returned, so take the HTTP
+    // listener down with it.
+    http_task.abort();
 
     // Only if the path still names the socket we bound. If something replaced
     // it while we were running, removing it would take out a live daemon on the
