@@ -75,6 +75,57 @@ Per-device keeps the secret's blast radius at one machine.
 layers, and WP C2's implementation keeps it there deliberately — the
 whole-directory `CLAUDE_CONFIG_DIR` relocation was rejected on these grounds.
 
+**Revised mechanism — (f), the credential mount is read-write (2026-09-05,
+Product Owner ruling; SPEC 1.102).** The substance is unchanged: per-device,
+never synced, never in a bundle, injected from the host. What changes is that
+the session may now *write* the one file it mounts, because Claude Code renews
+its login by rewriting it, and a read-only mount made every session's login
+die at the access token's eight-hour expiry with an error blaming revocation
+(F-130). Established before building, on the reference host with the real
+credential: a session refreshed an expired access token through a writable
+single-file bind, in place, and the host continued on the rotated pair.
+
+*The enumeration the ruling asked for — what a session can now write.* On a
+real host `~/.claude` holds: `.credentials.json` (the credential; the only
+thing mounted); `history.jsonl` (prompt history across every project — 190 KB
+here; must never be mounted); `projects/` and `sessions/` (session state — the
+M8 binds from the volume shadow these); `settings.json` (preferences — the
+F-131 question, not this one); and `backups/`, `cache/`, `debug/`, `plugins/`,
+`shell-snapshots/`, `daemon*`, `stats-cache.json` and similar machine-local
+state. Identity — `machineID`, `userID`, `oauthAccount` — lives in
+`~/.claude.json`, *outside* the directory, on the rootfs, never mounted (F-54).
+**So: not the whole directory.** One file becomes writable; identity files were
+never in the mount and stay read-only where they are; everything else stays
+container-local. A whole-directory bind would share the host's history in both
+directions and need a blocklist that fails open on the next Claude Code
+release (the F-54 argument).
+
+*The exposure, stated honestly.* Every process in a session — the agent
+included — could already read the credential (root, mode 600). Now it can
+write it: refresh it (intended), blank it (Claude Code does so itself after a
+dead refresh), or overwrite it, which would put the host's own Claude Code on
+whatever the session wrote. That is a same-user boundary, the same one the
+daemon socket relies on; it is why the file stays the *only* writable thing
+from `~/.claude`, and why nothing here touches what travels.
+
+*F-12, diagnosed and bounded.* The container's Claude Code writes the file in
+place — a rename over a mount point cannot succeed, so it falls back — and the
+host sees every session-side refresh. The host's Claude Code writes by rename,
+so after a *host-side* refresh a running session's bind still shows the
+previous file, whose refresh token has been rotated away, and its next refresh
+fails and blanks its own copy. Remedy: `nemr stop && nemr start`, which
+re-resolves the path (proven on a real project); not delete-and-recreate.
+Detection: `status` and `attach` compare device and inode of the task's view
+(`/proc/<pid>/root`) with the host's and say STALE, with that remedy. What a
+session cannot recover from by itself is now exactly three states — a spent
+refresh token, a blanked file, a stale mount — and those are the only ones
+reported; an eight-hour access expiry is routine and silent.
+
+*What existing projects do.* Their records carry `ro`; `start` repairs the
+record before the task exists (the NET-02 migration's shape, with the F-112
+lesson: a read-only control on the spec, a test seam for the old shape, and
+proof from the running task's `mountinfo`).
+
 ---
 
 ### D-03 — Concurrency: server-side lease
@@ -1177,6 +1228,18 @@ machine can be authenticated" would be solving the wrong problem carefully.
 > (exec-time injection needs no container-record change and is D-02's own
 > wording) and whether the file mount stays for the non-Claude agents.
 
+> **Ruled (2026-09-05): option (f), not (e).** The Product Owner chose to make
+> the mounted credential writable so the session refreshes it, rather than a
+> long-lived token — see D-02's revised mechanism. Established in the same
+> session: refresh tokens **rotate on every refresh** (both tokens changed on a
+> real refresh, twice), which is the mechanism this entry inferred; and the
+> previous access token kept working after the refresh. The cross-machine
+> question stands as inferred — two machines holding copies of one refresh
+> token cannot both refresh — and is no longer a daily cost, because a session
+> now shares the host's live file rather than a read-only snapshot of it.
+> Part B of the token spike is not needed for the ruling; it remains a valid
+> experiment if (e) is ever wanted for headless paths (`--bare`, Codex).
+
 ---
 
 ### D-11 — No user-facing path moves a bundle through storage
@@ -1417,3 +1480,5 @@ is overstating what has been demonstrated.
 | 2026-09-05 | E-13 | **Investigated** — the token model measured (8 h access, ~2-week refresh); no documented device/session limit; the community record fits refresh-token rotation, not a policy; the read-only mount means a session cannot refresh at all (F-12, sharpened); option (e) `claude setup-token` as a per-device env var, with two experiments to settle it. Still Open (Claude Code) |
 | 2026-09-05 | F-131 | **Opened** — first-run onboarding repeats every session because preferences share the identity-bearing user config on the rootfs; three shapes tabled, (a) seed-from-allowlist recommended; raised for a ruling, not built (Claude Code) |
 | 2026-09-05 | E-13 | **Experiment Part A run** — env-var token wins over the mounted file in every state incl. expired-present; F-130's mechanism confirmed in Claude Code's debug log; `--bare` ignores the env var; exposure measured (readable in-session like the file today; in the host container record). Part B (real token, 8 h, login elsewhere) is Rain's; ruling waits (Claude Code) |
+| 2026-09-05 | D-02 | **Mechanism revised — (f): the credential mount is read-write** so the session refreshes its own login; substance unchanged (per-device, never synced, never in a bundle). Enumeration: one file, not the directory; identity never in the mount. Exposure stated (read was already possible; write is new; same-user). F-12 bounded: in-place write from the session, rename on the host; stop/start is the remedy; STALE detected by inode. Existing records migrated at start (Rain; SPEC 1.102) |
+| 2026-09-05 | E-13 | **Ruled (f) over (e)**; refresh-token rotation observed directly (both tokens change on every refresh; the prior access token survives). Cross-machine mechanism stands as inferred; no longer a daily cost (Rain) |

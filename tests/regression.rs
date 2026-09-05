@@ -2301,6 +2301,9 @@ fn status_distinguishes_unmounted_from_wrongly_mounted() {
         credential: None,
         credential_modified: None,
         credential_expires_at: None,
+        credential_refresh_expires_at: None,
+        credential_blank: false,
+        credential_stale: None,
     };
     assert_eq!(
         detail.mount_is_correct(),
@@ -3302,6 +3305,117 @@ fn net02_a_project_created_before_net02_is_migrated_and_starts_wired() {
 
         let _ = project::stop(&client, &project.name).await;
     });
+}
+
+/// D-02 (f): a project created while the credential was bound read-only carries
+/// `ro` in its frozen spec, and a task started from that record cannot refresh
+/// its login — the F-130 loop for ever, whatever the engine does afterwards.
+/// `start` must repair the record first. `NEMR_TEST_PRE_F12` creates the old
+/// shape, because no fresh container can have it and an untested upgrade path
+/// is how NET-02's migration broke `htmltest` (F-112).
+///
+/// The proof of the running task's mount is read from its `mountinfo` on the
+/// host — no exec, and above all NO WRITE to the credential, which is the
+/// user's real login.
+#[test]
+fn f12_a_project_created_with_a_read_only_credential_is_migrated_at_start() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+
+        std::env::set_var("NEMR_TEST_PRE_F12", "1");
+        let project = TestProject::create(&client, "f12pre", VolumeSize::Small).await;
+        std::env::remove_var("NEMR_TEST_PRE_F12");
+
+        let id = nemr_engine::config::container_id(&project.name);
+        let cred = nemr_engine::config::CONTAINER_CREDENTIALS;
+        // Control, READ-ONLY: the subject really has the old shape (the NET-02
+        // lesson — a control that migrates what it observes is not a control).
+        assert!(
+            !client
+                .bind_is_writable(&id, cred)
+                .await
+                .expect("read the spec"),
+            "the subject must START with a read-only credential mount, or this proves nothing"
+        );
+
+        let pid = project::start(&client, &project.name)
+            .await
+            .expect("a project created before (f) must still start");
+
+        assert!(
+            client
+                .bind_is_writable(&id, cred)
+                .await
+                .expect("read the spec"),
+            "start must have repaired the container record"
+        );
+        assert_eq!(
+            mount_option(pid, cred).as_deref(),
+            Some("rw"),
+            "the RUNNING task's credential mount must be rw (read from /proc/{pid}/mountinfo)"
+        );
+
+        let _ = project::stop(&client, &project.name).await;
+    });
+}
+
+/// The control's control: a fresh project is writable from create, so the seam
+/// above is what made the subject read-only, not the engine.
+#[test]
+fn f12_a_fresh_project_mounts_the_credential_read_write() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "f12new", VolumeSize::Small).await;
+        let id = nemr_engine::config::container_id(&project.name);
+        let cred = nemr_engine::config::CONTAINER_CREDENTIALS;
+        assert!(
+            client
+                .bind_is_writable(&id, cred)
+                .await
+                .expect("read the spec"),
+            "a fresh project must record the credential mount as writable"
+        );
+        let pid = project::start(&client, &project.name).await.expect("start");
+        assert_eq!(mount_option(pid, cred).as_deref(), Some("rw"));
+        // And the F-12 detector reads "current" for a session started from the
+        // host's present file.
+        let detail = project::status(&client, &project.name)
+            .await
+            .expect("status");
+        assert_eq!(
+            detail.credential_stale,
+            Some(false),
+            "a session just started from the host's file must not read as stale"
+        );
+        let _ = project::stop(&client, &project.name).await;
+    });
+}
+
+/// The first option (`ro`/`rw`) of the mount at `mount_point` in a task's
+/// mountinfo, read from the host through /proc — a read, never an exec.
+fn mount_option(pid: u32, mount_point: &str) -> Option<String> {
+    let info = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")).ok()?;
+    info.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(' ').collect();
+        (fields.get(4) == Some(&mount_point))
+            .then(|| fields[5].split(',').next().unwrap_or("").to_string())
+    })
 }
 
 /// The control the migration rests on: a task that shares rootlesskit's network

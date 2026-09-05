@@ -108,6 +108,40 @@ pub fn add_network_namespace(oci: &mut serde_json::Value) -> Result<bool> {
     Ok(true)
 }
 
+/// Make the bind mount at `destination` read-write in a recorded OCI spec.
+///
+/// The second spec migration (the first is [`add_network_namespace`]), for the
+/// same reason: a container's spec is frozen at create time and read again at
+/// every task start, so a project created while the credential was bound
+/// read-only keeps that `ro` for ever unless the record is repaired. Returns
+/// `Ok(true)` if the spec changed, `Ok(false)` if the mount was already
+/// writable, and an error if no such mount is recorded — refusing rather than
+/// inventing a mount. Only the `ro` option moves; these records carry mounts,
+/// a cgroup path and process arguments for projects that have travelled
+/// between machines, and the migration touches nothing it was not asked to.
+pub fn make_bind_writable(oci: &mut serde_json::Value, destination: &str) -> Result<bool> {
+    let mounts = oci
+        .get_mut("mounts")
+        .and_then(|m| m.as_array_mut())
+        .context("the OCI spec has no mounts array")?;
+    let mount = mounts
+        .iter_mut()
+        .find(|m| m.get("destination").and_then(|d| d.as_str()) == Some(destination))
+        .with_context(|| format!("the OCI spec records no mount at {destination:?}"))?;
+    let options = mount
+        .get_mut("options")
+        .and_then(|o| o.as_array_mut())
+        .with_context(|| format!("the mount at {destination:?} has no options array"))?;
+    let mut changed = false;
+    for option in options.iter_mut() {
+        if option.as_str() == Some("ro") {
+            *option = serde_json::Value::String("rw".into());
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 /// A host path bind-mounted into a container.
 #[derive(Debug, Clone)]
 pub struct BindMount {
@@ -558,6 +592,108 @@ impl ContainerdClient {
             .context("the OCI spec has no linux.namespaces array")?
             .iter()
             .any(|n| n.get("type").and_then(|t| t.as_str()) == Some("network")))
+    }
+
+    /// The recorded OCI spec of a container, parsed, with the `Any` envelope it
+    /// came in so an edit can be written back under the same type URL.
+    async fn recorded_spec(&self, id: &str) -> Result<(serde_json::Value, String)> {
+        let request = ListContainersRequest {
+            filters: vec![format!("id=={id}")],
+        };
+        let mut containers = self
+            .raw()
+            .containers()
+            .list(with_namespace!(request, self.namespace()))
+            .await
+            .context("containerd ListContainers request failed")?
+            .into_inner()
+            .containers;
+        let Some(container) = containers.pop() else {
+            anyhow::bail!("container {id:?} does not exist");
+        };
+        let spec = container
+            .spec
+            .with_context(|| format!("container {id:?} has no OCI spec recorded"))?;
+        let oci: serde_json::Value = serde_json::from_slice(&spec.value)
+            .with_context(|| format!("parsing the OCI spec recorded for {id:?}"))?;
+        Ok((oci, spec.type_url))
+    }
+
+    /// Repair a recorded spec whose bind mount at `destination` is read-only
+    /// (the pre-(f) credential shape, D-02/F-12). Returns whether the record
+    /// changed. Idempotent: a writable mount is left alone and reported as
+    /// unchanged, so the caller can tell the user about a migration exactly
+    /// once.
+    pub async fn ensure_bind_writable(&self, id: &str, destination: &str) -> Result<bool> {
+        let (mut oci, type_url) = self.recorded_spec(id).await?;
+        if !make_bind_writable(&mut oci, destination)
+            .with_context(|| format!("reading the mounts in the spec for {id:?}"))?
+        {
+            return Ok(false);
+        }
+        let updated = serde_json::to_vec(&oci).context("re-serialising the OCI spec")?;
+        let request = UpdateContainerRequest {
+            container: Some(Container {
+                id: id.to_string(),
+                spec: Some(Any {
+                    type_url,
+                    value: updated,
+                }),
+                ..Default::default()
+            }),
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["spec".to_string()],
+            }),
+        };
+        self.raw()
+            .containers()
+            .update(with_namespace!(request, self.namespace()))
+            .await
+            .with_context(|| {
+                format!("failed to make the mount at {destination:?} writable in the OCI spec of {id:?}")
+            })?;
+        Ok(true)
+    }
+
+    /// Is the bind mount at `destination` recorded read-write in this
+    /// container's spec? Read-only, for the same reason as
+    /// [`Self::has_own_network_namespace`]: a control that migrates what it
+    /// observes is not a control.
+    pub async fn bind_is_writable(&self, id: &str, destination: &str) -> Result<bool> {
+        let (oci, _) = self.recorded_spec(id).await?;
+        let mount = oci
+            .get("mounts")
+            .and_then(|m| m.as_array())
+            .context("the OCI spec has no mounts array")?
+            .iter()
+            .find(|m| m.get("destination").and_then(|d| d.as_str()) == Some(destination))
+            .with_context(|| format!("the OCI spec records no mount at {destination:?}"))?;
+        Ok(!mount
+            .get("options")
+            .and_then(|o| o.as_array())
+            .map(|opts| opts.iter().any(|o| o.as_str() == Some("ro")))
+            .unwrap_or(false))
+    }
+
+    /// The host pid of a container's task, if it has one. `None` when no task
+    /// exists; the state is not consulted, so a stopped-but-unreaped task still
+    /// reports its (dead) pid — pair with [`Self::task_state`] where it matters.
+    pub async fn task_pid(&self, id: &str) -> Result<Option<u32>> {
+        let request = GetRequest {
+            container_id: id.to_string(),
+            exec_id: String::new(),
+        };
+        match self
+            .raw()
+            .tasks()
+            .get(with_namespace!(request, self.namespace()))
+            .await
+        {
+            Ok(response) => Ok(response.into_inner().process.map(|p| p.pid)),
+            Err(status) if status.code() == Code::NotFound => Ok(None),
+            Err(status) => Err(anyhow::Error::from(status))
+                .with_context(|| format!("failed to query the task pid for {id:?}")),
+        }
     }
 
     /// The parent of a container's rootfs snapshot — the CHAIN ID of the image
@@ -1314,6 +1450,76 @@ mod tests {
     fn a_spec_without_a_namespace_list_is_refused_rather_than_invented() {
         let mut oci = serde_json::json!({ "ociVersion": "1.0.2-dev" });
         assert!(add_network_namespace(&mut oci).is_err());
+    }
+
+    /// The mounts a container created before D-02's (f) carries: the credential
+    /// bound `ro`, the volume and the M8 state binds `rw`. The migration must
+    /// flip exactly the credential's option and nothing else.
+    fn pre_f12_spec() -> serde_json::Value {
+        serde_json::json!({
+            "ociVersion": "1.0.2-dev",
+            "process": { "args": ["sleep", "infinity"], "cwd": "/workspace" },
+            "mounts": [
+                { "destination": "/workspace", "type": "bind", "source": "/host/vol", "options": ["rbind", "rw"] },
+                { "destination": "/root/.claude/.credentials.json", "type": "bind",
+                  "source": "/home/u/.claude/.credentials.json", "options": ["rbind", "ro"] },
+                { "destination": "/root/.claude/projects", "type": "bind", "source": "/host/vol/.nemr-state/projects", "options": ["rbind", "rw"] }
+            ],
+            "linux": { "cgroupsPath": "user.slice:nemr:demo", "namespaces": [{ "type": "pid" }] }
+        })
+    }
+
+    #[test]
+    fn a_read_only_credential_mount_becomes_writable() {
+        let mut oci = pre_f12_spec();
+        assert!(
+            make_bind_writable(&mut oci, "/root/.claude/.credentials.json").unwrap(),
+            "a `ro` credential mount must be changed"
+        );
+        assert_eq!(
+            oci["mounts"][1]["options"],
+            serde_json::json!(["rbind", "rw"]),
+            "the option must read `rw` afterwards, in place"
+        );
+    }
+
+    /// Idempotent, and it says so: the caller tells the user about a migration
+    /// once, not on every start for ever after.
+    #[test]
+    fn making_a_mount_writable_twice_changes_nothing_the_second_time() {
+        let mut oci = pre_f12_spec();
+        assert!(make_bind_writable(&mut oci, "/root/.claude/.credentials.json").unwrap());
+        let after_first = oci.clone();
+        assert!(
+            !make_bind_writable(&mut oci, "/root/.claude/.credentials.json").unwrap(),
+            "the second call must report no change"
+        );
+        assert_eq!(oci, after_first);
+    }
+
+    /// Nothing but the named mount's option may move — not the other mounts,
+    /// not the process, not the cgroup path.
+    #[test]
+    fn making_a_mount_writable_touches_nothing_else() {
+        let mut oci = pre_f12_spec();
+        let before = oci.clone();
+        assert!(make_bind_writable(&mut oci, "/root/.claude/.credentials.json").unwrap());
+        assert_eq!(oci["mounts"][0], before["mounts"][0]);
+        assert_eq!(oci["mounts"][2], before["mounts"][2]);
+        assert_eq!(oci["mounts"][1]["source"], before["mounts"][1]["source"]);
+        assert_eq!(oci["process"], before["process"]);
+        assert_eq!(oci["linux"], before["linux"]);
+    }
+
+    /// A spec with no such mount is refused, not given one: inventing a bind
+    /// mount would write a record that mounts something the user never asked
+    /// for.
+    #[test]
+    fn a_missing_mount_is_refused_rather_than_invented() {
+        let mut oci = pre_f12_spec();
+        assert!(make_bind_writable(&mut oci, "/root/.claude/elsewhere.json").is_err());
+        let mut bare = serde_json::json!({ "ociVersion": "1.0.2-dev" });
+        assert!(make_bind_writable(&mut bare, "/root/.claude/.credentials.json").is_err());
     }
 
     /// The two shapes the builder can produce. `own_network_namespace` exists so
