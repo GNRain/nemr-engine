@@ -250,6 +250,57 @@ is read-write; `start` repairs a pre-(f) record; `status`/`attach` report the
 three unrecoverable states — spent refresh token, blanked file, stale mount —
 and stay silent on a routine access expiry.
 
+## Part D — killing F-12 with a file bind, and the shape the ruling named (2026-09-05)
+
+The ruling approved "a writable directory holding only the credential."
+That shape cannot be built: Claude Code reads the fixed path
+`~/.claude/.credentials.json`, the host's file lives in that directory among
+the other entries, and a directory that the host's Claude Code also writes
+into is `~/.claude` itself (rejected), a nemr-owned directory the host never
+writes to (host and session diverge; rotation kills one), or a symlink
+(rejected). So the file bind stays, and F-12 has to die another way.
+
+**D1 — the naive re-bind fails, twice, and both failures are kernel facts.**
+Inside the task's mount namespace, `mount --bind /proc/self/fd/3 <target>`
+fails with "special device does not exist": `/proc` there is the container's
+own, so the descriptor cannot be named by path. With the new mount API
+(`open_tree(OPEN_TREE_CLONE)` inside rootlesskit's namespaces, `setns` into
+the task's mount namespace, `move_mount`), the same sequence that works
+within one namespace fails across them with `ENOENT` — because the stale
+bind's root dentry is **unlinked** (the host renamed over it) and the kernel
+refuses to mount on top of an unlinked dentry.
+
+**D2 — the sequence that works.** Detach the stale bind first
+(`umount2(MNT_DETACH)`); the underlying rootfs placeholder is then the mount
+point; `move_mount` the detached clone onto it. On a real project with the
+task running, after a host-side rename:
+
+```
+before: host 4860899  task sees 4872350  (stale)
+umount2(stale bind, MNT_DETACH): ok
+underlying rootfs placeholder inode: 5908055 size: 0
+move_mount(new): ok
+after:  host 4860899  task sees 4860899
+inside: /home/nemr/.claude/.credentials.json /root/.claude/.credentials.json rw,relatime
+```
+
+The running session sees the host's current file, still read-write, with no
+stop, no start, no recreate. Joining a user namespace requires a
+single-threaded process, so in the engine this runs as `nemrd __rebind`, a
+child of the daemon dispatched before its runtime exists.
+
+**D3 — the observability condition and F-12 are one component.** The
+daemon's credential watcher (inotify on the host file and its directory)
+sees every rewrite: an in-place write is attributed to the running session
+(sessions write in place; a rename over a mount point cannot succeed), a
+replacement to the host; the result is parsed and named; the record goes to
+the daemon log and `nemr status`. And a replacement triggers the re-bind of
+every running session — so F-12 dies while the daemon runs, and `attach`
+covers a replacement that landed while it did not.
+
+**What is not prevented:** a session can still write junk into the host's
+login. It is named, with the session, in the record; the host logs in again.
+
 ## The verdict
 
 **Part A settled precedence; Part B is superseded by the ruling for (f); Part C established (f) and it is built.** The original verdict text follows for the record.
