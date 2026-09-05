@@ -1,9 +1,11 @@
 //! Claude Code credential injection (Section 3.5, AUTH-01..AUTH-03).
 //!
-//! Credentials are never baked into the base image (AUTH-01). They are
-//! bind-mounted read-only from the host at container creation (AUTH-02), and a
-//! missing host credential is a clear, actionable failure rather than a
-//! container that starts and then cannot authenticate (AUTH-03).
+//! Credentials are never baked into the base image (AUTH-01). The credential
+//! file — and only that file — is bind-mounted from the host at container
+//! creation, read-write since D-02's (f) so Claude Code can refresh the login
+//! inside the session (AUTH-02), and a missing host credential is a clear,
+//! actionable failure rather than a container that starts and then cannot
+//! authenticate (AUTH-03).
 
 use std::path::{Path, PathBuf};
 
@@ -23,12 +25,14 @@ const HOST_CREDENTIALS_RELATIVE: &str = ".claude/.credentials.json";
 /// 1. expose every other project's history to any code running in any
 ///    container, which defeats the isolation the product exists to provide,
 ///    and
-/// 2. break Claude Code anyway, because AUTH-02 requires the mount be
-///    read-only and Claude Code writes session state under `~/.claude`.
+/// 2. share the host's own `history.jsonl` and caches with every session, in
+///    both directions, since the mount must be writable for the refresh.
 ///
 /// Mounting only `.credentials.json` satisfies what AUTH-02 is for — the
-/// container authenticates using host credentials it cannot modify — without
-/// either consequence. This narrowing is recorded in SPEC.md Section 11.
+/// container authenticates with the host's login and can renew it — without
+/// either consequence. The write surface a session gains is that one file.
+/// This narrowing is recorded in SPEC.md Section 11; the read-write change
+/// under D-02's (f), with the enumeration of `~/.claude`, in DECISIONS.md.
 pub fn host_credentials_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("HOME is not set; cannot locate credentials")?;
     Ok(PathBuf::from(home).join(HOST_CREDENTIALS_RELATIVE))
@@ -47,8 +51,8 @@ pub fn resolve_credentials() -> Result<PathBuf> {
             "no Claude Code credentials found at {}.\n\
              Authenticate on the host first by running `claude` and completing login, \
              then retry.\n\
-             Credentials are mounted from the host read-only (AUTH-02); in-container \
-             authentication is out of scope for Phase 1.",
+             The host's credential file is mounted into every session (AUTH-02); \
+             a session refreshes it but cannot create it.",
             path.display()
         );
     }
@@ -59,7 +63,7 @@ pub fn resolve_credentials() -> Result<PathBuf> {
              path:     {}\n\
              expected: the Claude Code credentials file\n\
              found:    {}\n\n\
-             It is bind-mounted read-only into the container (AUTH-02), and only a \
+             It is bind-mounted into the container (AUTH-02), and only a \
              regular file can be. Remove or rename whatever is there, then \
              authenticate on the host by running `claude`.",
             path.display(),
@@ -146,6 +150,129 @@ pub fn credential_expiry_at(path: &Path) -> CredentialExpiry {
         Ok(contents) => credential_expiry(&contents),
         Err(_) => CredentialExpiry::Unknown,
     }
+}
+
+/// The facts a credential file states about itself, read without judging them.
+///
+/// Under D-02's (f) the credential is mounted read-write, so Claude Code
+/// refreshes the **access token** inside the session from the **refresh
+/// token** — routine, every eight hours, not a fault. What can no longer be
+/// recovered from inside a session is a spent refresh token, or a file Claude
+/// Code has *blanked* after a dead refresh (its "dead-token disk clear" writes
+/// empty tokens and `expiresAt: 0`). Those two, and only those, need the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialFacts {
+    /// `claudeAiOauth.expiresAt` — the access token.
+    pub access: CredentialExpiry,
+    /// `claudeAiOauth.refreshTokenExpiresAt` — the refresh token.
+    pub refresh: CredentialExpiry,
+    /// The OAuth object is present but its `accessToken` is empty: the shape
+    /// Claude Code leaves behind after a dead-token clear.
+    pub blank: bool,
+}
+
+/// What the facts mean right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialVerdict {
+    /// No OAuth shape to judge: an API key, a placeholder, or unparseable.
+    NotOauth,
+    /// The access token is live.
+    Fresh { access_left: i64 },
+    /// The access token is spent and the refresh token is live (or undated):
+    /// Claude Code refreshes on next use. Not a warning.
+    Refreshable { refresh_left: Option<i64> },
+    /// The refresh token is spent: nothing in the file can recover it. Log in
+    /// on the host.
+    RefreshExpired { since: i64 },
+    /// Claude Code cleared the tokens after a dead refresh. Log in on the host.
+    Blank,
+}
+
+impl CredentialFacts {
+    pub fn verdict(self, now_unix: i64) -> CredentialVerdict {
+        if self.blank {
+            return CredentialVerdict::Blank;
+        }
+        match self.access {
+            CredentialExpiry::Unknown => CredentialVerdict::NotOauth,
+            CredentialExpiry::At(access) if access > now_unix => CredentialVerdict::Fresh {
+                access_left: access - now_unix,
+            },
+            CredentialExpiry::At(_) => match self.refresh {
+                CredentialExpiry::At(refresh) if refresh <= now_unix => {
+                    CredentialVerdict::RefreshExpired {
+                        since: now_unix - refresh,
+                    }
+                }
+                CredentialExpiry::At(refresh) => CredentialVerdict::Refreshable {
+                    refresh_left: Some(refresh - now_unix),
+                },
+                // An older file shape with no dated refresh token: Claude Code
+                // can still try; we have no evidence it cannot, so no warning.
+                CredentialExpiry::Unknown => CredentialVerdict::Refreshable { refresh_left: None },
+            },
+        }
+    }
+}
+
+/// Parse the facts out of a credential file's contents. Total, like
+/// [`credential_expiry`]: anything unparseable is "no facts", never an error.
+pub fn credential_facts(contents: &str) -> CredentialFacts {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(contents) else {
+        return CredentialFacts {
+            access: CredentialExpiry::Unknown,
+            refresh: CredentialExpiry::Unknown,
+            blank: false,
+        };
+    };
+    let oauth = value.get("claudeAiOauth");
+    let secs = |field: &str| {
+        oauth
+            .and_then(|o| o.get(field))
+            .and_then(serde_json::Value::as_i64)
+            .map(|millis| CredentialExpiry::At(millis / 1000))
+            .unwrap_or(CredentialExpiry::Unknown)
+    };
+    CredentialFacts {
+        access: secs("expiresAt"),
+        refresh: secs("refreshTokenExpiresAt"),
+        blank: oauth.is_some()
+            && oauth
+                .and_then(|o| o.get("accessToken"))
+                .and_then(|t| t.as_str())
+                .is_none_or(str::is_empty),
+    }
+}
+
+/// Read and parse the facts of the credential file at `path`.
+pub fn credential_facts_at(path: &Path) -> CredentialFacts {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => credential_facts(&contents),
+        Err(_) => credential_facts(""),
+    }
+}
+
+/// Does a running session see a *different* file than the host has now (F-12)?
+///
+/// A file bind mount pins the inode it was made from. Claude Code on the host
+/// rewrites the credential by rename on every refresh, so after a host-side
+/// refresh the session's mount still shows the previous file — whose refresh
+/// token has been rotated away — and the session's next refresh will fail and
+/// blank its own copy. Read, never repaired: the daemon's own user can stat the
+/// task's view through `/proc/<pid>/root`, so this compares device and inode
+/// of what the session sees at `container_path` with `host_path`. `None` when
+/// either side cannot be read.
+pub fn credential_is_stale(task_pid: u32, container_path: &Path, host_path: &Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let seen = std::fs::metadata(
+        std::path::Path::new("/proc")
+            .join(task_pid.to_string())
+            .join("root")
+            .join(container_path.strip_prefix("/").unwrap_or(container_path)),
+    )
+    .ok()?;
+    let host = std::fs::metadata(host_path).ok()?;
+    Some((seen.dev(), seen.ino()) != (host.dev(), host.ino()))
 }
 
 /// Warn if the credential file is more permissive than owner-only.
@@ -279,6 +406,89 @@ mod tests {
             !credential_expiry_at(&dir.join("missing.json")).is_expired_at(now),
             "an unreadable file is Unknown, not expired"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The five verdicts, from the file shapes Claude Code actually writes
+    /// (measured 2026-09-05: access token 8 h, refresh token ~2 weeks; the
+    /// dead-token clear leaves `accessToken: ""` and `expiresAt: 0`).
+    #[test]
+    fn credential_verdicts_follow_the_two_tokens() {
+        let now: i64 = 1_800_000_000;
+        let file = |access: i64, refresh: i64, token: &str| {
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"{token}","refreshToken":"r","expiresAt":{},"refreshTokenExpiresAt":{}}}}}"#,
+                access * 1000,
+                refresh * 1000
+            )
+        };
+        assert_eq!(
+            credential_facts(&file(now + 3600, now + 86_400, "a")).verdict(now),
+            CredentialVerdict::Fresh { access_left: 3600 }
+        );
+        assert_eq!(
+            credential_facts(&file(now - 3600, now + 86_400, "a")).verdict(now),
+            CredentialVerdict::Refreshable {
+                refresh_left: Some(86_400)
+            },
+            "a spent access token with a live refresh token is routine, not a fault"
+        );
+        assert_eq!(
+            credential_facts(&file(now - 3600, now - 60, "a")).verdict(now),
+            CredentialVerdict::RefreshExpired { since: 60 }
+        );
+        assert_eq!(
+            credential_facts(&file(0, now + 86_400, "")).verdict(now),
+            CredentialVerdict::Blank,
+            "the dead-token clear must read as Blank, not as a refreshable expiry"
+        );
+        // No dated refresh token: Claude Code may still refresh; no warning.
+        assert_eq!(
+            credential_facts(r#"{"claudeAiOauth":{"accessToken":"a","expiresAt":1000}}"#)
+                .verdict(now),
+            CredentialVerdict::Refreshable { refresh_left: None }
+        );
+        assert_eq!(
+            credential_facts(r#"{"_comment":"CI PLACEHOLDER"}"#).verdict(now),
+            CredentialVerdict::NotOauth
+        );
+        assert_eq!(
+            credential_facts("").verdict(now),
+            CredentialVerdict::NotOauth
+        );
+    }
+
+    /// The F-12 detector compares what a task sees with what the host has, by
+    /// device and inode through /proc/<pid>/root. Our own pid sees the host's
+    /// filesystem, so the same path must read as not stale and a different file
+    /// as stale; an unreadable side is "cannot tell", never a verdict.
+    #[test]
+    fn credential_staleness_is_an_inode_comparison() {
+        let dir = std::env::temp_dir().join(format!("nemr-auth-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.json");
+        let b = dir.join("b.json");
+        std::fs::write(&a, "{}").unwrap();
+        std::fs::write(&b, "{}").unwrap();
+        let me = std::process::id();
+        assert_eq!(
+            credential_is_stale(me, &a, &a),
+            Some(false),
+            "same file: not stale"
+        );
+        assert_eq!(
+            credential_is_stale(me, &a, &b),
+            Some(true),
+            "a different inode: stale"
+        );
+        // Replace-by-rename, exactly what the host's Claude Code does on refresh.
+        std::fs::rename(&b, &a).unwrap();
+        assert_eq!(
+            credential_is_stale(me, &a, &a),
+            Some(false),
+            "after the rename both sides read the new inode"
+        );
+        assert_eq!(credential_is_stale(me, &dir.join("missing"), &a), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
