@@ -1157,6 +1157,29 @@ async fn main() -> Result<()> {
         }
 
         Command::Attach { name } => {
+            // Say it BEFORE Claude Code's own login prompt does the wrong thing.
+            // The credential is mounted read-only (D-02/AUTH-02), so a `/login`
+            // inside the session validates in the browser, fails to persist —
+            // silently — and the next call reads the same dead token, with an
+            // error that blames revocation rather than the write. A user ran
+            // that loop three times. The fix is not a writable mount; it is to
+            // name the state here, once, where the remedy can be acted on.
+            // Non-fatal: the shell is still useful, and only an OAuth expiry
+            // we can read fires it — a placeholder or API key stays silent.
+            if let Ok(path) = nemr_engine::auth::host_credentials_path() {
+                if nemr_engine::auth::credential_expiry_at(&path).is_expired_at(unix_now()) {
+                    eprintln!(
+                        "[nemr] Claude Code's credential on this host is EXPIRED ({}).\n\
+                         \x20      Logging in from inside the session cannot fix it: the credential is\n\
+                         \x20      mounted read-only, so an in-container login validates in the browser\n\
+                         \x20      and then fails on the next call. Refresh it on the host instead:\n\
+                         \x20        1. run `claude` on the host and complete login\n\
+                         \x20        2. recreate this project so it mounts the new credential (F-12)\n\
+                         \x20      (`nemr status {name}` shows the expiry.)",
+                        path.display()
+                    );
+                }
+            }
             let mut session = daemon::connect().await?;
             let code = attach_client(session.client().clone(), &name).await?;
             drop(session);
