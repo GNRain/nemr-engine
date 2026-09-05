@@ -179,7 +179,82 @@ and `is_error` verbatim; the timestamps of B2/B3/B4 relative to the host's
 last refresh; `nemr status`'s credential line at each step; the Clawd login
 time. **Not the token.**
 
-## The verdict — pending Part B
+## Part C — option (f): the mounted credential made writable (2026-09-05, reference host)
+
+The Product Owner's ruling superseded Part B: rather than a long-lived token,
+make the mounted file writable so Claude Code refreshes it inside the session.
+Two things to establish first, both by hand, with the real credential where it
+mattered and fakes where it did not.
+
+**C1 — which writable shape persists a write.** Fake credentials, the same
+dead-refresh path as Part A's case D, which makes Claude Code *write* the file
+(its "dead-token disk clear"):
+
+| Bind | Write persisted? | Inode after | What Claude Code left |
+|---|---|---|---|
+| single **file**, rw | **yes** | **same** (in place) | `accessToken: ""`, `expiresAt: 0` |
+| **directory** at `/root/.claude`, rw | yes | new (rename) | the same, plus `backups/ debug/ projects/ sessions/` created in the host directory |
+
+A rename over a mount point cannot succeed, so through a file bind Claude Code
+falls back to an in-place write — which is the better outcome: the host's
+path and the session's mount stay the same file.
+
+**C2 — the real refresh, through the file bind.** The host credential copied,
+its `expiresAt` moved into the past, the real refresh token left intact; the
+copy bound read-write; `claude -p "Reply with the single word OK."` against the
+real API:
+
+```
+before: access=54ce7b95f18c refresh=563be3f049b1 expiresAt +3 h   mtime=1788580594 ino=525237
+result: 'OK' is_error: False api_ms: 2076
+after:  access=91ffcc77518b refresh=548f9c825b8a expiresAt +8 h   mtime=1788580605 ino=525237
+```
+
+The session refreshed: `OK` in two seconds, the file rewritten in place, the
+access token eight hours out, **both tokens rotated**. The rotated pair was
+copied back to the host (verified well-formed first), and a host-side
+`claude -p` then refreshed again from it — `OK`, both tokens rotated a second
+time. Refresh-token rotation on every refresh is therefore observed, not
+inferred; and the previous access token kept working after each rotation (the
+Claude Code session writing this report was running on it).
+
+**C3 — F-12, reproduced and bounded.** The host's Claude Code wrote by rename
+(inode 4872270 → 4872353). On a real project (`testing`), with the task
+running: host inode and the task's view agreed at start; after the host file
+was replaced by rename, the task still saw the old inode; after `nemr stop`
+and `nemr start`, they agreed again. So a running session is pinned to the
+file the host had when it started; a host-side refresh strands it on a
+rotated-away refresh token; **stop/start is the remedy**, not delete and
+recreate. The daemon's user can read the task's view through
+`/proc/<pid>/root` and its mount flags through `/proc/<pid>/mountinfo`, so the
+state can be detected without an exec and without a write.
+
+**C4 — the enumeration.** `~/.claude` on this host (names and roles only):
+
+```
+.credentials.json   the credential — the only thing mounted (600)
+history.jsonl       prompt history across every project, 190 KB — never mounted
+projects/ sessions/ session state — shadowed in a session by the M8 binds from the volume
+settings.json       preferences (F-131's question)
+backups/ cache/ debug/ downloads/ file-history/ jobs/ paste-cache/ plugins/
+session-env/ shell-snapshots/ daemon* stats-cache.json .last-*   machine-local state and caches
+```
+
+and identity (`machineID`, `userID`, `oauthAccount`, plus onboarding flags and
+sixty-odd caches) in `~/.claude.json`, outside the directory, never mounted.
+The answer to "the whole directory?" is no: one file becomes writable, nothing
+else moves, and identity was never in the mount.
+
+**What was built from this** (SPEC 1.102, D-02 revised, F-12 fixed): the bind
+is read-write; `start` repairs a pre-(f) record; `status`/`attach` report the
+three unrecoverable states — spent refresh token, blanked file, stale mount —
+and stay silent on a routine access expiry.
+
+## The verdict
+
+**Part A settled precedence; Part B is superseded by the ruling for (f); Part C established (f) and it is built.** The original verdict text follows for the record.
+
+### Verdict as written before the ruling
 
 Part A settles precedence: the env var wins, including over an expired file.
 Part B decides whether (e) is the design. If B2–B4 hold, D-02 is unchanged in
