@@ -834,14 +834,16 @@ that matters. The proxy stays a fallback on paper, not a plan: the ones that
 - Arm B's stop/start persistence check could not be measured: no file was
   ever written to persist.
 - Prediction 9's wall times were not recorded.
-- Two identifiers are absent from the run report and are placeholders in the
-  upstream drafts: the llama.cpp image digest / `llama-server --version`, and
-  the Claude Code version in the base image.
+- Codex with `qwen3-coder:30b` was never tried; the fifth Ollama combination
+  was the 7B under Codex re-run with `sandbox_mode=workspace-write`.
 
 **Preconditions, in force for any re-run:** everything from Phases 1 and 2
 (driver store discovered, never hardcoded; the Arm C delta; `CTRUN` for every
 run; the three-signal residency check; the warmup rule). Plus: Ollama 0.33.3;
-`ghcr.io/ggml-org/llama.cpp:server-cuda` (digest to record); models
+`ghcr.io/ggml-org/llama.cpp:server-cuda` at
+`sha256:7f87a3bbe3143cdb857f5c84f82d2c15528be70ca0e7c5ade9a47d56b791f93f`
+(`llama-server` 0.3.0-dev, build 10795, commit 6703d7894); Claude Code
+2.1.240; models
 `llama3.1:8b`, `qwen2.5-coder:7b`, `qwen3-coder:30b`, and the source GGUF
 `bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M`; context 8192; `claude
 --bare -p` with `--allowedTools`; the prompt from a file via stdin; the
