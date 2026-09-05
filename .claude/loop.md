@@ -344,6 +344,19 @@ In practice:
 - A cleanup command's false all-clear is worse than a noisy one: it ends the
   investigation.
 
+## The spike rule (a label is not a gate)
+
+The HTTP-listener spike (#64) was a PR whose title said "not for merge as-is",
+and it was merged. Not the merger's fault: a title is a note, and the merge
+button does not read notes. The code in a spike PR is the measurement, which
+is why it was there — but anything that *can* be merged eventually is.
+
+**Standing rule: a spike whose code must not land is a GitHub draft PR**, or
+a branch with no PR at all and the diff pasted into the doc. A draft cannot be
+merged from the button; that is the gate. Only the measurement doc goes in a
+mergeable PR. Same shape as the pre-push rule: what must not happen is made
+structurally impossible, not written down and remembered.
+
 ## The pre-push rule (a check CI runs is a hook, not a memory)
 
 Twice in WP-J the same lapse shipped: code that was `cargo clippy`-checked but

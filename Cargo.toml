@@ -67,9 +67,6 @@ prost = "0.14"
 tokio-stream = "0.1"
 tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
-# SPIKE (docs/http-spike.md): a second listener beside gRPC. Already in the graph
-# through tonic; this makes it a direct dependency so nemrd can build a Router.
-axum = { version = "0.8", features = ["json"] }
 http = "1"
 
 [build-dependencies]
