@@ -1509,6 +1509,7 @@ dependencies = [
  "axum",
  "base64",
  "clap",
+ "http-body-util",
  "libc",
  "nemr-crypto",
  "nemr-storage",
@@ -1518,9 +1519,11 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "time",
  "tokio",
+ "tower",
 ]
 
 [[package]]

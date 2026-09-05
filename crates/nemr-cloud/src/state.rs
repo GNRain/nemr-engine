@@ -62,6 +62,13 @@ pub fn delete_account() -> Result<()> {
     }
 }
 
+/// The UI's launch URL (token in the fragment), 0600 — readable by this user
+/// only, the same trust the daemon's socket relies on. Overwritten on every
+/// `nemr ui`; the token inside is single-use anyway.
+pub fn save_ui_url(url: &str) -> Result<()> {
+    write_private(&state_dir().join("ui-url"), url.as_bytes())
+}
+
 /// Per-session lease state, written by push/pull and by the heartbeat holder.
 ///
 /// `status` is the client-side verdict the holder maintains: `held` while

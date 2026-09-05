@@ -40,13 +40,22 @@ rpassword = "7"
 # daemon's autostart).
 libc = "0.2"
 tempfile = "3"
+# The UI's HTTP surface (E-11 ruling, 2026-09-06): served by THIS process as a
+# gRPC client of the daemon, on a loopback port that opens only when the user
+# starts the UI. axum is the workspace's server framework already (nemr-sync).
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+# Constant-time comparison for the launch token (the same crate nemr-crypto uses).
+subtle = "2"
 
 [dev-dependencies]
+# `oneshot` against the Router in tests — the handshake's control matrix runs
+# with no socket at all.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 # The integration tests spawn the real sync server in-process (against the same
 # Postgres the nemr-sync suite uses) and drive THIS crate's binary as separate
 # processes — the same shape a user runs.
 nemr-sync = { path = "../nemr-sync", version = "0.1.0" }
 nemr-storage = { path = "../nemr-storage", version = "0.1.0" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
-axum = { version = "0.8" }
 time = "0.3"
