@@ -548,6 +548,50 @@ with CI coverage, and nothing in this line ever will have it.
 
 ## Open
 
+### F-131 — First-run onboarding repeats in every fresh session: preferences live on the rootfs
+
+**Status:** Open · **raised, not built** · 2026-09-05
+**Raised by:** Product Owner (WSL2 daily use) · **Relates to:** F-54, D-02, WP-C
+
+**What was observed.** Every fresh session opens Claude Code with the theme
+picker and the syntax-theme step, as if the user had never run it. Cosmetic,
+but it is the "why does this session feel new every time" experience, and it
+is separate from the credential (F-129/F-130).
+
+**Why.** Claude Code keeps first-run state and preferences in the *user*
+config (`~/.claude.json` fields such as `hasCompletedOnboarding` and `theme`,
+and `~/.claude/settings.json`), which lives on the container rootfs — not on
+the volume — because WP-C classified the user config as identity-bearing
+(`machineID`, `userID`, `oauthAccount`) and kept it off the portable layers
+(D-02). That classification is right for identity and wrong for a theme. F-54
+already made this exact distinction once, for MCP configuration, and resolved
+it *structurally*: project-scoped `.mcp.json` lives at the project root, which
+is the volume, so it travels without any field filtering.
+
+**The question, for a ruling.** Does a portable-preferences subset exist, and
+where does it live? Three shapes, none chosen:
+
+| # | Shape | What it buys | What it costs |
+|---|---|---|---|
+| a | **Seed, don't sync**: at create, copy a small allowlist of preference fields from the *host's* `~/.claude.json` (theme, onboarding-complete) into the session's rootfs config | No onboarding on this host's sessions; nothing travels in a bundle, so D-02 is untouched | Host-specific: a session pulled onto another machine onboards once there. Needs the allowlist to be maintained as Claude Code's schema moves (the F-54 drift-warning pattern) |
+| b | **Travel on the volume**: a preferences file on the volume, pointed at with `CLAUDE_CONFIG_DIR` or a settings path | Preferences follow the session across machines | `CLAUDE_CONFIG_DIR` relocates the *whole* config directory including the credential — WP-C2 rejected exactly this on D-02 grounds. Only viable if Claude Code offers a preferences-only path, which must be established, not assumed |
+| c | **Leave it** | Nothing to maintain | The first-run flow on every session, forever; the UI's "click one, it comes down, attach" lands on a theme picker |
+
+**What must not happen:** any shape that moves `~/.claude.json` wholesale.
+The identity fields are the reason the file stays put, and F-54's allowlist
+(portable: `mcpServers`, `projects`; everything else stays) is the measured
+boundary. A preferences subset would extend that allowlist by named fields,
+not replace it.
+
+**Recommendation, held loosely:** (a) — seed at create from an allowlist, no
+sync — is the smallest change that removes the daily annoyance without
+touching D-02 or the bundle format, and it degrades to today's behaviour on a
+foreign host. It waits on a ruling and on one measurement: the exact fields
+Claude Code reads for onboarding state and theme in the installed version,
+verified by reading them, not remembered.
+
+---
+
 ### E-11 — Open-core seam
 
 **Status:** Open · **decide now**
@@ -1031,6 +1075,87 @@ inode) is now scheduled, and its fix should not be designed until this is
 understood. Fixing rotation propagation while the underlying model is "only one
 machine can be authenticated" would be solving the wrong problem carefully.
 
+> **Investigation (2026-09-05, Claude Code — evidence, not a ruling).** Raised
+> again by the Product Owner after it became a daily cost: three in-container
+> logins on the WSL2 box, each browser-validated, each followed by
+> `401 OAuth access token has been revoked`. What can now be established from
+> primary sources, and what cannot:
+>
+> **1. The token model, from the file and the docs.** A subscription login is
+> stored in `~/.claude/.credentials.json` (mode 0600 on Linux) as
+> `claudeAiOauth: {accessToken, refreshToken, expiresAt, refreshTokenExpiresAt,
+> scopes, subscriptionType, rateLimitTier}`. Measured on the reference host:
+> the **access token lives 8 hours** (file mtime → `expiresAt`, 8.0 h), the
+> **refresh token about two weeks** (`refreshTokenExpiresAt`). Claude Code
+> refreshes the access token with the refresh token and rewrites the file. The
+> docs describe the login lifetime and a startup warning three days before it
+> ends ("Renew an expiring login"); `/logout` "removes and revokes the
+> credential this sign-in wrote."
+> ([docs: Authentication](https://code.claude.com/docs/en/authentication))
+>
+> **2. What the docs do NOT say.** Nothing in the authentication or error
+> reference states a per-device limit, a concurrent-session limit, or that a
+> login on one machine revokes another's. The error reference lists
+> `OAuth token revoked` with the cause "revoked or expired" and the single
+> remedy `/login` ([docs: Errors](https://code.claude.com/docs/en/errors)). A
+> policy of "one machine at a time" is **not documented**; the observation
+> stands, its cause does not.
+>
+> **3. What the community record suggests — refresh-token rotation, not a
+> device policy.** Issue
+> [anthropics/claude-code#54443](https://github.com/anthropics/claude-code/issues/54443)
+> (2.1.121, Linux, Max; closed stale, no maintainer answer) reproduces
+> cascading `/login` prompts across *two concurrent sessions sharing one
+> credentials file*, with the token endpoint returning 400 on refresh hours
+> before the local `expiresAt`, and reasons that refresh tokens are rotated
+> and single-use: a stale refresh from one holder invalidates the family for
+> the other. That mechanism fits our observation exactly, with no device
+> policy needed: two machines holding copies of one refresh token cannot both
+> refresh; the loser is "revoked." The "revoked immediately after login"
+> class is a recurring bug with no stated cause
+> ([#13350](https://github.com/anthropics/claude-code/issues/13350),
+> [#29497](https://github.com/anthropics/claude-code/issues/29497), both
+> closed without explanation). Separately,
+> [#53063](https://github.com/anthropics/claude-code/issues/53063) reports
+> that a non-interactive `claude -p` does not refresh at all and fails after
+> the 8-hour expiry. **This is where the daily pain actually lives: a
+> read-only mount (D-02) can never persist a refresh, so a session's
+> credential is dead within 8 hours of the host's last refresh regardless of
+> any other machine.** That is F-12's problem, sharpened: rotation on the host
+> is invisible in the container *and* the container cannot rotate for itself.
+>
+> **4. An option the first table did not have — (e).** The docs describe
+> `claude setup-token`: a **one-year OAuth token** for "CI pipelines, scripts,
+> or other environments where interactive browser login isn't available,"
+> read from the `CLAUDE_CODE_OAUTH_TOKEN` environment variable (precedence
+> rank 5, above the `/login` credential). It "authenticates with your Claude
+> subscription," "can only make model requests," and is self-managed — no
+> on-disk rotation for a read-only mount to defeat. Injected per device as an
+> environment variable rather than a file, it fits D-02 unchanged (per-device,
+> never synced, present at attach) and sidesteps the read-only-file problem
+> structurally. Two caveats from the same page: **bare mode does not read
+> it** (`--bare` needs `ANTHROPIC_API_KEY` or an `apiKeyHelper`), and a
+> one-year token is a longer-lived secret than an 8-hour one — the same
+> trade option (b) named, but for a *subscription* token rather than an API
+> key. Whether it is also subject to whatever revoked the WSL2 credential is
+> exactly what the experiment must establish.
+>
+> **5. What would settle it now — two experiments, both cheap, neither run.**
+> (i) The one already proposed: authenticate on A, confirm; authenticate on
+> B; re-test A — and this time read `refreshToken` (hashed) on A before and
+> after, so rotation is observed rather than inferred. (ii) A session
+> carrying `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` instead of the
+> file mount, left past the 8-hour mark and past a login on another machine.
+> If (ii) survives both, option (e) is the design; if it does not, the
+> revocation is account-level and (a) is the honest answer.
+>
+> **Recommendation, unchanged in kind: (d), then decide.** The two immediate
+> costs are addressed without waiting: `nemr status` now reports the expiry
+> (F-129) and `nemr attach` names the state before Claude Code's login prompt
+> can mislead (F-130). Nothing here designs around E-13; it only replaces
+> "one event, unexplained" with a mechanism the evidence supports and a test
+> that would confirm or kill it.
+
 ---
 
 ### D-11 — No user-facing path moves a bundle through storage
@@ -1268,3 +1393,5 @@ is overstating what has been demonstrated.
 | 2026-09-02 | E-10 | **Windows half resolved — WSL2** (no native binary, no bundled VM); macOS stays deferred, remote fallback stays rejected. Sequencing reopened for a GPU test host; permanent manual-verification cost accepted (Rain) |
 | 2026-09-03 | D-13 | **Resolved** — Node and Claude Code are prerequisites nemr detects and instructs for, never installs; no NodeSource apt repo, no `npm -g` by the script (NFR-01 one layer out; WSL2 spike divergence 3) (Rain) |
 | 2026-09-05 | E-18 | **Deferred with direction** — a local LLM on the host GPU: the contract is three binds + one env var and a session reaches the server at its gateway with the credential override holding, but tool calling fails under a real toolset in every server/model/agent combination (upstream, drafted in `docs/gpu-upstream-issues.md`); 8B on 8 GB is a plumbing proof, not an assistant. Phase 4 reopens on an upstream fix or a card that matters; the two Arm B findings are settled inputs (Rain) |
+| 2026-09-05 | E-13 | **Investigated** — the token model measured (8 h access, ~2-week refresh); no documented device/session limit; the community record fits refresh-token rotation, not a policy; the read-only mount means a session cannot refresh at all (F-12, sharpened); option (e) `claude setup-token` as a per-device env var, with two experiments to settle it. Still Open (Claude Code) |
+| 2026-09-05 | F-131 | **Opened** — first-run onboarding repeats every session because preferences share the identity-bearing user config on the rootfs; three shapes tabled, (a) seed-from-allowlist recommended; raised for a ruling, not built (Claude Code) |
