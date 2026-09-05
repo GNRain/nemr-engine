@@ -329,8 +329,9 @@ re-bind, and both sides agree on the file. The `.claude.json` identity
 clause of the re-framed acceptance is moot by E1–E5 (nothing crosses; each
 side heals from the token). Not exercised: the session refreshing *first*
 (the host refreshed first here, the harder direction for F-12); the
-session-first direction is C2's in-place write, proven separately. The
-unexplained empty first attempt is recorded, not smoothed.
+session-first direction is C2's in-place write, proven separately. The unexplained empty first attempt is recorded, not smoothed — and the
+check that hid its cause is F-132: it discarded stderr. The re-runnable
+version, stderr kept, is `docs/credential-acceptance.sh`.
 
 ## The verdict
 
