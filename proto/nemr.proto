@@ -173,6 +173,14 @@ message StatusResponse {
   int64 credential_refresh_expires_at_secs = 22;
   bool credential_blank = 23;
   int32 credential_stale = 24;
+  // The last observed rewrite of the host credential (D-02 (f) observability):
+  // when, who could have made it (by elimination — see the daemon's watcher),
+  // and what the file parsed as afterwards. Zero/empty if none was observed
+  // since the daemon started.
+  int64 credential_last_write_secs = 25;
+  string credential_last_write_by = 26;
+  string credential_last_write_verdict = 27;
+  bool credential_last_write_valid = 28;
 }
 
 message SwitchAgentRequest { string name = 1; string agent = 2; }

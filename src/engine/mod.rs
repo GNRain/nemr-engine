@@ -3,6 +3,7 @@
 //! Scaffolded per Section 3.4; populated from Milestone 2 onward.
 
 pub mod agent;
+pub mod credential_bind;
 pub mod image;
 pub mod netns;
 pub mod packages;

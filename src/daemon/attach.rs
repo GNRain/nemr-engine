@@ -45,6 +45,24 @@ pub async fn serve(
         }
     };
 
+    // F-12: if the host replaced its credential while this session ran (and
+    // the watcher was not there to see it), re-bind the current file before
+    // the shell starts — so the Claude Code the user is about to run reads
+    // the login the host has now, not the one it had at start.
+    match crate::engine::project::rebind_credential(&client, &start.name).await {
+        Ok(true) => tracing::warn!(
+            nemr_audit = "warning",
+            "[nemr] {}: re-bound the host's current credential into the session before attach (F-12)",
+            start.name
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            nemr_audit = "warning",
+            "[nemr] {}: could not check or re-bind the credential before attach: {e:#}",
+            start.name
+        ),
+    }
+
     let session = crate::engine::project::attach_exec_start(
         &client,
         &start.name,

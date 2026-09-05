@@ -10,8 +10,23 @@ use nemr_engine::proto::nemr_server::NemrServer;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // `nemrd __rebind …` is the single-threaded child that re-binds the host's
+    // current credential into a running session (F-12). It must run before any
+    // runtime thread exists: joining a user namespace refuses a multi-threaded
+    // process.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("__rebind") {
+        return nemr_engine::engine::credential_bind::rebind_main(&args[2..]);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building the daemon runtime")?
+        .block_on(daemon_main())
+}
+
+async fn daemon_main() -> Result<()> {
     let audit_registry = audit::new_registry();
     nemr_engine::observability::init_daemon(
         std::env::var_os("NEMR_VERBOSE").is_some(),
@@ -103,7 +118,19 @@ async fn main() -> Result<()> {
         nemr_engine::proto::PROTOCOL_VERSION
     );
 
-    let service = NemrService::new(client, audit_registry);
+    let last_credential_write = nemr_engine::daemon::credential_watch::new_last_write();
+    let service = NemrService::new(client, audit_registry, last_credential_write.clone());
+    // D-02 (f): observe every rewrite of the host credential, and re-bind
+    // running sessions when the host replaces it (F-12). Absent credential:
+    // nothing to watch yet; the watcher starts with the next daemon.
+    match nemr_engine::auth::host_credentials_path() {
+        Ok(cred) if cred.exists() => nemr_engine::daemon::credential_watch::spawn(
+            service.client(),
+            cred,
+            last_credential_write,
+        ),
+        _ => eprintln!("[nemrd] no host credential to watch yet"),
+    }
     let incoming = UnixListenerStream::new(listener);
 
     // Shut down cleanly on SIGTERM/SIGINT so the socket file is removed and a

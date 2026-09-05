@@ -423,20 +423,31 @@ fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<S
         ),
     };
     // F-12 overlay: what the RUNNING session sees may not be what the host has.
+    // The daemon re-binds it at the next attach (and its watcher does so the
+    // moment a host-side replacement lands), so this is a fact for `status`,
+    // not a warning for `attach` — the attach that follows repairs it.
     if d.credential_stale == 1 {
         line.push_str(&format!(
             "\n  credential:   STALE in the running session — the host replaced the file after this session \
              started (F-12);\n\
-             \x20               its copy holds a rotated-away refresh token and will fail on its next refresh.\n\
-             \x20               Fix: nemr stop {name} && nemr start {name}"
-        ));
-        warning = Some(format!(
-            "[nemr] This session holds a STALE credential: the host's login was refreshed after the session\n\
-             \x20      started, and a file mount keeps the old file (F-12). Its next refresh will fail.\n\
-             \x20      Fix: nemr stop {name} && nemr start {name}{}",
-            warning.map(|w| format!("\n{w}")).unwrap_or_default()
+             \x20               re-bound automatically at the next `nemr attach {name}` (or: nemr stop {name} && nemr start {name})"
         ));
     }
+    // D-02 (f) observability: the last rewrite the daemon saw, whoever made it.
+    if d.credential_last_write_secs > 0 {
+        line.push_str(&format!(
+            "\n  last rewrite: {} ago by {} — {}{}",
+            human_duration(unix_now() - d.credential_last_write_secs),
+            d.credential_last_write_by,
+            d.credential_last_write_verdict,
+            if d.credential_last_write_valid {
+                ""
+            } else {
+                "  ← NOT a usable credential: log in on this host"
+            }
+        ));
+    }
+    let _ = &mut warning;
     (line, warning)
 }
 
