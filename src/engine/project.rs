@@ -1677,6 +1677,11 @@ pub struct ProjectDetail {
     /// Host credential (AUTH-02), and when it was last written.
     pub credential: Option<std::path::PathBuf>,
     pub credential_modified: Option<std::time::SystemTime>,
+    /// When the credential's OAuth token expires (unix seconds), if the file
+    /// carries one. Presence is not validity: the three-login loop that
+    /// motivated this was a *present*, read-only, *expired* credential, and
+    /// "last written 0 days ago" was true and useless (the F-56 shape).
+    pub credential_expires_at: Option<i64>,
 }
 
 impl ProjectDetail {
@@ -1772,6 +1777,10 @@ pub async fn status(client: &ContainerdClient, name: &str) -> crate::error::Resu
         .as_ref()
         .and_then(|p| std::fs::metadata(p).ok())
         .and_then(|m| m.modified().ok());
+    let credential_expires_at = credential
+        .as_ref()
+        .map(|p| auth::credential_expiry_at(p))
+        .and_then(auth::CredentialExpiry::expires_at_secs);
 
     Ok(ProjectDetail {
         name: name.to_string(),
@@ -1802,6 +1811,7 @@ pub async fn status(client: &ContainerdClient, name: &str) -> crate::error::Resu
         mounted,
         credential,
         credential_modified,
+        credential_expires_at,
     })
 }
 

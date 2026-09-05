@@ -2300,6 +2300,7 @@ fn status_distinguishes_unmounted_from_wrongly_mounted() {
         base_image_digest: None,
         credential: None,
         credential_modified: None,
+        credential_expires_at: None,
     };
     assert_eq!(
         detail.mount_is_correct(),

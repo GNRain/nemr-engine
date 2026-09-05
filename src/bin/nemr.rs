@@ -321,6 +321,30 @@ fn resolve_agent(provided: Option<Agent>, interactive: bool) -> Result<Agent> {
 /// The daemon puts the full engine error — including the D-08-standard
 /// actionable ones — in the status message, so surfacing that verbatim keeps
 /// the CLI's error quality identical to the pre-daemon version.
+/// Now, in unix seconds; 0 if the clock is before the epoch (it is not).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// A duration for a human: the largest unit that keeps the number small.
+/// "2 days", not "172800 seconds"; "6 hours", not "0 days".
+fn human_duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    let (n, unit) = if secs >= 86_400 {
+        (secs / 86_400, "day")
+    } else if secs >= 3_600 {
+        (secs / 3_600, "hour")
+    } else if secs >= 60 {
+        (secs / 60, "minute")
+    } else {
+        (secs, "second")
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
 fn status_err(status: tonic::Status) -> anyhow::Error {
     anyhow::anyhow!("{}", status.message())
 }
@@ -942,24 +966,43 @@ async fn main() -> Result<()> {
             );
 
             // The expired-credential failure took three steps to identify; this
-            // is the line that would have made it one.
+            // is the line that would have made it one. Then it happened again
+            // with the line present, because it reported presence ("last
+            // written 0 days ago" — true) instead of validity (expired two days
+            // ago — the fact that mattered). Presence is not validity; the
+            // OAuth expiry is what decides whether `claude` will work.
             if d.credential_path.is_empty() {
                 println!(
                     "  credential:   ABSENT — `nemr start` will fail (AUTH-03).\n\
                      \x20               Authenticate on this host by running `claude`."
                 );
+            } else if d.credential_expires_at_secs == 0 {
+                // Present, but nothing to check it against: an API-key
+                // credential or a placeholder carries no OAuth expiry. Say that
+                // rather than pretend to a verdict.
+                println!(
+                    "  credential:   present at {} (no OAuth expiry to check — API-key auth or a placeholder)",
+                    d.credential_path
+                );
             } else {
-                let age = if d.credential_modified_secs > 0 {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    let days = (now - d.credential_modified_secs).max(0) / 86_400;
-                    format!(", last written {days} days ago")
+                let now = unix_now();
+                let remaining = d.credential_expires_at_secs - now;
+                if remaining <= 0 {
+                    println!(
+                        "  credential:   present at {} — EXPIRED {} ago.\n\
+                         \x20               Claude Code inside a session cannot refresh it (the mount is\n\
+                         \x20               read-only, D-02). Run `claude` on this host and log in, then\n\
+                         \x20               recreate the project so it mounts the new credential (F-12).",
+                        d.credential_path,
+                        human_duration(-remaining)
+                    );
                 } else {
-                    String::new()
-                };
-                println!("  credential:   present at {}{age}", d.credential_path);
+                    println!(
+                        "  credential:   present at {}, valid — expires in {}",
+                        d.credential_path,
+                        human_duration(remaining)
+                    );
+                }
             }
         }
 
