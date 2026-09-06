@@ -1,0 +1,31 @@
+[package]
+name = "nemr-daemon-api"
+version = "0.1.0"
+edition = "2021"
+description = "The nemrd control-plane API (NEMR-SPEC-001 E-09): the proto, the generated client and server stubs, and the connect-and-handshake path every client of the daemon uses"
+# Workspace-internal, like the wrapper crate (see crates/nemr-containerd).
+publish = false
+
+# The seam (E-11 ruling, 2026-09-06): the open half's daemon is reached through
+# THIS crate by every client — the open CLI and the commercial process alike —
+# so a client need not link the engine to talk to the daemon. Open, like the
+# engine and the wrapper; scripts/check_seam.sh scans its sources.
+[lib]
+name = "nemr_daemon_api"
+path = "src/lib.rs"
+
+[dependencies]
+# Pinned to the same 0.14 line containerd-client re-exports, so cargo unifies
+# to one tonic rather than resolving a second, incompatible version (the M1
+# lesson, carried over from the engine's manifest).
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["net", "time"] }
+tower = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
+anyhow = "1"
+libc = "0.2"
+
+[build-dependencies]
+tonic-prost-build = "0.14"

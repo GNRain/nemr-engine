@@ -7,19 +7,12 @@
 //! The wrapper is re-exported here as `containerd` so existing call sites read
 //! `crate::containerd::…` unchanged after the crate extraction.
 
-/// The nemrd control-plane gRPC service (E-09), generated from
-/// `proto/nemr.proto` at build time.
-pub mod proto {
-    tonic::include_proto!("nemr.v1");
-
-    /// The wire protocol version. Bump on ANY incompatible change to the
-    /// service. The daemon refuses a client whose version differs (the
-    /// hash-gate lesson applied to the protocol).
-    // v2: adds Provision (F-118). Bumped so a new CLI against an old daemon —
-    // or the reverse — refuses with the reinstall advice instead of failing
-    // with an unimplemented-RPC error that names nothing.
-    pub const PROTOCOL_VERSION: u32 = 2;
-}
+/// The nemrd control-plane API (E-09): the proto and generated stubs, the
+/// socket path and the client, now the standalone `nemr-daemon-api` crate so
+/// that a client of the daemon need not link the engine (the E-11 seam of
+/// 2026-09-06). Re-exported here so existing call sites read `crate::proto::…`
+/// unchanged, exactly as `containerd` is re-exported below.
+pub use nemr_daemon_api::proto;
 
 pub mod auth;
 pub mod bundle;

@@ -19,9 +19,12 @@ use tonic::{Request, Response, Status};
 
 pub mod attach;
 pub mod audit;
-pub mod client;
 pub mod credential_watch;
-pub mod socket;
+
+// The client side and the socket path live in `nemr-daemon-api` (the seam);
+// re-exported so `nemr_engine::daemon::client` and `::socket` keep working.
+pub use nemr_daemon_api::client;
+pub use nemr_daemon_api::socket;
 
 /// The service implementation. One containerd connection, shared.
 pub struct NemrService {

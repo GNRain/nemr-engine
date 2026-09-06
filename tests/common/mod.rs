@@ -393,10 +393,13 @@ fn newest_helper_source() -> Result<Option<(PathBuf, std::time::SystemTime)>, St
 ///
 /// The list is the engine's actual dependency closure, not the workspace:
 ///
-/// - `src/`, `build.rs`, `proto/` — the engine crate itself. `build.rs`
-///   compiles `proto/nemr.proto` into the binary, so both belong here; before
-///   F-90 neither was scanned and a proto edit left the gate green.
-/// - `crates/nemr-containerd/` — the one workspace crate the engine links.
+/// - `src/`, `proto/` — the engine crate itself, and the daemon's public
+///   interface. Before F-90 neither `proto/` nor the build script was scanned
+///   and a proto edit left the gate green; the build script has since moved
+///   into `crates/nemr-daemon-api/`, which is scanned below.
+/// - `crates/nemr-containerd/` and `crates/nemr-daemon-api/` — the two
+///   workspace crates the engine links (the wrapper, and the daemon API with
+///   its proto build).
 ///   Before F-90 this was `crates/` wholesale, which swept the COMMERCIAL
 ///   crates the engine must never depend on (`check_seam.sh` proves it does
 ///   not), so editing a sync-server test reported the engine stale. A gate
@@ -416,9 +419,9 @@ fn newest_engine_source() -> Result<Option<(PathBuf, std::time::SystemTime)>, St
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     Ok(newest_under(&[
         root.join("src"),
-        root.join("build.rs"),
         root.join("proto"),
         root.join("crates/nemr-containerd"),
+        root.join("crates/nemr-daemon-api"),
         root.join("Cargo.toml"),
     ]))
 }
