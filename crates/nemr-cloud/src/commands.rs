@@ -5,18 +5,14 @@ use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use nemr_crypto::{
-    decrypt_bundle, encrypt_bundle, recovery_acknowledgement, MasterKey, RecoveryCode,
-};
-use rand::RngCore;
+use nemr_crypto::{decrypt_bundle, encrypt_bundle};
 use serde_json::json;
 
 use crate::api::{Api, LeaseLost, LeaseResponse};
+use crate::core;
 use crate::engine_cli;
-use crate::keys::{self, b64, unb64};
-use crate::state::{self, Account, LeaseState};
-
-const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
+use crate::keys;
+use crate::state::{self, LeaseState};
 
 fn now_unix() -> i64 {
     SystemTime::now()
@@ -26,9 +22,8 @@ fn now_unix() -> i64 {
 }
 
 fn resolve_server(flag: Option<String>) -> String {
-    flag.or_else(|| std::env::var("NEMR_SERVER_URL").ok())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_SERVER.to_string())
+    flag.filter(|s| !s.is_empty())
+        .unwrap_or_else(core::default_server)
 }
 
 fn resolve_email(flag: Option<String>) -> Result<String> {
@@ -50,54 +45,24 @@ fn resolve_email(flag: Option<String>) -> Result<String> {
     Ok(email)
 }
 
-// --- register ---------------------------------------------------------------
+// --- register / login / logout ----------------------------------------------
+//
+// The CLI is a thin driver of `core`: it prompts, calls, prints. The HTTP
+// surface (`serve`) is another driver of the same functions, so the two can
+// never disagree about what a login or a registration IS.
 
 pub fn register(server: Option<String>, email: Option<String>) -> Result<()> {
     let server = resolve_server(server);
     let email = resolve_email(email)?;
     let password = keys::read_password(true)?;
-    let api = Api::new(&server, None);
-
-    // The full E-16 material, generated client-side. The server receives only
-    // what it can store without being able to read anything: the auth key (it
-    // hashes), public salts/params, sealed envelopes, and a one-way ack hash.
-    let params = keys::registration_params();
-    let mut salt = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut salt);
-    let root = keys::derive(&password, &salt, params)?;
-    let mk = MasterKey::generate();
-    let password_envelope = root.wrap_key().seal(&mk);
-
-    let recovery_code = RecoveryCode::generate();
-    let mut recovery_salt = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut recovery_salt);
-    // The recovery code is raw bytes, not text — derive over the bytes.
-    let recovery_root = nemr_crypto::derive_root(recovery_code.as_secret(), &recovery_salt, params)
-        .map_err(|e| anyhow!("deriving the recovery key: {e}"))?;
-    let recovery_envelope = recovery_root.recovery_wrap_key().seal(&mk);
-
-    api.register(&json!({
-        "email": email,
-        "kdf_salt": b64(&salt),
-        "kdf_m_cost": params.m_cost,
-        "kdf_t_cost": params.t_cost,
-        "kdf_p_cost": params.p_cost,
-        "auth_key": b64(root.auth_key().as_bytes()),
-        "password_envelope": b64(&password_envelope.to_bytes()),
-        "recovery_salt": b64(&recovery_salt),
-        "recovery_m_cost": params.m_cost,
-        "recovery_t_cost": params.t_cost,
-        "recovery_p_cost": params.p_cost,
-        "recovery_envelope": b64(&recovery_envelope.to_bytes()),
-        "recovery_ack_hash": b64(&recovery_acknowledgement(&mk)),
-    }))?;
+    let pending = core::register_begin(&server, &email, &password)?;
 
     // Recovery is not deferrable (E-16): show the code once, and the account
     // stays unusable until the user proves they stored it by typing it back.
     println!();
     println!("Your recovery code — the ONLY way back in if you forget your password:");
     println!();
-    println!("    {}", recovery_code.display());
+    println!("    {}", pending.recovery_code.display());
     println!();
     println!("Store it now (password manager, paper — not this machine).");
     println!("A forgotten password with no recovery code means your data is");
@@ -124,15 +89,7 @@ pub fn register(server: Option<String>, email: Option<String>) -> Result<()> {
         {
             break; // stdin closed
         }
-        // The confirmation is real, not a string compare: recover the master
-        // key THROUGH the recovery envelope with the typed code and prove it
-        // matches.
-        let opened = RecoveryCode::parse(typed.trim()).ok().and_then(|code| {
-            nemr_crypto::derive_root(code.as_secret(), &recovery_salt, params)
-                .ok()
-                .and_then(|root| root.recovery_wrap_key().open(&recovery_envelope).ok())
-        });
-        match opened {
+        match core::register_check_code(&pending, &typed) {
             Some(mk) => {
                 recovered = Some(mk);
                 break;
@@ -145,73 +102,33 @@ pub fn register(server: Option<String>, email: Option<String>) -> Result<()> {
         }
     }
     let Some(recovered) = recovered else {
-        bail!(
-            "recovery was not confirmed, so the account is registered but NOT usable.\n\
-             The recovery code above is the only copy — store it, then finish with:\n\
-             \n    nemr login\n\n\
-             and re-run the confirmation. Registering again with this email will be\n\
-             refused because the account now exists."
-        );
+        bail!("{}", core::unconfirmed_message());
     };
-    api.confirm_recovery(&email, &b64(&recovery_acknowledgement(&recovered)))?;
+    let account = core::register_confirm(&pending, &recovered)?;
     println!("Recovery confirmed. Account is active.");
-
-    // Log straight in so `register` ends in a usable state.
-    finish_login(&api, &server, &email, root.auth_key().as_bytes())
+    println!("logged in as {} ({})", account.email, account.server);
+    Ok(())
 }
-
-// --- login / logout ---------------------------------------------------------
 
 pub fn login(server: Option<String>, email: Option<String>) -> Result<()> {
     let server = resolve_server(server);
     let email = resolve_email(email)?;
     let password = keys::read_password(false)?;
-    let api = Api::new(&server, None);
-
-    let p = api.kdf_params(&email)?;
-    let salt = unb64(&p.kdf_salt, "server KDF salt")?;
-    // The params come from an unauthenticated endpoint: hold them to a floor
-    // before stretching the real password with them (F-92).
-    let params = keys::check_params_floor(nemr_crypto::KdfParams {
-        m_cost: p.kdf_m_cost,
-        t_cost: p.kdf_t_cost,
-        p_cost: p.kdf_p_cost,
-    })?;
-    let root = keys::derive(&password, &salt, params)?;
-    finish_login(&api, &server, &email, root.auth_key().as_bytes())
-}
-
-fn finish_login(api: &Api, server: &str, email: &str, auth_key: &[u8; 32]) -> Result<()> {
-    let resp = api.login(email, &b64(auth_key))?;
-    state::save_account(&Account {
-        server: server.to_string(),
-        email: email.to_string(),
-        token: resp.token,
-        kdf_salt: resp.kdf_salt,
-        kdf_m_cost: resp.kdf_m_cost,
-        kdf_t_cost: resp.kdf_t_cost,
-        kdf_p_cost: resp.kdf_p_cost,
-        password_envelope: resp.password_envelope,
-    })?;
-    println!("logged in as {email} ({server})");
+    let account = core::login(&server, &email, &password)?;
+    println!("logged in as {} ({})", account.email, account.server);
     Ok(())
 }
 
 pub fn logout() -> Result<()> {
-    match state::load_account() {
-        Ok(account) => {
-            // Revoke server-side first; a local-only logout leaves a live token
-            // on the server for its whole TTL. Best-effort: an unreachable
-            // server must not trap the user in a logged-in state.
-            let api = Api::new(&account.server, Some(account.token.clone()));
-            if let Err(e) = api.logout() {
-                eprintln!("warning: could not revoke the token server-side: {e:#}");
-                eprintln!("         (it expires on its own; local state is cleared regardless)");
-            }
-            state::delete_account()?;
-            println!("logged out");
-        }
-        Err(_) => println!("not logged in"),
+    let report = core::logout()?;
+    if let Some(e) = report.revoke_failed {
+        eprintln!("warning: could not revoke the token server-side: {e}");
+        eprintln!("         (it expires on its own; local state is cleared regardless)");
+    }
+    if report.was_logged_in {
+        println!("logged out");
+    } else {
+        println!("not logged in");
     }
     Ok(())
 }
@@ -219,10 +136,6 @@ pub fn logout() -> Result<()> {
 // --- sessions ---------------------------------------------------------------
 
 pub fn sessions() -> Result<()> {
-    let account = state::load_account()?;
-    let api = Api::new(&account.server, Some(account.token.clone()));
-    let remote = api.sessions()?;
-
     // Local projects, best-effort: sync must still show the server list on a
     // machine where the engine is absent or its daemon cannot start.
     let local = match engine_cli::list_projects() {
@@ -233,59 +146,32 @@ pub fn sessions() -> Result<()> {
             None
         }
     };
+    let rows = core::sessions(local.as_deref())?;
 
-    let mut names: Vec<String> = remote.iter().map(|s| s.name.clone()).collect();
-    if let Some(local) = &local {
-        for p in local {
-            if !names.contains(&p.name) {
-                names.push(p.name.clone());
-            }
-        }
-    }
-    names.sort();
-
-    if names.is_empty() {
+    if rows.is_empty() {
         println!("no sessions anywhere. Create one with: nemr create <name> --size 2GB");
         return Ok(());
     }
 
     println!(
-        "{:<18} {:<8} {:<7} {:<9} {:<12} LAST MACHINE",
-        "NAME", "AGENT", "WHERE", "SIZE", "UPDATED"
+        "{:<18} {:<8} {:<7} {:<9} {:<12} {:<14} OPEN ON",
+        "NAME", "AGENT", "WHERE", "SIZE", "UPDATED", "LAST MACHINE"
     );
-    for name in &names {
-        let r = remote.iter().find(|s| &s.name == name);
-        let l = local
-            .as_ref()
-            .and_then(|list| list.iter().find(|p| &p.name == name));
+    for r in &rows {
         // A session that exists remotely but not locally is a normal state —
         // that is the whole product — so WHERE says it plainly.
-        let wher = match (l.is_some(), r.is_some()) {
-            (true, true) => "both",
-            (true, false) => "local",
-            (false, true) => "remote",
-            (false, false) => unreachable!("name came from one of the lists"),
-        };
-        let agent = l
-            .map(|p| p.agent.clone())
-            .or_else(|| r.map(|s| s.agent.clone()))
-            .unwrap_or_default();
-        let size = r
-            .and_then(|s| s.ciphertext_bytes)
-            .map(human_bytes)
-            .or_else(|| {
-                l.filter(|p| p.usage_known)
-                    .map(|p| human_bytes(p.used_bytes as i64))
-            })
-            .or_else(|| r.map(|s| s.size_bytes).filter(|n| *n > 0).map(human_bytes))
-            .unwrap_or_else(|| "-".into());
-        let updated = r
-            .map(|s| ago(s.updated_at_unix))
-            .unwrap_or_else(|| "-".into());
-        let machine = r
-            .and_then(|s| s.last_machine.clone())
-            .unwrap_or_else(|| "-".into());
-        println!("{name:<18} {agent:<8} {wher:<7} {size:<9} {updated:<12} {machine}");
+        let size = r.size_bytes.map(human_bytes).unwrap_or_else(|| "-".into());
+        let updated = r.updated_at_unix.map(ago).unwrap_or_else(|| "-".into());
+        let machine = r.last_machine.clone().unwrap_or_else(|| "-".into());
+        // Held right now, per the server: the D-03 state a user must know
+        // before pulling.
+        let open_on = r.held_by.clone().unwrap_or_else(|| "-".into());
+        println!(
+            "{:<18} {:<8} {:<7} {size:<9} {updated:<12} {machine:<14} {open_on}",
+            r.name,
+            r.agent,
+            r.location.as_str()
+        );
     }
     Ok(())
 }

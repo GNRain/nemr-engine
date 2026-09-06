@@ -25,6 +25,11 @@ pub struct SessionEntry {
     pub has_bundle: bool,
     pub ciphertext_bytes: Option<i64>,
     pub updated_at_unix: i64,
+    /// Who holds the D-03 lease right now, if anyone — "open on <machine>" in
+    /// the list, the state the lease UX was designed around. Only a lease that
+    /// has not expired counts; an expired row is nobody.
+    pub held_by: Option<String>,
+    pub lease_expires_at_unix: Option<i64>,
 }
 
 /// List the caller's sessions, most-recently-updated first.
@@ -33,10 +38,13 @@ pub async fn list(
     user: AuthUser,
 ) -> ApiResult<Json<Vec<SessionEntry>>> {
     let rows: Vec<SessionRow> = sqlx::query_as(
-        "SELECT id, name, agent, size_bytes, description, base_image_version,
-                last_machine, storage_key, ciphertext_bytes, updated_at
-           FROM sessions WHERE user_id = $1
-          ORDER BY updated_at DESC",
+        "SELECT s.id, s.name, s.agent, s.size_bytes, s.description, s.base_image_version,
+                s.last_machine, s.storage_key, s.ciphertext_bytes, s.updated_at,
+                l.holder AS held_by, l.expires_at AS lease_expires_at
+           FROM sessions s
+           LEFT JOIN leases l ON l.session_id = s.id AND l.expires_at >= now()
+          WHERE s.user_id = $1
+          ORDER BY s.updated_at DESC",
     )
     .bind(user.id)
     .fetch_all(&state.pool)
@@ -55,6 +63,8 @@ pub async fn list(
             has_bundle: r.storage_key.is_some(),
             ciphertext_bytes: r.ciphertext_bytes,
             updated_at_unix: r.updated_at.unix_timestamp(),
+            held_by: r.held_by,
+            lease_expires_at_unix: r.lease_expires_at.map(|t| t.unix_timestamp()),
         })
         .collect();
     Ok(Json(entries))
@@ -72,6 +82,8 @@ struct SessionRow {
     storage_key: Option<String>,
     ciphertext_bytes: Option<i64>,
     updated_at: OffsetDateTime,
+    held_by: Option<String>,
+    lease_expires_at: Option<OffsetDateTime>,
 }
 
 #[derive(Deserialize)]

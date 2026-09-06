@@ -758,7 +758,10 @@ impl Drop for TestProject {
 /// the cleanup acted on a hardcoded echo printed beneath a task listing that
 /// said RUNNING — against the one project designated irreplaceable. A
 /// protected subject must not depend on every future check being correct.
-pub const PROTECTED_SUBJECTS: &[&str] = &["htmltest"];
+// 2026-09-06: `htmltest` retired — the artifact is gone (deleted deliberately
+// to reclaim disk; no bundle survives on this host). Empty until something
+// irreplaceable exists again; the guard and its own test stay armed.
+pub const PROTECTED_SUBJECTS: &[&str] = &[];
 
 /// Is this name protected from automated teardown?
 ///

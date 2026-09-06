@@ -356,3 +356,57 @@ async fn a_fenced_out_write_is_refused_and_publishes_nothing() {
         "the refused write must not have published its bundle over the good one"
     );
 }
+
+/// The session list says who holds the lease — "open on <machine>", the state
+/// D-03's takeover UX is built around — and stops saying so once it is
+/// released. Read from the same endpoint the UI's list reads.
+#[tokio::test]
+async fn the_session_list_names_the_live_lease_holder() {
+    let app = spawn().await;
+    let (token, _) = app.enroll(&Enrolled::new()).await;
+    create_session(&app, &token, "proj").await;
+
+    let list = |app: &common::TestApp, token: &str| {
+        let http = app.http.clone();
+        let url = app.url("/v1/sessions");
+        let token = token.to_string();
+        async move {
+            http.get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .json::<Vec<Value>>()
+                .await
+                .unwrap()
+        }
+    };
+    let before = list(&app, &token).await;
+    assert_eq!(
+        before[0]["held_by"],
+        Value::Null,
+        "nobody holds a fresh session"
+    );
+
+    let lease = acquire(&app, &token, "proj", "laptop").await;
+    assert_eq!(lease["granted"], true);
+    let during = list(&app, &token).await;
+    assert_eq!(during[0]["held_by"], "laptop", "{during:?}");
+    assert!(during[0]["lease_expires_at_unix"].as_i64().unwrap() > 0);
+
+    let released = release_status(
+        &app,
+        &token,
+        "proj",
+        "laptop",
+        lease["fence"].as_i64().unwrap(),
+    )
+    .await;
+    assert!((200..300).contains(&released), "release: {released}");
+    let after = list(&app, &token).await;
+    assert_eq!(
+        after[0]["held_by"],
+        Value::Null,
+        "a released lease is nobody: {after:?}"
+    );
+}

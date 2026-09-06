@@ -57,6 +57,12 @@ pub struct SessionEntry {
     pub has_bundle: bool,
     pub ciphertext_bytes: Option<i64>,
     pub updated_at_unix: i64,
+    /// The live lease holder, if any (server ≥ SPEC 1.108); absent from an
+    /// older server, which serde reads as `None`.
+    #[serde(default)]
+    pub held_by: Option<String>,
+    #[serde(default)]
+    pub lease_expires_at_unix: Option<i64>,
 }
 
 #[derive(Deserialize)]
