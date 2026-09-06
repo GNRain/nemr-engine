@@ -46,12 +46,23 @@ tempfile = "3"
 # The UI's HTTP surface (E-11 ruling, 2026-09-06): served by THIS process as a
 # gRPC client of the daemon, on a loopback port that opens only when the user
 # starts the UI. axum is the workspace's server framework already (nemr-sync).
-axum = { version = "0.8", features = ["json"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+# "ws": the attach step — the daemon's Attach stream bridged to the page over
+# a WebSocket on the same guarded origin.
+axum = { version = "0.8", features = ["json", "ws"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+# The attach bridge reads the daemon's stream through tonic's streaming API.
+tonic = "0.14"
+tokio-stream = "0.1"
+# Splitting the page's WebSocket and the daemon's stream into halves the
+# bridge can drive concurrently.
+futures-util = "0.3"
 # Constant-time comparison for the launch token (the same crate nemr-crypto uses).
 subtle = "2"
 
 [dev-dependencies]
+# A real WebSocket client against the served router: the attach bridge's
+# refusals and its round trip, with no daemon (a fake engine echoes).
+tokio-tungstenite = "0.29"
 # `oneshot` against the Router in tests — the handshake's control matrix runs
 # with no socket at all.
 tower = { version = "0.5", features = ["util"] }

@@ -97,27 +97,98 @@ async fn a_wrong_recovery_acknowledgement_does_not_activate_the_account() {
     assert_eq!(r.status(), 403);
 }
 
+/// An ACTIVE account's email is taken: a second registration is refused and
+/// the account is untouched.
 #[tokio::test]
-async fn a_duplicate_email_is_refused() {
+async fn a_duplicate_email_is_refused_once_the_account_is_active() {
     let app = spawn().await;
     let e = Enrolled::new();
-    let first = app
-        .http
-        .post(app.url("/v1/register"))
-        .json(&e.register_body())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(first.status(), 201);
+    let (_token, _) = app.enroll(&e).await;
 
+    let mut again = Enrolled::new();
+    again.email = e.email.clone();
     let second = app
         .http
         .post(app.url("/v1/register"))
-        .json(&e.register_body())
+        .json(&again.register_body())
         .send()
         .await
         .unwrap();
     assert_eq!(second.status(), 409);
+    // The original still logs in — nothing about it was replaced.
+    let (_token, mk) = app.login(&e).await;
+    assert!(
+        common::keys_match(&mk, &e.mk),
+        "the active account's key survived"
+    );
+}
+
+/// A registration that never confirmed its recovery holds nothing, and a
+/// second registration with the same email REPLACES it — the abandoned first
+/// attempt (a closed terminal, a reloaded page) must not take the email with
+/// it. The first attempt's recovery code no longer confirms anything; the
+/// second's does, and the second's password is the one that logs in.
+#[tokio::test]
+async fn re_registering_an_unconfirmed_email_replaces_the_pending_account() {
+    let app = spawn().await;
+    let first = Enrolled::new();
+    let r = app
+        .http
+        .post(app.url("/v1/register"))
+        .json(&first.register_body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    // Abandoned here: no confirmation.
+
+    let mut second = Enrolled::new();
+    second.email = first.email.clone();
+    let r = app
+        .http
+        .post(app.url("/v1/register"))
+        .json(&second.register_body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        201,
+        "a pending email is free to register again: {}",
+        r.text().await.unwrap()
+    );
+
+    // The FIRST attempt's code is dead: its acknowledgement does not activate.
+    let stale = app
+        .http
+        .post(app.url("/v1/recovery/confirm"))
+        .json(&serde_json::json!({
+            "email": first.email,
+            "recovery_ack_hash": first.recovery_confirm_ack_b64(&first.recovery_code),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        stale.status(),
+        401,
+        "the replaced registration's code must not confirm"
+    );
+
+    // The second's does, and its password logs in with its key.
+    let ok = app
+        .http
+        .post(app.url("/v1/recovery/confirm"))
+        .json(&serde_json::json!({
+            "email": second.email,
+            "recovery_ack_hash": second.recovery_confirm_ack_b64(&second.recovery_code),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    let (_token, mk) = app.login(&second).await;
+    assert!(common::keys_match(&mk, &second.mk));
 }
 
 #[tokio::test]
