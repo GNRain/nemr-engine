@@ -252,6 +252,30 @@ pub fn credential_facts_at(path: &Path) -> CredentialFacts {
     }
 }
 
+/// Refuse to provision against a credential that cannot authenticate
+/// (AUTH-03, extended 2026-09-06): a spent refresh token or a file Claude Code
+/// has blanked after a dead refresh. A dead credential is worse than a missing
+/// one — it looks present — and there is no point provisioning a session that
+/// will fail at its first request. Only those two states refuse: an expired
+/// access token with a live refresh token is routine (the session refreshes
+/// it), and a non-OAuth file (an API key, the CI placeholder) is not judged.
+pub fn refuse_dead_credential(path: &Path, now_unix: i64) -> Result<()> {
+    let verdict = credential_facts_at(path).verdict(now_unix);
+    let what = match verdict {
+        CredentialVerdict::Blank => "is BLANK: Claude Code cleared it after a refresh was refused (the login was revoked, or its refresh token spent)",
+        CredentialVerdict::RefreshExpired { .. } => "has an EXPIRED refresh token: nothing in it can authenticate any more",
+        _ => return Ok(()),
+    };
+    bail!(
+        "the Claude Code credential on this host {what}.\n\
+         path: {}\n\
+         A session created now would fail at its first request, and a login from inside \
+         a session cannot repair the host's login. Run `claude` on this host and log in, \
+         then create the project.",
+        path.display()
+    )
+}
+
 /// Does a running session see a *different* file than the host has now (F-12)?
 ///
 /// A file bind mount pins the inode it was made from. Claude Code on the host
@@ -489,6 +513,63 @@ mod tests {
             "after the rename both sides read the new inode"
         );
         assert_eq!(credential_is_stale(me, &dir.join("missing"), &a), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The create-time refusal fires on exactly the two dead states and on
+    /// nothing else — a routine access expiry and a non-OAuth file pass.
+    #[test]
+    fn create_refuses_a_dead_credential_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("nemr-auth-dead-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now: i64 = 1_800_000_000;
+        let write = |name: &str, body: String| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let blank = write("blank.json", r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"refreshTokenExpiresAt":1900000000000}}"#.into());
+        let err = refuse_dead_credential(&blank, now).unwrap_err().to_string();
+        assert!(err.contains("BLANK") && err.contains("log in"), "{err}");
+        let spent = write(
+            "spent.json",
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"r","expiresAt":{},"refreshTokenExpiresAt":{}}}}}"#,
+                (now - 3600) * 1000,
+                (now - 60) * 1000
+            ),
+        );
+        let err = refuse_dead_credential(&spent, now).unwrap_err().to_string();
+        assert!(err.contains("EXPIRED refresh token"), "{err}");
+        // Controls: these must NOT refuse.
+        let routine = write(
+            "routine.json",
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"r","expiresAt":{},"refreshTokenExpiresAt":{}}}}}"#,
+                (now - 3600) * 1000,
+                (now + 86_400) * 1000
+            ),
+        );
+        assert!(
+            refuse_dead_credential(&routine, now).is_ok(),
+            "an expired access token with a live refresh token is routine"
+        );
+        let fresh = write(
+            "fresh.json",
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"r","expiresAt":{}}}}}"#,
+                (now + 3600) * 1000
+            ),
+        );
+        assert!(refuse_dead_credential(&fresh, now).is_ok());
+        let placeholder = write(
+            "placeholder.json",
+            r#"{"_comment":"CI PLACEHOLDER"}"#.into(),
+        );
+        assert!(
+            refuse_dead_credential(&placeholder, now).is_ok(),
+            "a non-OAuth file is not judged"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

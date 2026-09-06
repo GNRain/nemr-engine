@@ -3570,6 +3570,54 @@ fn f131_first_start_seeds_claude_config_by_allowlist_and_only_once() {
     });
 }
 
+/// AUTH-03 extended: `create` refuses a host credential that cannot
+/// authenticate — blanked, or refresh token spent — before provisioning
+/// anything. HOME is pointed at a temp directory holding the dead file; the
+/// refusal must come before any volume exists there. Serial by the harness
+/// (F-71), and HOME is restored on every path.
+#[test]
+fn create_refuses_a_dead_host_credential_before_provisioning() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    let temp = std::env::temp_dir().join(format!("nemr-dead-cred-{}", std::process::id()));
+    std::fs::create_dir_all(temp.join(".claude")).unwrap();
+    std::fs::write(
+        temp.join(".claude/.credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"refreshTokenExpiresAt":1900000000000}}"#,
+    )
+    .unwrap();
+    let previous = std::env::var_os("HOME");
+    std::env::set_var("HOME", &temp);
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let result = runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        project::create(
+            &client,
+            "deadcred",
+            VolumeSize::Small,
+            nemr_engine::engine::agent::Agent::ClaudeCode,
+        )
+        .await
+        .map(|_| ())
+    });
+    match previous {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+    let err = result.expect_err("create must refuse a blanked credential");
+    let text = format!("{err:#}");
+    assert!(text.contains("BLANK") && text.contains("log in"), "{text}");
+    assert!(
+        !temp.join(".local/share/nemr/volumes/deadcred.img").exists(),
+        "the refusal must come before any volume is provisioned"
+    );
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
 /// The first option (`ro`/`rw`) of the mount at `mount_point` in a task's
 /// mountinfo, read from the host through /proc — a read, never an exec.
 fn mount_option(pid: u32, mount_point: &str) -> Option<String> {

@@ -199,6 +199,9 @@ async fn create_with_auth(
         AuthPolicy::Required => {
             let credentials = auth::resolve_credentials()?;
             auth::check_permissions(&credentials)?;
+            // A dead credential is worse than a missing one: it looks present.
+            // AUTH-03's reasoning, one step further (2026-09-06).
+            auth::refuse_dead_credential(&credentials, unix_now())?;
             credentials
         }
         AuthPolicy::DeferredForRestore => match auth::resolve_credentials() {
