@@ -57,6 +57,18 @@
 //! that is already here. The engine is behind `UiEngine`: the daemon in the
 //! binary, a fake in the router's tests.
 //!
+//! Step 4, attach: the daemon's `Attach` stream bridged to the page over a
+//! WebSocket, rendered by xterm.js (pinned, served from this binary — no
+//! external resource). A browser cannot put the custom header on a
+//! WebSocket handshake, so `/ws/attach/{name}` has its own gate instead:
+//! the session cookie, a **single-use ticket** minted by a guarded
+//! `POST /api/sessions/{name}/attach-ticket` (bound to that cookie and that
+//! session name, expiring in thirty seconds), and an `Origin` that must be
+//! present and this origin — every browser sends one on a WebSocket
+//! handshake, and a cross-site page's fails. Bytes typed go to the session's
+//! stdin as binary frames; the session's stdout and stderr come back as
+//! binary frames; resizes and the exit are small text frames.
+//!
 //! One page, no framework, no build step: the same HTML serves the login form
 //! and the list, and picks by asking `whoami`.
 
@@ -65,12 +77,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use axum::extract::{Path as UrlPath, Request, State};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path as UrlPath, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::{SinkExt, StreamExt};
+use nemr_daemon_api::proto::{
+    attach_client, attach_server, AttachClient, AttachResize, AttachServer, AttachStart,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
@@ -87,7 +104,31 @@ pub trait UiEngine: EngineOps {
     fn start(&self, name: &str) -> Result<()>;
     #[allow(dead_code)] // step 5, stop-and-push
     fn stop(&self, name: &str) -> Result<String>;
+    /// Open an attach stream: the daemon's, or a fake's in the tests.
+    fn attach(
+        &self,
+        start: AttachStart,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AttachLink>> + Send + '_>>;
 }
+
+/// An open attach stream, both directions, as the bridge drives it.
+pub struct AttachLink {
+    pub to_session: tokio::sync::mpsc::Sender<AttachClient>,
+    pub from_session:
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<AttachServer>> + Send>>,
+    /// Whatever must outlive the stream (the daemon session and its audit
+    /// printer).
+    pub _keep: Option<Box<dyn std::any::Any + Send>>,
+}
+
+/// A ticket for one WebSocket handshake: bound to the page's session and
+/// the session name, spent on use, dead after thirty seconds.
+struct AttachTicket {
+    cookie_session: String,
+    name: String,
+    expires_at: i64,
+}
+const TICKET_TTL_SECS: i64 = 30;
 
 /// A long-running action the page watches: the lines the CLI would print,
 /// as they happen, and the outcome.
@@ -112,6 +153,7 @@ pub struct UiState {
     sessions: Mutex<HashSet<String>>,
     engine: Arc<dyn UiEngine>,
     jobs: Mutex<HashMap<String, Arc<Mutex<Job>>>>,
+    attach_tickets: Mutex<HashMap<String, AttachTicket>>,
     /// A registration waiting for its recovery code to be typed back (E-16:
     /// recovery is not deferrable). In memory only, for this process's life:
     /// the same place the CLI keeps it between showing the code and reading
@@ -128,6 +170,7 @@ impl UiState {
             sessions: Mutex::new(HashSet::new()),
             engine,
             jobs: Mutex::new(HashMap::new()),
+            attach_tickets: Mutex::new(HashMap::new()),
             pending_registration: Mutex::new(None),
         }
     }
@@ -230,13 +273,18 @@ pub fn router(state: Arc<UiState>) -> Router {
         .route("/sessions/{name}/pull", post(pull))
         .route("/sessions/{name}/start", post(start))
         .route("/jobs/{id}", get(job))
+        .route("/sessions/{name}/attach-ticket", post(attach_ticket))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_session,
         ));
     Router::new()
         .route("/", get(index))
+        .route("/assets/xterm.js", get(asset_xterm_js))
+        .route("/assets/xterm.css", get(asset_xterm_css))
+        .route("/assets/addon-fit.js", get(asset_fit_js))
         .route("/auth/session", post(exchange))
+        .route("/ws/attach/{name}", get(attach_ws))
         .nest("/api", api)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -647,12 +695,253 @@ async fn job(State(state): State<Arc<UiState>>, UrlPath(id): UrlPath<String>) ->
     .into_response()
 }
 
+async fn asset_xterm_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../assets/xterm.js"),
+    )
+        .into_response()
+}
+async fn asset_fit_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../assets/addon-fit.js"),
+    )
+        .into_response()
+}
+async fn asset_xterm_css() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../assets/xterm.css"),
+    )
+        .into_response()
+}
+
+/// Mint a single-use ticket for one attach handshake, bound to this page's
+/// session and to `name`. Guarded like every `/api` route, so the ticket
+/// carries the guard's proof into the one handshake a browser cannot put the
+/// header on.
+async fn attach_ticket(
+    State(state): State<Arc<UiState>>,
+    UrlPath(name): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(cookie_session) = session_cookie(&headers) else {
+        return (StatusCode::UNAUTHORIZED, "no session").into_response();
+    };
+    let ticket = hex(&random_bytes());
+    if let Ok(mut t) = state.attach_tickets.lock() {
+        // Sweep the dead ones while here; the map never grows past use.
+        let now = now_unix();
+        t.retain(|_, v| v.expires_at > now);
+        t.insert(
+            ticket.clone(),
+            AttachTicket {
+                cookie_session,
+                name,
+                expires_at: now + TICKET_TTL_SECS,
+            },
+        );
+    }
+    Json(json!({ "ticket": ticket, "expires_in_secs": TICKET_TTL_SECS })).into_response()
+}
+
+#[derive(Deserialize)]
+struct AttachQuery {
+    #[serde(default)]
+    ticket: String,
+}
+
+/// The WebSocket gate: cookie session live, Origin present and this origin
+/// (the outer layer already refused a wrong one; a missing one is refused
+/// here, because a browser always sends it and this route is for browsers),
+/// and a ticket that is unspent, unexpired, this cookie's and this name's.
+async fn attach_ws(
+    State(state): State<Arc<UiState>>,
+    UrlPath(name): UrlPath<String>,
+    Query(q): Query<AttachQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let Some(cookie_session) = session_cookie(&headers) else {
+        return (StatusCode::UNAUTHORIZED, "no session").into_response();
+    };
+    if !state
+        .sessions
+        .lock()
+        .is_ok_and(|s| s.contains(&cookie_session))
+    {
+        return (StatusCode::UNAUTHORIZED, "no session").into_response();
+    }
+    if headers.get(header::ORIGIN).is_none() {
+        return (StatusCode::FORBIDDEN, "no origin").into_response();
+    }
+    let ticket_ok = state.attach_tickets.lock().is_ok_and(|mut t| {
+        // Spent on the way out, right or wrong: a ticket is one handshake.
+        match t.remove(&q.ticket) {
+            Some(tk) => {
+                tk.cookie_session == cookie_session && tk.name == name && tk.expires_at > now_unix()
+            }
+            None => false,
+        }
+    });
+    if !ticket_ok {
+        return (StatusCode::UNAUTHORIZED, "bad ticket").into_response();
+    }
+    let engine = state.engine.clone();
+    ws.on_upgrade(move |socket| bridge(socket, engine, name))
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum PageControl {
+    #[serde(rename = "start")]
+    Start { rows: u32, cols: u32 },
+    #[serde(rename = "resize")]
+    Resize { rows: u32, cols: u32 },
+}
+
+/// Drive one attach: the page's first text frame says the terminal size;
+/// then bytes go down as stdin, bytes come up as stdout/stderr, resizes are
+/// text, and the exit (or the daemon's refusal) is the last text frame.
+/// One control frame to the page.
+async fn tell(socket: &mut WebSocket, v: Value) -> bool {
+    socket
+        .send(Message::Text(v.to_string().into()))
+        .await
+        .is_ok()
+}
+
+async fn bridge(mut socket: WebSocket, engine: Arc<dyn UiEngine>, name: String) {
+    // The page speaks first: its size. Anything else is a protocol error.
+    let (rows, cols) = match socket.recv().await {
+        Some(Ok(Message::Text(t))) => match serde_json::from_str::<PageControl>(&t) {
+            Ok(PageControl::Start { rows, cols }) => (rows, cols),
+            _ => {
+                tell(
+                    &mut socket,
+                    json!({"type": "error", "message": "attach: first frame must be start"}),
+                )
+                .await;
+                return;
+            }
+        },
+        _ => return,
+    };
+    let link = match engine
+        .attach(AttachStart {
+            name: name.clone(),
+            rows,
+            cols,
+            interactive: true,
+        })
+        .await
+    {
+        Ok(link) => link,
+        Err(e) => {
+            tell(
+                &mut socket,
+                json!({"type": "error", "message": format!("{e:#}")}),
+            )
+            .await;
+            return;
+        }
+    };
+    let AttachLink {
+        to_session,
+        mut from_session,
+        _keep,
+    } = link;
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    // Page -> session.
+    let down = async {
+        while let Some(Ok(m)) = ws_rx.next().await {
+            let msg = match m {
+                Message::Binary(b) => attach_client::Msg::Stdin(b.to_vec()),
+                Message::Text(t) => match serde_json::from_str::<PageControl>(&t) {
+                    Ok(PageControl::Resize { rows, cols }) => {
+                        attach_client::Msg::Resize(AttachResize { rows, cols })
+                    }
+                    _ => continue,
+                },
+                Message::Close(_) => break,
+                _ => continue,
+            };
+            if to_session
+                .send(AttachClient { msg: Some(msg) })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        // The page went away: the shell inside must be told, or it never exits.
+        let _ = to_session
+            .send(AttachClient {
+                msg: Some(attach_client::Msg::StdinEof(true)),
+            })
+            .await;
+    };
+    // Session -> page.
+    let up = async {
+        while let Some(m) = from_session.next().await {
+            let frame = match m {
+                Ok(AttachServer { msg: Some(m) }) => match m {
+                    attach_server::Msg::Started(_) => continue,
+                    attach_server::Msg::Stdout(b) | attach_server::Msg::Stderr(b) => {
+                        Message::Binary(b.into())
+                    }
+                    attach_server::Msg::ExitCode(code) => {
+                        let _ = ws_tx
+                            .send(Message::Text(
+                                json!({"type": "exit", "code": code}).to_string().into(),
+                            ))
+                            .await;
+                        break;
+                    }
+                    attach_server::Msg::Error(e) => {
+                        let _ = ws_tx
+                            .send(Message::Text(
+                                json!({"type": "error", "message": e}).to_string().into(),
+                            ))
+                            .await;
+                        break;
+                    }
+                },
+                Ok(_) => continue,
+                Err(e) => {
+                    let _ = ws_tx
+                        .send(Message::Text(
+                            json!({"type": "error", "message": format!("{e:#}")})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await;
+                    break;
+                }
+            };
+            if ws_tx.send(frame).await.is_err() {
+                break;
+            }
+        }
+        let _ = ws_tx.close().await;
+    };
+    tokio::select! {
+        _ = down => {}
+        _ = up => {}
+    }
+}
+
 /// The page: exchange the fragment's token, scrub the fragment, then show
 /// the login form or the session list by asking `whoami`. No framework, no
 /// build step, no external resource: everything the browser runs is in this
 /// binary.
 async fn index() -> Response {
     const PAGE: &str = r##"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>nemr</title>
+<link rel="stylesheet" href="/assets/xterm.css">
+<script src="/assets/xterm.js"></script>
+<script src="/assets/addon-fit.js"></script>
 <style>
   body { font: 14px/1.4 system-ui, sans-serif; margin: 0; background: #f6f7f8; color: #1a1a1a; }
   header { display: flex; align-items: baseline; gap: 1rem; padding: .75rem 1.25rem; background: #fff; border-bottom: 1px solid #ddd; }
@@ -677,6 +966,8 @@ async fn index() -> Response {
   .toolbar { display: flex; gap: .6rem; align-items: center; margin: 0 0 .8rem; }
   .toolbar .note { color: #777; margin-left: auto; }
   #status { min-height: 1.4em; margin: .8rem 0; }
+  #termwrap { margin-top: 1rem; background: #000; padding: .5rem; border-radius: 6px; }
+  #term { height: 60vh; }
 </style>
 <header><h1>nemr</h1><span class="who" id="who"></span><button id="logout" hidden>log out</button></header>
 <main>
@@ -719,6 +1010,10 @@ async fn index() -> Response {
       </form>
       <pre id="joblog" style="margin:0;white-space:pre-wrap"></pre>
       <div id="jobresult"></div>
+    </section>
+    <section id="attach" hidden>
+      <div class="toolbar" style="margin-top:1rem"><strong id="attachtitle"></strong><span class="note" id="attachnote"></span><button id="detach">detach</button></div>
+      <div id="termwrap"><div id="term"></div></div>
     </section>
   </section>
 </main>
@@ -783,6 +1078,7 @@ async fn index() -> Response {
       if (s.where === 'remote' && s.has_bundle) action = '<button data-pull="' + esc(s.name) + '">pull &amp; start</button>';
       else if (s.where === 'remote') action = '<span class="muted">no bundle yet</span>';
       else if (!s.running) action = '<button data-start="' + esc(s.name) + '">start</button>';
+      else action = '<button data-attach="' + esc(s.name) + '">attach</button>';
       rows.insertAdjacentHTML('beforeend', '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.agent) + '</td><td><span class="pill ' + esc(s.where) + '">' + esc(s.where) + '</span></td><td>' + state + '</td><td>' + human(s.size_bytes) + '</td><td>' + ago(s.updated_at_unix) + '</td><td>' + esc(s.last_machine || '-') + '</td><td>' + open + '</td><td>' + action + '</td></tr>');
     }
     $('localnote').textContent = d.local_available ? '' : 'daemon unreachable: showing the server index only (' + d.local_error + ')';
@@ -873,8 +1169,37 @@ async fn index() -> Response {
     else { $('jobresult').textContent = j.error; $('jobresult').className = 'bad'; }
     return j;
   }
+  // --- step 4: attach — the daemon's stream over a WebSocket, drawn by xterm.js ---
+  let term = null, fit = null, ws = null;
+  async function attach(name) {
+    if (ws) { ws.close(); ws = null; }
+    $('job').hidden = true;
+    $('attach').hidden = false; $('attachtitle').textContent = name; $('attachnote').textContent = 'connecting…';
+    if (!term) {
+      term = new Terminal({ cursorBlink: true, fontSize: 14, scrollback: 5000 });
+      fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open($('term'));
+      term.onData(d => { if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode(d)); });
+      term.onResize(({ rows, cols }) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', rows, cols })); });
+      window.addEventListener('resize', () => fit && fit.fit());
+    }
+    term.reset(); fit.fit();
+    const t = await api('/sessions/' + encodeURIComponent(name) + '/attach-ticket', { method: 'POST' });
+    if (!t.ok) { $('attachnote').textContent = 'refused (' + t.status + ')'; return; }
+    const { ticket } = await t.json();
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    ws = new WebSocket(proto + location.host + '/ws/attach/' + encodeURIComponent(name) + '?ticket=' + ticket);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => { ws.send(JSON.stringify({ type: 'start', rows: term.rows, cols: term.cols })); $('attachnote').textContent = 'attached — type as in nemr attach; exit the shell or detach'; term.focus(); };
+    ws.onmessage = ev => {
+      if (typeof ev.data === 'string') { const m = JSON.parse(ev.data); $('attachnote').textContent = m.type === 'exit' ? 'the shell exited (' + m.code + ')' : 'error: ' + m.message; $('attachnote').className = 'note ' + (m.type === 'exit' ? '' : 'bad'); return; }
+      term.write(new Uint8Array(ev.data));
+    };
+    ws.onclose = () => { if ($('attachnote').textContent.startsWith('attached')) $('attachnote').textContent = 'disconnected'; ws = null; refresh(); };
+  }
+  $('detach').addEventListener('click', () => { if (ws) ws.close(); $('attach').hidden = true; });
   $('rows').addEventListener('click', ev => {
     const b = ev.target.closest('button'); if (!b) return;
+    if (b.dataset.attach) attach(b.dataset.attach);
     if (b.dataset.start) runJob('start ' + b.dataset.start, '/sessions/' + encodeURIComponent(b.dataset.start) + '/start');
     if (b.dataset.pull) {
       pulling = b.dataset.pull;
@@ -1019,6 +1344,63 @@ mod tests {
         fn stop(&self, name: &str) -> Result<String> {
             self.stopped.lock().unwrap().push(name.to_string());
             Ok("graceful".into())
+        }
+        /// An echo session: stdin comes back upper-cased on stdout, a resize
+        /// is reported on stderr, "exit" ends it with code 7, and a session
+        /// named "absent" is refused the way the daemon refuses one that is
+        /// not running.
+        fn attach(
+            &self,
+            start: AttachStart,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AttachLink>> + Send + '_>>
+        {
+            Box::pin(async move {
+                if start.name == "absent" {
+                    anyhow::bail!("project \"absent\" is not running");
+                }
+                let (to_session, mut rx) = tokio::sync::mpsc::channel::<AttachClient>(16);
+                let (tx, from_session) = tokio::sync::mpsc::channel::<Result<AttachServer>>(16);
+                let hello = format!("attached {}x{} to {}\n", start.rows, start.cols, start.name);
+                tokio::spawn(async move {
+                    let out = |m| AttachServer { msg: Some(m) };
+                    tx.send(Ok(out(attach_server::Msg::Started(Default::default()))))
+                        .await
+                        .ok();
+                    tx.send(Ok(out(attach_server::Msg::Stdout(hello.into_bytes()))))
+                        .await
+                        .ok();
+                    while let Some(AttachClient { msg: Some(m) }) = rx.recv().await {
+                        match m {
+                            attach_client::Msg::Stdin(b) => {
+                                if b == b"exit\n" {
+                                    tx.send(Ok(out(attach_server::Msg::ExitCode(7)))).await.ok();
+                                    return;
+                                }
+                                let up = String::from_utf8_lossy(&b).to_uppercase();
+                                tx.send(Ok(out(attach_server::Msg::Stdout(up.into_bytes()))))
+                                    .await
+                                    .ok();
+                            }
+                            attach_client::Msg::Resize(r) => {
+                                tx.send(Ok(out(attach_server::Msg::Stderr(
+                                    format!("resized {}x{}\n", r.rows, r.cols).into_bytes(),
+                                ))))
+                                .await
+                                .ok();
+                            }
+                            attach_client::Msg::StdinEof(_) => return,
+                            attach_client::Msg::Start(_) => {}
+                        }
+                    }
+                });
+                Ok(AttachLink {
+                    to_session,
+                    from_session: Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+                        from_session,
+                    )),
+                    _keep: None,
+                })
+            })
         }
     }
     fn fake_engine(list: Vec<LocalProject>) -> Arc<FakeEngine> {
@@ -1288,6 +1670,7 @@ mod tests {
             ),
             ("POST", "/api/sessions/x/start", None),
             ("GET", "/api/jobs/abc", None),
+            ("POST", "/api/sessions/x/attach-ticket", None),
         ] {
             let r = send(&app, api_req(method, path, None, body)).await;
             assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
@@ -1351,9 +1734,9 @@ mod tests {
     /// them running at once see each other's login. They hold this for their
     /// whole duration — the F-71 shape: serial by construction, not by a
     /// flag someone must remember.
-    static SURFACE: Mutex<()> = Mutex::new(());
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        SURFACE.lock().unwrap_or_else(|p| p.into_inner())
+    static SURFACE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+        SURFACE.lock().await
     }
 
     /// Run the CLI's blocking code off the test runtime (its HTTP client is
@@ -1372,7 +1755,7 @@ mod tests {
     /// now, named. Logout clears it and the list is refused again.
     #[tokio::test]
     async fn login_then_the_session_list_names_the_lease_holder() {
-        let _serial = serial();
+        let _serial = serial().await;
         let (server, _store) = spawn_sync_server();
         let state_home = tempfile::tempdir().unwrap();
         // Process-wide, read by this test's own code paths only (the
@@ -1604,7 +1987,7 @@ mod tests {
     /// session already here is started on its own.
     #[tokio::test]
     async fn pull_and_start_through_the_surface() {
-        let _serial = serial();
+        let _serial = serial().await;
         let (server, _store) = spawn_sync_server();
         let state_home = tempfile::tempdir().unwrap();
         std::env::set_var("XDG_STATE_HOME", state_home.path());
@@ -1758,5 +2141,266 @@ mod tests {
         );
         let missing = send(&app, api_req("GET", "/api/jobs/nope", c, None)).await;
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Serve the router on an ephemeral port for a real WebSocket client.
+    async fn serve_for_ws(app: Router) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
+    }
+    /// A WebSocket handshake the way a browser makes it, with the headers
+    /// the test chooses; `Err(status)` is the server's refusal.
+    async fn ws_connect(
+        port: u16,
+        name: &str,
+        ticket: &str,
+        cookie: Option<&str>,
+        origin: Option<&str>,
+    ) -> std::result::Result<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>, StatusCode>
+    {
+        use tokio_tungstenite::tungstenite;
+        let mut b = tungstenite::http::Request::builder()
+            .uri(format!(
+                "ws://127.0.0.1:{port}/ws/attach/{name}?ticket={ticket}"
+            ))
+            .header("Host", host())
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tungstenite::handshake::client::generate_key(),
+            );
+        if let Some(c) = cookie {
+            b = b.header("Cookie", c);
+        }
+        if let Some(o) = origin {
+            b = b.header("Origin", o);
+        }
+        let req = b.body(()).unwrap();
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        match tokio_tungstenite::client_async(req, tcp).await {
+            Ok((ws, _)) => Ok(ws),
+            Err(tungstenite::Error::Http(resp)) => {
+                Err(StatusCode::from_u16(resp.status().as_u16()).unwrap())
+            }
+            Err(e) => panic!("handshake failed oddly: {e}"),
+        }
+    }
+    async fn ticket_for(app: &Router, cookie: &str, name: &str) -> String {
+        let r = send(
+            app,
+            api_req(
+                "POST",
+                &format!("/api/sessions/{name}/attach-ticket"),
+                Some(cookie),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        json_of(r).await["ticket"].as_str().unwrap().to_string()
+    }
+
+    /// THE gate for the attach WebSocket: without the cookie it is refused;
+    /// without an Origin (a non-browser, or a page that stripped it) it is
+    /// refused; with a cross-site Origin it is refused; without a ticket, or
+    /// with one minted for another session name, or with one already spent,
+    /// it is refused; and the one right handshake is accepted.
+    #[tokio::test]
+    async fn the_attach_websocket_needs_cookie_origin_and_a_fresh_ticket() {
+        let (app, _) = app();
+        let cookie = establish(&app).await;
+        let port = serve_for_ws(app.clone()).await;
+        let origin = format!("http://127.0.0.1:{PORT}");
+
+        let t = ticket_for(&app, &cookie, "sess").await;
+        assert_eq!(
+            ws_connect(port, "sess", &t, None, Some(&origin))
+                .await
+                .err(),
+            Some(StatusCode::UNAUTHORIZED),
+            "no cookie"
+        );
+        assert_eq!(
+            ws_connect(port, "sess", &t, Some(&cookie), None)
+                .await
+                .err(),
+            Some(StatusCode::FORBIDDEN),
+            "no Origin"
+        );
+        assert_eq!(
+            ws_connect(port, "sess", &t, Some(&cookie), Some("http://evil.example"))
+                .await
+                .err(),
+            Some(StatusCode::FORBIDDEN),
+            "cross-site Origin"
+        );
+        assert_eq!(
+            ws_connect(port, "sess", "", Some(&cookie), Some(&origin))
+                .await
+                .err(),
+            Some(StatusCode::UNAUTHORIZED),
+            "no ticket"
+        );
+        assert_eq!(
+            ws_connect(port, "other", &t, Some(&cookie), Some(&origin))
+                .await
+                .err(),
+            Some(StatusCode::UNAUTHORIZED),
+            "a ticket for another session name"
+        );
+        // The refusals above spent nothing that was right; the ticket is
+        // still unspent, so the right handshake succeeds — and the ticket is
+        // then gone.
+        let t = ticket_for(&app, &cookie, "sess").await;
+        let ws = ws_connect(port, "sess", &t, Some(&cookie), Some(&origin)).await;
+        assert!(ws.is_ok(), "the right handshake: {:?}", ws.err());
+        assert_eq!(
+            ws_connect(port, "sess", &t, Some(&cookie), Some(&origin))
+                .await
+                .err(),
+            Some(StatusCode::UNAUTHORIZED),
+            "a spent ticket"
+        );
+        // And a ticket minted by one page session does not open another's.
+        let (app2, _) = super::tests::app();
+        let cookie2 = establish(&app2).await;
+        let port2 = serve_for_ws(app2.clone()).await;
+        let t2 = ticket_for(&app2, &cookie2, "sess").await;
+        assert_eq!(
+            ws_connect(
+                port2,
+                "sess",
+                &t2,
+                Some("nemr_session=deadbeef"),
+                Some(&origin)
+            )
+            .await
+            .err(),
+            Some(StatusCode::UNAUTHORIZED),
+            "a ticket does not stand in for the cookie"
+        );
+    }
+
+    /// The next binary frame's bytes, as text; a text frame here is a fault.
+    async fn next_bytes(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> String {
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        // Bounded: a bridge that drops a frame must FAIL this, not stall it —
+        // the first form of this helper hung under exactly that mutation.
+        loop {
+            match next_frame(ws).await {
+                WsMsg::Binary(b) => return String::from_utf8(b.to_vec()).unwrap(),
+                WsMsg::Text(t) => panic!("unexpected text frame: {t}"),
+                _ => continue,
+            }
+        }
+    }
+    /// The next frame within five seconds, or a failed test.
+    async fn next_frame(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> tokio_tungstenite::tungstenite::Message {
+        tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .expect("no frame arrived within five seconds")
+            .expect("the socket closed before the expected frame")
+            .unwrap()
+    }
+
+    /// The bridge, both ways: the page's size reaches the session's start;
+    /// typed bytes come back through the session as stdout; a resize
+    /// reaches the session; the shell's exit closes the socket with its
+    /// code; and a session the daemon refuses is refused in the first frame.
+    #[tokio::test]
+    async fn the_attach_bridge_carries_bytes_both_ways_and_the_exit() {
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        let (app, _) = app();
+        let cookie = establish(&app).await;
+        let port = serve_for_ws(app.clone()).await;
+        let origin = format!("http://127.0.0.1:{PORT}");
+
+        let t = ticket_for(&app, &cookie, "sess").await;
+        let mut ws = ws_connect(port, "sess", &t, Some(&cookie), Some(&origin))
+            .await
+            .unwrap();
+        ws.send(WsMsg::Text(
+            json!({"type": "start", "rows": 24, "cols": 80})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(next_bytes(&mut ws).await, "attached 24x80 to sess\n");
+        ws.send(WsMsg::Binary(b"hello".to_vec().into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            next_bytes(&mut ws).await,
+            "HELLO",
+            "typed bytes went down and came back up"
+        );
+        ws.send(WsMsg::Text(
+            json!({"type": "resize", "rows": 50, "cols": 132})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            next_bytes(&mut ws).await,
+            "resized 50x132\n",
+            "the resize reached the session"
+        );
+        ws.send(WsMsg::Binary(b"exit\n".to_vec().into()))
+            .await
+            .unwrap();
+        let last = loop {
+            match next_frame(&mut ws).await {
+                WsMsg::Text(t) => break t.to_string(),
+                _ => continue,
+            }
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&last).unwrap(),
+            json!({"type": "exit", "code": 7})
+        );
+        assert!(
+            matches!(
+                ws.next().await,
+                None | Some(Ok(WsMsg::Close(_))) | Some(Err(_))
+            ),
+            "the socket closes after the exit"
+        );
+
+        // A session the daemon refuses: the refusal is the first frame.
+        let t = ticket_for(&app, &cookie, "absent").await;
+        let mut ws = ws_connect(port, "absent", &t, Some(&cookie), Some(&origin))
+            .await
+            .unwrap();
+        ws.send(WsMsg::Text(
+            json!({"type": "start", "rows": 24, "cols": 80})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let first = loop {
+            match next_frame(&mut ws).await {
+                WsMsg::Text(t) => break t.to_string(),
+                _ => continue,
+            }
+        };
+        let first: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first["type"], "error");
+        assert!(
+            first["message"].as_str().unwrap().contains("not running"),
+            "{first}"
+        );
     }
 }

@@ -12,11 +12,13 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use nemr_daemon_api::proto::{
-    ExportRequest, ImportRequest, ListRequest, StartRequest, StopRequest,
+    attach_client, AttachClient, AttachStart, ExportRequest, ImportRequest, ListRequest,
+    StartRequest, StopRequest,
 };
 
 use crate::core::EngineOps;
 use crate::engine_cli::LocalProject;
+use crate::serve::AttachLink;
 
 /// The daemon, driven from blocking code (the sync core is blocking; the
 /// UI's jobs run on blocking threads) on the UI's own runtime.
@@ -142,5 +144,43 @@ impl crate::serve::UiEngine for DaemonEngine {
     }
     fn stop(&self, name: &str) -> Result<String> {
         self.rt.block_on(Self::stop_project(name))
+    }
+    fn attach(
+        &self,
+        start: AttachStart,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AttachLink>> + Send + '_>> {
+        Box::pin(Self::attach_link(start))
+    }
+}
+// --- attach: the daemon's stream, as a link the bridge drives ---------------
+
+impl DaemonEngine {
+    /// Open the daemon's `Attach` stream for `start`. The returned link
+    /// carries bytes both ways; the session behind it (with its audit
+    /// stream) lives as long as the link.
+    pub async fn attach_link(start: AttachStart) -> Result<AttachLink> {
+        let mut s = Self::session().await?;
+        let (tx, rx) = tokio::sync::mpsc::channel::<AttachClient>(64);
+        tx.send(AttachClient {
+            msg: Some(attach_client::Msg::Start(start)),
+        })
+        .await
+        .ok();
+        let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let inbound = s
+            .client()
+            .attach(outbound)
+            .await
+            .map_err(|st| anyhow::anyhow!("{}", st.message()))
+            .context("attaching to the session")?
+            .into_inner();
+        let from_session = tokio_stream::StreamExt::map(inbound, |m| {
+            m.map_err(|st| anyhow::anyhow!("attach stream: {}", st.message()))
+        });
+        Ok(AttachLink {
+            to_session: tx,
+            from_session: Box::pin(from_session),
+            _keep: Some(Box::new(s)),
+        })
     }
 }
