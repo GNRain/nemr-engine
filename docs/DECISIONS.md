@@ -688,10 +688,11 @@ listener is routine wherever it lives) and on E-11's own test: the UI needs
 an account, so every route on it is commercial, and the open half loses
 nothing. The daemon-side seam the commercial process talks through — the
 proto and connect code as a small open crate — was referred to as
-`nemr-daemon-api`, "approved as landed"; **it is not on origin** (no such
-crate on `main`, any remote branch, or any other repository on the account,
-checked 2026-09-06); the reference has been requested, per the
-phantom-report rule, and the handshake was built without depending on it.
+`nemr-daemon-api`, "approved as landed", when it did not exist anywhere on
+origin (checked 2026-09-06; the phantom-report rule). It was then built,
+under that name, as SPEC 1.105: the engine re-exports it, the open CLI and
+the commercial process both reach the daemon through it, and the handshake
+had been built before it without depending on it.
 
 **Ruling — what is commercial (2026-08-20, recorded in SPEC 1.31).** Engine +
 wrapper + volume layer + privileged helper + **bundle format spec** are open.
@@ -1523,3 +1524,4 @@ is overstating what has been demonstrated.
 | 2026-09-05 | F-12 | **Closed** on E6 — the 8-hour acceptance: a session left running past the window, host refresh by rename meanwhile, answers `claude -p`; re-bound by the watcher; one inode both sides (Rain) |
 | 2026-09-05 | E-13 | **Mechanism resolved** — refresh-token rotation, observed; cross-machine revocation is the same mechanism; no longer a daily cost under D-02 (f) (Rain, on E6) |
 | 2026-09-06 | E-11 | **HTTP surface ruled** — commercial process, gRPC client of the daemon; daemon keeps its socket; no port unless the user starts the UI. `nemr-daemon-api` referred to as landed: not on origin, reference requested (Rain; recorded by Claude Code) |
+| 2026-09-06 | E-11 | **`nemr-daemon-api` built** — the daemon's proto, stubs, socket path and client as an open crate; engine re-exports; freshness gate and seam check extended to it (SPEC 1.105) (Claude Code) |

@@ -10,10 +10,10 @@
 //! crash does not kill running sessions: the next command autostarts a fresh
 //! daemon that reconnects to the same containerd state.
 
-use crate::daemon::socket::socket_path;
 use crate::proto::nemr_client::NemrClient;
 use crate::proto::{AuditEvent, WatchAuditRequest};
 use crate::proto::{HandshakeRequest, PROTOCOL_VERSION};
+use crate::socket::socket_path;
 use anyhow::{bail, Context, Result};
 use std::time::Duration;
 use tokio::net::UnixStream;

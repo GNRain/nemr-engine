@@ -24,6 +24,9 @@ path = "src/main.rs"
 
 [dependencies]
 nemr-crypto = { path = "../nemr-crypto", version = "0.1.0" }
+# The daemon's API (the E-11 seam): this process is a gRPC client of nemrd, and
+# links the API rather than the engine. The allowed direction: commercial → open.
+nemr-daemon-api = { path = "../nemr-daemon-api", version = "0.1.0" }
 
 clap = { version = "4.6.6", features = ["derive"] }
 # Blocking HTTP: a CLI has no concurrency to exploit, and blocking keeps the

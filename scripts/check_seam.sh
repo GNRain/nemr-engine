@@ -57,7 +57,7 @@ fi
 # ---------------------------------------------------------------------------
 # Catches a dependency added and used before the manifest is committed, and a
 # `path = "…"` import that bypasses the package name.
-open_sources=(src crates/nemr-containerd/src deploy/nemr-volume/src)
+open_sources=(src crates/nemr-containerd/src crates/nemr-daemon-api/src deploy/nemr-volume/src)
 existing=()
 for p in "${open_sources[@]}"; do [[ -d "$p" ]] && existing+=("$p"); done
 
