@@ -117,12 +117,34 @@ pub async fn register(
 
     let verifier = hash_auth_key(&auth_key, state.config.server_kdf)?;
 
-    let row: Result<(Uuid,), sqlx::Error> = sqlx::query_as(
+    // An account that never confirmed its recovery holds nothing: login is
+    // refused before a token exists, so no session, bundle or lease can hang
+    // off it. Registering the same email again REPLACES it, atomically, with
+    // the new material — otherwise a registration abandoned between "code
+    // shown" and "code typed back" (a closed terminal, a reloaded page) is a
+    // trap: the email is taken, and the only way in needs the code the user
+    // may not have stored, which is the very thing confirmation exists to
+    // check. An ACTIVE account is never touched: the WHERE fails, no row
+    // comes back, and the caller sees the conflict.
+    let row: Result<Option<(Uuid,)>, sqlx::Error> = sqlx::query_as(
         "INSERT INTO users (email, kdf_salt, kdf_m_cost, kdf_t_cost, kdf_p_cost,
                             auth_verifier, password_envelope,
                             recovery_salt, recovery_m_cost, recovery_t_cost, recovery_p_cost,
                             recovery_envelope, recovery_ack_hash)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         ON CONFLICT (email) DO UPDATE SET
+             kdf_salt = EXCLUDED.kdf_salt, kdf_m_cost = EXCLUDED.kdf_m_cost,
+             kdf_t_cost = EXCLUDED.kdf_t_cost, kdf_p_cost = EXCLUDED.kdf_p_cost,
+             auth_verifier = EXCLUDED.auth_verifier,
+             password_envelope = EXCLUDED.password_envelope,
+             recovery_salt = EXCLUDED.recovery_salt,
+             recovery_m_cost = EXCLUDED.recovery_m_cost,
+             recovery_t_cost = EXCLUDED.recovery_t_cost,
+             recovery_p_cost = EXCLUDED.recovery_p_cost,
+             recovery_envelope = EXCLUDED.recovery_envelope,
+             recovery_ack_hash = EXCLUDED.recovery_ack_hash,
+             status = 'pending_recovery', created_at = now()
+           WHERE users.status <> 'active'
          RETURNING id",
     )
     .bind(&email)
@@ -138,14 +160,12 @@ pub async fn register(
     .bind(req.recovery_p_cost as i32)
     .bind(&recovery_envelope)
     .bind(&recovery_ack_hash)
-    .fetch_one(&state.pool)
+    .fetch_optional(&state.pool)
     .await;
 
     let user_id = match row {
-        Ok((id,)) => id,
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-            return Err(ApiError::Conflict("email already registered".into()));
-        }
+        Ok(Some((id,))) => id,
+        Ok(None) => return Err(ApiError::Conflict("email already registered".into())),
         Err(e) => return Err(e.into()),
     };
 

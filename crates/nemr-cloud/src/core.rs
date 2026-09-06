@@ -152,11 +152,10 @@ pub fn register_confirm(pending: &RegistrationPending, recovered: &MasterKey) ->
 
 /// The message for a registration abandoned before confirmation.
 pub fn unconfirmed_message() -> &'static str {
-    "recovery was not confirmed, so the account is registered but NOT usable.\n\
-     The recovery code shown is the only copy — store it, then finish with:\n\
-     \n    nemr login\n\n\
-     and re-run the confirmation. Registering again with this email will be\n\
-     refused because the account now exists."
+    "recovery was not confirmed, so the account is registered but NOT usable, \
+     and the code shown is gone with this attempt. Register again with the \
+     same email: an unconfirmed account is replaced by the new registration, \
+     and a new code is shown."
 }
 
 /// What logout did: the server-side revocation's outcome, and whether there
