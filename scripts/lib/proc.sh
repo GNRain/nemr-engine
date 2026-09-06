@@ -182,7 +182,12 @@ require_tcp() {
 #
 # The Rust harness carries the same list (tests/common/mod.rs), and a unit
 # test asserts the two agree — one rule, two enforcement points, no drift.
-NEMR_PROTECTED_SUBJECTS="htmltest"
+# 2026-09-06: `htmltest` retired. The artifact is gone — the Product Owner
+# deleted every project on the reference host to reclaim disk, and no bundle
+# of it survives there (searched; the only candidate copy is the WSL2 box).
+# The mechanism stays, the list is empty until something irreplaceable exists
+# again; an empty list guards nothing and says so.
+NEMR_PROTECTED_SUBJECTS=""
 
 # The name check alone, for FLOW steps that run `nemr delete` with visible
 # output as part of what they test: guard first, then run the real command.

@@ -44,7 +44,15 @@ theme=$(count 'Choosethetext'); login=$(count 'Selectloginmethod'); trust=$(coun
 echo "screen: theme picker=$theme  login method=$login  trust dialog=$trust  ready prompt=$ready"
 if [ "$own" = 1 ]; then
     # Cleanup verifies before destroying, and never touches a protected subject.
-    case "$project" in htmltest) echo "refusing to delete a protected subject";; *) nemr list 2>/dev/null | grep -q "^$project " && nemr delete "$project" --yes >/dev/null 2>&1;; esac
+    # The roster lives in scripts/lib/proc.sh (empty since htmltest was
+    # retired, 2026-09-06); this script creates its own subject, and only
+    # ever deletes that.
+    if [ -f "$(dirname "$0")/../scripts/lib/proc.sh" ]; then
+        # shellcheck disable=SC1091
+        . "$(dirname "$0")/../scripts/lib/proc.sh"
+        refuse_protected "$project" || exit 3
+    fi
+    nemr list 2>/dev/null | grep -q "^$project " && nemr delete "$project" --yes >/dev/null 2>&1
 fi
 if [ "$theme" = 0 ] && [ "$login" = 0 ] && [ "$trust" = 0 ] && [ "$ready" -gt 0 ]; then
     echo "PASS — claude opened ready for input on a never-used session; no theme picker, no login method, no trust dialog"

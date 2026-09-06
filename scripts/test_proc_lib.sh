@@ -156,9 +156,14 @@ out=$(delete_disposable "scratch-123" 2>&1); rc=$?
 [[ $rc -eq 0 ]] && ok "delete_disposable deletes a disposable project" || bad "should have deleted"
 grep -q "delete scratch-123" "$STUB_LOG" && ok "  ...by actually invoking the engine" || bad "the engine was never invoked"
 
+# The list is empty since htmltest was retired (2026-09-06), so the guard is
+# proven the way the Rust harness proves it: a disposable name temporarily
+# marked protected. The mechanism is what is under test, not the roster.
+saved_protected="$NEMR_PROTECTED_SUBJECTS"
+NEMR_PROTECTED_SUBJECTS="keep-me"
 : > "$STUB_LOG"
-out=$(delete_disposable "htmltest" 2>&1); rc=$?
-[[ $rc -ne 0 ]] && ok "delete_disposable REFUSES the protected subject" || bad "htmltest was not refused"
+out=$(delete_disposable "keep-me" 2>&1); rc=$?
+[[ $rc -ne 0 ]] && ok "delete_disposable REFUSES the protected subject" || bad "keep-me was not refused"
 check "the refusal names the rule" "$out" "protected subject"
 [[ ! -s "$STUB_LOG" ]] \
     && ok "  ...and the engine was NEVER invoked — refusal precedes any command" \
@@ -168,8 +173,13 @@ unset -f nemr
 # refuse_protected alone — the flow-step guard. Both directions.
 out=$(refuse_protected "scratch-1" 2>&1); rc=$?
 [[ $rc -eq 0 ]] && ok "refuse_protected passes a disposable name" || bad "refused a disposable name"
-out=$(refuse_protected "htmltest" 2>&1); rc=$?
+out=$(refuse_protected "keep-me" 2>&1); rc=$?
 [[ $rc -ne 0 ]] && ok "refuse_protected refuses the protected subject" || bad "did not refuse"
+NEMR_PROTECTED_SUBJECTS="$saved_protected"
+# And with the roster as shipped (empty today), the same name passes: the
+# refusal above came from the list, not from the name.
+out=$(refuse_protected "keep-me" 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok "refuse_protected passes the same name once it is off the list" || bad "refused a name that is not on the list"
 
 printf '\n'
 if [[ $FAIL -eq 0 ]]; then
