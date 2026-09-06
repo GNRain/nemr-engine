@@ -47,17 +47,25 @@
 //!   row says local / remote / both, running or not, and **who holds the
 //!   lease right now** — the D-03 state a user must see before pulling.
 //!
+//! Step 3, pull-and-start: `POST /api/sessions/{name}/pull` (password and
+//! take-over in the body) runs the CLI's `pull` through the same core, on a
+//! blocking thread, then the daemon's `Start` — as a **job** the page polls
+//! (`GET /api/jobs/{id}`), so every line the CLI would have printed is shown
+//! as it happens, and an error is the CLI's error. A lease held elsewhere is
+//! typed in the reply (`held_by`) so the page can offer the take-over the
+//! CLI offers as a flag. `POST /api/sessions/{name}/start` starts a session
+//! that is already here. The engine is behind `UiEngine`: the daemon in the
+//! binary, a fake in the router's tests.
+//!
 //! One page, no framework, no build step: the same HTML serves the login form
 //! and the list, and picks by asking `whoami`.
 
-use std::collections::HashSet;
-use std::future::Future;
-use std::pin::Pin;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use axum::extract::{Request, State};
+use axum::extract::{Path as UrlPath, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -67,18 +75,33 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 
-use crate::core;
-use crate::engine_cli::LocalProject;
+use crate::core::{self, EngineOps, HeldElsewhere};
 
 const COOKIE: &str = "nemr_session";
 const TOKEN_HEADER: &str = "x-nemr-token";
 const REQUEST_HEADER: &str = "x-nemr-request";
 
-/// Where the local project list comes from: the daemon, over its socket.
-/// A function so the router's tests can stand in a fixed list and prove the
-/// merge without a daemon — the sync server in those tests is real.
-pub type LocalSource =
-    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Vec<LocalProject>>> + Send>> + Send + Sync>;
+/// The engine, as the UI needs it: the sync core's three verbs plus start
+/// and stop. The daemon over its socket in the binary; a fake in the tests.
+pub trait UiEngine: EngineOps {
+    fn start(&self, name: &str) -> Result<()>;
+    #[allow(dead_code)] // step 5, stop-and-push
+    fn stop(&self, name: &str) -> Result<String>;
+}
+
+/// A long-running action the page watches: the lines the CLI would print,
+/// as they happen, and the outcome.
+#[derive(Default)]
+pub struct Job {
+    kind: String,
+    session: String,
+    lines: Vec<(i64, String)>,
+    done: bool,
+    error: Option<String>,
+    /// Set when the error is a lease held elsewhere, so the page can offer
+    /// the take-over.
+    held_by: Option<String>,
+}
 
 /// Everything the surface knows. Held in memory for the life of the process;
 /// nothing here is written anywhere but the launch URL file.
@@ -87,7 +110,8 @@ pub struct UiState {
     token: [u8; 32],
     token_consumed: AtomicBool,
     sessions: Mutex<HashSet<String>>,
-    local: LocalSource,
+    engine: Arc<dyn UiEngine>,
+    jobs: Mutex<HashMap<String, Arc<Mutex<Job>>>>,
     /// A registration waiting for its recovery code to be typed back (E-16:
     /// recovery is not deferrable). In memory only, for this process's life:
     /// the same place the CLI keeps it between showing the code and reading
@@ -96,15 +120,52 @@ pub struct UiState {
 }
 
 impl UiState {
-    pub fn new(port: u16, token: [u8; 32], local: LocalSource) -> Self {
+    pub fn new(port: u16, token: [u8; 32], engine: Arc<dyn UiEngine>) -> Self {
         Self {
             port,
             token,
             token_consumed: AtomicBool::new(false),
             sessions: Mutex::new(HashSet::new()),
-            local,
+            engine,
+            jobs: Mutex::new(HashMap::new()),
             pending_registration: Mutex::new(None),
         }
+    }
+
+    /// Start a job on a blocking thread; the page polls it by id. `work`
+    /// gets the CLI's `report` callback; its lines land in the job as they
+    /// are said.
+    fn start_job(
+        self: &Arc<Self>,
+        kind: &str,
+        session: &str,
+        work: impl FnOnce(&mut dyn FnMut(&str)) -> Result<()> + Send + 'static,
+    ) -> String {
+        let id = hex(&random_bytes())[..16].to_string();
+        let job = Arc::new(Mutex::new(Job {
+            kind: kind.to_string(),
+            session: session.to_string(),
+            ..Job::default()
+        }));
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.insert(id.clone(), job.clone());
+        }
+        tokio::task::spawn_blocking(move || {
+            let mut say = |line: &str| {
+                if let Ok(mut j) = job.lock() {
+                    j.lines.push((now_unix(), line.to_string()));
+                }
+            };
+            let outcome = work(&mut say);
+            if let Ok(mut j) = job.lock() {
+                j.done = true;
+                if let Err(e) = outcome {
+                    j.held_by = e.downcast_ref::<HeldElsewhere>().map(|h| h.holder.clone());
+                    j.error = Some(format!("{e:#}"));
+                }
+            }
+        });
+        id
     }
 
     /// The URL the launcher opens: the token travels in the fragment only.
@@ -125,6 +186,13 @@ impl UiState {
             format!("localhost:{}", self.port),
         ]
     }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -159,6 +227,9 @@ pub fn router(state: Arc<UiState>) -> Router {
         .route("/register/confirm", post(register_confirm))
         .route("/logout", post(logout))
         .route("/sessions", get(sessions))
+        .route("/sessions/{name}/pull", post(pull))
+        .route("/sessions/{name}/start", post(start))
+        .route("/jobs/{id}", get(job))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_session,
@@ -433,13 +504,17 @@ async fn logout() -> Response {
 /// not hidden — the list still renders from the server alone, and the page
 /// says which rows it could not check locally.
 async fn sessions(State(state): State<Arc<UiState>>) -> Response {
-    let (local, local_error) = match (state.local)().await {
-        Ok(list) => (Some(list), None),
-        Err(e) => (None, Some(format!("{e:#}"))),
-    };
-    let rows = tokio::task::spawn_blocking(move || core::sessions(local.as_deref())).await;
+    let engine = state.engine.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        let (local, local_error) = match engine.list() {
+            Ok(list) => (Some(list), None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        };
+        core::sessions(local.as_deref()).map(|rows| (rows, local_error))
+    })
+    .await;
     match rows {
-        Ok(Ok(rows)) => {
+        Ok(Ok((rows, local_error))) => {
             let rows: Vec<Value> = rows
                 .iter()
                 .map(|r| {
@@ -473,6 +548,103 @@ async fn sessions(State(state): State<Arc<UiState>>) -> Response {
             anyhow::anyhow!("the sessions task failed: {e}"),
         ),
     }
+}
+
+#[derive(Deserialize)]
+struct PullBody {
+    password: String,
+    #[serde(default)]
+    take_over: bool,
+}
+
+/// Step 3: `nemr pull`, then the daemon's `Start`, as a job. The password
+/// is used for the master key on the blocking thread and dropped with the
+/// request, the CLI's policy (per-device caching is the deferred layer).
+async fn pull(
+    State(state): State<Arc<UiState>>,
+    UrlPath(name): UrlPath<String>,
+    Json(body): Json<PullBody>,
+) -> Response {
+    if core::whoami().is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "not logged in" })),
+        )
+            .into_response();
+    }
+    if body.password.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "the password is required to decrypt the bundle" })),
+        )
+            .into_response();
+    }
+    let engine = state.engine.clone();
+    let session = name.clone();
+    let id = state.start_job("pull", &name, move |say| {
+        let pulled = core::pull(&session, &body.password, body.take_over, &*engine, say)?;
+        say(&format!(
+            "{} of session restored as {:?}, lease held as {}",
+            core::human_bytes(pulled.plaintext_bytes as i64),
+            pulled.imported,
+            pulled.holder
+        ));
+        say("starting the session");
+        engine.start(&session)?;
+        say(&format!("{session:?} is running"));
+        Ok(())
+    });
+    Json(json!({ "job": id })).into_response()
+}
+
+/// Start a session that is already here, as a job (the daemon's Start can
+/// take a while: mounting, the task, provisioning checks).
+async fn start(State(state): State<Arc<UiState>>, UrlPath(name): UrlPath<String>) -> Response {
+    let engine = state.engine.clone();
+    let session = name.clone();
+    let id = state.start_job("start", &name, move |say| {
+        say("starting the session");
+        engine.start(&session)?;
+        say(&format!("{session:?} is running"));
+        Ok(())
+    });
+    Json(json!({ "job": id })).into_response()
+}
+
+/// What a job has said so far, and whether it is done.
+async fn job(State(state): State<Arc<UiState>>, UrlPath(id): UrlPath<String>) -> Response {
+    let job = state
+        .jobs
+        .lock()
+        .ok()
+        .and_then(|jobs| jobs.get(&id).cloned());
+    let Some(job) = job else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such job" })),
+        )
+            .into_response();
+    };
+    let j = match job.lock() {
+        Ok(j) => j,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "job state poisoned" })),
+            )
+                .into_response()
+        }
+    };
+    Json(json!({
+        "kind": j.kind,
+        "session": j.session,
+        "lines": j.lines.iter().map(|(at, l)| json!({ "at": at, "text": l })).collect::<Vec<_>>(),
+        "done": j.done,
+        "ok": j.done && j.error.is_none(),
+        "error": j.error,
+        "held_by": j.held_by,
+    }))
+    .into_response()
 }
 
 /// The page: exchange the fragment's token, scrub the fragment, then show
@@ -537,7 +709,17 @@ async fn index() -> Response {
   </section>
   <section id="list" hidden>
     <div class="toolbar"><button id="refresh">refresh</button><span class="note" id="localnote"></span></div>
-    <table><thead><tr><th>session</th><th>agent</th><th>where</th><th>state</th><th>size</th><th>updated</th><th>last machine</th><th>open on</th></tr></thead><tbody id="rows"></tbody></table>
+    <table><thead><tr><th>session</th><th>agent</th><th>where</th><th>state</th><th>size</th><th>updated</th><th>last machine</th><th>open on</th><th></th></tr></thead><tbody id="rows"></tbody></table>
+    <section id="job" class="login" style="max-width:40rem;margin-top:1rem" hidden>
+      <div><strong id="jobtitle"></strong></div>
+      <form id="pullform" style="display:grid;gap:.6rem" hidden>
+        <label>password (to decrypt the bundle on this machine) <input name="password" type="password" autocomplete="current-password" required></label>
+        <label style="display:flex;gap:.4rem;align-items:center"><input name="take_over" type="checkbox" style="width:auto"> take over the lease if another machine holds it (it will be locked out of writing)</label>
+        <div style="display:flex;gap:.6rem"><button class="primary" type="submit">pull &amp; start</button><button type="button" id="jobcancel">cancel</button></div>
+      </form>
+      <pre id="joblog" style="margin:0;white-space:pre-wrap"></pre>
+      <div id="jobresult"></div>
+    </section>
   </section>
 </main>
 <script>
@@ -597,7 +779,11 @@ async fn index() -> Response {
       const state = s.where === 'remote' ? '<span class="muted">not here</span>' : s.running ? 'running' : 'stopped';
       let open = '<span class="muted">-</span>';
       if (s.held_by) open = s.held_by === d.this_machine ? 'this machine' : '<span class="warn">' + esc(s.held_by) + '</span>';
-      rows.insertAdjacentHTML('beforeend', '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.agent) + '</td><td><span class="pill ' + esc(s.where) + '">' + esc(s.where) + '</span></td><td>' + state + '</td><td>' + human(s.size_bytes) + '</td><td>' + ago(s.updated_at_unix) + '</td><td>' + esc(s.last_machine || '-') + '</td><td>' + open + '</td></tr>');
+      let action = '';
+      if (s.where === 'remote' && s.has_bundle) action = '<button data-pull="' + esc(s.name) + '">pull &amp; start</button>';
+      else if (s.where === 'remote') action = '<span class="muted">no bundle yet</span>';
+      else if (!s.running) action = '<button data-start="' + esc(s.name) + '">start</button>';
+      rows.insertAdjacentHTML('beforeend', '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.agent) + '</td><td><span class="pill ' + esc(s.where) + '">' + esc(s.where) + '</span></td><td>' + state + '</td><td>' + human(s.size_bytes) + '</td><td>' + ago(s.updated_at_unix) + '</td><td>' + esc(s.last_machine || '-') + '</td><td>' + open + '</td><td>' + action + '</td></tr>');
     }
     $('localnote').textContent = d.local_available ? '' : 'daemon unreachable: showing the server index only (' + d.local_error + ')';
     $('localnote').className = 'note' + (d.local_available ? '' : ' warn');
@@ -660,6 +846,56 @@ async fn index() -> Response {
   });
   $('refresh').addEventListener('click', refresh);
 
+  // --- step 3: pull-and-start, and start, as jobs the page watches ---
+  let pulling = null;
+  function openJob(title) {
+    $('job').hidden = false; $('jobtitle').textContent = title;
+    $('joblog').textContent = ''; $('jobresult').textContent = ''; $('jobresult').className = '';
+  }
+  async function watch(id) {
+    for (;;) {
+      const r = await api('/jobs/' + id);
+      if (!r.ok) { $('jobresult').textContent = 'lost the job (' + r.status + ')'; $('jobresult').className = 'bad'; return null; }
+      const j = await r.json();
+      $('joblog').textContent = j.lines.map(l => l.text).join('\n');
+      if (j.done) return j;
+      await new Promise(res => setTimeout(res, 400));
+    }
+  }
+  async function runJob(title, path, body) {
+    openJob(title);
+    const r = await api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { $('jobresult').textContent = d.error || ('refused (' + r.status + ')'); $('jobresult').className = 'bad'; return null; }
+    const j = await watch(d.job);
+    if (!j) return null;
+    if (j.ok) { $('jobresult').textContent = 'done'; await refresh(); }
+    else { $('jobresult').textContent = j.error; $('jobresult').className = 'bad'; }
+    return j;
+  }
+  $('rows').addEventListener('click', ev => {
+    const b = ev.target.closest('button'); if (!b) return;
+    if (b.dataset.start) runJob('start ' + b.dataset.start, '/sessions/' + encodeURIComponent(b.dataset.start) + '/start');
+    if (b.dataset.pull) {
+      pulling = b.dataset.pull;
+      openJob('pull & start ' + pulling);
+      const f = $('pullform'); f.hidden = false; f.take_over.checked = false; f.password.value = ''; f.password.focus();
+    }
+  });
+  $('jobcancel').addEventListener('click', () => { $('pullform').hidden = true; $('job').hidden = true; pulling = null; });
+  $('pullform').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const f = ev.target, name = pulling;
+    const body = { password: f.password.value, take_over: f.take_over.checked };
+    f.hidden = true; f.password.value = '';
+    const j = await runJob('pull & start ' + name, '/sessions/' + encodeURIComponent(name) + '/pull', body);
+    if (j && !j.ok && j.held_by) {
+      // The CLI's --take-over, offered where the CLI offers it: on refusal, naming the holder.
+      $('jobresult').insertAdjacentHTML('beforeend', ' <button id="takeover">take over from ' + esc(j.held_by) + '</button>');
+      $('takeover').addEventListener('click', () => { pulling = name; f.hidden = false; f.take_over.checked = true; f.password.focus(); });
+    }
+  });
+
   (async () => {
     if (!await handshake()) return;
     const w = await api('/whoami').then(x => x.json());
@@ -695,8 +931,10 @@ pub fn run(port: Option<u16>, open: bool) -> Result<()> {
             .await
             .context("binding the UI's loopback port")?;
         let port = listener.local_addr()?.port();
-        let local: LocalSource = Arc::new(|| Box::pin(crate::daemon::list_projects()));
-        let state = Arc::new(UiState::new(port, random_bytes(), local));
+        let engine: Arc<dyn UiEngine> = Arc::new(crate::daemon::DaemonEngine::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let state = Arc::new(UiState::new(port, random_bytes(), engine));
         let url = state.launch_url();
         crate::state::save_ui_url(&url)?;
         println!("nemr ui: {url}");
@@ -718,6 +956,7 @@ pub fn run(port: Option<u16>, open: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine_cli::LocalProject;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
@@ -726,17 +965,73 @@ mod tests {
     fn token() -> [u8; 32] {
         [7u8; 32]
     }
-    fn fixed_local(list: Vec<LocalProject>) -> LocalSource {
-        Arc::new(move || {
-            let list = list.clone();
-            Box::pin(async move { Ok(list) })
+    /// The engine the router's tests run against: a list the test states,
+    /// and a record of every import and start — with the bundle's bytes and
+    /// the mode of the directory it arrived in, the F-92 property.
+    #[derive(Default)]
+    struct FakeEngine {
+        projects: Mutex<Vec<LocalProject>>,
+        imported: Mutex<Vec<(String, Vec<u8>, u32)>>,
+        started: Mutex<Vec<String>>,
+        exported: Mutex<Vec<String>>,
+        stopped: Mutex<Vec<String>>,
+    }
+    impl EngineOps for FakeEngine {
+        fn list(&self) -> Result<Vec<LocalProject>> {
+            Ok(self.projects.lock().unwrap().clone())
+        }
+        fn export(&self, name: &str, dest: &std::path::Path) -> Result<()> {
+            self.exported.lock().unwrap().push(name.to_string());
+            std::fs::write(dest, format!("bundle-of-{name}"))?;
+            Ok(())
+        }
+        fn import(&self, bundle: &std::path::Path, name: &str) -> Result<String> {
+            use std::os::unix::fs::PermissionsExt;
+            let bytes = std::fs::read(bundle)?;
+            let dir_mode = std::fs::metadata(bundle.parent().unwrap())?
+                .permissions()
+                .mode()
+                & 0o777;
+            self.imported
+                .lock()
+                .unwrap()
+                .push((name.to_string(), bytes, dir_mode));
+            self.projects.lock().unwrap().push(LocalProject {
+                name: name.to_string(),
+                agent: "claude-code".into(),
+                running: false,
+                usage_known: false,
+                used_bytes: 0,
+            });
+            Ok(name.to_string())
+        }
+    }
+    impl UiEngine for FakeEngine {
+        fn start(&self, name: &str) -> Result<()> {
+            self.started.lock().unwrap().push(name.to_string());
+            for p in self.projects.lock().unwrap().iter_mut() {
+                if p.name == name {
+                    p.running = true;
+                }
+            }
+            Ok(())
+        }
+        fn stop(&self, name: &str) -> Result<String> {
+            self.stopped.lock().unwrap().push(name.to_string());
+            Ok("graceful".into())
+        }
+    }
+    fn fake_engine(list: Vec<LocalProject>) -> Arc<FakeEngine> {
+        Arc::new(FakeEngine {
+            projects: Mutex::new(list),
+            ..FakeEngine::default()
         })
     }
     fn app() -> (Router, Arc<UiState>) {
-        app_with(fixed_local(vec![]))
+        app_with(fake_engine(vec![]))
     }
-    fn app_with(local: LocalSource) -> (Router, Arc<UiState>) {
-        let state = Arc::new(UiState::new(PORT, token(), local));
+    fn app_with(engine: Arc<FakeEngine>) -> (Router, Arc<UiState>) {
+        let state = Arc::new(UiState::new(PORT, token(), engine));
         (router(state.clone()), state)
     }
     fn host() -> String {
@@ -931,7 +1226,7 @@ mod tests {
     /// The launch URL carries the token in the fragment and nowhere else.
     #[test]
     fn the_launch_url_puts_the_token_in_the_fragment() {
-        let state = UiState::new(PORT, token(), fixed_local(vec![]));
+        let state = UiState::new(PORT, token(), fake_engine(vec![]));
         let url = state.launch_url();
         assert!(
             url.starts_with(&format!("http://127.0.0.1:{PORT}/#token=")),
@@ -986,6 +1281,13 @@ mod tests {
             ),
             ("POST", "/api/logout", None),
             ("GET", "/api/sessions", None),
+            (
+                "POST",
+                "/api/sessions/x/pull",
+                Some(json!({"password": "x"})),
+            ),
+            ("POST", "/api/sessions/x/start", None),
+            ("GET", "/api/jobs/abc", None),
         ] {
             let r = send(&app, api_req(method, path, None, body)).await;
             assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
@@ -1044,6 +1346,16 @@ mod tests {
         (format!("http://{addr}"), store_dir)
     }
 
+    /// The surface tests set process-wide environment (the state directory,
+    /// the holder identity) and read the account file it names, so two of
+    /// them running at once see each other's login. They hold this for their
+    /// whole duration — the F-71 shape: serial by construction, not by a
+    /// flag someone must remember.
+    static SURFACE: Mutex<()> = Mutex::new(());
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SURFACE.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Run the CLI's blocking code off the test runtime (its HTTP client is
     /// the blocking one, which refuses to run on an async thread).
     fn blocking<T: Send>(f: impl FnOnce() -> T + Send) -> T {
@@ -1060,6 +1372,7 @@ mod tests {
     /// now, named. Logout clears it and the list is refused again.
     #[tokio::test]
     async fn login_then_the_session_list_names_the_lease_holder() {
+        let _serial = serial();
         let (server, _store) = spawn_sync_server();
         let state_home = tempfile::tempdir().unwrap();
         // Process-wide, read by this test's own code paths only (the
@@ -1070,14 +1383,14 @@ mod tests {
         let email = format!("ui-{}@example.com", &hex(&random_bytes())[..12]);
         const PASSWORD: &str = "correct horse battery staple";
 
-        let local = fixed_local(vec![LocalProject {
+        let engine = fake_engine(vec![LocalProject {
             name: "here-only".into(),
             agent: "codex".into(),
             running: true,
             usage_known: true,
             used_bytes: 700,
         }]);
-        let (app, _) = app_with(local);
+        let (app, _) = app_with(engine);
         let cookie = establish(&app).await;
         let c = Some(cookie.as_str());
 
@@ -1258,5 +1571,192 @@ mod tests {
             crate::state::load_account().is_err(),
             "the account is cleared"
         );
+    }
+
+    /// Poll a job to completion, the way the page does.
+    async fn finish(app: &Router, cookie: &str, started: Response) -> Value {
+        assert_eq!(started.status(), StatusCode::OK);
+        let id = json_of(started).await["job"].as_str().unwrap().to_string();
+        for _ in 0..600 {
+            let j = json_of(
+                send(
+                    app,
+                    api_req("GET", &format!("/api/jobs/{id}"), Some(cookie), None),
+                )
+                .await,
+            )
+            .await;
+            if j["done"] == true {
+                return j;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("job {id} never finished");
+    }
+
+    /// Step 3, end to end against the real server: a bundle another machine
+    /// pushed comes down through the surface — refused while that machine
+    /// holds the lease (the holder named, so the page can offer the
+    /// take-over), refused with a wrong password before anything is
+    /// imported, and with the take-over: downloaded, decrypted to the bytes
+    /// that were pushed, imported from a directory only this user can
+    /// enter, started, and the lease now held by this machine. Then a
+    /// session already here is started on its own.
+    #[tokio::test]
+    async fn pull_and_start_through_the_surface() {
+        let _serial = serial();
+        let (server, _store) = spawn_sync_server();
+        let state_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", state_home.path());
+        std::env::set_var("NEMR_CLOUD_KDF_FAST", "1");
+        std::env::set_var("NEMR_CLOUD_HOLDER", "this-laptop");
+        // The heartbeat holder would be spawned as THIS test binary and read
+        // its verb as a test filter; the lease's server-side state is what
+        // the assertions read, so the holder can be a no-op here.
+        std::env::set_var("NEMR_CLOUD_HOLDER_BIN", "/bin/true");
+        let email = format!("pull-{}@example.com", &hex(&random_bytes())[..12]);
+        const PASSWORD: &str = "correct horse battery staple";
+        let plaintext = b"the session, as exported on the desktop".to_vec();
+
+        // Enrol here, then act as "desktop": push a bundle and keep the lease.
+        let pushed = plaintext.clone();
+        blocking(|| {
+            let pending = core::register_begin(&server, &email, PASSWORD).unwrap();
+            let mk = core::register_check_code(&pending, &pending.recovery_code.display()).unwrap();
+            let account = core::register_confirm(&pending, &mk).unwrap();
+            let api = crate::api::Api::new(&server, Some(account.token.clone()));
+            api.upsert_session(&json!({
+                "name": "shared", "agent": "claude-code", "size_bytes": pushed.len(), "last_machine": "desktop",
+            }))
+            .unwrap();
+            let lease = api.acquire_lease("shared", "desktop").unwrap();
+            assert!(lease.granted);
+            let mk = crate::keys::master_key(&account, PASSWORD).unwrap();
+            api.upload_bundle(
+                "shared",
+                "desktop",
+                lease.fence,
+                nemr_crypto::encrypt_bundle(&mk, &pushed),
+            )
+            .unwrap();
+        });
+
+        let engine = fake_engine(vec![LocalProject {
+            name: "here-only".into(),
+            agent: "codex".into(),
+            running: false,
+            usage_known: true,
+            used_bytes: 700,
+        }]);
+        let (app, _) = app_with(engine.clone());
+        let cookie = establish(&app).await;
+        let c = Some(cookie.as_str());
+        let pull = |body: Value| api_req("POST", "/api/sessions/shared/pull", c, Some(body));
+
+        // Held by the desktop: refused, holder named, nothing imported.
+        let j = finish(
+            &app,
+            &cookie,
+            send(&app, pull(json!({"password": PASSWORD}))).await,
+        )
+        .await;
+        assert_eq!(j["ok"], false, "{j}");
+        assert_eq!(
+            j["held_by"], "desktop",
+            "the page needs the holder to offer the take-over: {j}"
+        );
+        assert!(
+            j["error"].as_str().unwrap().contains("held by desktop"),
+            "{j}"
+        );
+        assert!(
+            engine.imported.lock().unwrap().is_empty(),
+            "nothing imported under a refused lease"
+        );
+
+        // Wrong password: refused before any download is decrypted or imported.
+        let j = finish(
+            &app,
+            &cookie,
+            send(&app, pull(json!({"password": "nope", "take_over": true}))).await,
+        )
+        .await;
+        assert_eq!(j["ok"], false);
+        assert!(
+            j["error"].as_str().unwrap().contains("wrong password"),
+            "{j}"
+        );
+        assert!(engine.imported.lock().unwrap().is_empty());
+        assert!(engine.started.lock().unwrap().is_empty());
+
+        // Take over: the bytes the desktop pushed, imported privately, started.
+        let j = finish(
+            &app,
+            &cookie,
+            send(&app, pull(json!({"password": PASSWORD, "take_over": true}))).await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "{j}");
+        let lines: Vec<String> = j["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["text"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("took over the lease from desktop")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("decrypting")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("\"shared\" is running")),
+            "{lines:?}"
+        );
+        let imported = engine.imported.lock().unwrap().clone();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].0, "shared");
+        assert_eq!(
+            imported[0].1, plaintext,
+            "the bytes the desktop pushed, decrypted here"
+        );
+        assert_eq!(
+            imported[0].2, 0o700,
+            "the plaintext sat in a directory only this user can enter (F-92)"
+        );
+        assert_eq!(*engine.started.lock().unwrap(), vec!["shared".to_string()]);
+
+        // The list now says: here, running, and the lease is this machine's.
+        let list = json_of(send(&app, api_req("GET", "/api/sessions", c, None)).await).await;
+        let shared = list["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "shared")
+            .unwrap()
+            .clone();
+        assert_eq!(shared["where"], "both");
+        assert_eq!(shared["running"], true);
+        assert_eq!(shared["held_by"], "this-laptop", "{shared}");
+
+        // A session already here starts on its own, no password involved.
+        let j = finish(
+            &app,
+            &cookie,
+            send(
+                &app,
+                api_req("POST", "/api/sessions/here-only/start", c, None),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "{j}");
+        assert_eq!(
+            *engine.started.lock().unwrap(),
+            vec!["shared".to_string(), "here-only".to_string()]
+        );
+        let missing = send(&app, api_req("GET", "/api/jobs/nope", c, None)).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 }

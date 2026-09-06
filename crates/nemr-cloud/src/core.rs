@@ -10,18 +10,23 @@
 //! derived here, in this process, and never written; the server receives what
 //! it always received.
 //!
-//! `push` and `pull` stay in `commands` for now; they move here when the
-//! UI's pull-and-start and stop-and-push steps are built, in the same shape.
+//! `push`, `pull` and `release` are here too, with the engine behind
+//! `EngineOps` (the CLI's subprocess, the UI's daemon client) and progress
+//! reported through a callback, so the browser's pull IS the CLI's pull.
 
-use anyhow::{anyhow, Result};
-use nemr_crypto::{recovery_acknowledgement, MasterKey, RecoveryCode};
+use std::path::Path;
+
+use anyhow::{anyhow, bail, Context, Result};
+use nemr_crypto::{
+    decrypt_bundle, encrypt_bundle, recovery_acknowledgement, MasterKey, RecoveryCode,
+};
 use rand::RngCore;
 use serde_json::json;
 
-use crate::api::{Api, SessionEntry};
+use crate::api::{Api, LeaseLost, LeaseResponse, SessionEntry};
 use crate::engine_cli::LocalProject;
 use crate::keys::{self, b64, unb64};
-use crate::state::{self, Account};
+use crate::state::{self, Account, LeaseState};
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 
@@ -278,6 +283,493 @@ pub fn sessions(local: Option<&[LocalProject]>) -> Result<Vec<SessionRow>> {
 /// Is anyone logged in on this machine, and as whom?
 pub fn whoami() -> Option<Account> {
     state::load_account().ok()
+}
+
+// --- the engine, as the core sees it ------------------------------------------
+
+/// How the sync core reaches the engine. The CLI drives `nemr` as a
+/// subprocess (`engine_cli`); the UI asks the daemon over its socket through
+/// `nemr-daemon-api` (`daemon`). The core sees three verbs and never learns
+/// which.
+pub trait EngineOps: Send + Sync {
+    fn list(&self) -> Result<Vec<LocalProject>>;
+    /// Export `name` to `dest` (absolute; the daemon resolves relative paths
+    /// in its own cwd).
+    fn export(&self, name: &str, dest: &Path) -> Result<()>;
+    /// Import a bundle as `name`; the engine creates the project and returns
+    /// the name it created.
+    fn import(&self, bundle: &Path, name: &str) -> Result<String>;
+}
+
+/// The lease is held by another machine. Typed so each driver can offer its
+/// own way to take over — the CLI its flag, the page its button.
+#[derive(Debug)]
+pub struct HeldElsewhere {
+    pub session: String,
+    pub holder: String,
+    pub expires_in_secs: i64,
+}
+
+impl std::fmt::Display for HeldElsewhere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session {:?} is held by {} (lease expires in {}s). Taking it over locks the other machine out of writing.",
+            self.session, self.holder, self.expires_in_secs
+        )
+    }
+}
+impl std::error::Error for HeldElsewhere {}
+
+/// The binary that runs the detached heartbeat holder: this one. Overridable
+/// for tests whose "own binary" is a test harness (the F-12 re-bind lesson:
+/// a helper spawned as the test binary reads its verb as a test filter).
+fn holder_binary() -> Result<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("NEMR_CLOUD_HOLDER_BIN") {
+        return Ok(std::path::PathBuf::from(p));
+    }
+    std::env::current_exe().context("locating our own binary")
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+pub fn human_bytes(n: i64) -> String {
+    let n = n.max(0) as f64;
+    if n >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1}GiB", n / (1024.0 * 1024.0 * 1024.0))
+    } else if n >= 1024.0 * 1024.0 {
+        format!("{:.1}MiB", n / (1024.0 * 1024.0))
+    } else if n >= 1024.0 {
+        format!("{:.1}KiB", n / 1024.0)
+    } else {
+        format!("{n:.0}B")
+    }
+}
+
+// --- the lease, client side --------------------------------------------------
+
+/// Ensure this machine holds the session's lease, returning the live fence.
+///
+/// A healthy hold already maintained by our heartbeat holder is REUSED — a
+/// fresh acquire would advance the fence and kill our own holder mid-flight.
+/// Otherwise acquire; a lease held by another machine is refused with its
+/// holder named, unless `take_over`.
+fn ensure_lease(
+    api: &Api,
+    name: &str,
+    take_over: bool,
+    report: &mut dyn FnMut(&str),
+) -> Result<LeaseResponse> {
+    let me = state::holder_identity();
+
+    if let Some(lease) = state::load_lease(name) {
+        let holder_alive = lease
+            .holder_pid
+            .is_some_and(|pid| holder_process_is_ours(pid, name, lease.fence));
+        if lease.status == "held"
+            && lease.holder == me
+            && lease.expires_at_unix > now_unix() + 2
+            && holder_alive
+        {
+            return Ok(LeaseResponse {
+                granted: true,
+                holder: lease.holder,
+                fence: lease.fence,
+                expires_at_unix: lease.expires_at_unix,
+                ttl_seconds: lease.ttl_seconds,
+            });
+        }
+    }
+
+    // We are about to take a NEW fence. Any holder still running carries the
+    // old one, and the server would keep honouring its heartbeats (it matches
+    // holder+fence, and this machine's holder string is unchanged) — so retire
+    // it BEFORE acquiring rather than leaving two holders racing (F-92).
+    stop_holder(name);
+
+    let resp = api.acquire_lease(name, &me)?;
+    if resp.granted {
+        return Ok(resp);
+    }
+    if take_over {
+        let taken = api.takeover_lease(name, &me)?;
+        report(&format!(
+            "took over the lease from {} (its next write will be refused)",
+            resp.holder
+        ));
+        return Ok(taken);
+    }
+    // Typed, so each driver can offer its own way to take over (the CLI's
+    // flag, the page's button) without the core knowing either.
+    Err(HeldElsewhere {
+        session: name.to_string(),
+        holder: resp.holder,
+        expires_in_secs: (resp.expires_at_unix - now_unix()).max(0),
+    }
+    .into())
+}
+
+/// Is `pid` one of OUR holder processes for this session AND this fence?
+///
+/// Checked before any kill: destroying a PID without verifying what it is would
+/// be the F-79 shape. The match is on **exact argv elements**, not a substring
+/// of the joined cmdline (F-92): PIDs are reused, and a substring test matches
+/// any holder whose session name merely contains ours (`proj` inside
+/// `proj-backup`), so the wrong process could be signalled. The fence is part of
+/// the identity because a holder on a stale fence is precisely NOT the holder we
+/// think we have.
+fn holder_process_is_ours(pid: u32, session: &str, fence: i64) -> bool {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    // /proc cmdline is NUL-separated argv with a trailing NUL.
+    let argv: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    let has = |needle: &str| argv.iter().any(|a| a == needle);
+    has("__hold") && has(session) && has(&fence.to_string())
+}
+
+/// Ensure a heartbeat holder is running for exactly this (session, fence), and
+/// record the lease state.
+///
+/// Idempotent by design (F-92): if a holder is already live on this same fence
+/// it is kept — spawning a second would leak the first, whose heartbeats the
+/// server would keep honouring because they carry identical credentials. A
+/// holder on any *other* fence is retired first.
+fn ensure_holder(name: &str, lease: &LeaseResponse) -> Result<()> {
+    if let Some(existing) = state::load_lease(name) {
+        if existing.fence == lease.fence
+            && existing
+                .holder_pid
+                .is_some_and(|pid| holder_process_is_ours(pid, name, lease.fence))
+        {
+            // Already held by a live holder on this fence: refresh the recorded
+            // expiry and keep the process.
+            return state::save_lease(
+                name,
+                &LeaseState {
+                    holder: lease.holder.clone(),
+                    fence: lease.fence,
+                    expires_at_unix: lease.expires_at_unix,
+                    ttl_seconds: lease.ttl_seconds,
+                    status: "held".into(),
+                    holder_pid: existing.holder_pid,
+                },
+            );
+        }
+        stop_holder(name);
+    }
+
+    let exe = holder_binary()?;
+    // Heartbeat at a third of the lease's FULL TTL, which the server reports —
+    // never at a third of what happens to remain on a partly-elapsed lease,
+    // which on a reused hold would collapse to a hot loop (F-92).
+    //
+    // The floor clamps the INTERVAL, never the TTL: clamping the TTL upward
+    // would make the holder renew more slowly than the lease actually expires,
+    // eating the 3x safety margin and letting a live session's lease lapse
+    // under load. TTL/3 is the margin; 200ms only stops a pathological spin.
+    let interval_ms = ((lease.ttl_seconds.max(1) as u64 * 1000) / 3).max(200);
+
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("__hold")
+        .arg(name)
+        .arg("--holder")
+        .arg(&lease.holder)
+        .arg("--fence")
+        .arg(lease.fence.to_string())
+        .arg("--interval-ms")
+        .arg(interval_ms.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Detach: survive this CLI's exit and its terminal.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().context("spawning the lease heartbeat holder")?;
+
+    state::save_lease(
+        name,
+        &LeaseState {
+            holder: lease.holder.clone(),
+            fence: lease.fence,
+            expires_at_unix: lease.expires_at_unix,
+            ttl_seconds: lease.ttl_seconds,
+            status: "held".into(),
+            holder_pid: Some(child.id()),
+        },
+    )
+}
+
+/// Stop our holder process for a session, verifying it is ours first, and wait
+/// for it to actually go — a release that races its own holder's next heartbeat
+/// would re-create the state it just cleared.
+fn stop_holder(name: &str) {
+    let Some(lease) = state::load_lease(name) else {
+        return;
+    };
+    let Some(pid) = lease.holder_pid else {
+        return;
+    };
+    if !holder_process_is_ours(pid, name, lease.fence) {
+        return;
+    }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    for _ in 0..100 {
+        if !holder_process_is_ours(pid, name, lease.fence) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+// --- push / pull / release ---------------------------------------------------
+
+/// A temp directory only this user can enter, for the **plaintext** bundle.
+///
+/// F-92: `tempfile::tempdir()` honours the process umask — measured 0775 with a
+/// 0664 file on the reference host — so the decrypted session, the very thing
+/// E-16 exists to keep private, sat world-readable in `/tmp` for the length of a
+/// push or pull. Any local user could read it. The mode is set on the directory
+/// **before** anything is written into it, so there is no window where the
+/// bundle exists under a permissive mode.
+fn private_tempdir() -> Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().context("creating a temp directory")?;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+        .context("restricting the temp directory to this user")?;
+    Ok(dir)
+}
+
+/// What a push did, for the driver to render (the CLI says it all through
+/// `report`; the UI's stop-and-push reads these).
+#[allow(dead_code)]
+pub struct PushReport {
+    pub plaintext_bytes: usize,
+    pub ciphertext_bytes: i64,
+    pub released: bool,
+    pub holder: String,
+}
+
+/// `nemr push`: export through the engine, encrypt here, upload under the
+/// lease's fence. `report` receives the CLI's progress lines as they happen.
+pub fn push(
+    name: &str,
+    password: &str,
+    release_after: bool,
+    take_over: bool,
+    engine: &dyn EngineOps,
+    report: &mut dyn FnMut(&str),
+) -> Result<PushReport> {
+    let account = state::load_account()?;
+    let mk = keys::master_key(&account, password)?;
+    let api = Api::new(&account.server, Some(account.token.clone()));
+
+    let locals = engine.list()?;
+    let project = locals
+        .iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| anyhow!("no local project {name:?} — see `nemr list`"))?;
+    if project.running {
+        bail!("project {name:?} is running; stop it first so the volume is quiescent: nemr stop {name}");
+    }
+
+    // The index entry first, so the lease has a session row to hang off.
+    api.upsert_session(&json!({
+        "name": name,
+        "agent": project.agent,
+        "size_bytes": project.used_bytes,
+        "last_machine": state::holder_identity(),
+    }))?;
+
+    let lease = ensure_lease(&api, name, take_over, report)?;
+    report(&format!("holding the lease as {}", lease.holder));
+
+    // Export through the engine, encrypt here, upload ciphertext. The
+    // plaintext bundle exists only inside this tempdir, briefly — the same
+    // artifact a manual `nemr export` produces, on the user's own disk.
+    let tmp = private_tempdir()?;
+    let bundle_path = tmp.path().join(format!("{name}.nemr"));
+    report("exporting the session");
+    engine.export(name, &bundle_path)?;
+    let plaintext = std::fs::read(&bundle_path).context("reading the exported bundle")?;
+    report(&format!(
+        "encrypting {} client-side",
+        human_bytes(plaintext.len() as i64)
+    ));
+    let ciphertext = encrypt_bundle(&mk, &plaintext);
+    let ciphertext_len = ciphertext.len() as i64;
+
+    report(&format!(
+        "uploading {} of ciphertext",
+        human_bytes(ciphertext_len)
+    ));
+    let result = api.upload_bundle(name, &lease.holder, lease.fence, ciphertext);
+    let ciphertext_bytes = match result {
+        Ok(info) => {
+            let bytes = info["bytes"].as_i64().unwrap_or(ciphertext_len);
+            report(&format!(
+                "pushed {name:?}: {} plaintext -> {} ciphertext (encrypted client-side; the server cannot read it)",
+                human_bytes(plaintext.len() as i64),
+                human_bytes(bytes),
+            ));
+            bytes
+        }
+        Err(e) => {
+            if let Some(lost) = e.downcast_ref::<LeaseLost>() {
+                // The server refused the write: this machine no longer holds the
+                // lease. Do not retry, do not take over silently — say so.
+                state::save_lease(
+                    name,
+                    &LeaseState {
+                        holder: lease.holder.clone(),
+                        fence: lease.fence,
+                        expires_at_unix: lease.expires_at_unix,
+                        ttl_seconds: lease.ttl_seconds,
+                        status: "lost".into(),
+                        holder_pid: None,
+                    },
+                )?;
+                bail!(
+                    "not writing: {lost}\n\
+                     Another machine holds this session now. Its work would be overwritten.\n\
+                     If you are sure, re-run with --take-over."
+                );
+            }
+            return Err(e);
+        }
+    };
+
+    if release_after {
+        stop_holder(name);
+        api.release_lease(name, &lease.holder, lease.fence)?;
+        state::delete_lease(name);
+        report("lease released");
+    } else {
+        // Unconditionally, because ensure_holder is idempotent per fence. The
+        // old fence-blind "only if no live holder" guard was the defect (F-92):
+        // when a re-acquire advanced the fence while the previous holder was
+        // still alive, the guard saw a live process and skipped — leaving the
+        // NEW fence recorded nowhere, no one heartbeating it, and a later
+        // release sending a stale fence that the server refused, stranding the
+        // lease held until its TTL ran out.
+        ensure_holder(name, &lease)?;
+    }
+    Ok(PushReport {
+        plaintext_bytes: plaintext.len(),
+        ciphertext_bytes,
+        released: release_after,
+        holder: lease.holder,
+    })
+}
+
+/// What a pull did, for the driver to render.
+pub struct PullReport {
+    /// The name the engine created (from the manifest).
+    pub imported: String,
+    pub holder: String,
+    pub plaintext_bytes: usize,
+}
+
+/// `nemr pull`: take the lease, download, decrypt here, import through the
+/// engine, keep the lease held. `report` receives the progress lines.
+pub fn pull(
+    name: &str,
+    password: &str,
+    take_over: bool,
+    engine: &dyn EngineOps,
+    report: &mut dyn FnMut(&str),
+) -> Result<PullReport> {
+    let account = state::load_account()?;
+    let mk = keys::master_key(&account, password)?;
+    let api = Api::new(&account.server, Some(account.token.clone()));
+
+    let sessions = api.sessions()?;
+    let session = sessions
+        .iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| anyhow!("no session {name:?} on the server — see `nemr sessions`"))?;
+    if !session.has_bundle {
+        bail!("session {name:?} has no uploaded bundle yet (push it from the machine that has it)");
+    }
+
+    // Take the lease BEFORE materializing anything: pulling is this machine
+    // claiming the session (D-03).
+    let lease = ensure_lease(&api, name, take_over, report)?;
+    report(&format!("holding the lease as {}", lease.holder));
+
+    report(&format!(
+        "downloading {} of ciphertext",
+        session
+            .ciphertext_bytes
+            .map(human_bytes)
+            .unwrap_or_else(|| "the bundle".into())
+    ));
+    let ciphertext = api.download_bundle(name)?;
+    report("decrypting client-side");
+    let plaintext = decrypt_bundle(&mk, &ciphertext).map_err(|_| {
+        anyhow!("the downloaded bundle does not decrypt — wrong key or corrupted ciphertext")
+    })?;
+
+    let tmp = private_tempdir()?;
+    let bundle_path = tmp.path().join(format!("{name}.nemr"));
+    std::fs::write(&bundle_path, &plaintext).context("writing the decrypted bundle")?;
+    report(&format!(
+        "importing {} into the engine",
+        human_bytes(plaintext.len() as i64)
+    ));
+    let imported = engine.import(&bundle_path, name)?;
+    report(&format!("imported as {imported:?}"));
+
+    ensure_holder(name, &lease)?;
+    report(&format!(
+        "holding the lease as {} (heartbeating in the background)",
+        lease.holder
+    ));
+    Ok(PullReport {
+        imported,
+        holder: lease.holder,
+        plaintext_bytes: plaintext.len(),
+    })
+}
+
+/// What `release` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseOutcome {
+    NoLeaseHere,
+    Released,
+    AlreadyLost,
+}
+
+pub fn release(name: &str) -> Result<ReleaseOutcome> {
+    let account = state::load_account()?;
+    let api = Api::new(&account.server, Some(account.token));
+    let Some(lease) = state::load_lease(name) else {
+        return Ok(ReleaseOutcome::NoLeaseHere);
+    };
+    stop_holder(name);
+    let outcome = match api.release_lease(name, &lease.holder, lease.fence) {
+        Ok(()) => ReleaseOutcome::Released,
+        Err(e) if e.downcast_ref::<LeaseLost>().is_some() => ReleaseOutcome::AlreadyLost,
+        Err(e) => return Err(e),
+    };
+    state::delete_lease(name);
+    Ok(outcome)
 }
 
 #[cfg(test)]

@@ -47,7 +47,7 @@ tempfile = "3"
 # gRPC client of the daemon, on a loopback port that opens only when the user
 # starts the UI. axum is the workspace's server framework already (nemr-sync).
 axum = { version = "0.8", features = ["json"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 # Constant-time comparison for the launch token (the same crate nemr-crypto uses).
 subtle = "2"
 
