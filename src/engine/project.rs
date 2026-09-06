@@ -568,6 +568,22 @@ pub async fn start(client: &ContainerdClient, name: &str) -> Result<u32> {
         }
     }
 
+    // F-131: the first `claude` in this session must open ready — no theme
+    // picker, no login method, no trust dialog — because the user is already
+    // signed in on this host. Seed the session's Claude Code config from the
+    // host's, by allowlist, once (the write is guarded by `test -e`, so a
+    // session that has run `claude` already is left alone). Best effort and
+    // said when it fails: a session that opens with onboarding is degraded,
+    // not broken, and the start must not fail for it.
+    match seed_session_config(client, name).await {
+        Ok(true) => tracing::info!("[nemr] {name}: seeded Claude Code's config (onboarding complete, workspace trusted, identity from the host)"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            nemr_audit = "warning",
+            "[nemr] {name}: could not seed Claude Code's config ({error:#}); the first `claude` may show onboarding"
+        ),
+    }
+
     // Re-apply declared forwards (WP-M). They are derived state: torn down on
     // stop, and gone entirely after a rootlesskit restart, so the declaration
     // is applied rather than assumed live. A port that cannot be bound is
@@ -1830,6 +1846,45 @@ pub async fn rebind_credential(client: &ContainerdClient, name: &str) -> Result<
         );
     }
     Ok(true)
+}
+
+/// Seed the session's `.claude.json` from the host's, by allowlist, if the
+/// session has none yet (F-131). Returns whether the seed was written — the
+/// exec's own report, read back: the guarded write prints nothing, so the
+/// presence of the file afterwards is what is checked.
+pub async fn seed_session_config(client: &ContainerdClient, name: &str) -> Result<bool> {
+    let host_config = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|h| h.join(".claude.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let seed = crate::engine::seed::session_config_seed(host_config.as_ref());
+    let (before, _) = exec_capture(
+        client,
+        name,
+        &["/bin/sh", "-c", "test -e /root/.claude.json"],
+    )
+    .await?;
+    if before == 0 {
+        return Ok(false);
+    }
+    let argv = crate::engine::seed::seed_write_argv(&seed);
+    let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let (exit, out) = exec_capture(client, name, &argv_ref).await?;
+    if exit != 0 {
+        bail!(
+            "writing the seed inside the session failed (exit {exit}): {}",
+            out.trim()
+        );
+    }
+    Ok(true)
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Gather everything `nemr status` reports.

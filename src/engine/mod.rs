@@ -9,5 +9,6 @@ pub mod netns;
 pub mod packages;
 pub mod ports;
 pub mod project;
+pub mod seed;
 pub mod tty;
 pub mod volume;

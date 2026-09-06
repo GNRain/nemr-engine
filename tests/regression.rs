@@ -3492,6 +3492,84 @@ fn f12_dies_a_host_rename_reaches_a_running_session_without_restart() {
     });
 }
 
+/// F-131: the first start seeds the session's Claude Code config by allowlist
+/// — onboarding complete, the workspace trusted, identity from the host when
+/// it has one — and a second start leaves the file alone. Read back from
+/// inside the session through the engine's own exec; nothing here runs
+/// `claude`, that is `docs/first-run-acceptance.sh`'s job.
+#[test]
+fn f131_first_start_seeds_claude_config_by_allowlist_and_only_once() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let project = TestProject::create(&client, "f131seed", VolumeSize::Small).await;
+        project::start(&client, &project.name).await.expect("start");
+
+        let (exit, json) =
+            project::exec_capture(&client, &project.name, &["cat", "/root/.claude.json"])
+                .await
+                .expect("read the seed");
+        assert_eq!(exit, 0, "the seed must exist after the first start");
+        let seed: serde_json::Value = serde_json::from_str(json.trim()).expect("the seed is JSON");
+        assert_eq!(seed["hasCompletedOnboarding"], true);
+        assert_eq!(
+            seed["projects"]["/workspace"]["hasTrustDialogAccepted"],
+            true
+        );
+        for forbidden in ["machineID", "userID", "cachedGrowthBookFeatures"] {
+            assert!(
+                seed.get(forbidden).is_none(),
+                "{forbidden} must not cross from the host"
+            );
+        }
+        // Identity crosses only if the host has it — and then it is the host's.
+        let host: Option<serde_json::Value> = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .and_then(|h| std::fs::read_to_string(h.join(".claude.json")).ok())
+            .and_then(|s| serde_json::from_str(&s).ok());
+        match host.as_ref().and_then(|h| h.get("oauthAccount")) {
+            Some(acct) => assert_eq!(
+                &seed["oauthAccount"], acct,
+                "identity must be the host's, verbatim"
+            ),
+            None => assert!(seed.get("oauthAccount").is_none()),
+        }
+
+        // Only once: mark the file, restart, the mark survives.
+        let (exit, _) = project::exec_capture(
+            &client,
+            &project.name,
+            &[
+                "/bin/sh",
+                "-c",
+                "printf '{\"nemrMarker\":1}' > /root/.claude.json",
+            ],
+        )
+        .await
+        .expect("mark");
+        assert_eq!(exit, 0);
+        let _ = project::stop(&client, &project.name).await;
+        project::start(&client, &project.name)
+            .await
+            .expect("second start");
+        let (_, again) =
+            project::exec_capture(&client, &project.name, &["cat", "/root/.claude.json"])
+                .await
+                .expect("read again");
+        assert!(
+            again.contains("nemrMarker"),
+            "a second start must not overwrite an existing config: {again}"
+        );
+        let _ = project::stop(&client, &project.name).await;
+    });
+}
+
 /// The first option (`ro`/`rw`) of the mount at `mount_point` in a task's
 /// mountinfo, read from the host through /proc — a read, never an exec.
 fn mount_option(pid: u32, mount_point: &str) -> Option<String> {

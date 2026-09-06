@@ -620,7 +620,14 @@ with CI coverage, and nothing in this line ever will have it.
 
 ### F-131 — First-run onboarding repeats in every fresh session: preferences live on the rootfs
 
-**Status:** Open · **raised, not built** · 2026-09-05
+**Status:** **Resolved — built as SPEC 1.106** (2026-09-06; approved as shape (a)
+on 2026-09-05, extended by the Product Owner to identity and onboarding after
+the fresh-session login prompt was described precisely). Measured before
+building: the two onboarding flags remove both the theme picker and the login
+prompt; a fresh `/workspace` trust entry removes the last dialog; identity is
+populated by Claude Code from the token and is copied from the host only
+because it is the same account. The `projects` map, `machineID`, `userID` and
+caches never cross. Was Open · raised, not built · 2026-09-05
 **Raised by:** Product Owner (WSL2 daily use) · **Relates to:** F-54, D-02, WP-C
 
 **What was observed.** Every fresh session opens Claude Code with the theme
@@ -1525,3 +1532,4 @@ is overstating what has been demonstrated.
 | 2026-09-05 | E-13 | **Mechanism resolved** — refresh-token rotation, observed; cross-machine revocation is the same mechanism; no longer a daily cost under D-02 (f) (Rain, on E6) |
 | 2026-09-06 | E-11 | **HTTP surface ruled** — commercial process, gRPC client of the daemon; daemon keeps its socket; no port unless the user starts the UI. `nemr-daemon-api` referred to as landed: not on origin, reference requested (Rain; recorded by Claude Code) |
 | 2026-09-06 | E-11 | **`nemr-daemon-api` built** — the daemon's proto, stubs, socket path and client as an open crate; engine re-exports; freshness gate and seam check extended to it (SPEC 1.105) (Claude Code) |
+| 2026-09-06 | F-131 | **Resolved** — the first `claude` in a session opens ready: seeded by allowlist at first start (onboarding flags, workspace trust, host identity when present); the login prompt was onboarding, not the token; `create` refuses a dead credential (SPEC 1.106) (Rain; built by Claude Code) |
