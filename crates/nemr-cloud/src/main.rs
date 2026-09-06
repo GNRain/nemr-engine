@@ -16,6 +16,8 @@ use clap::{Parser, Subcommand};
 
 mod api;
 mod commands;
+mod core;
+mod daemon;
 mod engine_cli;
 mod keys;
 mod serve;

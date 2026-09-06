@@ -29,8 +29,30 @@
 //! user, which can read the token file — the boundary the socket has today.
 //!
 //! The control that proves it: a request without the cookie is refused.
+//!
+//! On the handshake, the flow (ruled 2026-09-06: login, session list,
+//! pull-and-start, attach, stop-and-push). Steps 1 and 2 live here:
+//!
+//! - `POST /api/login` / `POST /api/logout` / `GET /api/whoami`, and
+//!   `POST /api/register` + `/api/register/confirm` (the recovery code shown
+//!   once and typed back through the envelope, exactly the CLI's step) — the
+//!   same `core` functions the CLI's `nemr login` and `nemr register` run, so
+//!   the browser's login IS the CLI's login: the KDF runs in this process, the password crosses only
+//!   the loopback under the cookie-and-header guard, and nothing but the
+//!   account (token, public KDF material, sealed envelope) is stored — the
+//!   E-16 line unchanged.
+//! - `GET /api/sessions` — the server's index merged with the daemon's
+//!   project list, asked over the daemon's socket through `nemr-daemon-api`
+//!   (the UI is the daemon's gRPC client; it does not link the engine). Each
+//!   row says local / remote / both, running or not, and **who holds the
+//!   lease right now** — the D-03 state a user must see before pulling.
+//!
+//! One page, no framework, no build step: the same HTML serves the login form
+//! and the list, and picks by asking `whoami`.
 
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -41,11 +63,22 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
+
+use crate::core;
+use crate::engine_cli::LocalProject;
 
 const COOKIE: &str = "nemr_session";
 const TOKEN_HEADER: &str = "x-nemr-token";
 const REQUEST_HEADER: &str = "x-nemr-request";
+
+/// Where the local project list comes from: the daemon, over its socket.
+/// A function so the router's tests can stand in a fixed list and prove the
+/// merge without a daemon — the sync server in those tests is real.
+pub type LocalSource =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Vec<LocalProject>>> + Send>> + Send + Sync>;
 
 /// Everything the surface knows. Held in memory for the life of the process;
 /// nothing here is written anywhere but the launch URL file.
@@ -54,15 +87,23 @@ pub struct UiState {
     token: [u8; 32],
     token_consumed: AtomicBool,
     sessions: Mutex<HashSet<String>>,
+    local: LocalSource,
+    /// A registration waiting for its recovery code to be typed back (E-16:
+    /// recovery is not deferrable). In memory only, for this process's life:
+    /// the same place the CLI keeps it between showing the code and reading
+    /// it back.
+    pending_registration: Mutex<Option<core::RegistrationPending>>,
 }
 
 impl UiState {
-    pub fn new(port: u16, token: [u8; 32]) -> Self {
+    pub fn new(port: u16, token: [u8; 32], local: LocalSource) -> Self {
         Self {
             port,
             token,
             token_consumed: AtomicBool::new(false),
             sessions: Mutex::new(HashSet::new()),
+            local,
+            pending_registration: Mutex::new(None),
         }
     }
 
@@ -112,6 +153,12 @@ fn unhex32(s: &str) -> Option<[u8; 32]> {
 pub fn router(state: Arc<UiState>) -> Router {
     let api = Router::new()
         .route("/ping", get(ping))
+        .route("/whoami", get(whoami))
+        .route("/login", post(login))
+        .route("/register", post(register_begin))
+        .route("/register/confirm", post(register_confirm))
+        .route("/logout", post(logout))
+        .route("/sessions", get(sessions))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_session,
@@ -217,24 +264,409 @@ async fn ping() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
-/// The page: exchange the fragment's token, scrub the fragment, prove the
-/// session with one guarded call. No framework, no build step.
+/// A failure the page can show: the message, nothing else. `anyhow`'s chain
+/// is the same text the CLI prints.
+fn failed(status: StatusCode, e: anyhow::Error) -> Response {
+    (status, Json(json!({ "error": format!("{e:#}") }))).into_response()
+}
+
+/// Who is logged in on this machine (the stored account), and the server the
+/// login form should offer.
+async fn whoami() -> Json<Value> {
+    Json(match core::whoami() {
+        Some(a) => json!({ "logged_in": true, "email": a.email, "server": a.server }),
+        None => json!({ "logged_in": false, "default_server": core::default_server() }),
+    })
+}
+
+#[derive(Deserialize)]
+struct LoginBody {
+    #[serde(default)]
+    server: String,
+    email: String,
+    password: String,
+}
+
+/// `nemr login`, from the page. The KDF and the exchange run on a blocking
+/// thread (they are the CLI's blocking code); the password lives in this
+/// request and nowhere after it.
+async fn login(Json(body): Json<LoginBody>) -> Response {
+    let server = if body.server.trim().is_empty() {
+        core::default_server()
+    } else {
+        body.server.trim().to_string()
+    };
+    let email = body.email.trim().to_string();
+    if email.is_empty() || body.password.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "email and password are required" })),
+        )
+            .into_response();
+    }
+    let done = tokio::task::spawn_blocking(move || core::login(&server, &email, &body.password))
+        .await
+        .map_err(|e| anyhow::anyhow!("the login task failed: {e}"));
+    match done {
+        Ok(Ok(account)) => Json(json!({
+            "logged_in": true, "email": account.email, "server": account.server
+        }))
+        .into_response(),
+        Ok(Err(e)) => failed(StatusCode::UNAUTHORIZED, e),
+        Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// `nemr register`, first half: create the account, hand the page the
+/// recovery code to show ONCE. The pending registration stays in this
+/// process until confirmed; a page reload loses it, and the response says
+/// what that means (the account exists and is not usable until confirmed).
+async fn register_begin(
+    State(state): State<Arc<UiState>>,
+    Json(body): Json<LoginBody>,
+) -> Response {
+    let server = if body.server.trim().is_empty() {
+        core::default_server()
+    } else {
+        body.server.trim().to_string()
+    };
+    let email = body.email.trim().to_string();
+    if email.is_empty() || body.password.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "email and password are required" })),
+        )
+            .into_response();
+    }
+    let begun =
+        tokio::task::spawn_blocking(move || core::register_begin(&server, &email, &body.password))
+            .await;
+    match begun {
+        Ok(Ok(pending)) => {
+            let reply = json!({
+                "email": pending.email,
+                "server": pending.server,
+                "recovery_code": pending.recovery_code.display(),
+                "if_abandoned": core::unconfirmed_message(),
+            });
+            if let Ok(mut slot) = state.pending_registration.lock() {
+                *slot = Some(pending);
+            }
+            Json(reply).into_response()
+        }
+        Ok(Err(e)) => failed(StatusCode::BAD_REQUEST, e),
+        Err(e) => failed(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("the register task failed: {e}"),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct ConfirmBody {
+    code: String,
+}
+
+/// `nemr register`, second half: the typed code must open the recovery
+/// envelope (a real recovery of the master key, not a string compare). A
+/// wrong code is refused and the registration stays pending, so the user
+/// can try again (F-92); the right one confirms and logs in.
+async fn register_confirm(
+    State(state): State<Arc<UiState>>,
+    Json(body): Json<ConfirmBody>,
+) -> Response {
+    let pending = match state.pending_registration.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => None,
+    };
+    let Some(pending) = pending else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "no registration is waiting for confirmation here" })),
+        )
+            .into_response();
+    };
+    let Some(recovered) = core::register_check_code(&pending, &body.code) else {
+        // Put it back: the code was wrong, the registration is intact.
+        if let Ok(mut slot) = state.pending_registration.lock() {
+            *slot = Some(pending);
+        }
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "that code does not open the recovery envelope — try again (hyphens and case do not matter)" })),
+        )
+            .into_response();
+    };
+    let done =
+        tokio::task::spawn_blocking(move || core::register_confirm(&pending, &recovered)).await;
+    match done {
+        Ok(Ok(account)) => Json(json!({
+            "logged_in": true, "email": account.email, "server": account.server
+        }))
+        .into_response(),
+        Ok(Err(e)) => failed(StatusCode::BAD_GATEWAY, e),
+        Err(e) => failed(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("the confirm task failed: {e}"),
+        ),
+    }
+}
+
+/// `nemr logout`, from the page: revoke server-side, clear the account.
+async fn logout() -> Response {
+    match tokio::task::spawn_blocking(core::logout).await {
+        Ok(Ok(report)) => Json(json!({
+            "was_logged_in": report.was_logged_in,
+            "revoke_failed": report.revoke_failed,
+        }))
+        .into_response(),
+        Ok(Err(e)) => failed(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => failed(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("the logout task failed: {e}"),
+        ),
+    }
+}
+
+/// `nemr sessions`, from the page: the server's index merged with the
+/// daemon's list. A daemon that cannot be reached is reported in the reply,
+/// not hidden — the list still renders from the server alone, and the page
+/// says which rows it could not check locally.
+async fn sessions(State(state): State<Arc<UiState>>) -> Response {
+    let (local, local_error) = match (state.local)().await {
+        Ok(list) => (Some(list), None),
+        Err(e) => (None, Some(format!("{e:#}"))),
+    };
+    let rows = tokio::task::spawn_blocking(move || core::sessions(local.as_deref())).await;
+    match rows {
+        Ok(Ok(rows)) => {
+            let rows: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "name": r.name,
+                        "agent": r.agent,
+                        "where": r.location.as_str(),
+                        "running": r.running,
+                        "size_bytes": r.size_bytes,
+                        "updated_at_unix": r.updated_at_unix,
+                        "last_machine": r.last_machine,
+                        "has_bundle": r.has_bundle,
+                        "held_by": r.held_by,
+                        "lease_expires_at_unix": r.lease_expires_at_unix,
+                    })
+                })
+                .collect();
+            Json(json!({
+                "rows": rows,
+                "local_available": local_error.is_none(),
+                "local_error": local_error,
+                "this_machine": crate::state::holder_identity(),
+            }))
+            .into_response()
+        }
+        // "not logged in" is the one the page acts on: it shows the form.
+        Ok(Err(e)) if core::whoami().is_none() => failed(StatusCode::UNAUTHORIZED, e),
+        Ok(Err(e)) => failed(StatusCode::BAD_GATEWAY, e),
+        Err(e) => failed(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("the sessions task failed: {e}"),
+        ),
+    }
+}
+
+/// The page: exchange the fragment's token, scrub the fragment, then show
+/// the login form or the session list by asking `whoami`. No framework, no
+/// build step, no external resource: everything the browser runs is in this
+/// binary.
 async fn index() -> Response {
-    const PAGE: &str = r#"<!doctype html><meta charset="utf-8"><title>nemr</title>
-<p id="s">connecting…</p>
+    const PAGE: &str = r##"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>nemr</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 0; background: #f6f7f8; color: #1a1a1a; }
+  header { display: flex; align-items: baseline; gap: 1rem; padding: .75rem 1.25rem; background: #fff; border-bottom: 1px solid #ddd; }
+  header h1 { font-size: 1.1rem; margin: 0; }
+  header .who { margin-left: auto; color: #555; }
+  main { max-width: 64rem; margin: 1.5rem auto; padding: 0 1.25rem; }
+  form.login { max-width: 22rem; display: grid; gap: .6rem; background: #fff; border: 1px solid #ddd; padding: 1.25rem; border-radius: 6px; }
+  label { display: grid; gap: .2rem; color: #444; }
+  input { font: inherit; padding: .4rem .5rem; border: 1px solid #bbb; border-radius: 4px; }
+  button { font: inherit; padding: .4rem .8rem; border: 1px solid #888; border-radius: 4px; background: #fff; cursor: pointer; }
+  button.primary { background: #1a1a1a; color: #fff; border-color: #1a1a1a; }
+  table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #ddd; }
+  th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid #eee; white-space: nowrap; }
+  th { font-weight: 600; color: #444; background: #fafafa; }
+  .muted { color: #777; }
+  .warn { color: #8a4b00; }
+  .bad { color: #a40000; }
+  .pill { display: inline-block; padding: 0 .45rem; border-radius: 999px; border: 1px solid #bbb; font-size: .85em; }
+  .pill.both { border-color: #2a7; color: #186; }
+  .pill.remote { border-color: #58c; color: #269; }
+  .pill.local { border-color: #999; color: #555; }
+  .toolbar { display: flex; gap: .6rem; align-items: center; margin: 0 0 .8rem; }
+  .toolbar .note { color: #777; margin-left: auto; }
+  #status { min-height: 1.4em; margin: .8rem 0; }
+</style>
+<header><h1>nemr</h1><span class="who" id="who"></span><button id="logout" hidden>log out</button></header>
+<main>
+  <div id="status">connecting…</div>
+  <form class="login" id="login" hidden>
+    <label>server <input name="server" autocomplete="url"></label>
+    <label>email <input name="email" type="email" autocomplete="username" required></label>
+    <label>password <input name="password" type="password" autocomplete="current-password" required></label>
+    <button class="primary" type="submit">log in</button>
+    <div class="muted">The password stays on this machine: the key is derived here, and only what the CLI's <code>nemr login</code> sends leaves it.</div>
+    <div class="muted">No account yet? <a href="#" id="to-register">register</a></div>
+  </form>
+  <form class="login" id="register" hidden>
+    <label>server <input name="server" autocomplete="url"></label>
+    <label>email <input name="email" type="email" autocomplete="username" required></label>
+    <label>password <input name="password" type="password" autocomplete="new-password" required></label>
+    <label>password, again <input name="again" type="password" autocomplete="new-password" required></label>
+    <button class="primary" type="submit">register</button>
+    <div class="muted">A recovery code is shown next — the only way back in if the password is forgotten. Have somewhere safe to put it. <a href="#" id="to-login">back to log in</a></div>
+  </form>
+  <section class="login" id="recovery" hidden>
+    <div><strong>Your recovery code</strong> — the ONLY way back in if you forget your password:</div>
+    <pre id="code" style="font-size:1.2em;user-select:all"></pre>
+    <div class="muted">Store it now (password manager, paper — not this machine). A forgotten password with no recovery code means your data is unrecoverable, permanently: the server cannot read it.</div>
+    <form id="confirm" style="display:grid;gap:.6rem">
+      <label>type the code back to confirm you stored it <input name="code" autocomplete="off" required></label>
+      <button class="primary" type="submit">confirm</button>
+    </form>
+    <div class="warn" id="abandon"></div>
+  </section>
+  <section id="list" hidden>
+    <div class="toolbar"><button id="refresh">refresh</button><span class="note" id="localnote"></span></div>
+    <table><thead><tr><th>session</th><th>agent</th><th>where</th><th>state</th><th>size</th><th>updated</th><th>last machine</th><th>open on</th></tr></thead><tbody id="rows"></tbody></table>
+  </section>
+</main>
 <script>
-(async () => {
-  const s = document.getElementById('s');
-  const m = location.hash.match(/token=([0-9a-f]{64})/);
-  if (m) {
-    const r = await fetch('/auth/session', { method: 'POST', headers: { 'X-Nemr-Token': m[1], 'X-Nemr-Request': '1' } });
-    history.replaceState(null, '', '/');
-    if (!r.ok) { s.textContent = 'handshake refused (' + r.status + '): start the UI again with nemr ui'; return; }
+(() => {
+  const $ = id => document.getElementById(id);
+  const H = { 'X-Nemr-Request': '1' };
+  const api = (path, opts = {}) => fetch('/api' + path, { ...opts, headers: { ...H, ...(opts.headers || {}) } });
+  const status = (text, cls) => { const s = $('status'); s.textContent = text; s.className = cls || ''; };
+  const esc = t => String(t ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const human = n => n == null ? '-' : n >= 2 ** 30 ? (n / 2 ** 30).toFixed(1) + ' GiB' : n >= 2 ** 20 ? (n / 2 ** 20).toFixed(1) + ' MiB' : n >= 1024 ? (n / 1024).toFixed(1) + ' KiB' : n + ' B';
+  const ago = u => { if (u == null) return '-'; const d = Math.max(0, Math.floor(Date.now() / 1000) - u); return d < 60 ? d + 's ago' : d < 3600 ? Math.floor(d / 60) + 'm ago' : d < 86400 ? Math.floor(d / 3600) + 'h ago' : Math.floor(d / 86400) + 'd ago'; };
+
+  async function handshake() {
+    const m = location.hash.match(/token=([0-9a-f]{64})/);
+    if (m) {
+      const r = await fetch('/auth/session', { method: 'POST', headers: { ...H, 'X-Nemr-Token': m[1] } });
+      history.replaceState(null, '', '/');
+      if (!r.ok) { status('handshake refused (' + r.status + '): start the UI again with nemr ui', 'bad'); return false; }
+    }
+    const p = await api('/ping');
+    if (!p.ok) { status('no session (' + p.status + '): start the UI again with nemr ui', 'bad'); return false; }
+    return true;
   }
-  const p = await fetch('/api/ping', { headers: { 'X-Nemr-Request': '1' } });
-  s.textContent = p.ok ? 'session established' : 'no session (' + p.status + '): start the UI again with nemr ui';
+
+  function showLogin(defaultServer) {
+    $('list').hidden = true; $('logout').hidden = true; $('register').hidden = true; $('recovery').hidden = true;
+    $('who').textContent = 'not logged in';
+    const f = $('login'); f.hidden = false;
+    if (!f.server.value) f.server.value = defaultServer || '';
+    status('');
+    f.email.focus();
+  }
+  function showRegister() {
+    const l = $('login'), f = $('register');
+    l.hidden = true; f.hidden = false; $('recovery').hidden = true;
+    if (!f.server.value) f.server.value = l.server.value;
+    status('');
+    f.email.focus();
+  }
+
+  async function showList(me) {
+    $('login').hidden = true; $('logout').hidden = false;
+    $('who').textContent = me.email + ' · ' + me.server;
+    $('list').hidden = false;
+    await refresh();
+  }
+
+  async function refresh() {
+    status('loading sessions…');
+    const r = await api('/sessions');
+    if (r.status === 401) { const w = await api('/whoami').then(x => x.json()); showLogin(w.default_server); return; }
+    if (!r.ok) { const e = await r.json().catch(() => ({})); status('could not list sessions: ' + (e.error || r.status), 'bad'); return; }
+    const d = await r.json();
+    const rows = $('rows'); rows.innerHTML = '';
+    if (!d.rows.length) rows.innerHTML = '<tr><td colspan="8" class="muted">no sessions anywhere. Create one with: nemr create &lt;name&gt; --size 2GB</td></tr>';
+    for (const s of d.rows) {
+      const state = s.where === 'remote' ? '<span class="muted">not here</span>' : s.running ? 'running' : 'stopped';
+      let open = '<span class="muted">-</span>';
+      if (s.held_by) open = s.held_by === d.this_machine ? 'this machine' : '<span class="warn">' + esc(s.held_by) + '</span>';
+      rows.insertAdjacentHTML('beforeend', '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.agent) + '</td><td><span class="pill ' + esc(s.where) + '">' + esc(s.where) + '</span></td><td>' + state + '</td><td>' + human(s.size_bytes) + '</td><td>' + ago(s.updated_at_unix) + '</td><td>' + esc(s.last_machine || '-') + '</td><td>' + open + '</td></tr>');
+    }
+    $('localnote').textContent = d.local_available ? '' : 'daemon unreachable: showing the server index only (' + d.local_error + ')';
+    $('localnote').className = 'note' + (d.local_available ? '' : ' warn');
+    status(d.rows.length + ' session' + (d.rows.length === 1 ? '' : 's'));
+  }
+
+  $('login').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const f = ev.target;
+    status('logging in… (deriving the key takes a moment)');
+    f.querySelector('button').disabled = true;
+    try {
+      const r = await api('/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ server: f.server.value, email: f.email.value, password: f.password.value }) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { status('login refused: ' + (d.error || r.status), 'bad'); return; }
+      f.password.value = '';
+      await showList(d);
+    } finally { f.querySelector('button').disabled = false; }
+  });
+  $('to-register').addEventListener('click', ev => { ev.preventDefault(); showRegister(); });
+  $('to-login').addEventListener('click', ev => { ev.preventDefault(); showLogin($('register').server.value); });
+  $('register').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const f = ev.target;
+    if (f.password.value !== f.again.value) { status('the two passwords differ', 'bad'); return; }
+    status('registering… (deriving the keys takes a moment)');
+    f.querySelector('button').disabled = true;
+    try {
+      const r = await api('/register', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ server: f.server.value, email: f.email.value, password: f.password.value }) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { status('registration refused: ' + (d.error || r.status), 'bad'); return; }
+      f.password.value = ''; f.again.value = '';
+      f.hidden = true; $('recovery').hidden = false;
+      $('code').textContent = d.recovery_code;
+      $('abandon').textContent = 'If you leave this page before confirming: ' + d.if_abandoned;
+      status('');
+      $('confirm').code.focus();
+    } finally { f.querySelector('button').disabled = false; }
+  });
+  $('confirm').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const f = ev.target;
+    const r = await api('/register/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: f.code.value }) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { status(d.error || ('confirmation failed (' + r.status + ')'), 'bad'); return; }
+    $('recovery').hidden = true; $('code').textContent = '';
+    status('recovery confirmed; the account is active');
+    await showList(d);
+  });
+  $('logout').addEventListener('click', async () => {
+    const r = await api('/logout', { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    const w = await api('/whoami').then(x => x.json());
+    showLogin(w.default_server);
+    if (d.revoke_failed) status('logged out here; the server could not be told (' + d.revoke_failed + ')', 'warn');
+    else status('logged out');
+  });
+  $('refresh').addEventListener('click', refresh);
+
+  (async () => {
+    if (!await handshake()) return;
+    const w = await api('/whoami').then(x => x.json());
+    if (w.logged_in) await showList(w); else showLogin(w.default_server);
+  })();
 })();
-</script>"#;
+</script>"##;
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], PAGE).into_response()
 }
 
@@ -263,7 +695,8 @@ pub fn run(port: Option<u16>, open: bool) -> Result<()> {
             .await
             .context("binding the UI's loopback port")?;
         let port = listener.local_addr()?.port();
-        let state = Arc::new(UiState::new(port, random_bytes()));
+        let local: LocalSource = Arc::new(|| Box::pin(crate::daemon::list_projects()));
+        let state = Arc::new(UiState::new(port, random_bytes(), local));
         let url = state.launch_url();
         crate::state::save_ui_url(&url)?;
         println!("nemr ui: {url}");
@@ -293,8 +726,17 @@ mod tests {
     fn token() -> [u8; 32] {
         [7u8; 32]
     }
+    fn fixed_local(list: Vec<LocalProject>) -> LocalSource {
+        Arc::new(move || {
+            let list = list.clone();
+            Box::pin(async move { Ok(list) })
+        })
+    }
     fn app() -> (Router, Arc<UiState>) {
-        let state = Arc::new(UiState::new(PORT, token()));
+        app_with(fixed_local(vec![]))
+    }
+    fn app_with(local: LocalSource) -> (Router, Arc<UiState>) {
+        let state = Arc::new(UiState::new(PORT, token(), local));
         (router(state.clone()), state)
     }
     fn host() -> String {
@@ -489,7 +931,7 @@ mod tests {
     /// The launch URL carries the token in the fragment and nowhere else.
     #[test]
     fn the_launch_url_puts_the_token_in_the_fragment() {
-        let state = UiState::new(PORT, token());
+        let state = UiState::new(PORT, token(), fixed_local(vec![]));
         let url = state.launch_url();
         assert!(
             url.starts_with(&format!("http://127.0.0.1:{PORT}/#token=")),
@@ -498,6 +940,323 @@ mod tests {
         assert!(
             !url.split('#').next().unwrap().contains("token"),
             "no token before the fragment: {url}"
+        );
+    }
+
+    fn api_req(
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        body: Option<Value>,
+    ) -> HttpRequest<Body> {
+        let mut b = HttpRequest::builder()
+            .method(method)
+            .uri(path)
+            .header("host", host())
+            .header(REQUEST_HEADER, "1");
+        if let Some(c) = cookie {
+            b = b.header("cookie", c);
+        }
+        match body {
+            Some(v) => b
+                .header("content-type", "application/json")
+                .body(Body::from(v.to_string()))
+                .unwrap(),
+            None => b.body(Body::empty()).unwrap(),
+        }
+    }
+    async fn json_of(r: Response) -> Value {
+        use http_body_util::BodyExt;
+        let bytes = r.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    }
+
+    /// The flow's routes sit behind the same guard as `/api/ping`: without
+    /// the cookie, every one of them is refused — and a login attempt without
+    /// a session never reaches the KDF or the server.
+    #[tokio::test]
+    async fn the_flows_routes_are_behind_the_cookie_guard() {
+        let (app, _) = app();
+        for (method, path, body) in [
+            ("GET", "/api/whoami", None),
+            (
+                "POST",
+                "/api/login",
+                Some(json!({"email": "a@b", "password": "x"})),
+            ),
+            ("POST", "/api/logout", None),
+            ("GET", "/api/sessions", None),
+        ] {
+            let r = send(&app, api_req(method, path, None, body)).await;
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+            // The GUARD's refusal, not the handler's own "not logged in" —
+            // the two share a status and only the body tells them apart.
+            use http_body_util::BodyExt;
+            let body = r.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                std::str::from_utf8(&body).unwrap(),
+                "no session",
+                "{method} {path} was refused by something other than the guard"
+            );
+        }
+    }
+
+    /// The real sync server, in-process (the same Postgres the nemr-sync suite
+    /// uses; `DATABASE_URL` required). The client's state lives in a private
+    /// directory for this test, and the KDF runs at test cost.
+    fn spawn_sync_server() -> (String, tempfile::TempDir) {
+        use nemr_sync::{connect_and_migrate, router, AppState, Config, DynStore, KdfCost};
+        let db = std::env::var("DATABASE_URL").expect(
+            "DATABASE_URL must be set (scripts/setup_sync_test_db.sh) for the UI surface test",
+        );
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_path = store_dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let pool = connect_and_migrate(&db).await.expect("connect + migrate");
+                let store: Arc<dyn DynStore> =
+                    Arc::new(nemr_storage::local::LocalStore::new(store_path));
+                let state = AppState {
+                    pool,
+                    store,
+                    config: Config {
+                        token_ttl: time::Duration::days(1),
+                        lease_ttl: time::Duration::seconds(60),
+                        server_kdf: KdfCost {
+                            m_cost: 8,
+                            t_cost: 1,
+                            p_cost: 1,
+                        },
+                        max_login_failures: 100,
+                        login_window: time::Duration::minutes(15),
+                        bundle_prefix: "ui-surface-test-bundles".into(),
+                        auth_pepper: [9u8; 32],
+                    },
+                };
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(listener.local_addr().unwrap()).unwrap();
+                axum::serve(listener, router(state)).await.unwrap();
+            });
+        });
+        let addr = rx.recv().expect("the sync server failed to start");
+        (format!("http://{addr}"), store_dir)
+    }
+
+    /// Run the CLI's blocking code off the test runtime (its HTTP client is
+    /// the blocking one, which refuses to run on an async thread).
+    fn blocking<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|s| s.spawn(f).join().unwrap())
+    }
+
+    /// Steps 1 and 2 of the flow, end to end against the real server:
+    /// registration with the recovery code typed back (wrong code refused,
+    /// registration kept; right code confirms and logs in); then a
+    /// wrong password is refused and leaves the machine logged out; the right
+    /// one logs in, and the stored account is what `nemr login` stores; the
+    /// list then merges the server's index with the local view — a local-only
+    /// running project, and a remote one that another machine holds right
+    /// now, named. Logout clears it and the list is refused again.
+    #[tokio::test]
+    async fn login_then_the_session_list_names_the_lease_holder() {
+        let (server, _store) = spawn_sync_server();
+        let state_home = tempfile::tempdir().unwrap();
+        // Process-wide, read by this test's own code paths only (the
+        // handshake tests never touch the state directory).
+        std::env::set_var("XDG_STATE_HOME", state_home.path());
+        std::env::set_var("NEMR_CLOUD_KDF_FAST", "1");
+        std::env::set_var("NEMR_CLOUD_HOLDER", "this-laptop");
+        let email = format!("ui-{}@example.com", &hex(&random_bytes())[..12]);
+        const PASSWORD: &str = "correct horse battery staple";
+
+        let local = fixed_local(vec![LocalProject {
+            name: "here-only".into(),
+            agent: "codex".into(),
+            running: true,
+            usage_known: true,
+            used_bytes: 700,
+        }]);
+        let (app, _) = app_with(local);
+        let cookie = establish(&app).await;
+        let c = Some(cookie.as_str());
+
+        let who = json_of(send(&app, api_req("GET", "/api/whoami", c, None)).await).await;
+        assert_eq!(who["logged_in"], false, "{who}");
+
+        // Register through the surface, the CLI's way: the code is shown
+        // once; a wrong code is refused and the registration stays pending;
+        // the right one opens the envelope, confirms, and logs in.
+        let nothing_pending = send(
+            &app,
+            api_req(
+                "POST",
+                "/api/register/confirm",
+                c,
+                Some(json!({"code": "AAAAA"})),
+            ),
+        )
+        .await;
+        assert_eq!(nothing_pending.status(), StatusCode::CONFLICT);
+        let begun = send(
+            &app,
+            api_req(
+                "POST",
+                "/api/register",
+                c,
+                Some(json!({"server": server, "email": email, "password": PASSWORD})),
+            ),
+        )
+        .await;
+        assert_eq!(begun.status(), StatusCode::OK);
+        let begun = json_of(begun).await;
+        let code = begun["recovery_code"].as_str().unwrap().to_string();
+        assert!(code.contains('-'), "the transcribable form: {code}");
+        assert!(begun["if_abandoned"]
+            .as_str()
+            .unwrap()
+            .contains("NOT usable"));
+        let wrong_code = send(
+            &app,
+            api_req(
+                "POST",
+                "/api/register/confirm",
+                c,
+                Some(json!({"code": "AAAAA-BBBBB"})),
+            ),
+        )
+        .await;
+        assert_eq!(
+            wrong_code.status(),
+            StatusCode::BAD_REQUEST,
+            "a wrong code is refused"
+        );
+        let who = json_of(send(&app, api_req("GET", "/api/whoami", c, None)).await).await;
+        assert_eq!(who["logged_in"], false, "a wrong code logs nobody in");
+        // Typed back with the transcription slips the CLI forgives.
+        let typed = code.to_lowercase().replace('-', " ");
+        let confirmed = send(
+            &app,
+            api_req(
+                "POST",
+                "/api/register/confirm",
+                c,
+                Some(json!({"code": typed})),
+            ),
+        )
+        .await;
+        assert_eq!(
+            confirmed.status(),
+            StatusCode::OK,
+            "the shown code confirms"
+        );
+        let who = json_of(send(&app, api_req("GET", "/api/whoami", c, None)).await).await;
+        assert_eq!(who["logged_in"], true, "register ends logged in: {who}");
+
+        // Seed the server with a session another machine holds, then log
+        // out so login is exercised from a clean machine.
+        let token = blocking(|| {
+            let account = crate::state::load_account().unwrap();
+            let api = crate::api::Api::new(&server, Some(account.token.clone()));
+            api.upsert_session(&json!({
+                "name": "shared", "agent": "claude-code", "size_bytes": 4096, "last_machine": "desktop",
+            }))
+            .unwrap();
+            let lease = api.acquire_lease("shared", "desktop").unwrap();
+            assert!(lease.granted);
+            core::logout().unwrap();
+            account.token
+        });
+        assert!(!token.is_empty());
+        let who = json_of(send(&app, api_req("GET", "/api/whoami", c, None)).await).await;
+        assert_eq!(who["logged_in"], false, "{who}");
+        let r = send(&app, api_req("GET", "/api/sessions", c, None)).await;
+        assert_eq!(
+            r.status(),
+            StatusCode::UNAUTHORIZED,
+            "the list needs a login"
+        );
+
+        let wrong = send(
+            &app,
+            api_req(
+                "POST",
+                "/api/login",
+                c,
+                Some(json!({"server": server, "email": email, "password": "not it"})),
+            ),
+        )
+        .await;
+        assert_eq!(
+            wrong.status(),
+            StatusCode::UNAUTHORIZED,
+            "a wrong password is refused"
+        );
+        let who = json_of(send(&app, api_req("GET", "/api/whoami", c, None)).await).await;
+        assert_eq!(who["logged_in"], false, "still logged out after a refusal");
+
+        let right = send(
+            &app,
+            api_req(
+                "POST",
+                "/api/login",
+                c,
+                Some(json!({"server": server, "email": email, "password": PASSWORD})),
+            ),
+        )
+        .await;
+        assert_eq!(right.status(), StatusCode::OK);
+        let who = json_of(send(&app, api_req("GET", "/api/whoami", c, None)).await).await;
+        assert_eq!(who["logged_in"], true, "{who}");
+        assert_eq!(who["email"], email.as_str());
+        let stored = crate::state::load_account().expect("the login stored the account");
+        assert_eq!(stored.server, server);
+        assert!(
+            !stored.password_envelope.is_empty(),
+            "the sealed envelope is stored; the key is not"
+        );
+
+        let list = send(&app, api_req("GET", "/api/sessions", c, None)).await;
+        assert_eq!(list.status(), StatusCode::OK);
+        let list = json_of(list).await;
+        assert_eq!(list["local_available"], true, "{list}");
+        assert_eq!(list["this_machine"], "this-laptop");
+        let rows = list["rows"].as_array().unwrap();
+        let row = |name: &str| {
+            rows.iter()
+                .find(|r| r["name"] == name)
+                .unwrap_or_else(|| panic!("no row {name} in {list}"))
+                .clone()
+        };
+        let here = row("here-only");
+        assert_eq!(here["where"], "local");
+        assert_eq!(here["running"], true);
+        assert_eq!(here["held_by"], Value::Null);
+        let shared = row("shared");
+        assert_eq!(shared["where"], "remote");
+        assert_eq!(shared["running"], false);
+        assert_eq!(
+            shared["held_by"], "desktop",
+            "open on another machine must be named: {shared}"
+        );
+        assert!(shared["lease_expires_at_unix"].as_i64().unwrap() > 0);
+
+        let out = json_of(send(&app, api_req("POST", "/api/logout", c, None)).await).await;
+        assert_eq!(out["was_logged_in"], true);
+        assert_eq!(
+            out["revoke_failed"],
+            Value::Null,
+            "the server was told: {out}"
+        );
+        let r = send(&app, api_req("GET", "/api/sessions", c, None)).await;
+        assert_eq!(
+            r.status(),
+            StatusCode::UNAUTHORIZED,
+            "logged out: the list is refused again"
+        );
+        assert!(
+            crate::state::load_account().is_err(),
+            "the account is cleared"
         );
     }
 }
