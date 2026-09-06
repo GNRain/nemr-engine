@@ -246,6 +246,19 @@ pub fn run(port: Option<u16>, open: bool) -> Result<()> {
         .build()
         .context("building the UI runtime")?;
     rt.block_on(async {
+        // The UI is a client of the daemon (E-11 ruling): reach it first, through
+        // the API crate — autostart, version handshake — and refuse to open a
+        // port for a UI that could not talk to the engine. The daemon's build
+        // is printed so the pairing is visible.
+        let daemon = nemr_daemon_api::client::connect()
+            .await
+            .context("the UI needs the daemon; it could not be reached")?;
+        drop(daemon);
+        println!(
+            "nemr ui: daemon reachable at {} (protocol v{})",
+            nemr_daemon_api::socket::socket_path()?.display(),
+            nemr_daemon_api::proto::PROTOCOL_VERSION
+        );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port.unwrap_or(0)))
             .await
             .context("binding the UI's loopback port")?;

@@ -1512,6 +1512,7 @@ dependencies = [
  "http-body-util",
  "libc",
  "nemr-crypto",
+ "nemr-daemon-api",
  "nemr-storage",
  "nemr-sync",
  "rand 0.8.8",
