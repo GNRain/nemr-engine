@@ -462,3 +462,125 @@ fn the_plaintext_bundle_is_never_readable_by_other_users() {
         kill_and_wait(pid as u32);
     }
 }
+
+/// E-19: the server of the last successful login is remembered across
+/// logout in a 0600 file, so the address is typed once — and the control
+/// proves the file is what carried it: a machine with no file and no
+/// `NEMR_SERVER_URL` cannot log in at all.
+#[test]
+fn the_server_is_remembered_across_logout_and_a_bare_machine_is_not() {
+    use std::os::unix::fs::PermissionsExt;
+    let (server, _store) = spawn_server(60);
+    let m = Machine::new("machine-A", &server, &unique_email("remember"), PASSWORD);
+    m.stub_no_local_projects();
+    m.register();
+
+    let remembered = m.state_dir().join("nemr/cloud/server-url");
+    assert_eq!(
+        std::fs::read_to_string(&remembered).unwrap().trim(),
+        server,
+        "the login's server is remembered"
+    );
+    assert_eq!(
+        std::fs::metadata(&remembered).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let (code, _, _) = m.run(&["logout"]);
+    assert_eq!(code, 0);
+    assert!(remembered.exists(), "logout must not forget the server");
+    assert!(
+        !m.state_dir().join("nemr/cloud/account.json").exists(),
+        "but the account is gone"
+    );
+
+    // Log in again with NEMR_SERVER_URL removed: only the remembered file
+    // can name the server.
+    let out = m
+        .client_cmd(&["login"])
+        .env_remove("NEMR_SERVER_URL")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "login from the remembered server: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The control: a second machine with no file and no environment has
+    // only the built-in default, which nothing serves here.
+    let bare = Machine::new("machine-B", &server, &m.email, PASSWORD);
+    let out = bare
+        .client_cmd(&["login"])
+        .env_remove("NEMR_SERVER_URL")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a bare machine must not find the server without the file"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("127.0.0.1:8080") || err.contains("reaching the server"),
+        "the refusal names the default it tried: {err}"
+    );
+}
+
+/// E-19: the install script's name list is the binary's subcommand list,
+/// so `nemr <cmd>` reaches every command the binary has — `ui` included —
+/// through the open CLI's extension form. Red today for `ui`.
+#[test]
+fn the_install_list_names_every_subcommand() {
+    let script = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/install_sync_client.sh"
+    ))
+    .unwrap();
+    let names_line = script
+        .lines()
+        .find(|l| l.starts_with("NAMES=("))
+        .expect("NAMES=(...) in the install script");
+    let mut installed: Vec<&str> = names_line
+        .trim_start_matches("NAMES=(")
+        .trim_end_matches(')')
+        .split_whitespace()
+        .collect();
+    installed.sort();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nemr-cloud"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&out.stdout);
+    let commands = help
+        .split("Commands:")
+        .nth(1)
+        .expect("a Commands section")
+        .split("Options:")
+        .next()
+        .unwrap();
+    let mut visible: Vec<&str> = commands
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|w| !w.is_empty() && *w != "help")
+        .collect();
+    visible.sort();
+    assert_eq!(
+        installed, visible,
+        "the install script lays names for every subcommand the binary shows"
+    );
+
+    // And the extension form works for `ui`: argv[0] `nemr-ui` is the `ui`
+    // subcommand.
+    let dir = tempfile::tempdir().unwrap();
+    let link = dir.path().join("nemr-ui");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_nemr-cloud"), &link).unwrap();
+    let out = std::process::Command::new(&link)
+        .arg("--help")
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("Port to bind") || help.to_lowercase().contains("port"),
+        "nemr-ui --help is the ui subcommand's help: {help}"
+    );
+}

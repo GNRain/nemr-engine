@@ -56,6 +56,9 @@ pub async fn upload(
         .put(&key, &body)
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("store put: {e}")))?;
+    // The operator's read-control for E-20: which key, how many bytes, in
+    // which store — never the bytes, never a credential.
+    tracing::info!(key = %key.as_str(), bytes = body.len(), store = %state.store.describe(), "stored bundle");
 
     // F-92: re-check the fence **inside the metadata write itself**. The check
     // above is a separate read, so a takeover landing between it and here would

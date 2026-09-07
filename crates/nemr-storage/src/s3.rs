@@ -99,7 +99,7 @@ impl S3Config {
     ///
     /// | Variable | Meaning |
     /// |---|---|
-    /// | `NEMR_S3_PROVIDER` | `r2`, `b2`, or anything else for a generic endpoint |
+    /// | `NEMR_S3_PROVIDER` | exactly `r2`, `b2` or `s3` (a generic endpoint); anything else is refused |
     /// | `NEMR_S3_BUCKET` | bucket name |
     /// | `NEMR_S3_ENDPOINT` | e.g. `https://<account>.r2.cloudflarestorage.com` |
     /// | `NEMR_S3_REGION` | optional; defaults per provider |
@@ -109,22 +109,35 @@ impl S3Config {
     /// "no backend set up" from "backend set up wrongly" — the first is the
     /// normal state for the open engine and must not look like an error.
     pub fn from_env() -> Result<Option<Self>> {
-        let Ok(bucket) = std::env::var("NEMR_S3_BUCKET") else {
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    /// The same, from any lookup — the sync server's settings merge a file
+    /// under the environment (E-19) and hand the result here. The provider
+    /// is validated as exactly `r2`, `b2` or `s3` (E-20): an unset or
+    /// misspelt provider used to become the generic endpoint silently, and a
+    /// server must not quietly talk to the wrong kind of store.
+    pub fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> Result<Option<Self>> {
+        let set = |k: &str| get(k).filter(|v| !v.is_empty());
+        let Some(bucket) = set("NEMR_S3_BUCKET") else {
             return Ok(None);
         };
 
-        let provider = match std::env::var("NEMR_S3_PROVIDER")
-            .unwrap_or_default()
-            .as_str()
-        {
-            "r2" => Provider::R2,
-            "b2" => Provider::B2,
-            _ => Provider::Other,
+        let provider = match set("NEMR_S3_PROVIDER").as_deref() {
+            Some("r2") => Provider::R2,
+            Some("b2") => Provider::B2,
+            Some("s3") => Provider::Other,
+            other => {
+                return Err(StorageError::Other(anyhow::anyhow!(
+                    "NEMR_S3_PROVIDER={:?} is not one of r2, b2, s3",
+                    other.unwrap_or("")
+                )))
+            }
         };
 
         let missing = |name: &str| {
             StorageError::Other(anyhow::anyhow!(
-                "{name} is not set. An S3 backend needs NEMR_S3_BUCKET, NEMR_S3_ENDPOINT, \
+                "{name} is not set. An S3 backend needs NEMR_S3_PROVIDER, NEMR_S3_BUCKET, NEMR_S3_ENDPOINT, \
              NEMR_S3_ACCESS_KEY_ID and NEMR_S3_SECRET_ACCESS_KEY."
             ))
         };
@@ -132,13 +145,12 @@ impl S3Config {
         Ok(Some(Self {
             provider,
             bucket,
-            endpoint: std::env::var("NEMR_S3_ENDPOINT").map_err(|_| missing("NEMR_S3_ENDPOINT"))?,
-            region: std::env::var("NEMR_S3_REGION")
-                .unwrap_or_else(|_| provider.default_region().to_string()),
-            access_key_id: std::env::var("NEMR_S3_ACCESS_KEY_ID")
-                .map_err(|_| missing("NEMR_S3_ACCESS_KEY_ID"))?,
-            secret_access_key: std::env::var("NEMR_S3_SECRET_ACCESS_KEY")
-                .map_err(|_| missing("NEMR_S3_SECRET_ACCESS_KEY"))?,
+            endpoint: set("NEMR_S3_ENDPOINT").ok_or_else(|| missing("NEMR_S3_ENDPOINT"))?,
+            region: set("NEMR_S3_REGION").unwrap_or_else(|| provider.default_region().to_string()),
+            access_key_id: set("NEMR_S3_ACCESS_KEY_ID")
+                .ok_or_else(|| missing("NEMR_S3_ACCESS_KEY_ID"))?,
+            secret_access_key: set("NEMR_S3_SECRET_ACCESS_KEY")
+                .ok_or_else(|| missing("NEMR_S3_SECRET_ACCESS_KEY"))?,
         }))
     }
 }

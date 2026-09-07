@@ -41,7 +41,16 @@ PASS=0; FAIL=0
 # otherwise say PASS with fewer assertions, the green-over-nothing shape
 # verify_wp_a.sh guards against for the regression suite. Raise this number
 # when a step is added; a run that counts anything else fails.
-EXPECTED_ASSERTIONS=44
+#
+# The storage backend (E-20) picks the mode: with NEMR_S3_BUCKET in the
+# caller's environment the sync server stores in that bucket and the run
+# reads the bucket back independently (six more assertions); otherwise a
+# directory under the work dir.
+if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=52
+else
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=49
+fi
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS+1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
 fail() { FAIL=$((FAIL+1)); printf '   %sFAIL%s %s\n' "$RED" "$RESET" "$1"; }
@@ -83,7 +92,9 @@ trap finish EXIT
 # Everything the surface writes for this run lives here, not in the user's
 # real state directory: the acceptance must not log the user out.
 export XDG_STATE_HOME="$WORK/state"
-export NEMR_SERVER_URL="$SERVER_URL"
+# NEMR_SERVER_URL is deliberately NOT exported (E-19): the server is named
+# once, at registration, and the client remembers it across logout. A step
+# that reaches the server with no address of its own is proving that.
 export NEMR_CLOUD_KDF_FAST=1   # test cost; the binary says so on stderr
 # Every browser action goes through the page-as-a-script, carrying the one
 # session cookie the handshake produced.
@@ -101,25 +112,68 @@ pass "Postgres is reachable"
 cargo build --release -p nemr-sync -p nemr-cloud --quiet || die "the release build failed"
 pass "nemr-sync and nemr-cloud built"
 
-step "Start the sync server"
-mkdir -p "$WORK/bundles"
-NEMR_BUNDLE_DIR="$WORK/bundles" NEMR_SERVER_ADDR="$SERVER_ADDR" \
-    NEMR_AUTH_PEPPER="$(head -c 32 /dev/urandom | base64 -w0)" \
-    "$REPO/target/release/nemr-sync" >"$WORK/server.log" 2>&1 &
+step "Start the sync server (storage: $STORAGE_MODE)"
+# NEMR_AUTH_PEPPER=ephemeral is E-19's one escape hatch: a throwaway server
+# with a random pepper and a loud warning. A server with no pepper refuses
+# to bind, which is what a real deployment gets. NEMR_SYNC_ENV_FILE is
+# emptied so the developer's own ~/.config/nemr/sync.env is never read here.
+BUNDLE_PREFIX="ui-acceptance-$$"
+if [[ "$STORAGE_MODE" == s3 ]]; then
+    # The bucket's own variables select it (E-20): NEMR_S3_* are inherited
+    # from the caller's environment — never echoed, never written — and
+    # NEMR_BUNDLE_DIR is unset, since exactly one backend is allowed. A
+    # per-run prefix keeps this run's objects apart and lets cleanup find
+    # exactly them.
+    env -u NEMR_BUNDLE_DIR NEMR_SYNC_ENV_FILE= NEMR_SERVER_ADDR="$SERVER_ADDR" \
+        NEMR_AUTH_PEPPER=ephemeral NEMR_BUNDLE_PREFIX="$BUNDLE_PREFIX" \
+        "$REPO/target/release/nemr-sync" >"$WORK/server.log" 2>&1 &
+else
+    mkdir -p "$WORK/bundles"
+    env -u NEMR_S3_BUCKET -u NEMR_S3_PROVIDER -u NEMR_S3_ENDPOINT -u NEMR_S3_ACCESS_KEY_ID -u NEMR_S3_SECRET_ACCESS_KEY \
+        NEMR_SYNC_ENV_FILE= NEMR_BUNDLE_DIR="$WORK/bundles" NEMR_SERVER_ADDR="$SERVER_ADDR" \
+        NEMR_AUTH_PEPPER=ephemeral NEMR_BUNDLE_PREFIX="$BUNDLE_PREFIX" \
+        "$REPO/target/release/nemr-sync" >"$WORK/server.log" 2>&1 &
+fi
 SYNC_PID=$!
 wait_for_service "the sync server" "$SYNC_PID" "$WORK/server.log" 15 \
     curl -fsS "$SERVER_URL/health" || exit 1
 pass "the sync server is up on $SERVER_ADDR"
+# The server's log, plain: no colour codes even if a subscriber emits them.
+server_log() { sed 's/\x1b\[[0-9;]*m//g' "$WORK/server.log"; }
+server_log | grep -q 'THROWAWAY SERVER' || die "the ephemeral pepper did not announce itself loudly"
+pass "the server says loudly that its pepper is ephemeral (E-19's escape hatch)"
+if [[ "$STORAGE_MODE" == s3 ]]; then
+    server_log | grep -q "storage backend store=r2:" \
+        || { server_log | grep 'storage backend' | sed 's/^/   | /'; die "the server did not choose the object store from NEMR_S3_*"; }
+    pass "the server chose the object store from its own variables (E-20)"
+    server_log | grep -q 'storage backend reachable' || die "the pre-bind probe did not pass"
+    pass "the egress-free probe passed before the port bound"
+else
+    server_log | grep -q "storage backend store=local:" || die "the server did not choose the directory backend"
+    pass "the server chose the directory backend from NEMR_BUNDLE_DIR (E-20)"
+    server_log | grep -q 'storage backend reachable' || die "the pre-bind probe did not pass"
+    pass "the egress-free probe passed before the port bound"
+fi
 
-step "Start the UI (this is the only port that opens, and only because we asked)"
-"$REPO/target/release/nemr-cloud" ui --no-open >"$WORK/ui.log" 2>&1 &
+step "Start the UI through the open CLI (nemr ui → nemr-ui on PATH; the only port that opens, and only because we asked)"
+# E-19: the launcher is the extension form. The build tree's binary is laid
+# on PATH under the same names the install script lays, and the open `nemr`
+# execs it — so the launcher this run proves is the one a user has.
+mkdir -p "$WORK/bin"
+for name in $(sed -n 's/^NAMES=(\(.*\))$/\1/p' "$REPO/scripts/install_sync_client.sh"); do
+    ln -sf "$REPO/target/release/nemr-cloud" "$WORK/bin/nemr-$name"
+done
+export PATH="$WORK/bin:$PATH"
+[[ -x "$WORK/bin/nemr-ui" ]] || die "the install script's name list does not include ui"
+command -v nemr >/dev/null || die "the open CLI (nemr) is not on PATH"
+nemr ui --no-open >"$WORK/ui.log" 2>&1 &
 UI_PID=$!
 for _ in $(seq 1 60); do grep -q 'nemr ui: http' "$WORK/ui.log" && break; sleep 0.25; done
 LAUNCH_URL=$(grep -o 'http://127.0.0.1:[0-9]*/#token=[0-9a-f]*' "$WORK/ui.log" | head -1)
 [[ -n "$LAUNCH_URL" ]] || { cat "$WORK/ui.log"; die "the UI did not print a launch URL"; }
 UI_PORT=${LAUNCH_URL#http://127.0.0.1:}; UI_PORT=${UI_PORT%%/*}
 grep -q 'daemon reachable' "$WORK/ui.log" && pass "the UI reached the daemon before opening its port"
-pass "the UI is serving on 127.0.0.1:$UI_PORT (token in the fragment, single-use)"
+pass "the UI is serving on 127.0.0.1:$UI_PORT, launched as nemr ui through the open CLI (token in the fragment, single-use)"
 
 # The page itself, and the terminal it draws with — served from the binary,
 # so the acceptance also proves the page needs nothing from the network.
@@ -221,12 +275,33 @@ python3 -c 'import json,sys; d=json.loads(sys.argv[1]); [print("   |",l["text"])
     || die "stop-and-push failed: $(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["error"])' "$out")"
 pass "the browser stopped the running session and pushed it"
 
-STORED=$(find "$WORK/bundles" -type f | head -1)
-[[ -n "$STORED" ]] || die "the server holds no bundle after the push"
+# What the server stored, read back from where it stored it. In s3 mode
+# the object is fetched from the bucket by the acceptance's own signer —
+# not by the server — at the key the server logged, and its size must be
+# the size the server logged.
+stored_key=$(server_log | sed -n 's/.*stored bundle key=\([^ ]*\) bytes=\([0-9]*\).*/\1/p' | tail -1)
+stored_bytes=$(server_log | sed -n 's/.*stored bundle key=\([^ ]*\) bytes=\([0-9]*\).*/\2/p' | tail -1)
+[[ -n "$stored_key" ]] || die "the server logged no stored bundle"
+if [[ "$STORAGE_MODE" == s3 ]]; then
+    [[ "$stored_key" == "$BUNDLE_PREFIX/"* ]] || die "the stored key is outside this run's prefix: $stored_key"
+    STORED="$WORK/from-bucket.bin"
+    got=$(python3 "$REPO/docs/ui-acceptance.py" s3-get "$LAUNCH_URL" "$stored_key" "$STORED") \
+        || die "the object the server logged is not in the bucket at $stored_key"
+    [[ "$got" == "$stored_bytes" ]] || die "the bucket holds $got bytes at that key; the server logged $stored_bytes"
+    pass "the bucket holds the object at the key the server logged, $got bytes, read back by the acceptance's own signer (E-20)"
+else
+    STORED=$(find "$WORK/bundles" -type f | head -1)
+    [[ -n "$STORED" ]] || die "the server holds no bundle after the push"
+fi
 if [[ "$SKIP_API" == "1" ]] && grep -q "MARKER-$$-TRANSCRIPT" "$STORED"; then
     die "the stored object contains plaintext — E-16 violated"
 fi
-pass "the server holds ciphertext ($(stat -c%s "$STORED") bytes); the marker is not in it"
+# A plaintext bundle is a tar of the session; ciphertext carries none of its
+# member names. The transcript directory's name is the one every session has.
+if grep -aq 'projects/-workspace' "$STORED"; then
+    die "the stored object carries a plaintext member name — the server saw plaintext"
+fi
+pass "the server holds ciphertext ($(stat -c%s "$STORED") bytes); no plaintext member name is in it"
 
 step "Delete the project entirely, so the pull has to be real"
 refuse_protected "$PROJECT" || die "refusing to delete a protected name"
@@ -325,7 +400,11 @@ else
 fi
 
 step "Stop and push again, and see it pushed"
-before=$(stat -c%Y "$STORED")
+if [[ "$STORAGE_MODE" == s3 ]]; then
+    before=$(sha256sum "$STORED" | cut -d' ' -f1)
+else
+    before=$(stat -c%Y "$STORED")
+fi
 sleep 1
 out=$(UI push "$PROJECT" "$PASSWORD" release) || die "the second push call failed: $out"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); [print("   |",l["text"]) for l in d["lines"]]; sys.exit(0 if d["ok"] else 1)' "$out" \
@@ -342,9 +421,30 @@ assert row["has_bundle"], f"the bundle is there: {row}"
 assert row["held_by"] is None, f"released, so another machine can take it: {row}"
 print(f"   row: {name} running={row['running']} bundle={row['has_bundle']} held_by={row['held_by']} updated={row['updated_at_unix']}")
 PY
-after=$(stat -c%Y "$(find "$WORK/bundles" -type f | head -1)")
-[[ "$after" -gt "$before" ]] || die "the stored bundle was not rewritten by the second push"
-pass "the list shows it stopped, pushed and released; the stored bundle was rewritten"
+if [[ "$STORAGE_MODE" == s3 ]]; then
+    key2=$(server_log | sed -n 's/.*stored bundle key=\([^ ]*\) bytes=.*/\1/p' | tail -1)
+    [[ "$key2" == "$stored_key" ]] || die "the second push went to a different key ($key2)"
+    python3 "$REPO/docs/ui-acceptance.py" s3-get "$LAUNCH_URL" "$stored_key" "$WORK/from-bucket-2.bin" >/dev/null \
+        || die "the rewritten object is not in the bucket"
+    after=$(sha256sum "$WORK/from-bucket-2.bin" | cut -d' ' -f1)
+    [[ "$after" != "$before" ]] || die "the object in the bucket was not rewritten by the second push"
+    pass "the list shows it stopped, pushed and released; the object in the bucket was rewritten (a different ciphertext at the same key)"
+else
+    after=$(stat -c%Y "$(find "$WORK/bundles" -type f | head -1)")
+    [[ "$after" -gt "$before" ]] || die "the stored bundle was not rewritten by the second push"
+    pass "the list shows it stopped, pushed and released; the stored bundle was rewritten"
+fi
+if [[ "$STORAGE_MODE" == s3 ]]; then
+    # The pull that came back byte-identical above came from the bucket:
+    # nothing else held the bundle once the local project was deleted.
+    pass "the pull on the deleted project came back byte-identical from the bucket (E-20's proof; D-05)"
+    # Leave the bucket as it was found: exactly this run's objects removed.
+    removed=$(python3 "$REPO/docs/ui-acceptance.py" s3-delete-prefix "$LAUNCH_URL" "$BUNDLE_PREFIX/") \
+        || die "could not remove this run's objects from the bucket"
+    left=$(python3 "$REPO/docs/ui-acceptance.py" s3-list "$LAUNCH_URL" "$BUNDLE_PREFIX/" | grep -c . || true)
+    [[ "$removed" -ge 1 && "$left" -eq 0 ]] || die "cleanup: removed $removed, $left left under $BUNDLE_PREFIX/"
+    pass "the bucket is left as it was found: $removed object(s) under this run's prefix removed, none left"
+fi
 
 printf '\n'
 if [[ $FAIL -eq 0 && $PASS -ne $EXPECTED_ASSERTIONS ]]; then

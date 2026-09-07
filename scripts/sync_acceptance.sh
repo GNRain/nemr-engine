@@ -73,7 +73,7 @@ pass "server and client built"
 # The client under its many names, resolved via the open CLI's external
 # subcommands — the acceptance runs `nemr login`, not `nemr-cloud login`.
 BIN="$WORK/bin"; mkdir -p "$BIN"
-for name in login logout register sessions push pull release; do
+for name in login logout register sessions push pull release ui; do
     ln -sf "$REPO/target/release/nemr-cloud" "$BIN/nemr-$name"
 done
 export PATH="$BIN:$PATH"

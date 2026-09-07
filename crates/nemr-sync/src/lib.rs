@@ -22,7 +22,8 @@ mod error;
 mod identity;
 mod index;
 mod lease;
-mod store;
+pub mod settings;
+pub mod store;
 
 pub use db::connect_and_migrate;
 pub use store::DynStore;
