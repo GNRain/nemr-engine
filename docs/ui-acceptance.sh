@@ -43,27 +43,30 @@ die()  { fail "$1"; finish; exit 1; }
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/nemr-ui-acceptance.XXXXXX")
 PROJECT="uiacc-$$"
+LOCAL2="uiacc-$$-local"   # a second, local-only session for the page block (a push button beside a pull button)
 SERVER_ADDR=127.0.0.1:18090
 SERVER_URL="http://$SERVER_ADDR"
 EMAIL="ui-acceptance-$$@example.com"
 PASSWORD="ui acceptance horse battery staple $$"
 SKIP_API="${NEMR_SKIP_API:-0}"
-SYNC_PID=""; UI_PID=""
+SYNC_PID=""; UI_PID=""; UI2_PID=""
 
 finish() {
     printf '\n%s== Cleanup%s\n' "$BOLD" "$RESET"
     # Verify before destroying, and never touch a protected subject.
-    if refuse_protected "$PROJECT" 2>/dev/null; then
-        if output_has "^$PROJECT " -- nemr list; then
-            nemr stop "$PROJECT" >/dev/null 2>&1
-            nemr delete "$PROJECT" --yes >/dev/null 2>&1 && echo "   removed $PROJECT"
+    for p in "$PROJECT" "$LOCAL2"; do
+        if refuse_protected "$p" 2>/dev/null; then
+            if output_has "^$p " -- nemr list; then
+                nemr stop "$p" >/dev/null 2>&1
+                nemr delete "$p" --yes >/dev/null 2>&1 && echo "   removed $p"
+            else
+                echo "   no local $p to remove"
+            fi
         else
-            echo "   no local $PROJECT to remove"
+            echo "   REFUSED to touch $p: it is a protected subject"
         fi
-    else
-        echo "   REFUSED to touch $PROJECT: it is a protected subject"
-    fi
-    for pid in "$UI_PID" "$SYNC_PID"; do
+    done
+    for pid in "$UI_PID" "$UI2_PID" "$SYNC_PID"; do
         [[ -n "$pid" && "$pid" -gt 1 ]] && kill "$pid" 2>/dev/null
     done
     wait 2>/dev/null
@@ -83,6 +86,7 @@ UI() { local op="$1"; shift; NEMR_UI_COOKIE="${COOKIE:-}" python3 "$REPO/docs/ui
 step "Prerequisites"
 [[ -n "${DATABASE_URL:-}" ]] || die "DATABASE_URL must be set (scripts/setup_sync_test_db.sh)"
 python3 -c 'import websockets' 2>/dev/null || die "python3 -m pip install websockets (the browser half needs a WebSocket client)"
+command -v firefox >/dev/null || die "firefox is needed: the page itself is driven in a headless browser for the claims about what it shows"
 db_host_port="$(sed -E 's|.*@([^/]+)/.*|\1|' <<<"$DATABASE_URL")"
 require_tcp "${db_host_port%%:*}" "${db_host_port##*:}" "Postgres (from DATABASE_URL)" \
     "./scripts/setup_sync_test_db.sh" || exit 1
@@ -238,6 +242,38 @@ assert row["held_by"] is None, f"the lease was released, so nobody holds it: {ro
 print(f"   row: {name} where={row['where']} bundle={row['has_bundle']} held_by={row['held_by']} last_machine={row['last_machine']}")
 PY
 pass "the browser's list shows it remote, with a bundle, held by nobody"
+
+step "The page itself, in a headless browser: what it shows (F-1, F-3, F-2)"
+# The claims here are about the DOM the user sees — a form gone after
+# login, one action panel at a time, the terminal closing on shell exit —
+# so they are made against the real page in a real browser (Firefox,
+# headless, driven over WebDriver BiDi), with real keyboard input for the
+# `exit`. A second UI instance serves it: a launch token is single-use and
+# the page must spend its own. A second, local-only session gives the list a
+# push button beside the first session's pull button.
+NEMR_NON_INTERACTIVE=1 nemr create "$LOCAL2" --size 500MB >"$WORK/create2.log" 2>&1 \
+    || { cat "$WORK/create2.log"; die "nemr create $LOCAL2 failed"; }
+"$REPO/target/release/nemr-cloud" ui --no-open >"$WORK/ui2.log" 2>&1 &
+UI2_PID=$!
+for _ in $(seq 1 60); do grep -q 'nemr ui: http' "$WORK/ui2.log" && break; sleep 0.25; done
+LAUNCH2=$(grep -o 'http://127.0.0.1:[0-9]*/#token=[0-9a-f]*' "$WORK/ui2.log" | head -1)
+[[ -n "$LAUNCH2" ]] || { cat "$WORK/ui2.log"; die "the second UI did not print a launch URL"; }
+page_out=$(python3 "$REPO/docs/ui-acceptance.py" page "$LAUNCH2" "$EMAIL" "$PASSWORD" "$SERVER_URL" "$PROJECT" "$LOCAL2" 2>"$WORK/page.err"); page_rc=$?
+if [[ -z "$page_out" ]]; then
+    sed 's/^/   | /' "$WORK/page.err" | grep -v Gtk-Message | tail -15
+    die "the page-driving half produced no result (its stderr above; rc=$page_rc)"
+fi
+printf '%s\n' "$page_out" > "$WORK/page.json"
+while IFS=$'\t' read -r ok name detail; do
+    if [[ "$ok" == "True" ]]; then pass "$name"; else fail "$name${detail:+ — $detail}"; fi
+done < <(python3 -c 'import json,sys; [print(r["ok"], r["name"], r.get("detail",""), sep="\t") for r in json.load(open(sys.argv[1]))]' "$WORK/page.json")
+[[ "$page_rc" -eq 0 ]] || { grep -v Gtk-Message "$WORK/page.err" | tail -5 | sed 's/^/   | /'; die "the page did not show what it should (details above)"; }
+# The page started $LOCAL2 on the way; stop it and remove it now, so the
+# rest of the flow sees exactly what it saw before this block.
+kill "$UI2_PID" 2>/dev/null; wait "$UI2_PID" 2>/dev/null; UI2_PID=""
+nemr stop "$LOCAL2" >/dev/null 2>&1; nemr delete "$LOCAL2" --yes >/dev/null 2>&1
+output_has "^$LOCAL2 " -- nemr list && die "$LOCAL2 survived its removal"
+pass "the page block left nothing behind"
 
 step "Pull it into a fresh project and start it, from the browser"
 out=$(UI pull "$PROJECT" "$PASSWORD") || die "the pull call failed: $out"

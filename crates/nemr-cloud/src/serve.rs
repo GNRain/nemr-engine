@@ -1043,6 +1043,13 @@ async fn index() -> Response {
 <script src="/assets/xterm.js"></script>
 <script src="/assets/addon-fit.js"></script>
 <style>
+  /* The hidden attribute only works through the browser's default `display:
+     none`, and any author `display` rule on the same element outranks it —
+     so `form.login { display: grid }` kept the register form on screen with
+     hidden set (F-1), and the inline display on the pull and push forms kept
+     both open at once (F-3). Measured in Firefox before this rule existed:
+     hidden=true, computed display=grid. This makes hidden mean hidden. */
+  [hidden] { display: none !important; }
   body { font: 14px/1.4 system-ui, sans-serif; margin: 0; background: #f6f7f8; color: #1a1a1a; }
   header { display: flex; align-items: baseline; gap: 1rem; padding: .75rem 1.25rem; background: #fff; border-bottom: 1px solid #ddd; }
   header h1 { font-size: 1.1rem; margin: 0; }
@@ -1146,6 +1153,7 @@ async fn index() -> Response {
   }
 
   function showLogin(defaultServer) {
+    closePanels(); // nothing from before the log out (or the refusal) comes back with the next login
     $('list').hidden = true; $('logout').hidden = true; $('register').hidden = true; $('recovery').hidden = true;
     $('who').textContent = 'not logged in';
     const f = $('login'); f.hidden = false;
@@ -1162,7 +1170,11 @@ async fn index() -> Response {
   }
 
   async function showList(me) {
-    $('login').hidden = true; $('logout').hidden = false;
+    // Authenticated: every auth form goes; the header carries the account
+    // and the log-out control. The forms come back only through showLogin
+    // (log out, or an auth refusal on the list).
+    $('login').hidden = true; $('register').hidden = true; $('recovery').hidden = true;
+    $('logout').hidden = false;
     $('who').textContent = me.email + ' · ' + me.server;
     $('list').hidden = false;
     await refresh();
@@ -1250,13 +1262,33 @@ async fn index() -> Response {
 
   // --- step 3: pull-and-start, and start, as jobs the page watches ---
   let pulling = null, pushing = null;
+  // Exactly one action panel is open at a time: the job panel (with one of
+  // its two forms) or the terminal. Opening either closes the other; cancel
+  // closes; a job that completes closes and leaves its result on the status
+  // line. A job that FAILED stays open, because its error and its remedy
+  // (the take-over button) are the panel's content.
+  // Every change of what is open bumps this; a job's poll, a job's
+  // completion and a shell's exit carry the generation they started under
+  // and do nothing once it has moved on — so an action the user superseded
+  // can neither write into the panel that replaced it nor close it.
+  let panelGen = 0;
+  function closePanels() {
+    panelGen++;
+    $('job').hidden = true; $('pullform').hidden = true; $('pushform').hidden = true;
+    if (ws) { const w = ws; ws = null; w.close(); }
+    $('attach').hidden = true;
+    pulling = null; pushing = null;
+  }
   function openJob(title) {
+    closePanels();
     $('job').hidden = false; $('jobtitle').textContent = title;
     $('joblog').textContent = ''; $('jobresult').textContent = ''; $('jobresult').className = '';
+    return panelGen;
   }
-  async function watch(id) {
+  async function watch(id, gen) {
     for (;;) {
       const r = await api('/jobs/' + id);
+      if (gen !== panelGen) return null; // superseded: this panel is no longer ours
       if (!r.ok) { $('jobresult').textContent = 'lost the job (' + r.status + ')'; $('jobresult').className = 'bad'; return null; }
       const j = await r.json();
       $('joblog').textContent = j.lines.map(l => l.text).join('\n');
@@ -1264,22 +1296,38 @@ async fn index() -> Response {
       await new Promise(res => setTimeout(res, 400));
     }
   }
-  async function runJob(title, path, body) {
-    openJob(title);
+  // Completion closes the panel — ok or not — and the outcome moves to the
+  // status line: the error in red, and for a lease held elsewhere the
+  // take-over offer beside it. A superseded job (the user opened something
+  // else meanwhile) closes nothing and writes nothing.
+  async function runJob(title, path, body, onRetry) {
+    const gen = openJob(title);
     const r = await api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
     const d = await r.json().catch(() => ({}));
+    if (gen !== panelGen) return null;
     if (!r.ok) { $('jobresult').textContent = d.error || ('refused (' + r.status + ')'); $('jobresult').className = 'bad'; return null; }
-    const j = await watch(d.job);
-    if (!j) return null;
-    if (j.ok) { $('jobresult').textContent = 'done'; await refresh(); }
-    else { $('jobresult').textContent = j.error; $('jobresult').className = 'bad'; }
+    const j = await watch(d.job, gen);
+    if (!j || gen !== panelGen) return null;
+    const last = j.lines.length ? j.lines[j.lines.length - 1].text : 'done';
+    closePanels();
+    const g2 = panelGen;
+    await refresh();
+    if (g2 !== panelGen) return j; // the user opened something during the refresh
+    if (j.ok) status(title + ': ' + last);
+    else {
+      status(title + ' failed: ' + j.error, 'bad');
+      if (j.held_by && onRetry) {
+        $('status').insertAdjacentHTML('beforeend', ' <button id="takeover">take over from ' + esc(j.held_by) + '</button>');
+        $('takeover').addEventListener('click', onRetry);
+      }
+    }
     return j;
   }
   // --- step 4: attach — the daemon's stream over a WebSocket, drawn by xterm.js ---
   let term = null, fit = null, ws = null;
   async function attach(name) {
-    if (ws) { ws.close(); ws = null; }
-    $('job').hidden = true;
+    closePanels();
+    status(''); // a previous exit's status is cleared by the next attach
     $('attach').hidden = false; $('attachtitle').textContent = name; $('attachnote').textContent = 'connecting…';
     if (!term) {
       term = new Terminal({ cursorBlink: true, fontSize: 14, scrollback: 5000 });
@@ -1293,56 +1341,73 @@ async fn index() -> Response {
     if (!t.ok) { $('attachnote').textContent = 'refused (' + t.status + ')'; return; }
     const { ticket } = await t.json();
     const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-    ws = new WebSocket(proto + location.host + '/ws/attach/' + encodeURIComponent(name) + '?ticket=' + ticket);
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = () => { ws.send(JSON.stringify({ type: 'start', rows: term.rows, cols: term.cols })); $('attachnote').textContent = 'attached — type as in nemr attach; exit the shell or detach'; term.focus(); };
-    ws.onmessage = ev => {
-      if (typeof ev.data === 'string') { const m = JSON.parse(ev.data); $('attachnote').textContent = m.type === 'exit' ? 'the shell exited (' + m.code + ')' : 'error: ' + m.message; $('attachnote').className = 'note ' + (m.type === 'exit' ? '' : 'bad'); return; }
+    // Handlers belong to THIS socket: one a user replaced by attaching
+    // elsewhere may still deliver its close or its last bytes afterwards,
+    // and must not touch the socket that replaced it.
+    const sock = new WebSocket(proto + location.host + '/ws/attach/' + encodeURIComponent(name) + '?ticket=' + ticket);
+    ws = sock;
+    sock.binaryType = 'arraybuffer';
+    sock.onopen = () => { if (ws !== sock) return; sock.send(JSON.stringify({ type: 'start', rows: term.rows, cols: term.cols })); $('attachnote').textContent = 'attached — type as in nemr attach; exit the shell or detach'; term.focus(); };
+    sock.onmessage = ev => {
+      if (ws !== sock) return;
+      if (typeof ev.data === 'string') {
+        // The shell exited, or the daemon refused: the terminal closes
+        // exactly as detach does, and the outcome is one line of status
+        // above the table. Shell exit is not stop — the session stays
+        // running, the same as after `nemr attach`.
+        const m = JSON.parse(ev.data);
+        closePanels();
+        const gen = panelGen;
+        // The list refresh writes the status line itself ("N sessions"), so
+        // the outcome is written AFTER it — and only if the user has not
+        // opened anything newer meanwhile (the next attach clears it).
+        refresh().then(() => {
+          if (gen !== panelGen) return;
+          if (m.type === 'exit') status('the shell exited (' + m.code + ')');
+          else status('attach failed: ' + m.message, 'bad');
+        });
+        return;
+      }
       term.write(new Uint8Array(ev.data));
     };
-    ws.onclose = () => { if ($('attachnote').textContent.startsWith('attached')) $('attachnote').textContent = 'disconnected'; ws = null; refresh(); };
+    sock.onclose = () => { if (ws === sock) { ws = null; $('attachnote').textContent = 'disconnected'; refresh(); } };
   }
-  $('detach').addEventListener('click', () => { if (ws) ws.close(); $('attach').hidden = true; });
+  $('detach').addEventListener('click', closePanels);
   $('rows').addEventListener('click', ev => {
     const b = ev.target.closest('button'); if (!b) return;
     if (b.dataset.attach) attach(b.dataset.attach);
     if (b.dataset.start) runJob('start ' + b.dataset.start, '/sessions/' + encodeURIComponent(b.dataset.start) + '/start');
     if (b.dataset.pull) {
+      openJob('pull & start ' + b.dataset.pull);
       pulling = b.dataset.pull;
-      openJob('pull & start ' + pulling);
       const f = $('pullform'); f.hidden = false; f.take_over.checked = false; f.password.value = ''; f.password.focus();
     }
     if (b.dataset.push) {
+      openJob((b.textContent.startsWith('stop') ? 'stop & push ' : 'push ') + b.dataset.push);
       pushing = b.dataset.push;
-      if (ws) { ws.close(); $('attach').hidden = true; }
-      openJob((b.textContent.startsWith('stop') ? 'stop & push ' : 'push ') + pushing);
       const f = $('pushform'); f.hidden = false; f.release.checked = true; f.take_over.checked = false; f.password.value = ''; f.password.focus();
     }
   });
-  $('jobcancel').addEventListener('click', () => { $('pullform').hidden = true; $('job').hidden = true; pulling = null; });
-  $('pushcancel').addEventListener('click', () => { $('pushform').hidden = true; $('job').hidden = true; pushing = null; });
+  $('jobcancel').addEventListener('click', closePanels);
+  $('pushcancel').addEventListener('click', closePanels);
   $('pushform').addEventListener('submit', async ev => {
     ev.preventDefault();
     const f = ev.target, name = pushing;
     const body = { password: f.password.value, release: f.release.checked, take_over: f.take_over.checked };
     f.hidden = true; f.password.value = '';
-    const j = await runJob('push ' + name, '/sessions/' + encodeURIComponent(name) + '/push', body);
-    if (j && !j.ok && j.held_by) {
-      $('jobresult').insertAdjacentHTML('beforeend', ' <button id="pushtakeover">take over from ' + esc(j.held_by) + '</button>');
-      $('pushtakeover').addEventListener('click', () => { pushing = name; f.hidden = false; f.take_over.checked = true; f.password.focus(); });
-    }
+    await runJob('push ' + name, '/sessions/' + encodeURIComponent(name) + '/push', body, () => {
+      openJob('push ' + name); pushing = name; f.hidden = false; f.take_over.checked = true; f.password.focus();
+    });
   });
   $('pullform').addEventListener('submit', async ev => {
     ev.preventDefault();
     const f = ev.target, name = pulling;
     const body = { password: f.password.value, take_over: f.take_over.checked };
     f.hidden = true; f.password.value = '';
-    const j = await runJob('pull & start ' + name, '/sessions/' + encodeURIComponent(name) + '/pull', body);
-    if (j && !j.ok && j.held_by) {
-      // The CLI's --take-over, offered where the CLI offers it: on refusal, naming the holder.
-      $('jobresult').insertAdjacentHTML('beforeend', ' <button id="takeover">take over from ' + esc(j.held_by) + '</button>');
-      $('takeover').addEventListener('click', () => { pulling = name; f.hidden = false; f.take_over.checked = true; f.password.focus(); });
-    }
+    // The CLI's --take-over, offered where the CLI offers it: on refusal, naming the holder.
+    await runJob('pull & start ' + name, '/sessions/' + encodeURIComponent(name) + '/pull', body, () => {
+      openJob('pull & start ' + name); pulling = name; f.hidden = false; f.take_over.checked = true; f.password.focus();
+    });
   });
 
   (async () => {
