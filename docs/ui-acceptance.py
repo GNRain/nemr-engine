@@ -8,6 +8,13 @@ exchanged for the cookie, the guarded /api calls with their custom header,
 and the attach WebSocket with its Origin and single-use ticket. Nothing here
 reaches around the surface — if the page could not do it, this does not do
 it either.
+
+The `Browser` class goes one step further and drives the REAL page in a
+real browser: Firefox, headless, over WebDriver BiDi (a WebSocket JSON
+protocol), with nothing but the `websockets` module this file already needs.
+That is how claims about what the page SHOWS — a form gone after login, a
+panel closed on shell exit, one action panel at a time — are made against
+the DOM the user sees, not against the API underneath it.
 """
 import asyncio, json, os, re, sys, time
 import urllib.request, urllib.error
@@ -164,10 +171,283 @@ async def attach_run(surface, name, command, timeout=600):
     return raw, output, rc, None
 
 
+class Browser:
+    """Headless Firefox driven over WebDriver BiDi.
+
+    Firefox (the snap on Ubuntu, or any 129+) prints "WebDriver BiDi
+    listening on ws://…" when started with --remote-debugging-port; the
+    session endpoint is /session. The profile lives where the snap can
+    reach it ($HOME/snap/firefox/common, or $HOME/.cache for a non-snap
+    Firefox) — a profile under /tmp is invisible to the snap, and Firefox
+    then falls back to the user's own profile and refuses because it is
+    in use.
+    """
+
+    def __init__(self, keep_profile_under=None):
+        home = os.path.expanduser("~")
+        base = keep_profile_under or (
+            os.path.join(home, "snap", "firefox", "common")
+            if os.path.isdir(os.path.join(home, "snap", "firefox"))
+            else os.path.join(home, ".cache")
+        )
+        self.profile = os.path.join(base, f"nemr-ui-acceptance-{os.getpid()}")
+        os.makedirs(self.profile, exist_ok=True)
+        self.proc = None
+        self.ws = None
+        self.ctx = None
+        self._n = 0
+        self.log = []
+
+    async def __aenter__(self):
+        try:
+            return await self._start()
+        except BaseException:
+            # A browser that never announced itself, or a session that could
+            # not be opened, must not outlive the failure — nor leave its
+            # profile behind for the next run to trip on.
+            await self.__aexit__(None, None, None)
+            raise
+
+    async def _start(self):
+        import subprocess, shutil, threading, queue
+        exe = shutil.which("firefox")
+        if not exe:
+            raise SystemExit("no firefox on PATH: the page-driving half of the acceptance needs a browser")
+        env = dict(os.environ, MOZ_HEADLESS="1")
+        self.proc = subprocess.Popen(
+            [exe, "--headless", "--no-remote", "--profile", self.profile,
+             "--remote-debugging-port", "0", "about:blank"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        # The browser's output is read on a thread into a queue, so the
+        # deadline below is a real deadline: a readline that never returns
+        # cannot hold it.
+        lines = queue.Queue()
+        def pump():
+            # readline, not iteration: iterating a pipe read-buffers whole
+            # chunks and can hold the one line we wait for past the deadline.
+            for l in iter(self.proc.stdout.readline, ""):
+                lines.put(l.rstrip())
+            lines.put(None)
+        threading.Thread(target=pump, daemon=True).start()
+        url = None
+        deadline = time.time() + 60
+        while url is None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise SystemExit("firefox did not announce a BiDi endpoint within 60 s:\n" + "\n".join(self.log[-10:]))
+            try:
+                line = lines.get(timeout=remaining)
+            except queue.Empty:
+                continue
+            if line is None:
+                raise SystemExit("firefox exited before announcing a BiDi endpoint:\n" + "\n".join(self.log[-10:]))
+            self.log.append(line)
+            m = re.search(r"WebDriver BiDi listening on (ws://\S+)", line)
+            if m:
+                url = m.group(1)
+        self.ws = await asyncio.wait_for(websockets.connect(url.rstrip("/") + "/session", max_size=None), 30)
+        await self.cmd("session.new", {"capabilities": {}})
+        tree = await self.cmd("browsingContext.getTree", {})
+        self.ctx = tree["contexts"][0]["context"]
+        return self
+
+    async def __aexit__(self, *exc):
+        try:
+            if self.ws and self.ctx:
+                try:
+                    await asyncio.wait_for(self.cmd("session.end", {}), 5)
+                except Exception:
+                    pass
+                await self.ws.close()
+        finally:
+            if self.proc:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=10)
+                except Exception:
+                    self.proc.kill()
+            import shutil
+            shutil.rmtree(self.profile, ignore_errors=True)
+
+    async def cmd(self, method, params):
+        self._n += 1
+        n = self._n
+        await self.ws.send(json.dumps({"id": n, "method": method, "params": params}))
+        while True:
+            r = json.loads(await self.ws.recv())
+            if r.get("id") == n:
+                if r.get("type") == "error":
+                    raise RuntimeError(f"{method}: {r.get('error')}: {r.get('message')}")
+                return r["result"]
+
+    async def goto(self, url):
+        await self.cmd("browsingContext.navigate", {"context": self.ctx, "url": url, "wait": "complete"})
+
+    async def eval(self, expression):
+        """Evaluate JS in the page (promises awaited) and return its value."""
+        r = await self.cmd("script.evaluate", {
+            "expression": expression, "target": {"context": self.ctx},
+            "awaitPromise": True, "resultOwnership": "none",
+        })
+        if r.get("type") == "exception":
+            raise RuntimeError(f"page threw: {r.get('exceptionDetails', {}).get('text')}")
+        return _bidi_value(r["result"])
+
+    async def wait_for(self, expression, timeout=30, what=None):
+        """Poll a JS expression until it is truthy, the way a user waits."""
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            last = await self.eval(expression)
+            if last:
+                return last
+            await asyncio.sleep(0.2)
+        raise SystemExit(f"timed out waiting for {what or expression!r} (last value {last!r})")
+
+
+def _bidi_value(v):
+    """Flatten BiDi's typed remote values into plain Python."""
+    t = v.get("type")
+    if t in ("string", "number", "boolean"):
+        return v.get("value")
+    if t in ("null", "undefined"):
+        return None
+    if t == "array":
+        return [_bidi_value(x) for x in v.get("value", [])]
+    if t == "object":
+        return {(_bidi_value(k) if isinstance(k, dict) else k): _bidi_value(val) for k, val in v.get("value", [])}
+    return v.get("value")
+
+
+# --- the page, driven: the claims about what the page SHOWS -----------------
+
+VISIBLE = "(id => { const e = document.getElementById(id); return !!e && e.checkVisibility(); })"
+ENTER = ""
+
+
+async def type_keys(b, text):
+    """Real keyboard input to whatever the page has focused — what a user does."""
+    actions = []
+    for ch in text:
+        v = ENTER if ch == "\n" else ch
+        actions.append({"type": "keyDown", "value": v})
+        actions.append({"type": "keyUp", "value": v})
+    await b.cmd("input.performActions", {"context": b.ctx, "actions": [{"type": "key", "id": "kb", "actions": actions}]})
+
+
+async def page_flow(launch_url, email, password, server, remote_name, local_name):
+    """F-1, F-3, F-2 against the real DOM. Returns a list of (name, ok, detail).
+
+    Preconditions the shell arranges: `remote_name` exists only on the server
+    with a bundle (a pull button), `local_name` exists locally and is stopped
+    (start and push buttons), and this machine is logged in.
+    """
+    out = []
+    def check(name, ok, detail=""):
+        out.append({"name": name, "ok": bool(ok), "detail": detail})
+        return ok
+    try:
+        await _page_flow(launch_url, email, password, server, remote_name, local_name, check)
+    except SystemExit as e:
+        # A wait that never came true is a failed claim, not a crash: record
+        # it so the run reads as red with the reason, and stop there.
+        check("the page never reached the expected state", False, str(e))
+    return out
+
+
+async def _page_flow(launch_url, email, password, server, remote_name, local_name, check):
+    async with Browser() as b:
+        await b.goto(launch_url)
+        await b.wait_for("document.getElementById('status').textContent !== 'connecting…'", 30, "the page's own handshake")
+        # Logged in already (the account is on this machine), so the list is up.
+        await b.wait_for(VISIBLE + "('list')", 30, "the list after the handshake")
+
+        # ---- F-1: log out → the forms are back; log in → they go.
+        await b.eval("document.getElementById('logout').click()")
+        await b.wait_for(VISIBLE + "('login')", 30, "the login form after logging out")
+        check("F-1 after logout the login form is on the page", await b.eval(VISIBLE + "('login')"))
+        check("F-1 after logout the header says not logged in", await b.eval("document.getElementById('who').textContent") == "not logged in")
+        check("F-1 after logout the list is gone", not await b.eval(VISIBLE + "('list')"))
+        await b.eval("document.getElementById('to-register').click()")
+        check("F-1 the register form can be shown", await b.eval(VISIBLE + "('register')"))
+        await b.eval("document.getElementById('to-login').click()")
+        await b.eval(f"(f => {{ f.server.value = {json.dumps(server)}; f.email.value = {json.dumps(email)}; f.password.value = {json.dumps(password)}; f.requestSubmit(); }})(document.getElementById('login'))")
+        await b.wait_for(VISIBLE + "('list')", 60, "the list after logging in through the form")
+        check("F-1 after login the page has no login form", not await b.eval(VISIBLE + "('login')"))
+        check("F-1 after login the page has no register form", not await b.eval(VISIBLE + "('register')"))
+        check("F-1 after login the page has no recovery panel", not await b.eval(VISIBLE + "('recovery')"))
+        who = await b.eval("document.getElementById('who').textContent")
+        check("F-1 after login the header shows the account", email in (who or ""), who)
+        check("F-1 after login the header shows a log-out control", await b.eval(VISIBLE + "('logout')"))
+        await b.wait_for(f"!!document.querySelector('button[data-pull={json.dumps(remote_name)}]')", 30, "the remote row's pull button")
+        await b.wait_for(f"!!document.querySelector('button[data-push={json.dumps(local_name)}]')", 30, "the local row's push button")
+
+        # ---- F-3: open pull, then push — only the push form is in the page.
+        panels = "['pullform','pushform','attach'].filter(id => document.getElementById(id).checkVisibility())"
+        await b.eval(f"document.querySelector('button[data-pull={json.dumps(remote_name)}]').click()")
+        await b.wait_for(VISIBLE + "('pullform')", 10, "the pull form")
+        check("F-3 the pull form opens", await b.eval(VISIBLE + "('pullform')"))
+        await b.eval(f"document.querySelector('button[data-push={json.dumps(local_name)}]').click()")
+        await b.wait_for(VISIBLE + "('pushform')", 10, "the push form")
+        open_now = await b.eval(panels)
+        check("F-3 open pull then push: only the push form is in the page", open_now == ["pushform"], str(open_now))
+        title = await b.eval("document.getElementById('jobtitle').textContent")
+        check("F-3 the heading names the open action", title == f"push {local_name}", title)
+        await b.eval("document.getElementById('pushcancel').click()")
+        check("F-3 cancel closes it", await b.eval(panels) == [] and not await b.eval(VISIBLE + "('job')"), str(await b.eval(panels)))
+
+        # ---- F-2: start the local session through the page, attach, type exit.
+        await b.eval(f"document.querySelector('button[data-start={json.dumps(local_name)}]').click()")
+        await b.wait_for(f"!!document.querySelector('button[data-attach={json.dumps(local_name)}]')", 120, "the row to say running after start")
+        check("F-2 a completed job closed its panel", not await b.eval(VISIBLE + "('job')"))
+        await b.eval(f"document.querySelector('button[data-attach={json.dumps(local_name)}]').click()")
+        await b.wait_for("document.getElementById('attachnote').textContent.startsWith('attached')", 30, "the terminal to attach")
+        check("F-2 the terminal panel opens on attach", await b.eval(VISIBLE + "('attach')"))
+        check("F-2 attach clears a previous status", (await b.eval("document.getElementById('status').textContent")) == "")
+        await b.eval("document.querySelector('#term textarea').focus()")
+        await asyncio.sleep(0.5)
+        await type_keys(b, "exit\n")
+        await b.wait_for("!document.getElementById('attach').checkVisibility()", 30, "the terminal panel to close on shell exit")
+        check("F-2 after exit the terminal panel is gone", not await b.eval(VISIBLE + "('attach')"))
+        # The page refreshes the list after an exit and then writes the
+        # outcome; reading the status the instant the panel closes is a race
+        # by construction, so wait for it the way a user's eye does.
+        try:
+            await b.wait_for("document.getElementById('status').textContent === 'the shell exited (0)'", 20, "the exit status line")
+            st = "the shell exited (0)"
+        except SystemExit:
+            st = await b.eval("document.getElementById('status').textContent")
+        check("F-2 the exit code is one line of status above the table", st == "the shell exited (0)", st)
+        row = await b.wait_for(f"(() => {{ const b = document.querySelector('button[data-attach={json.dumps(local_name)}]'); return b ? b.closest('tr').children[3].textContent : ''; }})()", 30, "the row after the exit")
+        check("F-2 the row still says running: shell exit is not stop", row == "running", row)
+        await b.eval(f"document.querySelector('button[data-attach={json.dumps(local_name)}]').click()")
+        await b.wait_for("document.getElementById('attachnote').textContent.startsWith('attached')", 30, "a second attach")
+        check("F-2 the next attach clears the exit status", (await b.eval("document.getElementById('status').textContent")) == "")
+        await b.eval("document.getElementById('detach').click()")
+
+        # ---- F-1, the other direction, once more at the end.
+        await b.eval("document.getElementById('logout').click()")
+        await b.wait_for(VISIBLE + "('login')", 30, "the login form after the final logout")
+        check("F-1 after logout the forms are back", await b.eval(VISIBLE + "('login')") and not await b.eval(VISIBLE + "('logout')"))
+        # Logging out deleted the account this machine shares with the rest
+        # of the acceptance; leave the machine as it was found — logged in,
+        # through the form, one more time.
+        await b.eval(f"(f => {{ f.server.value = {json.dumps(server)}; f.email.value = {json.dumps(email)}; f.password.value = {json.dumps(password)}; f.requestSubmit(); }})(document.getElementById('login'))")
+        await b.wait_for(VISIBLE + "('list')", 60, "the list after logging back in")
+        check("the page block leaves the machine logged in, as it found it", not await b.eval(VISIBLE + "('login')") and await b.eval(VISIBLE + "('logout')"))
+
+
 def main():
     # NEMR_UI_COOKIE carries the one session cookie between the steps of the
     # acceptance, the way an open tab carries it between clicks.
     op = sys.argv[1]
+    if op == "page":
+        # The page itself exchanges the launch token; this process must not.
+        email, password, server, remote_name, local_name = sys.argv[3:8]
+        results = asyncio.run(page_flow(sys.argv[2], email, password, server, remote_name, local_name))
+        print(json.dumps(results))
+        raise SystemExit(0 if all(r["ok"] for r in results) else 4)
     surface = Surface(sys.argv[2], os.environ.get("NEMR_UI_COOKIE") or None)
     surface.handshake()
     if op == "register":
