@@ -1482,6 +1482,230 @@ is overstating what has been demonstrated.
 
 ---
 
+---
+
+### E-19 — The UI launcher, and where the server address and the auth pepper live between runs
+
+**Status:** Ruled · 2026-09-07 (Product Owner) — implementation is its own PR
+**Raised by:** Rain (F-4, daily use) · **Relates to:** E-11 (the extension form, "How commercial commands reach the open CLI", `docs/DECISIONS.md:728-738`), F-89 (pepper), D-05 / D-09 (the S3 credentials will need the same home), D-02 (state dir), SPEC 1.104 (names `nemr ui`), 1.110, 1.115 (`docs/ui-acceptance.sh`)
+
+**Question.** (a) Is the UI's launcher a `nemr ui` built into the open CLI, or `nemr-ui` on PATH through the external-subcommand form the CLI already describes? (b) Where do the sync server's address (client side) and the auth pepper (server side) live between runs, so that neither is typed — and, by extension, where do the S3 credentials live when D-05 rules?
+
+**What is true today.** The UI is the commercial binary's `ui` subcommand (`crates/nemr-cloud/src/main.rs:88-95`, dispatched at `:143` to `serve::run`, `crates/nemr-cloud/src/serve.rs:1402-1445`). The binary rewrites argv[0] `nemr-<x>` into the `<x>` subcommand (`main.rs:117-128`), and the open CLI's `External` arm execs `nemr-<cmd>` from PATH (`src/bin/nemr.rs:153-161`, exec at `:1355-1356`, not-found message at `:1358-1361`). So `nemr ui` would work end to end if a `nemr-ui` name existed; it does not — `scripts/install_sync_client.sh:19` is `NAMES=(login logout register sessions push pull release)`, and `scripts/sync_acceptance.sh:76` carries the same list without `ui`. No test reads either list. SPEC row 1.104 (`SPEC.md:121`) already states `nemr ui` is "reached through the open CLI's external-subcommand seam", and the page tells the user to "start the UI again with nemr ui" (`serve.rs:1148`, `:1151`). The only launcher is `docs/ui-acceptance.sh:109`, `"$REPO/target/release/nemr-cloud" ui --no-open`.
+
+Client side, `core::default_server()` is `NEMR_SERVER_URL` if non-empty, else `http://127.0.0.1:8080` (`crates/nemr-cloud/src/core.rs:31-40`); `--server` beats it (`commands.rs:56-59`); a successful login or registration stores the server in `account.json` (`core.rs:58-72`, `:152-156`; `state.rs:45-47`, 0600 via `write_private` at `state.rs:124-142`); logged-in commands use `account.server` (`core.rs:178, 278, 591, 710, 771`); the page's form is pre-filled from `whoami`'s `default_server` (`serve.rs:403-408`, `:1159`) and an empty field falls back to `default_server()` (`serve.rs:422-426`, `:456-460`). `logout` deletes `account.json` (`core.rs:180`, `state.rs:56-63`) — the remembered server dies with it. The browser acceptance runs the server on `127.0.0.1:18090` (`docs/ui-acceptance.sh:47-48`), isolates `XDG_STATE_HOME`, exports `NEMR_SERVER_URL` (`:79-80`) and still passes the URL through the form at register and login (`:128`, `:147`; `docs/ui-acceptance.py:421`, `:432`). The sync acceptance uses 18080 (`scripts/sync_acceptance.sh:43-44`); the client's and the server's built-in defaults already agree on 8080 (`core.rs:31`; `crates/nemr-sync/src/main.rs:25`).
+
+Server side, `nemr-sync` reads `DATABASE_URL` (required), `NEMR_SERVER_ADDR` (default `127.0.0.1:8080`), `NEMR_BUNDLE_DIR` (required) (`crates/nemr-sync/src/main.rs:23-27`) and `NEMR_AUTH_PEPPER`, SHA-256'd to 32 bytes, else `Config::default()`'s random pepper with a warning (`main.rs:36-46`; `lib.rs:48-54`, `:66-82`, `:85-93`; consumed by `pseudo_salt`, `identity.rs:262`, `:279-285`). The store is hard-wired `LocalStore` (`main.rs:30`); `S3Config::from_env` reads `NEMR_S3_*` (`crates/nemr-storage/src/s3.rs:111-143`) and nothing calls it (D-05 Open, `docs/DECISIONS.md:865-890`; D-09, `:1454-1483`). No unit for `nemr-sync` exists (`deploy/systemd/user/` holds `buildkitd-rootless`, `containerd-rootless`, `nemrd`). The browser acceptance passes a fresh random pepper per run (`docs/ui-acceptance.sh:100-102`); the sync acceptance passes none (`scripts/sync_acceptance.sh:85-86`) and does not isolate `XDG_STATE_HOME` — its login and its cleanup `logout` (`:55`) act on the developer's real state directory today. The client's only secret env, `NEMR_CLOUD_PASSWORD`, is read for automation and never persisted (`crates/nemr-cloud/src/keys.rs:97-102`).
+
+**Options.**
+1. *Launcher built into the open CLI.* Either names `nemr-cloud` in the open tree (fails `scripts/check_seam.sh:28`, `:65-76` outright) or is a list of one that the CLI's own doc forbids (`src/bin/nemr.rs:155-159`) and this file already rejected (`:736-738`). **Rejected.**
+2. *`nemr-ui` on PATH via the extension form* — one word in the install script; both acceptances launch through PATH from that list. **Recommended.**
+3. *Client server URL under `~/.config`, a `config set server` verb, or a TOML file.* The acceptances and the test harness isolate `XDG_STATE_HOME` only (`docs/ui-acceptance.sh:79`; `crates/nemr-cloud/tests/common/mod.rs:183`), so a config-dir file would be overwritten with a test port by every acceptance run — a stale-value trap planted by our own script; TOML adds a dependency and a second precedence layer for a one-line value. **Rejected.**
+4. *Keep part of `account.json` past logout.* `load_account`'s "not logged in" contract (`state.rs:49-54`) and `core::whoami` (`core.rs:294-296`) both mean "account.json exists". **Rejected.**
+5. *Client remembers the server of its last successful login in `$XDG_STATE_HOME/nemr/cloud/server-url`* (0600, survives logout; flag > env > remembered > built-in). **Recommended.**
+6. *Server secrets stay environment-only (today).* Typed per run or random per restart; the S3 credentials would live in a shell profile. **Rejected — the finding.**
+7. *Server-minted pepper file under the state dir.* Two homes for server secrets (settings in one file, the pepper in another), two mode checks, and a pepper is shared config an operator must copy between replicas, not per-node state. **Rejected.**
+8. *One 0600 env file the server reads itself* — `$XDG_CONFIG_HOME/nemr/sync.env`, `NEMR_SYNC_ENV_FILE` override (empty = read none), `KEY=VALUE` lines, process env wins key by key, wider mode refused not repaired, names logged never values, pepper generated into it once by a documented one-liner. The same shape a future `EnvironmentFile=` accepts, though the unit will not need one. **Recommended.**
+9. *Keyring / secret-service* — no session bus for a service process. *Pepper in Postgres* — a dump would carry it. *A stable UI port, a UI unit, or `nemr ui` autostarting the server* — the token is single-use (`serve.rs:373-375`) and 1.104 rules that no port opens unless the user starts the UI. **All rejected.**
+
+**Recommendation.** 2 + 5 + 8. The open half is untouched (`src/bin/nemr.rs`, `nemrd`, `crates/nemr-daemon-api`, `crates/nemr-containerd`: zero files) and `scripts/check_seam.sh` remains the seam control. One rule on both halves — a per-invocation environment beats a persistent file — stated in one place:
+
+- Client server URL: `--server` / the page's field > `NEMR_SERVER_URL` > `server-url` > `http://127.0.0.1:8080`; logged-in commands keep `account.json`'s server.
+- Server settings: process environment > `sync.env` > built-in (`NEMR_SERVER_ADDR=127.0.0.1:8080`; `DATABASE_URL` and `NEMR_BUNDLE_DIR` required, as today).
+- Pepper: `NEMR_AUTH_PEPPER` from either source, hashed as today > the fallback below.
+
+Two operator-facing additions ride along: `$BROWSER` is tried before `xdg-open` (`serve.rs:1435-1439`; on the WSL2 box `xdg-open` is absent and the URL is copied by hand today), and a stale remembered value is visible without a second command — the server logs `settings: <path> (keys: A, B, C)` at start, and a failed login names its source ("remembered from your last login; pass --server or set NEMR_SERVER_URL to change it").
+
+**Controls the PR must carry, each seen red.** (i) The install script's `NAMES` equals the binary's visible subcommands — red today, `ui` is missing. (ii) A symlink named `nemr-ui` prints the `ui` subcommand's help ("Port to bind", `main.rs:89`) — red if argv[0] dispatch stops covering it. (iii) `server-url` exists, 0600, after login and still reads the same URL after logout, and a second machine with no file and `NEMR_SERVER_URL` removed cannot log in — the negative arm proves the file carried the first. (iv) `GET /api/whoami` logged-out returns the remembered server. (v) A 0644 `sync.env` is refused, naming the path — red with the mode check removed. (vi) A key already in the process environment is not overridden by the file. (vii) A malformed line's error names the line number and never contains the line's text. (viii) Two servers built from one pepper file return byte-equal pseudo-salts for an unknown email, and a third from a second file differs — the F-89 property at the endpoint, with a two-file control. (ix) The browser acceptance, with no `NEMR_SERVER_URL` export, asserts after logout that `whoami.default_server == http://127.0.0.1:18090` and then logs in with an empty server field.
+
+**Reconciled with E-20 (written the same day).** E-20 first proposed the env file be *sourced into the process* by a shell or a unit (zero code); this row proposes the server *reads it itself* (`sync.env`, env wins key by key, mode refused not repaired). One mechanism is chosen for both: **the server reads its own file**, because a hand run and a unit then take one code path, the 0600 refusal is a control the server performs rather than a habit the operator keeps, and the S3 credential E-20 needs lands in the same file under the same rule. E-20's own text is amended to say so.
+
+**Ruling (Product Owner, 2026-09-07).** Everything as recommended — `nemr-ui` on PATH as the extension form with the open CLI untouched, the server remembered client-side across logout, one 0600 `sync.env` read by the server — with the open question decided against the recommendation: **a server with no pepper refuses to bind.** The refusal names the file and the exact line to add. One explicit escape hatch exists for throwaway servers: an unmistakable value, `NEMR_AUTH_PEPPER=ephemeral`, which starts the server with a random per-process pepper and prints a loud warning at start; the acceptances use that value, so a test server never looks like a configured one and a configured one is never silently weaker than it claims.
+
+**The question as it was put, kept for the record.** When no pepper is present in the environment or the file, does the server keep today's warn-and-random or refuse to start? The recommendation leaned to keeping the warning because the PR is about where config lives; the ruling chose refusal, with the escape hatch making the throwaway case explicit rather than the default.
+
+**Follow-ups, recorded, not in this row.** A `deploy/systemd/user/nemr-sync.service` (`ExecStart=%h/.local/bin/nemr-sync`, shaped like `nemrd.service:11`, deliberately *without* `EnvironmentFile=` so a hand run and the unit read `sync.env` through one code path), an `install_sync_server.sh`, and a PREREQUISITES step — a deployment ruling with its own unresolved dependency: the test database is started by `podman run -d` with no restart policy (`scripts/setup_sync_test_db.sh:59-64`), so a unit that survives a reboot would come up against a database that did not. D-05's S3 wiring is a separate PR on that ruling; `sync.env` is merely where `NEMR_S3_*` will live.
+
+**Consequence of not deciding.** The command the SPEC and the page name does not exist on any host `setup_host.sh` provisions (`scripts/setup_host.sh:481-486` runs the install script that omits it); the address is retyped after every logout; enumeration resistance resets on every server restart; the first S3 credential lands in a shell history; and both acceptances keep passing over the gap.
+
+Log line: `| 2026-09-07 | E-19 | Opened — F-4: UI launcher = extension form (`nemr-ui` on PATH); server URL remembered client-side across logout; pepper and every server setting in one 0600 env file the server reads, env wins. Proposed, not ruled; unit and DB restart policy recorded as follow-ups (Claude Code) |`
+
+---
+
+### E-20 — The sync server takes its storage backend from the environment (F-5; the mechanism half of D-05)
+
+**Status:** Ruled · 2026-09-07 (Product Owner) — accepted as written; implementation is its own PR
+**Raised by:** Rain (F-5) · **Relates to:** D-01, D-05, D-09, D-11, M12, E-11, E-16, F-61, F-89
+
+**Question.** `nemr-sync` reads `NEMR_BUNDLE_DIR` as required and builds
+`LocalStore` unconditionally (`crates/nemr-sync/src/main.rs:26-30`); its own
+header says "R2/B2 will be a config change" (`main.rs:6-7`). The `DynStore`
+façade has one impl and a comment reserving the second line
+(`crates/nemr-sync/src/store.rs:46-47`). M12's `S3Store` was proven against a
+bucket that no longer exists (SPEC 1.71) and is consumed by nothing but
+`bucket_roundtrip` (`crates/nemr-storage/src/bin/bucket_roundtrip.rs:139-148`).
+How does the server take a backend from configuration, keeping the directory
+backend for tests and selecting R2 by `NEMR_S3_*`?
+
+**Established first, not argued.**
+- `S3Config::from_env` already defines "configured" as `NEMR_S3_BUCKET` present
+  and returns `Ok(None)` otherwise (`crates/nemr-storage/src/s3.rs:111-114`);
+  a half-configured bucket is refused naming the four required variables
+  (`s3.rs:125-130`); an unset or misspelt `NEMR_S3_PROVIDER` silently becomes
+  the generic provider with region `us-east-1` (`s3.rs:116-123`, `:57-62`).
+  `Debug` redacts both halves of the credential (`s3.rs:79-95`), `describe()` is
+  `provider:bucket` (`s3.rs:172`), error text is cut at `?` and 200 chars
+  (`s3.rs:208-212`). `S3Store::new` makes no network call (`s3.rs:153-174`).
+- Bundle keys are `{bundle_prefix}/{user_uuid}/{session_uuid}`
+  (`crates/nemr-sync/src/bundles.rs:20-23`; prefix defaults to `bundles`,
+  `src/lib.rs:79`). A store failure on upload or download is an `Internal` 500
+  whose detail is logged and never returned (`bundles.rs:54-58`, `:129-133`;
+  `src/error.rs:30-32`, `:60-63`).
+- `object_store` maps every HTTP 404 to `NotFound`
+  (`object_store-0.14.1/src/client/retry.rs:159`), so a `head` cannot tell a
+  missing bucket from a missing key; `S3Store::list` maps every error to
+  `StorageError::Other` (`s3.rs:293-295`) and returns an empty page for a prefix
+  that matches nothing. `LocalStore::list` on a missing root returns
+  `Ok(empty)` (`crates/nemr-storage/src/local.rs:164-166`), so a directory's
+  existence must be checked directly.
+- The integration harness never goes through `main.rs`: it builds `LocalStore`
+  on a tempdir (`crates/nemr-sync/tests/common/mod.rs:56-57`), as do the client
+  harness (`crates/nemr-cloud/tests/common/mod.rs:37`) and the UI test server
+  (`crates/nemr-cloud/src/serve.rs:1882`). Both acceptance scripts start the
+  binary with `NEMR_BUNDLE_DIR` under a temp dir
+  (`scripts/sync_acceptance.sh:84-86`; `docs/ui-acceptance.sh:99-102`), capture
+  its log (`:86`; `:102`), wait on `/health` (`:107-108`; `:104-105`) and later
+  `find` the directory to assert ciphertext at rest (`:170-175`; `:218-222`,
+  `:339-341`). CI runs the CLI acceptance in that mode
+  (`.github/workflows/ci.yml:278-287`).
+- Nothing installs or supervises the server: `scripts/install_sync_client.sh`
+  installs `nemr-cloud` and its symlinks only (`:19-27`); `deploy/systemd/user/`
+  holds units for containerd, buildkitd and `nemrd` (`nemrd.service:9-12`,
+  `ExecStart=%h/.local/bin/nemrd`, no arguments) and none for `nemr-sync`. The
+  house pattern is "ships as a file" (`containerd-rootless.service:1-9`).
+- The client never learns the backend: it uploads ciphertext to an opaque
+  server (E-16; `crates/nemr-cloud/src/core.rs:625-632`) and stores the server
+  URL in `account.json` at login (`core.rs:58-71`; `src/state.rs:45-47`, 0600
+  via `:124-141`). F-5 needs no client change.
+- The seam: `nemr-storage` and `nemr-sync` are both in `COMMERCIAL`
+  (`scripts/check_seam.sh:28`); nothing on the open side is touched.
+
+**Options.**
+- (a) **The backend's own variables are the switch; exactly one; no default;
+  probed before bind.** Complete `NEMR_S3_*` (provider validated as exactly
+  `r2|b2|s3`) names an object store; `NEMR_BUNDLE_DIR` names a directory that
+  must already exist; both set → refuse naming both; neither → refuse naming
+  both; empty means unset; a half-configured S3 is the existing four-name
+  refusal, never a fallback to a directory; one egress-free `list` under
+  `{bundle_prefix}/.startup-probe` must succeed before the database is migrated
+  and before the listener binds. The environment is the only configuration
+  surface; its durable form is the 0600 `sync.env` the server reads itself
+  under E-19's rule (process environment wins key by key; a wider mode is
+  refused, not repaired). **Recommended.**
+- (b) An explicit selector `NEMR_STORAGE=local|s3`. Contradicts the question
+  as asked ("R2 selected by `NEMR_S3_*`"), adds a third variable that can
+  disagree with the family variables and needs its own rules for the
+  disagreement, and buys nothing: the exclusive rule leaves exactly one
+  ambiguous case, and (a) refuses it. Second reason: a selector is knowledge of
+  which vendor sits behind the trait, held above the trait — the thing E-11
+  forbids and `store.rs:7-9` states.
+- (c) Default to a directory when nothing is set. A server whose env file lost
+  its `NEMR_S3_*` lines starts fine and stores everything on one disk; every
+  test green; found when the disk dies. Today's binary already refuses without
+  `NEMR_BUNDLE_DIR` (`main.rs:26-27`), so refusal loses nothing.
+- (d) Precedence when both are set (S3 wins, or the directory wins). Silent in
+  exactly the two cases that cost money or lose data: a developer shell still
+  carrying `NEMR_S3_*` after a `bucket_roundtrip` run pushing acceptance
+  bundles into a real bucket; a production host with a stale `NEMR_BUNDLE_DIR`
+  keeping ciphertext on one disk.
+- (e) A config file the server parses. A parser, a schema, a second source of
+  truth with precedence against the environment, and a secret in a format we
+  must keep out of logs ourselves — where `nemr-storage` was written never to
+  put one (`s3.rs:16-22`). `EnvironmentFile=` gives one-file-typed-once for
+  zero code.
+- (f) No startup probe — discover a bad bucket on the first push. A
+  misconfiguration reported by a user's 500 is the opposite of a control that
+  reads.
+
+**Recommendation.** (a), as one PR after this ruling. `impl_dyn_store!(S3Store)`
+beside `LocalStore` and `list` added to the façade (`store.rs:15-21`); pure
+`select_storage` / `open_store` / async `preflight` in `store.rs`; `main.rs`
+validates every input before any side effect, opens the store, logs
+`storage backend store=<describe()>`, probes, logs `storage backend
+reachable`, then migrates the database, then binds; `S3Config` gains a pure
+`from_lookup(get)` and a validated provider (`b2` starts with a `warn!` citing
+D-09); `bundles.rs` logs `stored bundle key=… bytes=…` per successful put;
+`scripts/sync_acceptance.sh` gains an S3 mode selected by `NEMR_S3_BUCKET`
+already being in the caller's environment and asserts the backend line in the
+server log in both modes (CI unchanged, local mode); `docs/ui-acceptance.sh`
+stays local-only and gains the same log read-control. Guard tests, each
+written red first against today's logic and each with a control beside it:
+selection precedence (both, neither, half-configured-plus-directory — all `Err`,
+none `local:`), empty-means-unset, local-must-exist, probe refusal against a
+`FailsOnList` store with a `LocalStore` control, startup order proven by
+spawning the binary with `env_clear()` and a dead `DATABASE_URL`, and `S3Store`
+as a `DynStore` at compile time.
+
+**What is never typed.** The credential on a command line. With E-19's file
+the server finds `NEMR_S3_*` on its own; Rain's live run is
+`./scripts/sync_acceptance.sh` with the bucket in `~/.config/nemr/sync.env`
+(the script starts the real binary, which reads the file), and the
+`bucket_roundtrip` one-liner at `docs/CONFORMANCE.md:99` is reworded to source
+the same file rather than carry the key on its line. The startup line prints `describe()` only — the endpoint embeds the
+R2 account id and stays out of the journal; the probe's refusal may carry the
+endpoint host through `error_summary`, never the credential.
+
+**What this does not decide.** D-05's commercial half — the default backend at
+launch and whether tiers map to providers — stays in D-05 and becomes a config
+change under this mechanism. D-09 stays open until the server runs against a
+live B2 bucket. Bundle deletion on the server (nothing calls
+`DynStore::delete`; a bucket grows monotonically and acceptance runs in S3
+mode leave objects behind) is a separate item. TLS for a server bound beyond
+loopback is a separate item.
+
+**Ruling (Product Owner, 2026-09-07).** Accepted as written: the backend chosen by its own variables, exactly one set, no default, the egress-free check before the port binds. The implementation must prove the R2 path against a real bucket, not only the directory — a push from the browser landing as ciphertext in the bucket, a pull on a project deleted locally coming back byte-identical, the server never seeing plaintext — red under a neuter that swaps the backend out. That proof closes D-05. The side questions below stand as asked, to be answered in the implementation PR.
+
+**Open questions, as asked before the ruling.**
+1. Ship `deploy/systemd/user/nemr-sync.service` (`EnvironmentFile=%h/.config/nemr/sync.env`,
+   `ExecStart=%h/.local/bin/nemr-sync`, no arguments, `StartLimitBurst=5` so a
+   wrong env file stops after five refusals rather than looping) with the
+   how-to in its header, in the same PR? The code is identical either way;
+   F-5 did not ask for deployment.
+2. `_FILE` indirection for `NEMR_S3_SECRET_ACCESS_KEY` and `DATABASE_URL`
+   (systemd `LoadCredential=`, container secrets) — raise as its own finding
+   with its own row, not built under F-5.
+3. `docs/ui-acceptance.sh` stays local-only (it reads the directory at `:218`
+   and `:339`); an S3 mode there is not proposed.
+
+**Consequences.**
+- `NEMR_BUNDLE_DIR` and `NEMR_S3_BUCKET` are mutually exclusive by rule; a
+  host with both refuses to serve until one is unset, and both acceptance
+  scripts surface the refusal through `wait_for_service`'s log dump (F-95).
+- A server that is listening is one whose store answered; a bucket or key
+  revoked while running still 500s pushes (`bundles.rs:54-58`) and refuses at
+  the next start, visible in `systemctl --user status`.
+- The credential lives in the process environment and a 0600 file; never in
+  argv, a log, or the client. The startup line is the operator's read-only
+  confirmation of the backend.
+- Adding a backend stays "config, not code": one `impl_dyn_store!` line and
+  one arm in `select_storage`, each with a red-capable test; no vendor
+  behaviour above the trait (E-11).
+- `bucket_roundtrip` inherits the stricter provider rule; its documented
+  invocation already sets `NEMR_S3_PROVIDER=r2` (`bucket_roundtrip.rs:11`).
+- CONFORMANCE M12 (`docs/CONFORMANCE.md:90`) stays 🟡 until Rain's one live
+  run through the server; the same run with `NEMR_S3_PROVIDER=b2` is the
+  one-command close for D-09 (F-61: the object is then found at
+  `bundles/<user>/<session>` in the provider console, outside the tool).
+
+**Consequence of not deciding.** The R2 seam stays unconsumed and unexercised;
+drift in `object_store` or R2's API surfaces the day someone needs it; D-09
+cannot close because there is no server path to run against B2; daily sync
+between the reference host, the WSL2 box and the second Linux box runs through
+a server whose store is one machine's disk — the arrangement D-01 was ruled to
+avoid; and the precedence gets chosen under pressure the day R2 is needed, with
+the stale-`NEMR_BUNDLE_DIR` failure (server silently local, every test green)
+as the case every test passes.
+
 ## Log
 
 | Date | Entry | Change |
@@ -1533,3 +1757,7 @@ is overstating what has been demonstrated.
 | 2026-09-06 | E-11 | **HTTP surface ruled** — commercial process, gRPC client of the daemon; daemon keeps its socket; no port unless the user starts the UI. `nemr-daemon-api` referred to as landed: not on origin, reference requested (Rain; recorded by Claude Code) |
 | 2026-09-06 | E-11 | **`nemr-daemon-api` built** — the daemon's proto, stubs, socket path and client as an open crate; engine re-exports; freshness gate and seam check extended to it (SPEC 1.105) (Claude Code) |
 | 2026-09-06 | F-131 | **Resolved** — the first `claude` in a session opens ready: seeded by allowlist at first start (onboarding flags, workspace trust, host identity when present); the login prompt was onboarding, not the token; `create` refuses a dead credential (SPEC 1.106) (Rain; built by Claude Code) |
+| 2026-09-07 | E-19 | **Opened** — F-4: the UI launcher is the extension form (`nemr-ui` on PATH, one name added to the install script; the open CLI untouched); the client remembers the server of its last login in `server-url` across logout; every server setting and the pepper live in one 0600 `sync.env` the server reads itself, environment winning key by key. Proposed, not ruled; one question left for the ruling (no pepper anywhere: warn-and-random or refuse); a `nemr-sync` unit and the test database's missing restart policy recorded as follow-ups (Claude Code) |
+| 2026-09-07 | E-20 | **Opened** — F-5, the mechanism half of D-05: the backend's own variables are the switch (complete `NEMR_S3_*` names an object store, `NEMR_BUNDLE_DIR` an existing directory; exactly one, no default, both or neither refused naming both); one egress-free list must succeed before the database is migrated and the port binds; the credential never in argv or the journal; `NEMR_S3_*` live in E-19's `sync.env`. Proposed, not ruled; three side questions listed; D-05's commercial half stays in D-05 (Claude Code) |
+| 2026-09-07 | E-19 | **Ruled** — as recommended, except the pepper: a server with no pepper **refuses to bind**, naming the file and the line to add; `NEMR_AUTH_PEPPER=ephemeral` is the one explicit escape hatch (random pepper, loud warning), used by the acceptances (Rain) |
+| 2026-09-07 | E-20 | **Ruled** — accepted as written; the implementation proves R2 against a real bucket (browser push lands as ciphertext, a pull after local delete comes back byte-identical, the server never sees plaintext), red under a backend-swap neuter; that closes D-05 (Rain) |
