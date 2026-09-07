@@ -57,6 +57,14 @@
 //! that is already here. The engine is behind `UiEngine`: the daemon in the
 //! binary, a fake in the router's tests.
 //!
+//! Step 5, stop-and-push: `POST /api/sessions/{name}/push` (password,
+//! release and take-over in the body) stops the session first when it is
+//! running — the engine's export needs a quiescent volume, and `core::push`
+//! refuses a running project outright — then runs the CLI's `push` through
+//! the same core, as a job like the pull. Releasing the lease is the
+//! default here, because the point of pushing from the browser is to hand
+//! the session on.
+//!
 //! Step 4, attach: the daemon's `Attach` stream bridged to the page over a
 //! WebSocket, rendered by xterm.js (pinned, served from this binary — no
 //! external resource). A browser cannot put the custom header on a
@@ -102,7 +110,6 @@ const REQUEST_HEADER: &str = "x-nemr-request";
 /// and stop. The daemon over its socket in the binary; a fake in the tests.
 pub trait UiEngine: EngineOps {
     fn start(&self, name: &str) -> Result<()>;
-    #[allow(dead_code)] // step 5, stop-and-push
     fn stop(&self, name: &str) -> Result<String>;
     /// Open an attach stream: the daemon's, or a fake's in the tests.
     fn attach(
@@ -272,6 +279,8 @@ pub fn router(state: Arc<UiState>) -> Router {
         .route("/sessions", get(sessions))
         .route("/sessions/{name}/pull", post(pull))
         .route("/sessions/{name}/start", post(start))
+        .route("/sessions/{name}/push", post(push))
+        .route("/sessions/{name}/stop", post(stop))
         .route("/jobs/{id}", get(job))
         .route("/sessions/{name}/attach-ticket", post(attach_ticket))
         .route_layer(middleware::from_fn_with_state(
@@ -659,6 +668,97 @@ async fn start(State(state): State<Arc<UiState>>, UrlPath(name): UrlPath<String>
     Json(json!({ "job": id })).into_response()
 }
 
+#[derive(Deserialize)]
+struct PushBody {
+    password: String,
+    /// Release the lease after the push — the default from the browser,
+    /// because pushing from here is handing the session on. The CLI's
+    /// `--release`.
+    #[serde(default = "yes")]
+    release: bool,
+    #[serde(default)]
+    take_over: bool,
+}
+fn yes() -> bool {
+    true
+}
+
+/// Step 5: stop, then `nemr push`, as one job. The stop comes first
+/// because the export needs a quiescent volume — `core::push` refuses a
+/// running project, and refusing the user for a state the button could fix
+/// would be the CLI's rule enforced without the CLI's remedy. The password
+/// is checked before the stop, because a stop a later refusal cannot undo
+/// must not be paid for a push that will not happen.
+async fn push(
+    State(state): State<Arc<UiState>>,
+    UrlPath(name): UrlPath<String>,
+    Json(body): Json<PushBody>,
+) -> Response {
+    if core::whoami().is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "not logged in" })),
+        )
+            .into_response();
+    }
+    if body.password.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "the password is required to encrypt the bundle" })),
+        )
+            .into_response();
+    }
+    let engine = state.engine.clone();
+    let session = name.clone();
+    let id = state.start_job("push", &name, move |say| {
+        // The password FIRST. Stopping is not undoable by a later refusal,
+        // and the first form of this handler stopped the session and then
+        // failed on a typo — the user paid a running session for a push
+        // that never happened. `push` derives the same key again; this only
+        // moves the refusal in front of the destructive step.
+        core::verify_password(&body.password)?;
+        // Stop only what is running: a stop of a stopped session is not an
+        // error, but saying "stopping" about one that was never running
+        // would be a line the CLI never printed.
+        let running = engine
+            .list()?
+            .into_iter()
+            .any(|p| p.name == session && p.running);
+        if running {
+            say(&format!("stopping {session:?} so the volume is quiescent"));
+            let outcome = engine.stop(&session)?;
+            say(&format!("stopped ({outcome})"));
+        }
+        let pushed = core::push(
+            &session,
+            &body.password,
+            body.release,
+            body.take_over,
+            &*engine,
+            say,
+        )?;
+        if !pushed.released {
+            say(&format!("lease still held as {}", pushed.holder));
+        }
+        Ok(())
+    });
+    Json(json!({ "job": id })).into_response()
+}
+
+/// Stop a session without pushing it — the local half of step 5, for a
+/// session the user is not handing on.
+async fn stop(State(state): State<Arc<UiState>>, UrlPath(name): UrlPath<String>) -> Response {
+    let engine = state.engine.clone();
+    let session = name.clone();
+    let id = state.start_job("stop", &name, move |say| {
+        say(&format!("stopping {session:?}"));
+        let outcome = engine.stop(&session)?;
+        say(&format!("stopped ({outcome})"));
+        Ok(())
+    });
+    Json(json!({ "job": id })).into_response()
+}
+
 /// What a job has said so far, and whether it is done.
 async fn job(State(state): State<Arc<UiState>>, UrlPath(id): UrlPath<String>) -> Response {
     let job = state
@@ -1008,6 +1108,12 @@ async fn index() -> Response {
         <label style="display:flex;gap:.4rem;align-items:center"><input name="take_over" type="checkbox" style="width:auto"> take over the lease if another machine holds it (it will be locked out of writing)</label>
         <div style="display:flex;gap:.6rem"><button class="primary" type="submit">pull &amp; start</button><button type="button" id="jobcancel">cancel</button></div>
       </form>
+      <form id="pushform" style="display:grid;gap:.6rem" hidden>
+        <label>password (to encrypt the bundle on this machine) <input name="password" type="password" autocomplete="current-password" required></label>
+        <label style="display:flex;gap:.4rem;align-items:center"><input name="release" type="checkbox" style="width:auto" checked> release the lease afterwards, so another machine can take it</label>
+        <label style="display:flex;gap:.4rem;align-items:center"><input name="take_over" type="checkbox" style="width:auto"> take over the lease if another machine holds it</label>
+        <div style="display:flex;gap:.6rem"><button class="primary" type="submit">push</button><button type="button" id="pushcancel">cancel</button></div>
+      </form>
       <pre id="joblog" style="margin:0;white-space:pre-wrap"></pre>
       <div id="jobresult"></div>
     </section>
@@ -1077,8 +1183,8 @@ async fn index() -> Response {
       let action = '';
       if (s.where === 'remote' && s.has_bundle) action = '<button data-pull="' + esc(s.name) + '">pull &amp; start</button>';
       else if (s.where === 'remote') action = '<span class="muted">no bundle yet</span>';
-      else if (!s.running) action = '<button data-start="' + esc(s.name) + '">start</button>';
-      else action = '<button data-attach="' + esc(s.name) + '">attach</button>';
+      else if (!s.running) action = '<button data-start="' + esc(s.name) + '">start</button> <button data-push="' + esc(s.name) + '">push</button>';
+      else action = '<button data-attach="' + esc(s.name) + '">attach</button> <button data-push="' + esc(s.name) + '">stop &amp; push</button>';
       rows.insertAdjacentHTML('beforeend', '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.agent) + '</td><td><span class="pill ' + esc(s.where) + '">' + esc(s.where) + '</span></td><td>' + state + '</td><td>' + human(s.size_bytes) + '</td><td>' + ago(s.updated_at_unix) + '</td><td>' + esc(s.last_machine || '-') + '</td><td>' + open + '</td><td>' + action + '</td></tr>');
     }
     $('localnote').textContent = d.local_available ? '' : 'daemon unreachable: showing the server index only (' + d.local_error + ')';
@@ -1143,7 +1249,7 @@ async fn index() -> Response {
   $('refresh').addEventListener('click', refresh);
 
   // --- step 3: pull-and-start, and start, as jobs the page watches ---
-  let pulling = null;
+  let pulling = null, pushing = null;
   function openJob(title) {
     $('job').hidden = false; $('jobtitle').textContent = title;
     $('joblog').textContent = ''; $('jobresult').textContent = ''; $('jobresult').className = '';
@@ -1206,8 +1312,26 @@ async fn index() -> Response {
       openJob('pull & start ' + pulling);
       const f = $('pullform'); f.hidden = false; f.take_over.checked = false; f.password.value = ''; f.password.focus();
     }
+    if (b.dataset.push) {
+      pushing = b.dataset.push;
+      if (ws) { ws.close(); $('attach').hidden = true; }
+      openJob((b.textContent.startsWith('stop') ? 'stop & push ' : 'push ') + pushing);
+      const f = $('pushform'); f.hidden = false; f.release.checked = true; f.take_over.checked = false; f.password.value = ''; f.password.focus();
+    }
   });
   $('jobcancel').addEventListener('click', () => { $('pullform').hidden = true; $('job').hidden = true; pulling = null; });
+  $('pushcancel').addEventListener('click', () => { $('pushform').hidden = true; $('job').hidden = true; pushing = null; });
+  $('pushform').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const f = ev.target, name = pushing;
+    const body = { password: f.password.value, release: f.release.checked, take_over: f.take_over.checked };
+    f.hidden = true; f.password.value = '';
+    const j = await runJob('push ' + name, '/sessions/' + encodeURIComponent(name) + '/push', body);
+    if (j && !j.ok && j.held_by) {
+      $('jobresult').insertAdjacentHTML('beforeend', ' <button id="pushtakeover">take over from ' + esc(j.held_by) + '</button>');
+      $('pushtakeover').addEventListener('click', () => { pushing = name; f.hidden = false; f.take_over.checked = true; f.password.focus(); });
+    }
+  });
   $('pullform').addEventListener('submit', async ev => {
     ev.preventDefault();
     const f = ev.target, name = pulling;
@@ -1343,6 +1467,14 @@ mod tests {
         }
         fn stop(&self, name: &str) -> Result<String> {
             self.stopped.lock().unwrap().push(name.to_string());
+            // The row goes to stopped, as the real engine's does — so a
+            // push that follows sees a quiescent volume, and a push that
+            // followed a stop which did NOT take is refused here too.
+            for p in self.projects.lock().unwrap().iter_mut() {
+                if p.name == name {
+                    p.running = false;
+                }
+            }
             Ok("graceful".into())
         }
         /// An echo session: stdin comes back upper-cased on stdout, a resize
@@ -1669,6 +1801,12 @@ mod tests {
                 Some(json!({"password": "x"})),
             ),
             ("POST", "/api/sessions/x/start", None),
+            (
+                "POST",
+                "/api/sessions/x/push",
+                Some(json!({"password": "x"})),
+            ),
+            ("POST", "/api/sessions/x/stop", None),
             ("GET", "/api/jobs/abc", None),
             ("POST", "/api/sessions/x/attach-ticket", None),
         ] {
@@ -1737,6 +1875,29 @@ mod tests {
     static SURFACE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
         SURFACE.lock().await
+    }
+
+    /// The one file the bundle store holds, read back — the server's own
+    /// bytes, not the client's idea of them.
+    fn stored_ciphertext(store_dir: &std::path::Path) -> Vec<u8> {
+        let mut found = Vec::new();
+        let mut stack = vec![store_dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    found.push(path);
+                }
+            }
+        }
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one stored bundle: {found:?}"
+        );
+        std::fs::read(&found[0]).unwrap()
     }
 
     /// Run the CLI's blocking code off the test runtime (its HTTP client is
@@ -2401,6 +2562,137 @@ mod tests {
         assert!(
             first["message"].as_str().unwrap().contains("not running"),
             "{first}"
+        );
+    }
+
+    /// Step 5, end to end against the real server: a running session is
+    /// stopped first (the export needs a quiescent volume, and `core::push`
+    /// refuses a running project), exported, encrypted here, uploaded — and
+    /// what the server stores decrypts, with this account's key, to exactly
+    /// the bytes the engine exported. A wrong password is refused before
+    /// anything is stopped or uploaded; the lease is released by default,
+    /// so another machine can take it; and the row the pull side reads then
+    /// says the bundle is there.
+    #[tokio::test]
+    async fn stop_and_push_through_the_surface() {
+        let _serial = serial().await;
+        let (server, store) = spawn_sync_server();
+        let state_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", state_home.path());
+        std::env::set_var("NEMR_CLOUD_KDF_FAST", "1");
+        std::env::set_var("NEMR_CLOUD_HOLDER", "this-laptop");
+        std::env::set_var("NEMR_CLOUD_HOLDER_BIN", "/bin/true");
+        let email = format!("push-{}@example.com", &hex(&random_bytes())[..12]);
+        const PASSWORD: &str = "correct horse battery staple";
+
+        blocking(|| {
+            let pending = core::register_begin(&server, &email, PASSWORD).unwrap();
+            let mk = core::register_check_code(&pending, &pending.recovery_code.display()).unwrap();
+            core::register_confirm(&pending, &mk).unwrap();
+        });
+
+        let engine = fake_engine(vec![LocalProject {
+            name: "work".into(),
+            agent: "claude-code".into(),
+            running: true,
+            usage_known: true,
+            used_bytes: 4096,
+        }]);
+        let (app, _) = app_with(engine.clone());
+        let cookie = establish(&app).await;
+        let c = Some(cookie.as_str());
+        let push = |body: Value| api_req("POST", "/api/sessions/work/push", c, Some(body));
+
+        // A wrong password: refused before the session is stopped or
+        // anything is uploaded — the key is derived before any of it.
+        let j = finish(
+            &app,
+            &cookie,
+            send(&app, push(json!({"password": "nope"}))).await,
+        )
+        .await;
+        assert_eq!(j["ok"], false, "{j}");
+        assert!(
+            j["error"].as_str().unwrap().contains("wrong password"),
+            "{j}"
+        );
+        assert!(
+            engine.stopped.lock().unwrap().is_empty(),
+            "a refused push must not have stopped the session"
+        );
+        assert!(engine.exported.lock().unwrap().is_empty());
+
+        // The real one: stopped, exported, encrypted, uploaded, released.
+        let j = finish(
+            &app,
+            &cookie,
+            send(&app, push(json!({"password": PASSWORD}))).await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "{j}");
+        let lines: Vec<String> = j["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["text"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            lines.iter().any(|l| l.contains("stopping \"work\"")),
+            "the running session is stopped first: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("encrypting")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("lease released")),
+            "the lease is released by default from the browser: {lines:?}"
+        );
+        assert_eq!(*engine.stopped.lock().unwrap(), vec!["work".to_string()]);
+        assert_eq!(*engine.exported.lock().unwrap(), vec!["work".to_string()]);
+
+        // THE property: what the server stores is this session, encrypted —
+        // it decrypts with this account's key to exactly what the engine
+        // exported, and the ciphertext is not the plaintext.
+        let stored = stored_ciphertext(store.path());
+        let plaintext = blocking(|| {
+            let account = crate::state::load_account().unwrap();
+            let mk = crate::keys::master_key(&account, PASSWORD).unwrap();
+            nemr_crypto::decrypt_bundle(&mk, &stored).expect("the stored bundle decrypts")
+        });
+        assert_eq!(
+            plaintext,
+            b"bundle-of-work".to_vec(),
+            "the server holds the bytes the engine exported"
+        );
+        assert!(
+            !stored.windows(6).any(|w| w == b"bundle"),
+            "the stored bytes are ciphertext, not the plaintext"
+        );
+
+        // And the list now offers it to the other machine: a bundle, and
+        // nobody holding it.
+        let list = json_of(send(&app, api_req("GET", "/api/sessions", c, None)).await).await;
+        let work = list["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "work")
+            .unwrap()
+            .clone();
+        assert_eq!(work["has_bundle"], true, "{work}");
+        assert_eq!(work["running"], false, "the row shows it stopped: {work}");
+        assert_eq!(work["held_by"], Value::Null, "released: {work}");
+
+        // A stop on its own, for a session not being handed on.
+        engine.projects.lock().unwrap()[0].running = true;
+        let j = finish(
+            &app,
+            &cookie,
+            send(&app, api_req("POST", "/api/sessions/work/stop", c, None)).await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "{j}");
+        assert_eq!(
+            *engine.stopped.lock().unwrap(),
+            vec!["work".to_string(), "work".to_string()]
         );
     }
 }

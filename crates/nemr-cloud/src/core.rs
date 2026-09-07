@@ -280,6 +280,16 @@ pub fn sessions(local: Option<&[LocalProject]>) -> Result<Vec<SessionRow>> {
     Ok(merge_rows(&remote, local))
 }
 
+/// Does this password open the stored envelope? The same check `push` and
+/// `pull` make when they derive the master key, callable **before** taking
+/// an action that a later refusal cannot undo — the UI's stop-and-push
+/// stops the session first, and a typo must not cost the user a running
+/// session for a push that was never going to happen.
+pub fn verify_password(password: &str) -> Result<()> {
+    let account = state::load_account()?;
+    keys::master_key(&account, password).map(|_| ())
+}
+
 /// Is anyone logged in on this machine, and as whom?
 pub fn whoami() -> Option<Account> {
     state::load_account().ok()
