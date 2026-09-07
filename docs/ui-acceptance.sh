@@ -36,6 +36,12 @@ REPO="$PWD"
 
 GREEN=$'\033[32m'; RED=$'\033[31m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
 PASS=0; FAIL=0
+# The count is asserted, not merely printed (F-6). A run that skipped a step
+# — Firefox missing, BiDi failing, a block silently short-circuited — would
+# otherwise say PASS with fewer assertions, the green-over-nothing shape
+# verify_wp_a.sh guards against for the regression suite. Raise this number
+# when a step is added; a run that counts anything else fails.
+EXPECTED_ASSERTIONS=44
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS+1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
 fail() { FAIL=$((FAIL+1)); printf '   %sFAIL%s %s\n' "$RED" "$RESET" "$1"; }
@@ -341,8 +347,11 @@ after=$(stat -c%Y "$(find "$WORK/bundles" -type f | head -1)")
 pass "the list shows it stopped, pushed and released; the stored bundle was rewritten"
 
 printf '\n'
+if [[ $FAIL -eq 0 && $PASS -ne $EXPECTED_ASSERTIONS ]]; then
+    fail "expected $EXPECTED_ASSERTIONS assertions, counted $PASS — a step was skipped or added without raising EXPECTED_ASSERTIONS"
+fi
 if [[ $FAIL -eq 0 ]]; then
-    printf '%sPASS%s — the whole flow ran through the browser: %d assertions.\n' "$GREEN" "$RESET" "$PASS"
+    printf '%sPASS%s — the whole flow ran through the browser: %d assertions, all %d expected.\n' "$GREEN" "$RESET" "$PASS" "$EXPECTED_ASSERTIONS"
     [[ "$SKIP_API" == "1" ]] && printf '  (NEMR_SKIP_API=1: the recall claim was file-level, not a live conversation.)\n'
     exit 0
 fi
