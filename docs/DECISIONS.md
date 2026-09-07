@@ -1486,7 +1486,7 @@ is overstating what has been demonstrated.
 
 ### E-19 — The UI launcher, and where the server address and the auth pepper live between runs
 
-**Status:** Open — proposed, awaiting Product Owner ruling (2026-09-07); implementation is its own PR
+**Status:** Ruled · 2026-09-07 (Product Owner) — implementation is its own PR
 **Raised by:** Rain (F-4, daily use) · **Relates to:** E-11 (the extension form, "How commercial commands reach the open CLI", `docs/DECISIONS.md:728-738`), F-89 (pepper), D-05 / D-09 (the S3 credentials will need the same home), D-02 (state dir), SPEC 1.104 (names `nemr ui`), 1.110, 1.115 (`docs/ui-acceptance.sh`)
 
 **Question.** (a) Is the UI's launcher a `nemr ui` built into the open CLI, or `nemr-ui` on PATH through the external-subcommand form the CLI already describes? (b) Where do the sync server's address (client side) and the auth pepper (server side) live between runs, so that neither is typed — and, by extension, where do the S3 credentials live when D-05 rules?
@@ -1520,7 +1520,9 @@ Two operator-facing additions ride along: `$BROWSER` is tried before `xdg-open` 
 
 **Reconciled with E-20 (written the same day).** E-20 first proposed the env file be *sourced into the process* by a shell or a unit (zero code); this row proposes the server *reads it itself* (`sync.env`, env wins key by key, mode refused not repaired). One mechanism is chosen for both: **the server reads its own file**, because a hand run and a unit then take one code path, the 0600 refusal is a control the server performs rather than a habit the operator keeps, and the S3 credential E-20 needs lands in the same file under the same rule. E-20's own text is amended to say so.
 
-**Open question for the ruling, not decided here.** When no pepper is present in the environment or the file, does the server keep today's warn-and-random (`main.rs:42-45`, now naming the file as the remedy) or refuse to start? That is a security-posture choice between a server that runs weaker than it claims and one that will not run at all on a bare box; the PR implements whichever is ruled, and the recommendation leans to keeping the warning because the PR is about where config lives, not about changing what an unconfigured server does.
+**Ruling (Product Owner, 2026-09-07).** Everything as recommended — `nemr-ui` on PATH as the extension form with the open CLI untouched, the server remembered client-side across logout, one 0600 `sync.env` read by the server — with the open question decided against the recommendation: **a server with no pepper refuses to bind.** The refusal names the file and the exact line to add. One explicit escape hatch exists for throwaway servers: an unmistakable value, `NEMR_AUTH_PEPPER=ephemeral`, which starts the server with a random per-process pepper and prints a loud warning at start; the acceptances use that value, so a test server never looks like a configured one and a configured one is never silently weaker than it claims.
+
+**The question as it was put, kept for the record.** When no pepper is present in the environment or the file, does the server keep today's warn-and-random or refuse to start? The recommendation leaned to keeping the warning because the PR is about where config lives; the ruling chose refusal, with the escape hatch making the throwaway case explicit rather than the default.
 
 **Follow-ups, recorded, not in this row.** A `deploy/systemd/user/nemr-sync.service` (`ExecStart=%h/.local/bin/nemr-sync`, shaped like `nemrd.service:11`, deliberately *without* `EnvironmentFile=` so a hand run and the unit read `sync.env` through one code path), an `install_sync_server.sh`, and a PREREQUISITES step — a deployment ruling with its own unresolved dependency: the test database is started by `podman run -d` with no restart policy (`scripts/setup_sync_test_db.sh:59-64`), so a unit that survives a reboot would come up against a database that did not. D-05's S3 wiring is a separate PR on that ruling; `sync.env` is merely where `NEMR_S3_*` will live.
 
@@ -1532,7 +1534,7 @@ Log line: `| 2026-09-07 | E-19 | Opened — F-4: UI launcher = extension form (`
 
 ### E-20 — The sync server takes its storage backend from the environment (F-5; the mechanism half of D-05)
 
-**Status:** Open — proposed, awaiting Product Owner ruling · 2026-09-07
+**Status:** Ruled · 2026-09-07 (Product Owner) — accepted as written; implementation is its own PR
 **Raised by:** Rain (F-5) · **Relates to:** D-01, D-05, D-09, D-11, M12, E-11, E-16, F-61, F-89
 
 **Question.** `nemr-sync` reads `NEMR_BUNDLE_DIR` as required and builds
@@ -1661,7 +1663,9 @@ live B2 bucket. Bundle deletion on the server (nothing calls
 mode leave objects behind) is a separate item. TLS for a server bound beyond
 loopback is a separate item.
 
-**Open questions for the ruling.**
+**Ruling (Product Owner, 2026-09-07).** Accepted as written: the backend chosen by its own variables, exactly one set, no default, the egress-free check before the port binds. The implementation must prove the R2 path against a real bucket, not only the directory — a push from the browser landing as ciphertext in the bucket, a pull on a project deleted locally coming back byte-identical, the server never seeing plaintext — red under a neuter that swaps the backend out. That proof closes D-05. The side questions below stand as asked, to be answered in the implementation PR.
+
+**Open questions, as asked before the ruling.**
 1. Ship `deploy/systemd/user/nemr-sync.service` (`EnvironmentFile=%h/.config/nemr/sync.env`,
    `ExecStart=%h/.local/bin/nemr-sync`, no arguments, `StartLimitBurst=5` so a
    wrong env file stops after five refusals rather than looping) with the
@@ -1755,3 +1759,5 @@ as the case every test passes.
 | 2026-09-06 | F-131 | **Resolved** — the first `claude` in a session opens ready: seeded by allowlist at first start (onboarding flags, workspace trust, host identity when present); the login prompt was onboarding, not the token; `create` refuses a dead credential (SPEC 1.106) (Rain; built by Claude Code) |
 | 2026-09-07 | E-19 | **Opened** — F-4: the UI launcher is the extension form (`nemr-ui` on PATH, one name added to the install script; the open CLI untouched); the client remembers the server of its last login in `server-url` across logout; every server setting and the pepper live in one 0600 `sync.env` the server reads itself, environment winning key by key. Proposed, not ruled; one question left for the ruling (no pepper anywhere: warn-and-random or refuse); a `nemr-sync` unit and the test database's missing restart policy recorded as follow-ups (Claude Code) |
 | 2026-09-07 | E-20 | **Opened** — F-5, the mechanism half of D-05: the backend's own variables are the switch (complete `NEMR_S3_*` names an object store, `NEMR_BUNDLE_DIR` an existing directory; exactly one, no default, both or neither refused naming both); one egress-free list must succeed before the database is migrated and the port binds; the credential never in argv or the journal; `NEMR_S3_*` live in E-19's `sync.env`. Proposed, not ruled; three side questions listed; D-05's commercial half stays in D-05 (Claude Code) |
+| 2026-09-07 | E-19 | **Ruled** — as recommended, except the pepper: a server with no pepper **refuses to bind**, naming the file and the line to add; `NEMR_AUTH_PEPPER=ephemeral` is the one explicit escape hatch (random pepper, loud warning), used by the acceptances (Rain) |
+| 2026-09-07 | E-20 | **Ruled** — accepted as written; the implementation proves R2 against a real bucket (browser push lands as ciphertext, a pull after local delete comes back byte-identical, the server never sees plaintext), red under a backend-swap neuter; that closes D-05 (Rain) |
