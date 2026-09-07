@@ -231,11 +231,14 @@ class Browser:
             lines.put(None)
         threading.Thread(target=pump, daemon=True).start()
         url = None
-        deadline = time.time() + 60
+        # Generous: a cold snap start on a small VM with its page cache just
+        # evicted by a build was measured at 93 s. The deadline is there so a
+        # browser that never comes up fails instead of hanging, not to be tight.
+        deadline = time.time() + 180
         while url is None:
             remaining = deadline - time.time()
             if remaining <= 0:
-                raise SystemExit("firefox did not announce a BiDi endpoint within 60 s:\n" + "\n".join(self.log[-10:]))
+                raise SystemExit("firefox did not announce a BiDi endpoint within 180 s:\n" + "\n".join(self.log[-10:]))
             try:
                 line = lines.get(timeout=remaining)
             except queue.Empty:
