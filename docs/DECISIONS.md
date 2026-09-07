@@ -864,7 +864,7 @@ question is what it found, not how to make it pass.**
 
 ### D-05 — Storage backend
 
-**Status:** Open — technical direction set, commercial choice deferred
+**Status:** Resolved · 2026-09-07 — R2 first, behind the M12 S3-compatible trait, **proven through the sync server against a real bucket** (E-20 built, SPEC 1.121): the backend chosen by its own variables, probed before the port binds, a push from the browser landing as ciphertext read back independently, a pull after local delete byte-identical, red under a backend-swap neuter. The commercial choice (launch default, tiers) is a config change under that mechanism, and B2 stays D-09 until a live run.
 **Relates to:** M12
 
 **Direction.** Build Cloudflare R2 first behind the M12 S3-compatible trait;
@@ -1761,3 +1761,6 @@ as the case every test passes.
 | 2026-09-07 | E-20 | **Opened** — F-5, the mechanism half of D-05: the backend's own variables are the switch (complete `NEMR_S3_*` names an object store, `NEMR_BUNDLE_DIR` an existing directory; exactly one, no default, both or neither refused naming both); one egress-free list must succeed before the database is migrated and the port binds; the credential never in argv or the journal; `NEMR_S3_*` live in E-19's `sync.env`. Proposed, not ruled; three side questions listed; D-05's commercial half stays in D-05 (Claude Code) |
 | 2026-09-07 | E-19 | **Ruled** — as recommended, except the pepper: a server with no pepper **refuses to bind**, naming the file and the line to add; `NEMR_AUTH_PEPPER=ephemeral` is the one explicit escape hatch (random pepper, loud warning), used by the acceptances (Rain) |
 | 2026-09-07 | E-20 | **Ruled** — accepted as written; the implementation proves R2 against a real bucket (browser push lands as ciphertext, a pull after local delete comes back byte-identical, the server never sees plaintext), red under a backend-swap neuter; that closes D-05 (Rain) |
+| 2026-09-07 | E-19 | **Built** — `nemr-ui` on PATH via the install list (control: list = subcommands); the server remembered across logout (control: a bare machine cannot log in); `sync.env` read by the server, env wins, 0600 refused not repaired; no pepper = no bind, `ephemeral` = the loud hatch, used by the acceptances (SPEC 1.120) (Claude Code) |
+| 2026-09-07 | E-20 | **Built** — backend from its own variables, exactly one, probed before bind; R2 proven through the server against a real bucket by the browser acceptance's own SigV4 reader, red under a backend-swap neuter (SPEC 1.121) (Claude Code) |
+| 2026-09-07 | D-05 | **Resolved** — R2 first, proven end to end through the server; commercial choice is now a config change (Claude Code) |

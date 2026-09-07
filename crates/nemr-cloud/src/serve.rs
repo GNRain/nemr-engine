@@ -403,7 +403,13 @@ fn failed(status: StatusCode, e: anyhow::Error) -> Response {
 async fn whoami() -> Json<Value> {
     Json(match core::whoami() {
         Some(a) => json!({ "logged_in": true, "email": a.email, "server": a.server }),
-        None => json!({ "logged_in": false, "default_server": core::default_server() }),
+        None => json!({
+            "logged_in": false,
+            "default_server": core::default_server(),
+            // Where the pre-filled server came from, so a stale value can be
+            // seen for what it is (E-19).
+            "default_server_source": core::default_server_source(),
+        }),
     })
 }
 
@@ -1455,7 +1461,13 @@ pub fn run(port: Option<u16>, open: bool) -> Result<()> {
         println!("(loopback only; the token in the URL is single-use; Ctrl-C stops the UI and closes the port)");
         if open {
             // Best effort: a missing opener is not an error, the URL is printed.
-            let _ = std::process::Command::new("xdg-open")
+            // `$BROWSER` first (E-19): on the WSL2 box xdg-open is absent and the
+            // user's opener is the Windows browser they name.
+            let opener = std::env::var("BROWSER")
+                .ok()
+                .filter(|b| !b.is_empty())
+                .unwrap_or_else(|| "xdg-open".into());
+            let _ = std::process::Command::new(opener)
                 .arg(&url)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -2092,6 +2104,13 @@ mod tests {
         assert!(!token.is_empty());
         let who = json_of(send(&app, api_req("GET", "/api/whoami", c, None)).await).await;
         assert_eq!(who["logged_in"], false, "{who}");
+        // E-19: logged out, the page's form is pre-filled with the server
+        // remembered from the registration — not the built-in default.
+        std::env::remove_var("NEMR_SERVER_URL");
+        assert_eq!(
+            who["default_server"], server,
+            "the remembered server survives logout: {who}"
+        );
         let r = send(&app, api_req("GET", "/api/sessions", c, None)).await;
         assert_eq!(
             r.status(),

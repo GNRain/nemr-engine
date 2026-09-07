@@ -433,15 +433,110 @@ async def _page_flow(launch_url, email, password, server, remote_name, local_nam
         # Logging out deleted the account this machine shares with the rest
         # of the acceptance; leave the machine as it was found — logged in,
         # through the form, one more time.
-        await b.eval(f"(f => {{ f.server.value = {json.dumps(server)}; f.email.value = {json.dumps(email)}; f.password.value = {json.dumps(password)}; f.requestSubmit(); }})(document.getElementById('login'))")
-        await b.wait_for(VISIBLE + "('list')", 60, "the list after logging back in")
-        check("the page block leaves the machine logged in, as it found it", not await b.eval(VISIBLE + "('login')") and await b.eval(VISIBLE + "('logout')"))
+        # E-19: the form is pre-filled with the server remembered from the
+        # last login, so an EMPTY field logs in — the page's only way to
+        # reach a server here is that memory (NEMR_SERVER_URL is not set).
+        prefilled = await b.eval("document.getElementById('login').server.value")
+        check("E-19 after logout the form is pre-filled with the remembered server", prefilled == server, prefilled)
+        await b.eval(f"(f => {{ f.server.value = ''; f.email.value = {json.dumps(email)}; f.password.value = {json.dumps(password)}; f.requestSubmit(); }})(document.getElementById('login'))")
+        await b.wait_for(VISIBLE + "('list')", 60, "the list after logging back in with an empty server field")
+        check("E-19 an empty server field logs in through the remembered server", not await b.eval(VISIBLE + "('login')") and await b.eval(VISIBLE + "('logout')"))
+        who = await b.eval("document.getElementById('who').textContent")
+        check("the page block leaves the machine logged in, as it found it", server in (who or ""), who)
+
+
+# --- the bucket, read independently of the server -----------------------------
+#
+# E-20's proof needs a second opinion on what the server stored: the object
+# fetched from the bucket by something that is not the server. AWS Signature
+# V4 with the standard library only — no SDK, no third-party tool; the
+# credential is read from the environment, used for the signature, and never
+# printed, placed in a URL, or written anywhere.
+import datetime, hashlib, hmac, urllib.parse, urllib.request, urllib.error
+
+
+
+def _sign(key, msg):
+    return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+
+def s3_request(method, key, body=b"", query=None):
+    """One signed request against the bucket named by NEMR_S3_*; returns (status, bytes).
+
+    The credential is read from the environment and used for the signature
+    only; it is never printed, never placed in a URL, never written.
+    """
+    endpoint = os.environ["NEMR_S3_ENDPOINT"].rstrip("/")
+    bucket = os.environ["NEMR_S3_BUCKET"]
+    access = os.environ["NEMR_S3_ACCESS_KEY_ID"]
+    secret = os.environ["NEMR_S3_SECRET_ACCESS_KEY"]
+    region = os.environ.get("NEMR_S3_REGION") or ("auto" if os.environ.get("NEMR_S3_PROVIDER") == "r2" else "us-east-1")
+    host = urllib.parse.urlparse(endpoint).netloc
+    path = "/" + bucket + ("/" + urllib.parse.quote(key, safe="/-_.~") if key else "")
+    qs = "&".join(f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(str(v), safe='-_.~')}" for k, v in sorted((query or {}).items()))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    scope_date = now.strftime("%Y%m%d")
+    payload_hash = hashlib.sha256(body).hexdigest()
+    headers = {"host": host, "x-amz-content-sha256": payload_hash, "x-amz-date": amz_date}
+    signed = ";".join(sorted(headers))
+    canonical = "\n".join([method, path, qs, "".join(f"{k}:{headers[k]}\n" for k in sorted(headers)), signed, payload_hash])
+    scope = f"{scope_date}/{region}/s3/aws4_request"
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    k = _sign(_sign(_sign(_sign(("AWS4" + secret).encode(), scope_date), region), "s3"), "aws4_request")
+    signature = hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()
+    auth = f"AWS4-HMAC-SHA256 Credential={access}/{scope}, SignedHeaders={signed}, Signature={signature}"
+    url = endpoint + path + (("?" + qs) if qs else "")
+    req = urllib.request.Request(url, data=body if method in ("PUT", "POST") else None, method=method)
+    for h, v in headers.items():
+        if h != "host":
+            req.add_header(h, v)
+    req.add_header("Authorization", auth)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def s3_list(prefix):
+    """Keys under a prefix, from a ListObjectsV2 page (enough for an acceptance run's handful)."""
+    import re
+    status, body = s3_request("GET", "", query={"list-type": "2", "prefix": prefix, "max-keys": "1000"})
+    if status != 200:
+        raise SystemExit(f"bucket list refused: HTTP {status}")
+    return re.findall(r"<Key>([^<]+)</Key>", body.decode(errors="replace"))
+
+
+def main_no_page(op):
+    if op == "s3-get":
+        # s3-get <launch_url> <key> <out-file>   (the launch URL is unused; the op needs no page)
+        status, body = s3_request("GET", sys.argv[3])
+        if status != 200:
+            raise SystemExit(f"bucket GET refused: HTTP {status}")
+        with open(sys.argv[4], "wb") as f:
+            f.write(body)
+        print(len(body))
+    elif op == "s3-list":
+        print("\n".join(s3_list(sys.argv[3])))
+    elif op == "s3-delete-prefix":
+        keys = s3_list(sys.argv[3])
+        for k in keys:
+            st, _ = s3_request("DELETE", k)
+            if st not in (200, 204):
+                raise SystemExit(f"bucket DELETE {k!r} refused: HTTP {st}")
+        print(len(keys))
+    else:
+        raise SystemExit(f"unknown op {op!r}")
 
 
 def main():
     # NEMR_UI_COOKIE carries the one session cookie between the steps of the
     # acceptance, the way an open tab carries it between clicks.
     op = sys.argv[1]
+    if op.startswith("s3-"):
+        # The bucket ops touch no page and spend no token.
+        return main_no_page(op)
     if op == "page":
         # The page itself exchanges the launch token; this process must not.
         email, password, server, remote_name, local_name = sys.argv[3:8]

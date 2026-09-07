@@ -62,6 +62,25 @@ pub fn delete_account() -> Result<()> {
     }
 }
 
+/// The server of the last successful login or registration, remembered
+/// across `logout` (E-19): `account.json` dies with the session, so without
+/// this the address was retyped after every logout. Public data (a URL),
+/// still 0600 like everything under the state directory.
+fn server_url_path() -> PathBuf {
+    state_dir().join("server-url")
+}
+
+pub fn remember_server(url: &str) -> Result<()> {
+    write_private(&server_url_path(), url.trim().as_bytes())
+}
+
+pub fn remembered_server() -> Option<String> {
+    std::fs::read_to_string(server_url_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// The UI's launch URL (token in the fragment), 0600 — readable by this user
 /// only, the same trust the daemon's socket relies on. Overwritten on every
 /// `nemr ui`; the token inside is single-use anyway.

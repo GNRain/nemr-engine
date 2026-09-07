@@ -30,13 +30,27 @@ use crate::state::{self, Account, LeaseState};
 
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 
-/// The server to talk to when none is named: `NEMR_SERVER_URL`, else the
-/// development default.
+/// The server to talk to when none is named (E-19): `NEMR_SERVER_URL`, else
+/// the server remembered from the last successful login or registration,
+/// else the development default. A per-invocation environment beats a
+/// persistent file; the flag and the page's field beat both, in the callers.
 pub fn default_server() -> String {
     std::env::var("NEMR_SERVER_URL")
         .ok()
         .filter(|s| !s.is_empty())
+        .or_else(state::remembered_server)
         .unwrap_or_else(|| DEFAULT_SERVER.to_string())
+}
+
+/// Where the default came from, for a refusal that names its source.
+pub fn default_server_source() -> &'static str {
+    if std::env::var("NEMR_SERVER_URL").is_ok_and(|s| !s.is_empty()) {
+        "NEMR_SERVER_URL"
+    } else if state::remembered_server().is_some() {
+        "remembered from your last login; pass --server or set NEMR_SERVER_URL to change it"
+    } else {
+        "the built-in default"
+    }
 }
 
 /// Log in: derive the auth key from the password with the server's KDF
@@ -68,6 +82,8 @@ fn finish_login(api: &Api, server: &str, email: &str, auth_key: &[u8; 32]) -> Re
         password_envelope: resp.password_envelope,
     };
     state::save_account(&account)?;
+    // Remembered past logout, so the address is typed once (E-19).
+    state::remember_server(server)?;
     Ok(account)
 }
 
