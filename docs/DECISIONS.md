@@ -1747,6 +1747,22 @@ as the case every test passes.
 
 **Consequence of not deciding.** The second-machine milestone stops at `start`: a pulled session cannot start on a fresh host, the failure names a mount rather than a login, and the only way through installs Claude Code on the host — the thing the product exists to avoid.
 
+### E-22 — Deleting a session's cloud copy: not from the page until the server can delete bundles
+
+**Status:** Open — recorded with F-12 (2026-09-08); no code
+**Raised by:** Rain (F-12, the UI's second pass: "Deleting the cloud copy is out of scope until the server can delete bundles; record that as its own decision row") · **Relates to:** F-12 (remove from this machine), WP-J (the sync server), D-05/E-20 (the object store), E-16 (the key envelope: a bundle is opaque to the server)
+
+**Question.** F-12 removes a session from *this machine* only. When may the page (or the CLI) delete the copy in the cloud — the bundle in the object store and the row in the server's index — and what must be true first?
+
+**Established first.**
+- *The server cannot delete a bundle today.* Its routes are register, recovery, login, logout, the session index (list, upsert), the bundle put/get, and the lease (acquire, heartbeat, take over, release) — `crates/nemr-sync/src/lib.rs`. The store trait has a `delete`, used by nothing a client can reach.
+- *Remove-from-here is safe without it.* A removed session with a bundle reads as remote and can be pulled again from any machine (the acceptance's own flow does exactly this); the only-copy case is the one F-12 guards with the typed name.
+- *What a cloud delete needs, at least:* a route the account owns (the bundle belongs to the account that pushed it); a rule for a lease held elsewhere (deleting under another machine's lease is the D-03 shape); the index row's fate (gone, or kept as "deleted on <date>" for the "what did I lose?" question of D-04); and a proof that the object is gone from the store, read back by something that is not the server (E-20's discipline).
+
+**Options.** (a) Never from the page: a CLI-only `nemr sessions delete <name>` once the server has the route. (b) From the page, as a third remove case ("delete everywhere") with the typed name, once the server has the route. (c) Soft delete first: the index row marked deleted and the object kept for a grace period, then a sweep.
+
+**Proposal.** Out of scope until the server can delete bundles. Then (b) with the typed name for every cloud delete (never one click), refused while another machine holds the lease, and the index row kept for a grace period (c) so D-04 can name what was lost. To be ruled when the server route is built.
+
 ## Log
 
 | Date | Entry | Change |
@@ -1807,3 +1823,4 @@ as the case every test passes.
 | 2026-09-07 | D-05 | **Resolved** — R2 first, proven end to end through the server; commercial choice is now a config change (Claude Code) |
 | 2026-09-08 | E-21 | **Opened** — the credential step on a second machine: placeholder at start when the host has no credential, login inside the session through the page's terminal (Claude Code's own OAuth URL rendered as a link; measured: the manual flow exists), the write landing on the host through the rw bind; acceptance in two arms (automated with a test seam; human-completed once on the fresh VM). Proposed, not ruled; three questions listed (Claude Code) |
 | 2026-09-08 | E-21 | **Ruled and built** — create and restore identical on a host with no login (AUTH-03 amended); the placeholder at create and start, bound rw; the page's login line, the sign-in URL as text and link; the seam test-only and path-only; the write-through measured under the real bind (SPEC 1.125) (Rain; built by Claude Code) |
+| 2026-09-08 | E-22 | **Opened** — deleting a session's cloud copy waits for a server route; F-12 removes from this machine only, the cloud copy never touched (Claude Code, on F-12) |

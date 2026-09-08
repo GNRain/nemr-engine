@@ -12,8 +12,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use nemr_daemon_api::proto::{
-    attach_client, AttachClient, AttachStart, ExportRequest, ImportRequest, ListRequest,
-    StartRequest, StatusRequest, StopRequest,
+    attach_client, AttachClient, AttachStart, CreateRequest, DeleteRequest, ExportRequest,
+    ImportRequest, ListRequest, StartRequest, StatusRequest, StopRequest,
 };
 
 use crate::core::EngineOps;
@@ -125,6 +125,38 @@ impl DaemonEngine {
         Ok(())
     }
 
+    /// F-11: create through the daemon's `Create` — the same RPC `nemr
+    /// create` uses; the daemon validates the size and the agent.
+    pub async fn create_project(name: &str, size: &str, agent: &str) -> Result<()> {
+        let mut s = Self::session().await?;
+        let req = s.req(CreateRequest {
+            name: name.to_string(),
+            size: size.to_string(),
+            agent: agent.to_string(),
+        });
+        s.client()
+            .create(req)
+            .await
+            .map_err(|st| anyhow::anyhow!("{}", st.message()))
+            .context("creating the session")?;
+        Ok(())
+    }
+
+    /// F-12: remove from this machine through the daemon's `Delete` — the
+    /// same RPC `nemr delete` uses. The cloud copy is never touched here.
+    pub async fn delete_project(name: &str) -> Result<()> {
+        let mut s = Self::session().await?;
+        let req = s.req(DeleteRequest {
+            name: name.to_string(),
+        });
+        s.client()
+            .delete(req)
+            .await
+            .map_err(|st| anyhow::anyhow!("{}", st.message()))
+            .context("removing the session from this machine")?;
+        Ok(())
+    }
+
     /// Stop; returns the daemon's outcome word (graceful, killed, no_task,
     /// wedged).
     pub async fn stop_project(name: &str) -> Result<String> {
@@ -161,6 +193,12 @@ impl crate::serve::UiEngine for DaemonEngine {
     }
     fn stop(&self, name: &str) -> Result<String> {
         self.rt.block_on(Self::stop_project(name))
+    }
+    fn create(&self, name: &str, size: &str, agent: &str) -> Result<()> {
+        self.rt.block_on(Self::create_project(name, size, agent))
+    }
+    fn delete(&self, name: &str) -> Result<()> {
+        self.rt.block_on(Self::delete_project(name))
     }
     fn attach(
         &self,
