@@ -785,6 +785,59 @@ pub enum ReleaseOutcome {
     AlreadyLost,
 }
 
+/// E-22: delete a session's cloud copy — the object and the server index row.
+/// This machine's local copy, if any, is untouched; the server refuses if
+/// another machine holds the lease, and `take_over` first claims it (D-03).
+/// Returns `Err(HeldElsewhere)` when another machine holds the lease and
+/// `take_over` is false, so the driver can offer the take-over — the same shape
+/// pull and push use.
+pub fn delete_cloud(name: &str, take_over: bool, report: &mut dyn FnMut(&str)) -> Result<()> {
+    let account = state::load_account()?;
+    let api = Api::new(&account.server, Some(account.token.clone()));
+    let me = state::holder_identity();
+
+    if take_over {
+        report("taking over the lease before deleting the cloud copy");
+        api.takeover_lease(name, &me)?;
+    }
+
+    match api.delete_cloud(name, &me) {
+        Ok(()) => {
+            // The server dropped the row and, by cascade, its lease; drop any
+            // local lease record so nothing here points at a session the cloud
+            // no longer knows.
+            state::delete_lease(name);
+            report(&format!(
+                "deleted the cloud copy of {name:?}; nothing on this machine was touched"
+            ));
+            Ok(())
+        }
+        Err(e) if e.downcast_ref::<LeaseLost>().is_some() => {
+            // Held by another machine. Name the holder from the index so the
+            // driver can offer the take-over (the HeldElsewhere shape).
+            let row = api
+                .sessions()
+                .ok()
+                .and_then(|rows| rows.into_iter().find(|s| s.name == name));
+            let holder = row
+                .as_ref()
+                .and_then(|s| s.held_by.clone())
+                .unwrap_or_else(|| "another machine".to_string());
+            let expires_in_secs = row
+                .and_then(|s| s.lease_expires_at_unix)
+                .map(|t| (t - now_unix()).max(0))
+                .unwrap_or(0);
+            Err(HeldElsewhere {
+                session: name.to_string(),
+                holder,
+                expires_in_secs,
+            }
+            .into())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub fn release(name: &str) -> Result<ReleaseOutcome> {
     let account = state::load_account()?;
     let api = Api::new(&account.server, Some(account.token));

@@ -101,6 +101,76 @@ pub async fn upload(
     }))
 }
 
+/// E-22: delete a session's cloud copy — the stored object AND the index row —
+/// so the merge reads the session as local-only (or drops it entirely if it
+/// lived only in the cloud). Refused while an ACTIVE lease is held by ANOTHER
+/// machine: deleting a bundle another machine holds would let its next push
+/// write into a deleted key and leave a half-state (D-03). The lease test is in
+/// the DELETE's own WHERE clause, so a lease acquired mid-delete is refused
+/// atomically rather than raced. The object is removed synchronously (not
+/// tombstoned): a storage tier bills what the store holds, so what exists is the
+/// store's live contents with no tombstone ledger to reconcile.
+pub async fn delete_cloud(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    // 404 before anything else, so "no such session" is not reported as a lease
+    // conflict.
+    let session_id = index::resolve(&state, user.id, &name).await?;
+    let caller = header_str(&headers, "x-nemr-lease-holder")?;
+
+    let deleted: Option<(Option<String>,)> = sqlx::query_as(
+        "DELETE FROM sessions
+          WHERE id = $1
+            AND NOT EXISTS (
+                SELECT 1 FROM leases l
+                 WHERE l.session_id = $1 AND l.holder <> $2 AND l.expires_at >= now()
+            )
+        RETURNING storage_key",
+    )
+    .bind(session_id)
+    .bind(&caller)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let Some((storage_key,)) = deleted else {
+        // The row exists (resolved above) but was not deleted: an active lease
+        // is held by another machine. Name the holder so the client can offer
+        // take-over.
+        let holder: Option<(String,)> = sqlx::query_as(
+            "SELECT holder FROM leases WHERE session_id = $1 AND expires_at >= now()",
+        )
+        .bind(session_id)
+        .fetch_optional(&state.pool)
+        .await?;
+        let who = holder
+            .map(|(h,)| h)
+            .unwrap_or_else(|| "another machine".to_string());
+        return Err(ApiError::Conflict(format!(
+            "the session's lease is held by {who}; take it over before deleting the cloud copy"
+        )));
+    };
+
+    // The row (and, by cascade, its lease) is gone. Remove the object too, so
+    // what the store holds is exactly what exists (E-22). An object-delete
+    // failure after the row is gone would orphan bytes — logged loudly rather
+    // than silently left.
+    if let Some(key) = storage_key {
+        let key = ObjectKey::new(key).map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
+        state.store.delete(&key).await.map_err(|e| {
+            tracing::error!(key = %key.as_str(), "deleted the index row but the object delete failed: {e} — possible orphan");
+            ApiError::Internal(anyhow::anyhow!("store delete: {e}"))
+        })?;
+        tracing::info!(key = %key.as_str(), store = %state.store.describe(), "deleted bundle (E-22)");
+    }
+
+    Ok(Json(
+        serde_json::json!({ "deleted": true, "session": name }),
+    ))
+}
+
 #[derive(serde::Serialize)]
 pub struct UploadResponse {
     pub bytes: i64,

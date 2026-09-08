@@ -283,6 +283,7 @@ pub fn router(state: Arc<UiState>) -> Router {
         .route("/logout", post(logout))
         .route("/sessions", get(sessions).post(create))
         .route("/sessions/{name}", delete(remove))
+        .route("/sessions/{name}/cloud", delete(delete_cloud))
         .route("/sessions/{name}/pull", post(pull))
         .route("/sessions/{name}/start", post(start))
         .route("/sessions/{name}/push", post(push))
@@ -866,6 +867,36 @@ async fn remove(State(state): State<Arc<UiState>>, UrlPath(name): UrlPath<String
     Json(json!({ "job": id })).into_response()
 }
 
+#[derive(Deserialize)]
+struct CloudDeleteBody {
+    #[serde(default)]
+    take_over: bool,
+}
+
+/// E-22: delete a session's cloud copy, as a job. This machine's local copy is
+/// never touched. The server refuses while another machine holds the lease;
+/// `take_over` claims it first (the job carries `held_by` on refusal, so the
+/// page offers the take-over as it does for pull and push).
+async fn delete_cloud(
+    State(state): State<Arc<UiState>>,
+    UrlPath(name): UrlPath<String>,
+    Json(body): Json<CloudDeleteBody>,
+) -> Response {
+    if core::whoami().is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "not logged in" })),
+        )
+            .into_response();
+    }
+    let session = name.clone();
+    let take_over = body.take_over;
+    let id = state.start_job("delete-cloud", &name, move |say| {
+        core::delete_cloud(&session, take_over, say)
+    });
+    Json(json!({ "job": id })).into_response()
+}
+
 /// What a job has said so far, and whether it is done.
 async fn job(State(state): State<Arc<UiState>>, UrlPath(id): UrlPath<String>) -> Response {
     let job = state
@@ -1335,6 +1366,12 @@ async fn index() -> Response {
         <label id="removetypeit" hidden>type the session's name to confirm <input name="typed" autocomplete="off"></label>
         <div style="display:flex;gap:.6rem"><button class="primary" type="submit" id="removeconfirm">remove from this machine</button><button type="button" id="removecancel">cancel</button></div>
       </form>
+      <form id="cloudform" style="display:grid;gap:.6rem" hidden>
+        <div id="cloudcase"></div>
+        <label id="cloudtypeit" hidden>type the session's name to confirm <input name="typed" autocomplete="off"></label>
+        <label class="checkline"><input name="take_over" type="checkbox" style="width:auto"> take over the lease if another machine holds it</label>
+        <div style="display:flex;gap:.6rem"><button class="primary" type="submit" id="cloudconfirm">delete from cloud</button><button type="button" id="cloudcancel">cancel</button></div>
+      </form>
       <pre id="joblog" style="margin:0;white-space:pre-wrap"></pre>
       <div id="jobresult"></div>
     </section>
@@ -1418,6 +1455,10 @@ async fn index() -> Response {
       else action = '<button data-attach="' + esc(s.name) + '">attach</button> <button data-push="' + esc(s.name) + '">stop &amp; push</button>';
       // F-12: remove from THIS machine; the button says which case it is.
       if (s.where !== 'remote') action += ' <button class="linkish" data-remove="' + esc(s.name) + '" data-bundle="' + (s.has_bundle ? '1' : '0') + '" data-running="' + (s.running ? '1' : '0') + '">' + (s.has_bundle ? 'remove from this machine' : 'remove the only copy') + '</button>';
+      // E-22: delete the CLOUD copy, whenever one exists. The label and confirm
+      // say which case it is: a local copy survives (both) → one click; the
+      // cloud is the only copy (remote) → the typed name (F-12's rule).
+      if (s.has_bundle) { const localToo = s.where !== 'remote'; action += ' <button class="linkish" data-cloud="' + esc(s.name) + '" data-localtoo="' + (localToo ? '1' : '0') + '">' + (localToo ? 'delete from cloud' : 'delete the only copy') + '</button>'; }
       // The session's data on one row, then its actions on their own row
       // beneath (grouped, fixed order) — so a long remove label never widens
       // the table (F-13). The data row carries data-name so the acceptance can
@@ -1501,7 +1542,7 @@ async fn index() -> Response {
   }
 
   // --- step 3: pull-and-start, and start, as jobs the page watches ---
-  let pulling = null, pushing = null, removing = null;
+  let pulling = null, pushing = null, removing = null, clouding = null;
   // Exactly one action panel is open at a time: the job panel (with one of
   // its two forms) or the terminal. Opening either closes the other; cancel
   // closes; a job that completes closes and leaves its result on the status
@@ -1515,7 +1556,7 @@ async fn index() -> Response {
   function closePanels() {
     panelGen++;
     $('job').hidden = true; $('pullform').hidden = true; $('pushform').hidden = true;
-    $('createform').hidden = true; $('removeform').hidden = true;
+    $('createform').hidden = true; $('removeform').hidden = true; $('cloudform').hidden = true;
     if (ws) { const w = ws; ws = null; w.close(); }
     $('attach').hidden = true;
     pulling = null; pushing = null; removing = null;
@@ -1701,6 +1742,36 @@ async fn index() -> Response {
     if ($('removeconfirm').disabled) return;
     ev.target.hidden = true;
     await runJob('remove ' + name, '/sessions/' + encodeURIComponent(name), null, null, 'DELETE');
+  });
+  // E-22: delete the cloud copy. One click when a local copy survives; the
+  // typed name when the cloud is the only copy (F-12's rule). On a lease held
+  // elsewhere the job carries held_by and runJob offers the take-over.
+  $('rows').addEventListener('click', ev => {
+    const b = ev.target.closest('button[data-cloud]'); if (!b) return;
+    const name = b.dataset.cloud, localToo = b.dataset.localtoo === '1';
+    openJob(localToo ? 'delete the cloud copy of ' + name : 'delete ' + name + ' (the only copy)');
+    clouding = name;
+    const f = $('cloudform'); f.hidden = false; f.typed.value = ''; f.take_over.checked = false;
+    $('cloudcase').innerHTML = localToo
+      ? 'This deletes the cloud copy of <strong>' + esc(name) + '</strong>. Your copy on this machine stays, and the row will read local, with no bundle. You can push it again later.'
+      : '<span class="bad">This is the only copy of <strong>' + esc(name) + '</strong>.</span> It is not on this machine; deleting it from the cloud erases it for good.';
+    $('cloudtypeit').hidden = localToo;
+    $('cloudconfirm').disabled = !localToo;
+    if (!localToo) f.typed.focus();
+  });
+  $('cloudform').typed.addEventListener('input', ev => {
+    if (!$('cloudtypeit').hidden) $('cloudconfirm').disabled = ev.target.value !== clouding;
+  });
+  $('cloudcancel').addEventListener('click', closePanels);
+  $('cloudform').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const name = clouding, f = ev.target;
+    if ($('cloudconfirm').disabled) return;
+    const body = { take_over: f.take_over.checked };
+    f.hidden = true;
+    await runJob('delete the cloud copy of ' + name, '/sessions/' + encodeURIComponent(name) + '/cloud', body, () => {
+      openJob('delete the cloud copy of ' + name); clouding = name; f.hidden = false; f.take_over.checked = true;
+    }, 'DELETE');
   });
   $('pushform').addEventListener('submit', async ev => {
     ev.preventDefault();
@@ -2235,6 +2306,7 @@ mod tests {
                 Some(json!({"name": "x", "size": "2GB", "agent": "claude-code"})),
             ),
             ("DELETE", "/api/sessions/x", None),
+            ("DELETE", "/api/sessions/x/cloud", None),
             ("GET", "/api/jobs/abc", None),
             ("POST", "/api/sessions/x/attach-ticket", None),
         ] {
@@ -2307,6 +2379,22 @@ mod tests {
 
     /// The one file the bundle store holds, read back — the server's own
     /// bytes, not the client's idea of them.
+    fn stored_object_count(store_dir: &std::path::Path) -> usize {
+        let mut n = 0;
+        let mut stack = vec![store_dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     fn stored_ciphertext(store_dir: &std::path::Path) -> Vec<u8> {
         let mut found = Vec::new();
         let mut stack = vec![store_dir.to_path_buf()];
@@ -3302,6 +3390,116 @@ mod tests {
         assert_eq!(
             *engine.stopped.lock().unwrap(),
             vec!["work".to_string(), "work".to_string()]
+        );
+
+        // E-22: delete the cloud copy of a session that also exists locally
+        // (the one-click case). The stored object is gone, and the row reads
+        // local with no bundle — the session stays in the FakeEngine's local
+        // list, so it is not lost.
+        assert_eq!(
+            stored_object_count(store.path()),
+            1,
+            "a bundle is stored before the delete"
+        );
+        let j = finish(
+            &app,
+            &cookie,
+            send(
+                &app,
+                api_req("DELETE", "/api/sessions/work/cloud", c, Some(json!({}))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "{j}");
+        assert_eq!(
+            stored_object_count(store.path()),
+            0,
+            "the object is removed from the store (E-22: not tombstoned)"
+        );
+        let list = json_of(send(&app, api_req("GET", "/api/sessions", c, None)).await).await;
+        let work = list["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "work")
+            .expect("work still listed (it is local)")
+            .clone();
+        assert_eq!(
+            work["where"], "local",
+            "after the cloud copy is deleted the row reads local: {work}"
+        );
+        assert_eq!(work["has_bundle"], false, "and no bundle: {work}");
+
+        // E-22 lease guard: with an ACTIVE lease held by ANOTHER machine, the
+        // cloud delete is refused and the job carries held_by so the page can
+        // offer the take-over; take_over then claims the lease and deletes.
+        // Push again to restore a bundle, releasing the lease.
+        engine.projects.lock().unwrap()[0].running = false;
+        let j = finish(
+            &app,
+            &cookie,
+            send(&app, push(json!({"password": PASSWORD}))).await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "{j}");
+        assert_eq!(stored_object_count(store.path()), 1);
+        // Another machine takes the lease.
+        blocking(|| {
+            let account = crate::state::load_account().unwrap();
+            let api = crate::api::Api::new(&server, Some(account.token.clone()));
+            api.acquire_lease("work", "other-machine")
+                .expect("foreign lease");
+        });
+        let j = finish(
+            &app,
+            &cookie,
+            send(
+                &app,
+                api_req(
+                    "DELETE",
+                    "/api/sessions/work/cloud",
+                    c,
+                    Some(json!({"take_over": false})),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            j["ok"], false,
+            "a cloud delete under another machine's lease must be refused: {j}"
+        );
+        assert_eq!(
+            j["held_by"], "other-machine",
+            "the refusal names the holder so the page offers take-over: {j}"
+        );
+        assert_eq!(
+            stored_object_count(store.path()),
+            1,
+            "the object is untouched while the lease is held elsewhere"
+        );
+        // With take_over, claim the lease first, then delete.
+        let j = finish(
+            &app,
+            &cookie,
+            send(
+                &app,
+                api_req(
+                    "DELETE",
+                    "/api/sessions/work/cloud",
+                    c,
+                    Some(json!({"take_over": true})),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "take-over then delete: {j}");
+        assert_eq!(
+            stored_object_count(store.path()),
+            0,
+            "the object is gone after the taken-over delete"
         );
     }
 }
