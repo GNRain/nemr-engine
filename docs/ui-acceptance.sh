@@ -47,9 +47,9 @@ PASS=0; FAIL=0
 # reads the bucket back independently (six more assertions); otherwise a
 # directory under the work dir.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=65
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=66
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=61
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=62
 fi
 # The human arm (E-21) adds its own assertions when it runs.
 [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]] && EXPECTED_ASSERTIONS=$((EXPECTED_ASSERTIONS + 4))
@@ -408,13 +408,29 @@ step "The credential step on a machine with no Claude login (E-21) — the autom
 # end the seamed daemon is stopped again, and the next command starts a
 # clean one. Nothing logs in here; the human arm does that, once.
 NOCRED="$WORK/nocred/.credentials.json"
+# Stop every nemrd of this user and WAIT FOR THE LISTENER TO GO, not merely the
+# process — F-9 makes a second nemrd exit rather than displace one that is still
+# answering, so if a clean daemon is still listening when the seamed one
+# autostarts, the seamed one exits silently and every later `nemr` talks to the
+# clean daemon at the canonical path. Waiting on the process alone left a window;
+# this waits until nothing listens on the socket, then removes the file, and
+# refuses if a listener somehow survives.
+daemon_listening() { ss -xln 2>/dev/null | grep -qF "$1"; }
 stop_daemon() {
-    # Only the daemon on this user's socket, found by its socket's owner pid.
     local sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/nemr/nemrd.sock"
-    [[ -S "$sock" ]] || return 0
     for pid in $(pgrep -x nemrd -u "$(id -u)"); do kill "$pid" 2>/dev/null; done
-    for _ in $(seq 1 50); do pgrep -x nemrd -u "$(id -u)" >/dev/null || break; sleep 0.2; done
+    # Wait for the LISTENER to go, not the process: nemrd closes its socket on
+    # SIGTERM but its runtime can linger a while draining, and a not-listening
+    # process does not block a new daemon (F-9 only refuses to displace one that
+    # is still ANSWERING). Once nothing listens, remove the socket file so the
+    # seamed daemon binds cleanly.
+    local gone=0
+    for _ in $(seq 1 150); do
+        daemon_listening "$sock" || { gone=1; break; }
+        sleep 0.2
+    done
     rm -f "$sock"
+    [[ "$gone" -eq 1 ]] || die "a nemrd is still listening on $sock after stop_daemon — something keeps autostarting one (a browser or UI still polling?); a seamed daemon would exit rather than displace it (F-9)"
 }
 stop_daemon
 export NEMR_HOST_CREDENTIALS="$NOCRED"
@@ -422,6 +438,14 @@ NOLOGIN="uiacc-$$-nologin"
 NEMR_NON_INTERACTIVE=1 nemr create "$NOLOGIN" --size 500MB >"$WORK/create3.log" 2>&1 \
     || { cat "$WORK/create3.log"; die "create must succeed on a host with no login (AUTH-03 as amended by E-21)"; }
 pass "create succeeded on a host with no Claude login (AUTH-03 amended: create and restore alike)"
+# The daemon we are talking to MUST be the seamed one, or every check below is
+# about the wrong machine. Assert it names the seam credential path before any
+# credential assertion, so a daemon-takeover failure can never again read as a
+# credential failure (F-9/E-21). `nemr status` prints `path: <credential path>`.
+seam_reported=$(nemr status "$NOLOGIN" 2>/dev/null | sed -n 's/.*path: *//p' | tail -1)
+[[ "$seam_reported" == "$NOCRED" ]] \
+    || die "the seamed daemon did not take over: nemr status names $seam_reported, not the seam path $NOCRED. A clean daemon is still listening, so the seamed one exited rather than displace it (F-9) — this is a daemon-restart failure, not a credential one."
+pass "the seamed daemon took over: nemr status names the seam credential path ($NOCRED)"
 [[ -f "$NOCRED" ]] || die "no placeholder was written at $NOCRED"
 [[ "$(stat -c %a "$NOCRED")" == "600" ]] || die "the placeholder is mode $(stat -c %a "$NOCRED"), not 600"
 grep -q '_nemr_placeholder' "$NOCRED" || die "the file at the credential path is not the engine's placeholder"
