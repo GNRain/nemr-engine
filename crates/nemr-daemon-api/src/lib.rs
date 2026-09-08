@@ -23,7 +23,8 @@ pub mod proto {
     // v2: adds Provision (F-118). Bumped so a new CLI against an old daemon —
     // or the reverse — refuses with the reinstall advice instead of failing
     // with an unimplemented-RPC error that names nothing.
-    pub const PROTOCOL_VERSION: u32 = 2;
+    // v3: adds Adopt (E-23).
+    pub const PROTOCOL_VERSION: u32 = 3;
 }
 
 pub mod client;

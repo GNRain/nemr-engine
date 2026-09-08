@@ -46,9 +46,9 @@ PASS=0; FAIL=0
 # reads the bucket back independently (six more assertions); otherwise a
 # directory under the work dir.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=86
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=91
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=82
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=87
 fi
 # The human arm (E-21) adds its own assertions when it runs.
 [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]] && EXPECTED_ASSERTIONS=$((EXPECTED_ASSERTIONS + 4))
@@ -59,7 +59,8 @@ die()  { fail "$1"; finish; exit 1; }
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/nemr-ui-acceptance.XXXXXX")
 PROJECT="uiacc-$$"
-LOCAL2="uiacc-$$-local"   # a second, local-only session for the page block (a push button beside a pull button)
+LOCAL2="uiacc-$$-local"
+ADOPTED="uiacc-$$-adopted"   # E-23: a session adopted from a host directory   # a second, local-only session for the page block (a push button beside a pull button)
 SERVER_ADDR=127.0.0.1:18090
 SERVER_URL="http://$SERVER_ADDR"
 EMAIL="ui-acceptance-$$@example.com"
@@ -70,7 +71,7 @@ SYNC_PID=""; UI_PID=""; UI2_PID=""; UI3_PID=""; NOLOGIN=""
 finish() {
     printf '\n%s== Cleanup%s\n' "$BOLD" "$RESET"
     # Verify before destroying, and never touch a protected subject.
-    for p in "$PROJECT" "$LOCAL2" "$LOCAL2-b"; do
+    for p in "$PROJECT" "$LOCAL2" "$LOCAL2-b" "$ADOPTED"; do
         if refuse_protected "$p" 2>/dev/null; then
             if output_has "^$p " -- nemr list; then
                 nemr stop "$p" >/dev/null 2>&1
@@ -639,6 +640,63 @@ else
     [[ "$after" -gt "$before" ]] || die "the stored bundle was not rewritten by the second push"
     pass "the list shows it stopped, pushed and released; the stored bundle was rewritten"
 fi
+step "Adopt a host directory, push it, and continue it across a pull (E-23)"
+# A throwaway git repo with a derived directory that must NOT travel, and a
+# Claude Code history holding a marker planted BEFORE adoption. The marker is
+# unique and does not appear in the recall question, so a pass is real recall.
+ADOPT_SRC="$WORK/adopt-src"; mkdir -p "$ADOPT_SRC/target/debug" "$ADOPT_SRC/src"
+( cd "$ADOPT_SRC" \
+  && git init -q && git config user.email t@t && git config user.name t \
+  && printf 'target/\n' > .gitignore \
+  && printf 'adopt me\n' > README.md && printf 'fn main() {}\n' > src/main.rs \
+  && head -c 200000 /dev/zero > target/debug/blob \
+  && git add -A && git commit -qm initial ) || die "could not build the adopt source repo"
+ADOPT_MARK="ADOPT-RECALL-$$-$RANDOM"
+# Plant the marker in the source directory's OWN Claude Code history, on the host.
+( cd "$ADOPT_SRC" && timeout 150 claude -p "Remember this token exactly for later: $ADOPT_MARK . Acknowledge with just OK." --output-format json < /dev/null ) >"$WORK/adopt-plant.json" 2>&1
+grep -q '"result"' "$WORK/adopt-plant.json" || { sed 's/^/   | /' "$WORK/adopt-plant.json" | tail -5; die "could not plant the marker in the host history (is the host logged in?)"; }
+pass "planted a marker in the host directory's Claude Code history (before adoption)"
+# Adopt it (CLI — the user names the directory; E-23).
+nemr adopt "$ADOPT_SRC" --name "$ADOPTED" --size 500MB >"$WORK/adopt.log" 2>&1 || { cat "$WORK/adopt.log"; die "nemr adopt failed"; }
+MNT="$HOME/.local/share/nemr/mounts/$ADOPTED"
+[[ -f "$MNT/README.md" && -d "$MNT/.git" ]] || die "the adopted tree is missing README.md or .git"
+[[ ! -e "$MNT/target" ]] || die "target/ must never be adopted (it is 11G of derived output on the real tree)"
+ls "$MNT"/.nemr-state/projects/-workspace/*.jsonl >/dev/null 2>&1 || die "the adopted history did not land at the -workspace key"
+pass "adopted the tree (README + .git, no target/) and the history at the -workspace key"
+# Push the adopted session through the page.
+out=$(UI push "$ADOPTED" "$PASSWORD" release) || die "the adopt push call failed: $out"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d["ok"] else 1)' "$out" || { echo "$out"; die "pushing the adopted session failed"; }
+pass "pushed the adopted session to the cloud"
+# Another machine: remove it here, then pull it back and start it.
+out=$(UI remove "$ADOPTED") || die "the adopt remove call failed: $out"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d["ok"] else 1)' "$out" || die "removing the adopted session locally failed"
+out=$(UI pull "$ADOPTED" "$PASSWORD") || die "the adopt pull call failed: $out"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); [print("   |",l["text"]) for l in d["lines"]]; sys.exit(0 if d["ok"] else 1)' "$out" || die "pulling the adopted session (another machine) failed"
+pass "removed it here and pulled it back — the cross-machine round trip"
+# Continue the adopted conversation: recall the marker. The question does not
+# contain it; only the adopted history does.
+# --model: the host's Claude Code (2.1.263) records its default model
+# (claude-fable-5-1) in the history it writes; the base image's Claude Code
+# (2.1.240) refuses that model ("2.1.251 or newer is required"), so a bare
+# --continue on an adopted history 400s before it recalls anything. The
+# override resumes the same conversation on a model the session supports —
+# measured 2026-09-08. The real fix is a base image with a newer Claude Code.
+UI attach "$ADOPTED" \
+    'claude --continue --model claude-opus-5 --permission-mode acceptEdits -p "Without reading any files, what exact token did I ask you to remember earlier? Answer with only the token."' \
+    "$WORK/adopt-recall.raw" > "$WORK/adopt-recall.txt" 2>&1
+if grep -q "$ADOPT_MARK" "$WORK/adopt-recall.txt"; then
+    pass "claude --continue recalled the marker planted on the host before adoption ($ADOPT_MARK) — adoption travelled across the pull (E-23)"
+else
+    echo "   --- what the continued adopted session answered:"; sed 's/^/   | /' "$WORK/adopt-recall.txt" | tail -20
+    die "the adopted conversation did not recall the marker (raw screen in $WORK/adopt-recall.raw)"
+fi
+# Clean the adopted session's cloud copy now (E-22), so only its local copy remains for finish().
+out=$(UI cloud-delete "$ADOPTED"); python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d["ok"] else 1)' "$out" 2>/dev/null || true
+# Remove the host history the plant created (leave the host as found).
+rm -rf ~/.claude/projects/$(echo "$ADOPT_SRC" | sed 's#[/.]#-#g') 2>/dev/null || true
+
+step "Delete the cloud copy through the page (E-22), and see it gone"
+
 step "Delete the cloud copy through the page (E-22), and see it gone"
 # $PROJECT exists here AND in the cloud (local + bundle), so deleting the cloud
 # copy is the one-click case: the row becomes local, no bundle, and the object

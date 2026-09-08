@@ -14,6 +14,7 @@ service Nemr {
   rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
 
   rpc Create(CreateRequest) returns (CreateResponse);
+  rpc Adopt(AdoptRequest) returns (AdoptResponse);
   rpc Start(StartRequest) returns (StartResponse);
   rpc Stop(StopRequest) returns (StopResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
@@ -68,6 +69,25 @@ message CreateResponse {
   string volume_path = 3;
   string size = 4;
   string agent = 5;
+}
+
+// E-23: adopt an existing host directory into a fresh session.
+message AdoptRequest {
+  string name = 1;
+  string size = 2;
+  string agent = 3;
+  string source_dir = 4;  // an absolute path on the host
+}
+message AdoptResponse {
+  string name = 1;
+  string container_id = 2;
+  string size = 3;
+  string agent = 4;
+  uint64 files_copied = 5;
+  uint64 bytes_copied = 6;
+  uint64 history_sessions = 7;
+  uint64 history_lines_dropped = 8;
+  string source = 9;
 }
 
 message StartRequest { string name = 1; }

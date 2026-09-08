@@ -14,6 +14,8 @@ use crate::config;
 use crate::containerd::client::ContainerdClient;
 use crate::containerd::containers::{BindMount, ContainerSpec, StopOutcome};
 use crate::engine::volume::{HelperOps, PrivilegedOps, Volume, VolumePaths, VolumeSize};
+use std::os::unix::ffi::OsStringExt;
+use std::path::Path;
 
 /// Runs in the container's shell before every prompt, so a prompt never lands
 /// on top of the previous command's output.
@@ -319,6 +321,349 @@ async fn create_with_auth(
         size,
         agent,
     })
+}
+
+/// What `adopt` produced, for the CLI to report.
+#[derive(Debug, Clone)]
+pub struct AdoptSummary {
+    pub name: String,
+    pub container_id: String,
+    pub size: VolumeSize,
+    pub agent: Agent,
+    pub files_copied: u64,
+    pub bytes_copied: u64,
+    pub history_sessions: u64,
+    pub history_lines_dropped: u64,
+    pub source: std::path::PathBuf,
+}
+
+/// Claude Code's history key for a directory: the absolute path with every
+/// `/` and `.` mapped to `-` (measured 2026-09-08). A session's project is
+/// `/workspace`, so its key is `-workspace`.
+pub fn history_key(abs: &Path) -> String {
+    abs.to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+/// A path component that is always excluded from an adopted tree: derived and
+/// huge (`target/` on nemr-engine is 11G; `node_modules/` likewise), rebuilt
+/// from source, and never belonging in a bundle (E-23).
+fn is_always_excluded_component(name: &str) -> bool {
+    name == "target" || name == "node_modules"
+}
+
+/// The files to copy from a source tree, `.gitignore`-respecting when it is a
+/// git repo, with `target/` and `node_modules/` excluded unconditionally.
+/// Returns the copy set as paths relative to `source`, plus whether `.git`
+/// should travel whole. `.git` itself is not enumerated here (git does not list
+/// its own internals); the caller copies it wholesale.
+fn adopt_copy_set(source: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let is_git = source.join(".git").exists();
+    let mut rels: Vec<std::path::PathBuf> = Vec::new();
+    if is_git {
+        // Tracked + untracked-but-not-ignored, NUL-separated. This is exactly
+        // what `.gitignore` lets through (so `target/` — ignored — never
+        // appears), and it is the measured case (a git repo).
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(source)
+            .args([
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ])
+            .output()
+            .context("running git ls-files to enumerate the adoptable tree")?;
+        if !out.status.success() {
+            bail!(
+                "git ls-files failed in {}: {}",
+                source.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        for rel in out.stdout.split(|b| *b == 0) {
+            if rel.is_empty() {
+                continue;
+            }
+            let rel = std::path::PathBuf::from(std::ffi::OsString::from_vec(rel.to_vec()));
+            if rel
+                .components()
+                .any(|c| is_always_excluded_component(&c.as_os_str().to_string_lossy()))
+            {
+                continue;
+            }
+            rels.push(rel);
+        }
+    } else {
+        // Not a repo: copy everything except the always-excluded directories.
+        for entry in walkdir_files(source)? {
+            let rel = entry.strip_prefix(source).unwrap().to_path_buf();
+            if rel
+                .components()
+                .any(|c| is_always_excluded_component(&c.as_os_str().to_string_lossy()))
+            {
+                continue;
+            }
+            rels.push(rel);
+        }
+    }
+    Ok(rels)
+}
+
+/// Every regular file under `dir`, recursively (no symlink following into
+/// directories). Used only for the non-git copy set.
+fn walkdir_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d)
+            .with_context(|| format!("reading {}", d.display()))?
+            .flatten()
+        {
+            let path = entry.path();
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Recursively copy `src` to `dst` (files and directories), preserving nothing
+/// but the bytes. Used for `.git`.
+fn copy_tree(src: &Path, dst: &Path) -> Result<(u64, u64)> {
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut stack = vec![src.to_path_buf()];
+    std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d)
+            .with_context(|| format!("reading {}", d.display()))?
+            .flatten()
+        {
+            let path = entry.path();
+            let rel = path.strip_prefix(src).unwrap();
+            let target = dst.join(rel);
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                std::fs::create_dir_all(&target)
+                    .with_context(|| format!("creating {}", target.display()))?;
+                stack.push(path);
+            } else if ft.is_file() {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                let n = std::fs::copy(&path, &target)
+                    .with_context(|| format!("copying {}", path.display()))?;
+                files += 1;
+                bytes += n;
+            }
+        }
+    }
+    Ok((files, bytes))
+}
+
+/// Copy one Claude Code history entry into the session's `-workspace` key,
+/// validating `.jsonl` line by line and dropping a trailing line that does not
+/// parse (a torn final write; E-23's quiescence rule). Returns (jsonl_lines,
+/// lines_dropped) for a `.jsonl` file, `(0, 0)` otherwise.
+fn copy_history_jsonl(src: &Path, dst: &Path) -> Result<(u64, u64)> {
+    let raw = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
+    let mut kept: Vec<u8> = Vec::with_capacity(raw.len());
+    let mut lines = 0u64;
+    let mut dropped = 0u64;
+    for line in raw.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<serde_json::Value>(line) {
+            Ok(_) => {
+                kept.extend_from_slice(line);
+                kept.push(b'\n');
+                lines += 1;
+            }
+            Err(_) => {
+                // A line that does not parse is a torn write; drop it (and, as
+                // it can only be the last one, everything after — there is
+                // nothing after).
+                dropped += 1;
+            }
+        }
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(dst, &kept).with_context(|| format!("writing {}", dst.display()))?;
+    Ok((lines, dropped))
+}
+
+/// E-23: adopt an existing host directory into a fresh session — copy its tree
+/// (`.gitignore`-respecting, `target/`/`node_modules/` always excluded, `.git`
+/// carried whole) and its Claude Code history (rewritten to the `-workspace`
+/// key, valid JSONL to the last line) onto the session's volume, so a push and
+/// a pull on another machine can `--continue` the conversation. The host
+/// directory is read, never written (copy, not move).
+pub async fn adopt(
+    client: &ContainerdClient,
+    name: &str,
+    size: VolumeSize,
+    agent: Agent,
+    source: &Path,
+) -> Result<AdoptSummary> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("the source directory {} does not exist", source.display()))?;
+    if !source.is_dir() {
+        bail!("{} is not a directory", source.display());
+    }
+
+    // The copy set and its size, BEFORE provisioning anything — a refusal must
+    // not leave a half-created project.
+    let rels = adopt_copy_set(&source)?;
+    let git_dir = source.join(".git");
+    let mut planned_bytes = 0u64;
+    for rel in &rels {
+        if let Ok(m) = std::fs::symlink_metadata(source.join(rel)) {
+            if m.is_file() {
+                planned_bytes += m.len();
+            }
+        }
+    }
+    if git_dir.is_dir() {
+        for f in walkdir_files(&git_dir)? {
+            if let Ok(m) = std::fs::symlink_metadata(&f) {
+                planned_bytes += m.len();
+            }
+        }
+    }
+    let quota = size.bytes();
+    if planned_bytes > quota {
+        bail!(
+            "the tree to adopt is {} but the session quota is {} ({}). \
+             Exclude more (target/ and node_modules/ are already excluded), or choose a larger --size. \
+             Adopting {}",
+            human_size(planned_bytes),
+            human_size(quota),
+            size,
+            source.display()
+        );
+    }
+
+    // Provision the session (volume mounted, container created, persisted).
+    let summary = create_with_auth(client, name, size, agent).await?;
+    let mount_point = VolumePaths::from_env()?.mount_point(name);
+
+    // Copy the tree into /workspace (the volume root).
+    let mut files_copied = 0u64;
+    let mut bytes_copied = 0u64;
+    for rel in &rels {
+        let from = source.join(rel);
+        let to = mount_point.join(rel);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        // ls-files can name a path that vanished between listing and copy; skip it.
+        match std::fs::symlink_metadata(&from) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let target = std::fs::read_link(&from)?;
+                let _ = std::os::unix::fs::symlink(&target, &to);
+                files_copied += 1;
+            }
+            Ok(m) if m.is_file() => {
+                let n = std::fs::copy(&from, &to)
+                    .with_context(|| format!("copying {}", from.display()))?;
+                files_copied += 1;
+                bytes_copied += n;
+            }
+            _ => {}
+        }
+    }
+    if git_dir.is_dir() {
+        let (gf, gb) = copy_tree(&git_dir, &mount_point.join(".git"))?;
+        files_copied += gf;
+        bytes_copied += gb;
+    }
+
+    // Copy the Claude Code history for this directory, rewritten to the
+    // session's `-workspace` key, valid JSONL to the last line.
+    let mut history_sessions = 0u64;
+    let mut history_lines_dropped = 0u64;
+    let home = std::env::var_os("HOME").context("HOME is not set; cannot find the host history")?;
+    let src_hist = std::path::PathBuf::from(&home)
+        .join(".claude")
+        .join("projects")
+        .join(history_key(&source));
+    if src_hist.is_dir() {
+        let dst_hist = mount_point
+            .join(config::VOLUME_STATE_PROJECTS)
+            .join("-workspace");
+        std::fs::create_dir_all(&dst_hist)
+            .with_context(|| format!("creating {}", dst_hist.display()))?;
+        let mut stack = vec![src_hist.clone()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d)
+                .with_context(|| format!("reading {}", d.display()))?
+                .flatten()
+            {
+                let path = entry.path();
+                let rel = path.strip_prefix(&src_hist).unwrap();
+                let target = dst_hist.join(rel);
+                let ft = entry.file_type()?;
+                if ft.is_dir() {
+                    std::fs::create_dir_all(&target).ok();
+                    stack.push(path);
+                } else if ft.is_file() {
+                    if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                        let (lines, dropped) = copy_history_jsonl(&path, &target)?;
+                        if lines > 0 {
+                            history_sessions += 1;
+                        }
+                        history_lines_dropped += dropped;
+                    } else {
+                        if let Some(parent) = target.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        std::fs::copy(&path, &target).ok();
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(AdoptSummary {
+        name: summary.name,
+        container_id: summary.container_id,
+        size,
+        agent,
+        files_copied,
+        bytes_copied,
+        history_sessions,
+        history_lines_dropped,
+        source,
+    })
+}
+
+fn human_size(bytes: u64) -> String {
+    const G: u64 = 1024 * 1024 * 1024;
+    const M: u64 = 1024 * 1024;
+    const K: u64 = 1024;
+    if bytes >= G {
+        format!("{:.1}GiB", bytes as f64 / G as f64)
+    } else if bytes >= M {
+        format!("{:.1}MiB", bytes as f64 / M as f64)
+    } else if bytes >= K {
+        format!("{:.1}KiB", bytes as f64 / K as f64)
+    } else {
+        format!("{bytes}B")
+    }
 }
 
 /// Bind mounts that relocate Claude Code's session-critical state onto the

@@ -3393,13 +3393,13 @@ fn f14_a_fresh_project_binds_the_credential_directory() {
 /// the directory bind turns green.
 #[test]
 fn f14_a_login_write_by_rename_lands_on_the_host_through_the_directory_bind() {
+    use std::os::unix::fs::MetadataExt;
     if unit_only() {
         return;
     }
     if !require_host(HostRequirements::FULL) {
         return;
     }
-    use std::os::unix::fs::MetadataExt;
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
 
     // The measured login write pattern, as a shell the session runs: write #1
@@ -3524,13 +3524,13 @@ fn f14_a_login_write_by_rename_lands_on_the_host_through_the_directory_bind() {
 /// is touched.
 #[test]
 fn f14_a_host_rename_reaches_a_running_session_without_a_rebind() {
+    use std::os::unix::fs::MetadataExt;
     if unit_only() {
         return;
     }
     if !require_host(HostRequirements::FULL) {
         return;
     }
-    use std::os::unix::fs::MetadataExt;
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let temp = std::env::temp_dir().join(format!("nemr-f14-live-{}", std::process::id()));
@@ -4834,4 +4834,202 @@ fn f125_git_guard_acceptance_suite_passes() {
         stdout,
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// E-23: `adopt` copies a host directory's tree and Claude Code history into a
+/// fresh session — respecting .gitignore, always excluding target/ and
+/// node_modules/, carrying .git, rewriting the history to the session's
+/// `-workspace` key, and copying (never moving) the source. Fabricated inputs,
+/// no API: this proves the MECHANICS (what lands where, valid JSONL to the last
+/// line, the source untouched); `docs/ui-acceptance.sh` proves `--continue`
+/// recalls it across machines.
+#[test]
+fn e23_adopt_copies_the_tree_and_history_excludes_the_derived_and_leaves_the_source() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("nemr-e23-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let source = tmp.join("proj");
+    std::fs::create_dir_all(source.join(".git")).unwrap();
+    std::fs::create_dir_all(source.join("target/debug")).unwrap();
+    std::fs::create_dir_all(source.join("node_modules/x")).unwrap();
+    std::fs::create_dir_all(source.join("src")).unwrap();
+    std::fs::write(
+        source.join(".gitignore"),
+        "target/\nnode_modules/\nsecret.txt\n",
+    )
+    .unwrap();
+    std::fs::write(source.join("README.md"), "hello adopt").unwrap();
+    std::fs::write(source.join("src/main.rs"), "fn main() {}").unwrap();
+    std::fs::write(source.join("secret.txt"), "should be gitignored out").unwrap();
+    std::fs::write(source.join("target/debug/blob"), vec![0u8; 4096]).unwrap();
+    std::fs::write(source.join("node_modules/x/pkg"), vec![0u8; 4096]).unwrap();
+    std::fs::write(source.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    // Make it a real git repo so `git ls-files` drives the copy set.
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap()
+    };
+    // Re-init cleanly (the hand-made .git above is just to prove .git travels;
+    // a real init gives ls-files something to enumerate).
+    std::fs::remove_dir_all(source.join(".git")).unwrap();
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "initial"]);
+
+    // A fabricated host history for this directory, with a TORN final line.
+    let key: String = source
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect();
+    let home = std::env::var("HOME").unwrap();
+    let host_hist = std::path::PathBuf::from(&home)
+        .join(".claude/projects")
+        .join(&key);
+    std::fs::create_dir_all(&host_hist).unwrap();
+    let jsonl = host_hist.join("sess-e23.jsonl");
+    let mut body = String::new();
+    body.push_str(&format!(
+        "{}\n",
+        serde_json::json!({"type":"user","cwd": source.to_string_lossy(),"content":"MARKER-E23"})
+    ));
+    body.push_str(&format!(
+        "{}\n",
+        serde_json::json!({"type":"assistant","content":"ok"})
+    ));
+    body.push_str("{\"type\":\"user\",\"content\":\"half-writ"); // torn: no newline, invalid JSON
+    std::fs::write(&jsonl, &body).unwrap();
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    // A prior failed run (e.g. a neuter) can leave the projects behind; a
+    // create then fails with ProjectExists. Clear them first so the test is
+    // self-contained.
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        for n in ["e23adopt", "e23toobig"] {
+            let _ = project::stop(&client, n).await;
+            let _ = project::delete(&client, n).await;
+        }
+    });
+    let summary = runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        project::adopt(
+            &client,
+            "e23adopt",
+            nemr_engine::engine::volume::VolumeSize::Small,
+            nemr_engine::engine::agent::Agent::ClaudeCode,
+            &source,
+        )
+        .await
+        .expect("adopt")
+    });
+
+    let mount = nemr_engine::engine::volume::VolumePaths::from_env()
+        .unwrap()
+        .mount_point("e23adopt");
+    // The tree: tracked files present, .git present, derived dirs absent.
+    assert!(
+        mount.join("README.md").exists(),
+        "README.md must be adopted"
+    );
+    assert!(
+        mount.join("src/main.rs").exists(),
+        "src/main.rs must be adopted"
+    );
+    assert!(mount.join(".git/HEAD").exists(), ".git must travel");
+    assert!(
+        !mount.join("target").exists(),
+        "target/ must never be adopted"
+    );
+    assert!(
+        !mount.join("node_modules").exists(),
+        "node_modules/ must never be adopted"
+    );
+    assert!(
+        !mount.join("secret.txt").exists(),
+        "a gitignored file must not be adopted"
+    );
+
+    // The history: at the -workspace key, valid JSONL to the last line (the
+    // torn tail dropped), the marker present.
+    let adopted = mount.join(".nemr-state/projects/-workspace/sess-e23.jsonl");
+    assert!(
+        adopted.exists(),
+        "the history must land at the -workspace key"
+    );
+    let text = std::fs::read_to_string(&adopted).unwrap();
+    for line in text.lines() {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|_| panic!("every adopted history line must be valid JSON: {line:?}"));
+    }
+    assert!(text.contains("MARKER-E23"), "the marker line survives");
+    assert!(
+        !text.contains("half-writ"),
+        "the torn final line is dropped"
+    );
+    assert_eq!(
+        summary.history_lines_dropped, 1,
+        "exactly the torn line was dropped"
+    );
+    assert!(summary.history_sessions >= 1);
+
+    // Copy, not move: the source is untouched (its target/ and secret still there).
+    assert!(
+        source.join("target/debug/blob").exists(),
+        "the source target/ is untouched"
+    );
+    assert!(
+        source.join("secret.txt").exists(),
+        "the source is not modified"
+    );
+
+    // Size guard: a source larger than the quota is refused BEFORE provisioning.
+    std::fs::write(source.join("big.bin"), vec![7u8; 600 * 1024 * 1024]).unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "big"]);
+    let refused = runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        project::adopt(
+            &client,
+            "e23toobig",
+            nemr_engine::engine::volume::VolumeSize::Small, // 500MB
+            nemr_engine::engine::agent::Agent::ClaudeCode,
+            &source,
+        )
+        .await
+    });
+    let err = refused.expect_err("a tree over the quota must be refused");
+    assert!(
+        err.to_string().contains("quota"),
+        "the refusal names the quota: {err:#}"
+    );
+    // And it refused BEFORE provisioning: no e23toobig project exists.
+    let toobig_img = nemr_engine::engine::volume::VolumePaths::from_env()
+        .unwrap()
+        .image_file("e23toobig");
+    assert!(!toobig_img.exists(), "a refused adopt provisions nothing");
+
+    // Cleanup.
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let _ = project::stop(&client, "e23adopt").await;
+        let _ = project::delete(&client, "e23adopt").await;
+    });
+    let _ = std::fs::remove_dir_all(&host_hist);
+    let _ = std::fs::remove_dir_all(&tmp);
 }

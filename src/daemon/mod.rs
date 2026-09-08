@@ -144,6 +144,41 @@ impl Nemr for NemrService {
         }))
     }
 
+    async fn adopt(
+        &self,
+        request: Request<AdoptRequest>,
+    ) -> Result<Response<AdoptResponse>, Status> {
+        let req = request.into_inner();
+        let size = req
+            .size
+            .parse::<crate::engine::volume::VolumeSize>()
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let agent = req
+            .agent
+            .parse::<crate::engine::agent::Agent>()
+            .map_err(status_from_typed)?;
+        let summary = crate::engine::project::adopt(
+            &self.client,
+            &req.name,
+            size,
+            agent,
+            std::path::Path::new(&req.source_dir),
+        )
+        .await
+        .map_err(status_from_anyhow)?;
+        Ok(Response::new(AdoptResponse {
+            name: summary.name,
+            container_id: summary.container_id,
+            size: summary.size.to_string(),
+            agent: summary.agent.id().to_string(),
+            files_copied: summary.files_copied,
+            bytes_copied: summary.bytes_copied,
+            history_sessions: summary.history_sessions,
+            history_lines_dropped: summary.history_lines_dropped,
+            source: summary.source.to_string_lossy().into_owned(),
+        }))
+    }
+
     async fn start(
         &self,
         request: Request<StartRequest>,

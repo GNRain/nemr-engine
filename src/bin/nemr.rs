@@ -53,6 +53,27 @@ enum Command {
         agent: Option<Agent>,
     },
 
+    /// Adopt an existing host directory into a fresh session: copy its tree
+    /// (respecting .gitignore, always excluding target/ and node_modules/, .git
+    /// carried whole) and its Claude Code history, so it can be pushed and
+    /// continued on another machine (E-23). The directory is copied, not moved.
+    Adopt {
+        /// The host directory to adopt (its tree and Claude Code history).
+        dir: String,
+
+        /// Project name. Omitted, derived from the directory's basename.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Storage quota, fixed at creation time. Omitted, defaults to 2GB.
+        #[arg(long, value_parser = parse_size)]
+        size: Option<VolumeSize>,
+
+        /// Coding agent to run. Omitted, Claude Code.
+        #[arg(long, value_parser = parse_agent)]
+        agent: Option<Agent>,
+    },
+
     /// Start a project's container.
     Start { name: String },
 
@@ -681,6 +702,81 @@ async fn main() -> Result<()> {
             println!("  volume:    {} ({})", project.volume_path, project.size);
             println!("  status:    stopped (ready to start)");
             println!("  next:      nemr start {}", project.name);
+        }
+
+        Command::Adopt {
+            dir,
+            name,
+            size,
+            agent,
+        } => {
+            let source = std::path::Path::new(&dir)
+                .canonicalize()
+                .map_err(|e| anyhow::anyhow!("the directory {dir:?} cannot be read: {e}"))?;
+            let interactive = nemr_engine::interactive::is_interactive();
+            // Derive the name from the directory basename when not given.
+            let name = match name {
+                Some(n) => n,
+                None => {
+                    let base = source
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_lowercase())
+                        .unwrap_or_default();
+                    let derived: String = base
+                        .chars()
+                        .map(|c| {
+                            if c.is_ascii_alphanumeric() || c == '-' {
+                                c
+                            } else {
+                                '-'
+                            }
+                        })
+                        .collect();
+                    resolve_name(Some(derived).filter(|s| !s.is_empty()), interactive)?
+                }
+            };
+            let size = resolve_size(size, interactive)?;
+            let agent = resolve_agent(agent, interactive)?;
+
+            let mut session = daemon::connect().await?;
+            let summary = {
+                let __req = session.req(proto::AdoptRequest {
+                    name,
+                    size: size.to_string(),
+                    agent: agent.id().to_string(),
+                    source_dir: source.to_string_lossy().into_owned(),
+                });
+                session
+                    .client()
+                    .adopt(__req)
+                    .await
+                    .map_err(status_err)?
+                    .into_inner()
+            };
+            println!("adopted {} into session {:?}", summary.source, summary.name);
+            println!("  agent:     {}", agent_label(&summary.agent));
+            println!("  container: {}", summary.container_id);
+            println!(
+                "  copied:    {} files, {} (target/ and node_modules/ excluded; .git carried)",
+                summary.files_copied,
+                volume::human_bytes(summary.bytes_copied)
+            );
+            if summary.history_sessions > 0 {
+                println!(
+                    "  history:   {} session transcript(s) adopted{}",
+                    summary.history_sessions,
+                    if summary.history_lines_dropped > 0 {
+                        format!(" ({} torn line(s) dropped)", summary.history_lines_dropped)
+                    } else {
+                        String::new()
+                    }
+                );
+            } else {
+                println!("  history:   none found for this directory (a fresh session)");
+            }
+            println!("  quota:     {}", summary.size);
+            println!("  the host directory was copied, not moved — it is untouched");
+            println!("  next:      nemr start {}", summary.name);
         }
 
         Command::Start { name } => {
