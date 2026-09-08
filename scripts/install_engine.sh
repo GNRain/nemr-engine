@@ -28,7 +28,10 @@ install -m 0755 target/release/nemrd "$DAEMON_DEST"
 # discovered the hard way — the CLI protocol handshake catches incompatible
 # versions, and stopping here catches same-version behavioural drift.
 if [[ -n "${XDG_RUNTIME_DIR:-}" && -S "$XDG_RUNTIME_DIR/nemr/nemrd.sock" ]]; then
-    for pid in $(pgrep -f "$DAEMON_DEST" 2>/dev/null || true); do
+    # Every nemrd of this user, wherever it was started from (F-9: a daemon
+    # autostarted from a build tree by a test kept the socket while this
+    # matched only $DAEMON_DEST, and the fresh install never took over).
+    for pid in $(pgrep -x nemrd -u "$(id -u)" 2>/dev/null || true); do
         kill "$pid" 2>/dev/null || true
     done
     rm -f "$XDG_RUNTIME_DIR/nemr/nemrd.sock"

@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use nemr_daemon_api::proto::{
     attach_client, AttachClient, AttachStart, ExportRequest, ImportRequest, ListRequest,
-    StartRequest, StopRequest,
+    StartRequest, StatusRequest, StopRequest,
 };
 
 use crate::core::EngineOps;
@@ -50,6 +50,22 @@ impl DaemonEngine {
             .await
             .context("the daemon's List call")?
             .into_inner();
+        // E-21: the credential is a fact about this machine, the same for
+        // every session on it; one Status call reads it (the first project's),
+        // so the list can say "no login yet" without a call per row.
+        let credential_present = match reply.projects.first() {
+            Some(first) => {
+                let req = s.req(StatusRequest {
+                    name: first.name.clone(),
+                });
+                s.client()
+                    .status(req)
+                    .await
+                    .ok()
+                    .map(|r| r.into_inner().credential_present)
+            }
+            None => None,
+        };
         Ok(reply
             .projects
             .into_iter()
@@ -59,6 +75,7 @@ impl DaemonEngine {
                 running: p.running,
                 usage_known: p.usage_known,
                 used_bytes: p.used_bytes,
+                credential_present,
             })
             .collect())
     }

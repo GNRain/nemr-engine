@@ -25,6 +25,7 @@ pub mod credential_watch;
 // re-exported so `nemr_engine::daemon::client` and `::socket` keep working.
 pub use nemr_daemon_api::client;
 pub use nemr_daemon_api::socket;
+pub use nemr_daemon_api::userns;
 
 /// The service implementation. One containerd connection, shared.
 pub struct NemrService {
@@ -319,6 +320,7 @@ impl Nemr for NemrService {
             credential_expires_at_secs: d.credential_expires_at.unwrap_or(0),
             credential_refresh_expires_at_secs: d.credential_refresh_expires_at.unwrap_or(0),
             credential_blank: d.credential_blank,
+            credential_present: d.credential_present,
             credential_stale: match d.credential_stale {
                 None => -1,
                 Some(false) => 0,

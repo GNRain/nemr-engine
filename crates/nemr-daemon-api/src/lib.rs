@@ -28,3 +28,4 @@ pub mod proto {
 
 pub mod client;
 pub mod socket;
+pub mod userns;

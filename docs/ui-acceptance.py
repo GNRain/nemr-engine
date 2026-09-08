@@ -326,6 +326,10 @@ def _bidi_value(v):
 # --- the page, driven: the claims about what the page SHOWS -----------------
 
 VISIBLE = "(id => { const e = document.getElementById(id); return !!e && e.checkVisibility(); })"
+# The terminal's screen as text (xterm's buffer, blank rows dropped) — for evidence when a wait fails.
+SCREEN_TEXT = ("(() => { const term = window.nemrTerm; if (!term) return ''; const b = term.buffer.active; const o = []; "
+               "for (let i = 0; i < b.length; i++) { const l = b.getLine(i); if (l) { const t = l.translateToString(true); if (t) o.push(t); } } "
+               "return o.join('\\n'); })()")
 ENTER = ""
 
 
@@ -533,6 +537,55 @@ def main_no_page(op):
         raise SystemExit(f"unknown op {op!r}")
 
 
+async def credential_step_flow(launch_url, local_name):
+    """E-21's automated arm against the real page: on a machine with no
+    login, the list carries the login line, an attach shows Claude Code's
+    sign-in screen, and the page shows the URL as text and as a link.
+    Returns (checks, url). Nothing here logs in."""
+    out = []
+    def check(name, ok, detail=""):
+        out.append({"name": name, "ok": bool(ok), "detail": " ".join(str(detail).split())})
+        return ok
+    url = ""
+    try:
+        async with Browser() as b:
+            await b.goto(launch_url)
+            await b.wait_for("document.getElementById('status').textContent !== 'connecting…'", 30, "the page's own handshake")
+            await b.wait_for(VISIBLE + "('list')", 60, "the list")
+            await b.wait_for(f"!!document.querySelector('button[data-attach={json.dumps(local_name)}]')", 60, "the running row")
+            _rows = await b.eval("JSON.stringify((window.nemrRows||[]).map(r=>({n:r.name,w:r.where,cp:r.credential_present})))")
+            check("E-21 the page says this machine has no Claude login yet", await b.eval(VISIBLE + "('loginline')"), _rows)
+            text = await b.eval("document.getElementById('loginline').textContent")
+            check("E-21 the line says what to do: attach and run /login", "/login" in (text or ""), text)
+            await b.eval(f"document.querySelector('button[data-attach={json.dumps(local_name)}]').click()")
+            await b.wait_for("document.getElementById('attachnote').textContent.startsWith('attached')", 30, "the terminal to attach")
+            await b.eval("document.querySelector('#term textarea').focus()")
+            await asyncio.sleep(0.5)
+            # Claude Code, seeded (F-131), goes straight to the prompt; /login is
+            # the way to the sign-in screen. Unseeded it shows the theme picker
+            # first — Enter accepts it and the login prompt follows.
+            await type_keys(b, "claude\n")
+            await asyncio.sleep(12)
+            await type_keys(b, "/login\n")
+            await asyncio.sleep(8)
+            await type_keys(b, "\n")       # the first login method (Claude account)
+            try:
+                await b.wait_for("!document.getElementById('signin').hidden", 90, "Claude Code's sign-in URL to appear in the terminal")
+            except SystemExit as e:
+                # The screen is the evidence: what the terminal showed instead.
+                screen = await b.eval(SCREEN_TEXT)
+                raise SystemExit(f"{e} — the terminal showed: {(screen or '')[-1200:]}")
+            check("E-21 the terminal showed Claude Code's sign-in URL and the page shows it as a link", await b.eval("document.getElementById('signinlink').href.startsWith('https://claude.com/')"))
+            url = await b.eval("document.getElementById('signinurl').textContent")
+            check("E-21 the page shows the URL as text, as Claude Code printed it", "oauth/authorize" in (url or ""), url[:60] + "…" if url else "")
+            await type_keys(b, "\x03\x03")
+            await asyncio.sleep(1)
+            await b.eval("document.getElementById('detach').click()")
+    except SystemExit as e:
+        check("the page never reached the expected state", False, str(e))
+    return out, url
+
+
 def main():
     # NEMR_UI_COOKIE carries the one session cookie between the steps of the
     # acceptance, the way an open tab carries it between clicks.
@@ -540,6 +593,11 @@ def main():
     if op.startswith("s3-"):
         # The bucket ops touch no page and spend no token.
         return main_no_page(op)
+    if op == "credential-step":
+        # credential-step <launch_url> <local_name>
+        results, url = asyncio.run(credential_step_flow(sys.argv[2], sys.argv[3]))
+        print(json.dumps({"checks": results, "url": url}))
+        raise SystemExit(0 if all(r["ok"] for r in results) else 4)
     if op == "page":
         # The page itself exchanges the launch token; this process must not.
         email, password, server, remote_name, local_name = sys.argv[3:8]

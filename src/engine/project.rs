@@ -108,15 +108,6 @@ pub fn project_labels(
     labels
 }
 
-/// Whether a missing host credential is fatal (AUTH-03) or deferred (E-14).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthPolicy {
-    /// `nemr create`: AUTH-03 applies unchanged.
-    Required,
-    /// `nemr import`: E-11 requires the restore to work with no credential.
-    DeferredForRestore,
-}
-
 /// Create a project: a quota-bounded volume plus a ready-to-start container.
 ///
 /// # Ordering
@@ -134,15 +125,16 @@ enum AuthPolicy {
 /// 5. Only once the container exists, `persist()` the volume so it outlives
 ///    the guard — the container now depends on it.
 ///
-/// Step 2 is unconditional here. A *restore* defers it — see [`AuthPolicy`] and
-/// E-14 — because E-11 requires `nemr import` to work with no credential at all.
+/// Step 2 never refuses for a missing file (E-21, ruled 2026-09-08, amending
+/// AUTH-03): a host with no credential gets the engine's placeholder, and a
+/// restore takes exactly the same path — E-14's split is gone.
 pub async fn create(
     client: &ContainerdClient,
     name: &str,
     size: VolumeSize,
     agent: Agent,
 ) -> Result<ProjectSummary> {
-    create_with_auth(client, name, size, agent, AuthPolicy::Required).await
+    create_with_auth(client, name, size, agent).await
 }
 
 async fn create_with_auth(
@@ -150,7 +142,6 @@ async fn create_with_auth(
     name: &str,
     size: VolumeSize,
     agent: Agent,
-    auth_policy: AuthPolicy,
 ) -> Result<ProjectSummary> {
     crate::engine::volume::validate_name(name)
         .with_context(|| format!("invalid project name {name:?}"))?;
@@ -195,23 +186,16 @@ async fn create_with_auth(
     // unchanged and `attach` still resolves one — so this narrows *where*
     // AUTH-03 fires, not whether it does. Raised as E-14 because AUTH-03 is a
     // Section 3 requirement and narrowing it is not mine to decide.
-    let credentials = match auth_policy {
-        AuthPolicy::Required => {
-            let credentials = auth::resolve_credentials()?;
-            auth::check_permissions(&credentials)?;
-            // A dead credential is worse than a missing one: it looks present.
-            // AUTH-03's reasoning, one step further (2026-09-06).
-            auth::refuse_dead_credential(&credentials, unix_now())?;
-            credentials
-        }
-        AuthPolicy::DeferredForRestore => match auth::resolve_credentials() {
-            Ok(credentials) => {
-                auth::check_permissions(&credentials)?;
-                credentials
-            }
-            Err(_) => auth::host_credentials_path()?,
-        },
-    };
+    // AUTH-03 as amended by E-21 (2026-09-08): a host with no credential is
+    // a machine that has never logged in, not a fault. `create` and a restore
+    // behave identically — the placeholder is written where the credential
+    // will be, bound read-write like a real one, and `/login` inside the
+    // session writes the real credential through it onto this host. A
+    // credential that IS present is still held to what it says: readable,
+    // and not dead (a spent refresh token or a blanked file — F-129).
+    let credentials = auth::ensure_host_credential_file()?;
+    auth::check_permissions(&credentials)?;
+    auth::refuse_dead_credential(&credentials, unix_now())?;
 
     let volume = Volume::create(name, size, paths, HelperOps::new())
         .with_context(|| format!("failed to provision volume for project {name:?}"))?;
@@ -424,6 +408,10 @@ async fn resolve(client: &ContainerdClient, name: &str) -> Result<String> {
 /// PID 1 is the supervisor from PROC-01; no interactive session is created
 /// here. `attach` is what gives a shell.
 pub async fn start(client: &ContainerdClient, name: &str) -> Result<u32> {
+    // E-21: the bind source must exist before the task starts. On a machine
+    // that has never logged in that is the placeholder; on one that has, the
+    // real file, untouched.
+    auth::ensure_host_credential_file()?;
     let container_id = resolve(client, name).await?;
 
     // VOL-06. Container records live in containerd's database and survive a
@@ -1738,6 +1726,9 @@ pub struct ProjectDetail {
     pub credential_refresh_expires_at: Option<i64>,
     /// Claude Code blanked the file after a dead refresh.
     pub credential_blank: bool,
+    /// E-21: a credential file that is not the engine's placeholder. False
+    /// on a machine that has never logged in.
+    pub credential_present: bool,
     /// A running session still sees a file the host has since replaced
     /// (F-12); `None` when not running or unreadable.
     pub credential_stale: Option<bool>,
@@ -1911,6 +1902,12 @@ pub async fn status(client: &ContainerdClient, name: &str) -> crate::error::Resu
     let mounted = crate::engine::volume::is_mounted(&mount_point);
 
     let credential = auth::host_credentials_path().ok().filter(|p| p.exists());
+    // E-21: present means a file that is not the engine's placeholder — the
+    // page and `status` say "no login yet" from this, not from a verdict.
+    let credential_present = credential
+        .as_ref()
+        .map(|p| !auth::is_placeholder(&std::fs::read_to_string(p).unwrap_or_default()))
+        .unwrap_or(false);
     let credential_modified = credential
         .as_ref()
         .and_then(|p| std::fs::metadata(p).ok())
@@ -1970,6 +1967,7 @@ pub async fn status(client: &ContainerdClient, name: &str) -> crate::error::Resu
         credential_expires_at: facts.access.expires_at_secs(),
         credential_refresh_expires_at: facts.refresh.expires_at_secs(),
         credential_blank: facts.blank,
+        credential_present,
         credential_stale,
     })
 }
@@ -2282,7 +2280,7 @@ pub async fn import_creating(
         });
     }
 
-    create_with_auth(client, &name, size, agent, AuthPolicy::DeferredForRestore)
+    create_with_auth(client, &name, size, agent)
         .await
         .map_err(Error::Internal)?;
 

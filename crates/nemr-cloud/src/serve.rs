@@ -292,6 +292,7 @@ pub fn router(state: Arc<UiState>) -> Router {
         .route("/assets/xterm.js", get(asset_xterm_js))
         .route("/assets/xterm.css", get(asset_xterm_css))
         .route("/assets/addon-fit.js", get(asset_fit_js))
+        .route("/assets/addon-web-links.js", get(asset_web_links_js))
         .route("/auth/session", post(exchange))
         .route("/ws/attach/{name}", get(attach_ws))
         .nest("/api", api)
@@ -592,6 +593,7 @@ async fn sessions(State(state): State<Arc<UiState>>) -> Response {
                         "has_bundle": r.has_bundle,
                         "held_by": r.held_by,
                         "lease_expires_at_unix": r.lease_expires_at_unix,
+                        "credential_present": r.credential_present,
                     })
                 })
                 .collect();
@@ -812,6 +814,13 @@ async fn asset_fit_js() -> Response {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../assets/addon-fit.js"),
+    )
+        .into_response()
+}
+async fn asset_web_links_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../assets/addon-web-links.js"),
     )
         .into_response()
 }
@@ -1048,6 +1057,7 @@ async fn index() -> Response {
 <link rel="stylesheet" href="/assets/xterm.css">
 <script src="/assets/xterm.js"></script>
 <script src="/assets/addon-fit.js"></script>
+<script src="/assets/addon-web-links.js"></script>
 <style>
   /* The hidden attribute only works through the browser's default `display:
      none`, and any author `display` rule on the same element outranks it —
@@ -1113,6 +1123,7 @@ async fn index() -> Response {
   </section>
   <section id="list" hidden>
     <div class="toolbar"><button id="refresh">refresh</button><span class="note" id="localnote"></span></div>
+    <div id="loginline" class="warn" hidden>No Claude login on this machine yet — attach a session and run <code>/login</code> in it; the login is written to this machine and stays here.</div>
     <table><thead><tr><th>session</th><th>agent</th><th>where</th><th>state</th><th>size</th><th>updated</th><th>last machine</th><th>open on</th><th></th></tr></thead><tbody id="rows"></tbody></table>
     <section id="job" class="login" style="max-width:40rem;margin-top:1rem" hidden>
       <div><strong id="jobtitle"></strong></div>
@@ -1132,6 +1143,7 @@ async fn index() -> Response {
     </section>
     <section id="attach" hidden>
       <div class="toolbar" style="margin-top:1rem"><strong id="attachtitle"></strong><span class="note" id="attachnote"></span><button id="detach">detach</button></div>
+      <div id="signin" hidden>Sign in: open <a id="signinlink" href="#" target="_blank" rel="noopener"></a> in your browser, then paste the code it shows into the terminal. <span class="muted">The URL as Claude Code printed it:</span> <code id="signinurl" style="user-select:all;word-break:break-all"></code></div>
       <div id="termwrap"><div id="term"></div></div>
     </section>
   </section>
@@ -1205,6 +1217,10 @@ async fn index() -> Response {
       else action = '<button data-attach="' + esc(s.name) + '">attach</button> <button data-push="' + esc(s.name) + '">stop &amp; push</button>';
       rows.insertAdjacentHTML('beforeend', '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.agent) + '</td><td><span class="pill ' + esc(s.where) + '">' + esc(s.where) + '</span></td><td>' + state + '</td><td>' + human(s.size_bytes) + '</td><td>' + ago(s.updated_at_unix) + '</td><td>' + esc(s.last_machine || '-') + '</td><td>' + open + '</td><td>' + action + '</td></tr>');
     }
+    // E-21: the credential is a fact about this machine; any local row carries it.
+    window.nemrRows = d.rows; // read by the acceptance as evidence when a check fails
+    const noLogin = d.rows.some(s => s.credential_present === false);
+    $('loginline').hidden = !noLogin;
     $('localnote').textContent = d.local_available ? '' : 'daemon unreachable: showing the server index only (' + d.local_error + ')';
     $('localnote').className = 'note' + (d.local_available ? '' : ' warn');
     status(d.rows.length + ' session' + (d.rows.length === 1 ? '' : 's'));
@@ -1330,19 +1346,48 @@ async fn index() -> Response {
     return j;
   }
   // --- step 4: attach — the daemon's stream over a WebSocket, drawn by xterm.js ---
-  let term = null, fit = null, ws = null;
+  let term = null, fit = null, ws = null, signinBuf = '';
+  const signinDecoder = new TextDecoder();
+  // Claude Code prints its OAuth URL wrapped in an OSC 8 hyperlink whose
+  // target is the whole URL, and as visible text the terminal wraps over
+  // several lines (measured 2.1.240 at 80 columns). The page shows it once,
+  // as text and as a link, the moment it appears (E-21: the ruled shape).
+  // The hyperlink target is taken first — exact and unwrapped; the visible
+  // text is the fallback, with escape codes and line breaks removed. The
+  // scan is over a rolling buffer, so a URL split across two frames is seen.
+  function watchForSignin(bytes) {
+    if (!$('signin').hidden) return;
+    signinBuf += signinDecoder.decode(bytes, { stream: true });
+    if (signinBuf.length > 20000) signinBuf = signinBuf.slice(-8000);
+    let m = signinBuf.match(/\x1b\]8;[^;\x07\x1b]*;(https:\/\/claude\.com\/[^\x07\x1b]*oauth\/authorize\?[^\x07\x1b]*)(?:\x07|\x1b\\)/);
+    let url = m && m[1];
+    if (!url) {
+      const plain = signinBuf.replace(/\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').replace(/\r?\n/g, '');
+      const t = plain.match(/https:\/\/claude\.com\/[^\s"'<>\x07\x1b]*oauth\/authorize\?[^\s"'<>\x07\x1b]*/);
+      url = t && t[0].replace(/[).,]+$/, '');
+    }
+    if (url) {
+      $('signinlink').href = url; $('signinlink').textContent = 'the sign-in link';
+      $('signinurl').textContent = url; $('signin').hidden = false;
+    }
+  }
   async function attach(name) {
     closePanels();
     status(''); // a previous exit's status is cleared by the next attach
     $('attach').hidden = false; $('attachtitle').textContent = name; $('attachnote').textContent = 'connecting…';
     if (!term) {
       term = new Terminal({ cursorBlink: true, fontSize: 14, scrollback: 5000 });
-      fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open($('term'));
+      fit = new FitAddon.FitAddon(); term.loadAddon(fit);
+      // URLs in the terminal are clickable (E-21: Claude Code's own sign-in URL).
+      term.loadAddon(new WebLinksAddon.WebLinksAddon((ev, uri) => window.open(uri, '_blank', 'noopener')));
+      term.open($('term'));
+      window.nemrTerm = term; // read by the acceptance as evidence when a wait fails (the page's script scope is not the window's)
       term.onData(d => { if (ws && ws.readyState === 1) ws.send(new TextEncoder().encode(d)); });
       term.onResize(({ rows, cols }) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', rows, cols })); });
       window.addEventListener('resize', () => fit && fit.fit());
     }
     term.reset(); fit.fit();
+    $('signin').hidden = true; signinBuf = '';
     const t = await api('/sessions/' + encodeURIComponent(name) + '/attach-ticket', { method: 'POST' });
     if (!t.ok) { $('attachnote').textContent = 'refused (' + t.status + ')'; return; }
     const { ticket } = await t.json();
@@ -1353,7 +1398,7 @@ async fn index() -> Response {
     const sock = new WebSocket(proto + location.host + '/ws/attach/' + encodeURIComponent(name) + '?ticket=' + ticket);
     ws = sock;
     sock.binaryType = 'arraybuffer';
-    sock.onopen = () => { if (ws !== sock) return; sock.send(JSON.stringify({ type: 'start', rows: term.rows, cols: term.cols })); $('attachnote').textContent = 'attached — type as in nemr attach; exit the shell or detach'; term.focus(); };
+    sock.onopen = () => { if (ws !== sock) return; signinBuf = ''; sock.send(JSON.stringify({ type: 'start', rows: term.rows, cols: term.cols })); $('attachnote').textContent = 'attached — type as in nemr attach; exit the shell or detach'; term.focus(); };
     sock.onmessage = ev => {
       if (ws !== sock) return;
       if (typeof ev.data === 'string') {
@@ -1375,6 +1420,7 @@ async fn index() -> Response {
         return;
       }
       term.write(new Uint8Array(ev.data));
+      watchForSignin(new Uint8Array(ev.data));
     };
     sock.onclose = () => { if (ws === sock) { ws = null; $('attachnote').textContent = 'disconnected'; refresh(); } };
   }
@@ -1528,6 +1574,7 @@ mod tests {
                 running: false,
                 usage_known: false,
                 used_bytes: 0,
+                credential_present: None,
             });
             Ok(name.to_string())
         }
@@ -2010,6 +2057,7 @@ mod tests {
             running: true,
             usage_known: true,
             used_bytes: 700,
+            credential_present: None,
         }]);
         let (app, _) = app_with(engine);
         let cookie = establish(&app).await;
@@ -2275,6 +2323,7 @@ mod tests {
             running: false,
             usage_known: true,
             used_bytes: 700,
+            credential_present: None,
         }]);
         let (app, _) = app_with(engine.clone());
         let cookie = establish(&app).await;
@@ -2681,6 +2730,7 @@ mod tests {
             running: true,
             usage_known: true,
             used_bytes: 4096,
+            credential_present: None,
         }]);
         let (app, _) = app_with(engine.clone());
         let cookie = establish(&app).await;

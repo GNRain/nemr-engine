@@ -1044,6 +1044,21 @@ fn e11_export_and_import_work_with_no_network_and_no_credentials() {
          it inside proves nothing"
     );
 
+    // F-9: a daemon must be answering BEFORE the namespaced CLI runs. With
+    // none, the CLI used to autostart one inside the namespace, where it
+    // bound the host's socket and served every later caller with a helper
+    // that cannot elevate (measured 2026-09-08). The CLI now refuses that,
+    // so this one host-side call is what makes the offline run possible.
+    let on_host = std::process::Command::new(env!("CARGO_BIN_EXE_nemr"))
+        .arg("list")
+        .output()
+        .expect("run nemr list on the host");
+    assert!(
+        on_host.status.success(),
+        "a daemon must be reachable from the host before the offline run: {}",
+        String::from_utf8_lossy(&on_host.stderr)
+    );
+
     let export = run_offline(&["export", &source.name, "-o", &bundle.to_string_lossy()]);
     assert!(
         export.status.success(),
@@ -1956,84 +1971,54 @@ fn import_refuses_to_clobber_an_existing_project() {
     });
 }
 
-/// E-14 — a restore must not require a host credential.
+/// E-14, as amended by E-21 (Product Owner ruling, 2026-09-08): `create`
+/// and a restore behave IDENTICALLY on a host with no credential — both get
+/// the engine's placeholder and start against it. The policy split E-14
+/// introduced (create refuses, import defers) is gone, and so is the enum
+/// that carried it.
 ///
-/// E-11 rules that `nemr import` works with no network and no credential.
-/// AUTH-03 rules that a missing credential is fatal "at creation time". Those
-/// did not collide while import needed a pre-existing project; now that a
-/// restore creates its own, they do.
-///
-/// This asserts the resolution at the policy level: `create` still refuses
-/// without a credential, and a restore does not. It is weaker than the
-/// end-to-end offline run it replaces — a restore provisions a volume and so
-/// needs the privileged helper, which cannot run inside the offline test's user
-/// namespace — and that gap is recorded rather than hidden.
+/// The behavioural proof is `e21_a_host_with_no_login_gets_a_placeholder_…`,
+/// which creates and starts under the test seam. This test is the
+/// structural half: there is ONE credential path for both call sites, and
+/// the old refusal (`resolve_credentials`, AUTH-03's pre-amendment message
+/// "authenticate on the host") is called from nowhere in the engine's
+/// project code — so the amendment cannot silently regress into a create
+/// that refuses again.
 #[test]
-fn import_defers_the_credential_requirement() {
-    // BRITTLE BY CONSTRUCTION, deliberately — read this before "fixing" a
-    // failure here as a regression.
-    //
-    // The property is behavioural: `create` must refuse without a host
-    // credential (AUTH-03), and a restore must not. The honest way to assert
-    // that is to run each with no credential visible and observe the outcome —
-    // and that is not cheaply available here, for two real reasons, neither a
-    // shortcut:
-    //   1. The full no-credential IMPORT is blocked by the helper-vs-namespace
-    //      wall (E-14's second consequence): a restore provisions a volume, so
-    //      it needs the privileged helper, which cannot run inside the user
-    //      namespace that would hide the host credential. The e11 offline test
-    //      documents exactly this.
-    //   2. Making CREATE fail-without-credential observable means removing the
-    //      real credential file for the duration — and a test that renames a
-    //      user's live credential risks leaving it renamed if it dies, the same
-    //      cleanup-before-verify hazard F-79 was about. Not worth it for this.
-    //
-    // So this inspects the source. What it asserts is now token-level, NOT the
-    // exact call-site argument list, because matching the arg list is what
-    // snapped when the `agent` parameter landed (a change unrelated to the
-    // property). Tokens survive signature changes; the property does not depend
-    // on them.
+fn create_and_restore_take_one_credential_path() {
     let source = std::fs::read_to_string("src/engine/project.rs").expect("read project.rs");
-
-    // The public `create` must route through the Required policy. Checked
-    // against `create`'s own body, so an unrelated `Required` elsewhere cannot
-    // satisfy it.
-    let create_body = {
+    assert!(
+        !source.contains("AuthPolicy"),
+        "the E-14 policy split is gone under E-21; a reintroduced AuthPolicy re-opens the question"
+    );
+    let body_of = |name: &str| {
         let start = source
-            .find("pub async fn create(")
-            .expect("create must exist");
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} must exist"));
         let after = &source[start..];
         let end = after
-            .find(
-                "
-}
-",
-            )
+            .find("\n}\n")
             .map(|e| start + e)
             .unwrap_or(source.len());
         &source[start..end]
     };
-    assert!(
-        create_body.contains("AuthPolicy::Required"),
-        "nemr create must keep AUTH-03: its body must route through AuthPolicy::Required"
-    );
-
-    // The deferral must exist and be confined to exactly one site. This is the
-    // invariant that actually matters — widening it would repeal AUTH-03 rather
-    // than narrow it — and one stray extra site is what this catches.
-    assert!(
-        source.contains("AuthPolicy::DeferredForRestore"),
-        "a restore must defer the credential check, or E-11's offline guarantee breaks"
-    );
-    let deferred_sites = source.matches("AuthPolicy::DeferredForRestore").count();
+    let create_with_auth = body_of("async fn create_with_auth(");
     assert_eq!(
-        deferred_sites, 2,
-        "expected `AuthPolicy::DeferredForRestore` exactly twice — the match arm that \
-         implements the deferral and the single call site that selects it (the enum variant's \
-         own definition is spelled without the `AuthPolicy::` prefix and is not counted). \
-         {deferred_sites} occurrences means a new place selects the deferral, widening \
-         AUTH-03's exception."
+        create_with_auth
+            .matches("auth::ensure_host_credential_file()")
+            .count(),
+        1,
+        "create_with_auth resolves the credential through the placeholder path exactly once"
     );
+    assert!(
+        !source.contains("auth::resolve_credentials("),
+        "the pre-amendment refusal must not be called from the engine's project code"
+    );
+    // Both public entry points route through it: `create` directly, a restore
+    // through import_creating.
+    assert!(body_of("pub async fn create(").contains("create_with_auth(client, name, size, agent)"));
+    assert!(body_of("pub async fn import_creating(")
+        .contains("create_with_auth(client, &name, size, agent)"));
 }
 
 /// Quieting the success path must not quieten the failure path.
@@ -2303,6 +2288,7 @@ fn status_distinguishes_unmounted_from_wrongly_mounted() {
         credential_expires_at: None,
         credential_refresh_expires_at: None,
         credential_blank: false,
+        credential_present: true,
         credential_stale: None,
     };
     assert_eq!(
@@ -3568,6 +3554,121 @@ fn f131_first_start_seeds_claude_config_by_allowlist_and_only_once() {
         );
         let _ = project::stop(&client, &project.name).await;
     });
+}
+
+/// E-21 (ruled 2026-09-08): a host that has never logged in. Under the
+/// test seam (path-only) the engine finds no credential file, writes its
+/// placeholder there 0600, creates AND starts the session against it, and
+/// `status` says no login is present. Then the property the ruling requires
+/// is measured under the real bind, not assumed: Claude Code inside the
+/// session writes its credential store — by rename in a plain directory,
+/// measured 2026-09-08 — and what it writes must land in the HOST file, or
+/// a `/login` on a fresh machine would be lost. The store write here is
+/// the one a fake expired credential provokes (the dead-refresh clear),
+/// which needs no browser; the human arm proves the same for `/login`.
+#[test]
+fn e21_a_host_with_no_login_gets_a_placeholder_and_the_sessions_writes_land_on_it() {
+    use std::os::unix::fs::PermissionsExt;
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    let temp = std::env::temp_dir().join(format!("nemr-e21-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp);
+    std::fs::create_dir_all(&temp).unwrap();
+    let scratch = temp.join("claude").join(".credentials.json");
+    std::env::set_var("NEMR_HOST_CREDENTIALS", &scratch);
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        assert!(!scratch.exists(), "the seam names a file that does not exist yet");
+        let project = TestProject::create(&client, "e21nologin", VolumeSize::Small).await;
+        // Created: the placeholder is there, private, in the engine's shape.
+        assert!(scratch.exists(), "create wrote the placeholder");
+        assert_eq!(std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(nemr_engine::auth::is_placeholder(&std::fs::read_to_string(&scratch).unwrap()));
+        // Started against it, and status says no login yet.
+        project::start(&client, &project.name).await.expect("a session starts on a host with no login");
+        let detail = project::status(&client, &project.name).await.expect("status");
+        assert!(!detail.credential_present, "the placeholder is not a login");
+        assert!(detail.running);
+        // Inside, the placeholder is what is mounted.
+        let (_, inside) = project::exec_capture(&client, &project.name, &["cat", "/root/.claude/.credentials.json"]).await.unwrap();
+        assert!(nemr_engine::auth::is_placeholder(&inside), "the session sees the placeholder: {inside}");
+
+        // The measurement: a store write by Claude Code lands on the host.
+        // A fake, expired credential provokes the dead-refresh clear — the
+        // same store code path that a login uses, with no browser needed.
+        let fake = r#"{"claudeAiOauth":{"accessToken":"FAKE-EXPIRED","refreshToken":"FAKE-REFRESH","expiresAt":1700000000000,"scopes":["user:inference","user:profile"],"subscriptionType":"max"}}"#;
+        std::fs::write(&scratch, fake).unwrap();
+        let before = std::fs::metadata(&scratch).unwrap();
+        let (_, out) = project::exec_capture(
+            &client,
+            &project.name,
+            &["sh", "-c", "timeout 120 claude -p 'Reply with OK' --output-format json < /dev/null 2>&1 | tail -c 400; echo; stat -c 'inside inode=%i size=%s' /root/.claude/.credentials.json; cat /root/.claude/.credentials.json"],
+        )
+        .await
+        .unwrap();
+        let host_after = std::fs::read_to_string(&scratch).unwrap();
+        let after = std::fs::metadata(&scratch).unwrap();
+        eprintln!("--- claude's answer and the file as the session sees it ---\n{out}\n--- host file after: inode {}->{} size {}->{} ---\n{host_after}",
+            std::os::unix::fs::MetadataExt::ino(&before), std::os::unix::fs::MetadataExt::ino(&after), before.len(), after.len());
+        assert!(out.contains("could not be refreshed") || out.contains("OAuth"), "the fake credential provoked Claude Code's refresh: {out}");
+        // THE property: what Claude Code wrote is in the host file.
+        let inside_after = out.rsplit('\n').find(|l| l.trim_start().starts_with('{')).unwrap_or("").trim().to_string();
+        assert_eq!(host_after.trim(), inside_after, "the host file must contain what Claude Code wrote (E-21's required proof); if these differ, Claude Code's write escaped the bind");
+        assert!(host_after.contains("\"accessToken\":\"\""), "the write that landed is Claude Code's dead-refresh clear: {host_after}");
+        drop(project);
+    });
+    std::env::remove_var("NEMR_HOST_CREDENTIALS");
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+/// F-9: `nemrd` refuses to become a daemon inside a user namespace. Measured
+/// 2026-09-08: a CLI run under `unshare -rmn` with no daemon answering
+/// autostarted one inside the namespace; it bound the host's socket and
+/// every later `nemr create` on the machine failed in the privileged helper
+/// (`sudo: /etc/sudo.conf is owned by uid 65534`). The daemon is run here the
+/// way that orphan was, on a scratch socket path so nothing real is touched,
+/// and must exit at once naming the namespace. Without the guard it would
+/// bind and serve, so the run would hit the timeout instead — the red.
+#[test]
+fn f9_nemrd_refuses_to_start_inside_a_user_namespace() {
+    if unit_only() {
+        return;
+    }
+    if let Err(reason) = common::namespace_probe() {
+        panic!("unprivileged namespaces are unavailable: {reason}");
+    }
+    let scratch = std::env::temp_dir().join(format!("nemr-f9-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&scratch);
+    let output = std::process::Command::new("timeout")
+        .args(["10", "unshare", "-rmn", env!("CARGO_BIN_EXE_nemrd")])
+        .env("NEMR_DAEMON_SOCKET", &scratch)
+        .output()
+        .expect("run nemrd under unshare");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _ = std::fs::remove_file(&scratch);
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "nemrd ran until the timeout inside the namespace — it is serving where it cannot \
+         elevate.\nstderr: {stderr}"
+    );
+    assert!(
+        !output.status.success(),
+        "nemrd must refuse inside a user namespace.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("inside a user namespace") && stderr.contains("0 1000 1"),
+        "the refusal must name the namespace and the map it saw.\nstderr: {stderr}"
+    );
+    assert!(
+        !scratch.exists(),
+        "the refusal came before the socket was touched"
+    );
 }
 
 /// AUTH-03 extended: `create` refuses a host credential that cannot
