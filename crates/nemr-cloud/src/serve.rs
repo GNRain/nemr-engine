@@ -90,7 +90,7 @@ use axum::extract::{Path as UrlPath, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use nemr_daemon_api::proto::{
@@ -111,6 +111,11 @@ const REQUEST_HEADER: &str = "x-nemr-request";
 pub trait UiEngine: EngineOps {
     fn start(&self, name: &str) -> Result<()>;
     fn stop(&self, name: &str) -> Result<String>;
+    /// F-11: create a session on this machine (the daemon validates `size`
+    /// and `agent` against what the engine allows).
+    fn create(&self, name: &str, size: &str, agent: &str) -> Result<()>;
+    /// F-12: remove a session from this machine. Never the cloud copy.
+    fn delete(&self, name: &str) -> Result<()>;
     /// Open an attach stream: the daemon's, or a fake's in the tests.
     fn attach(
         &self,
@@ -276,7 +281,8 @@ pub fn router(state: Arc<UiState>) -> Router {
         .route("/register", post(register_begin))
         .route("/register/confirm", post(register_confirm))
         .route("/logout", post(logout))
-        .route("/sessions", get(sessions))
+        .route("/sessions", get(sessions).post(create))
+        .route("/sessions/{name}", delete(remove))
         .route("/sessions/{name}/pull", post(pull))
         .route("/sessions/{name}/start", post(start))
         .route("/sessions/{name}/push", post(push))
@@ -599,6 +605,7 @@ async fn sessions(State(state): State<Arc<UiState>>) -> Response {
                 .collect();
             Json(json!({
                 "rows": rows,
+                "create_options": create_options(),
                 "local_available": local_error.is_none(),
                 "local_error": local_error,
                 "this_machine": crate::state::holder_identity(),
@@ -762,6 +769,98 @@ async fn stop(State(state): State<Arc<UiState>>, UrlPath(name): UrlPath<String>)
         say(&format!("stopping {session:?}"));
         let outcome = engine.stop(&session)?;
         say(&format!("stopped ({outcome})"));
+        Ok(())
+    });
+    Json(json!({ "job": id })).into_response()
+}
+
+/// F-11: what the create panel offers. The wire vocabulary of the daemon's
+/// `CreateRequest`, stated here because the commercial half never links
+/// the engine (E-11); the browser acceptance holds it to what `nemr create`
+/// accepts, so the two cannot drift apart unnoticed.
+pub const CREATE_SIZES: [&str; 3] = ["500MB", "2GB", "10GB"];
+pub const CREATE_DEFAULT_SIZE: &str = "2GB";
+pub const CREATE_AGENTS: [(&str, &str); 2] = [
+    ("claude-code", "Claude Code"),
+    ("codex", "Codex CLI (implemented but unverified — F-84)"),
+];
+fn create_options() -> Value {
+    json!({
+        "sizes": CREATE_SIZES,
+        "default_size": CREATE_DEFAULT_SIZE,
+        "agents": CREATE_AGENTS.iter().map(|(id, label)| json!({"id": id, "label": label})).collect::<Vec<_>>(),
+    })
+}
+
+#[derive(Deserialize)]
+struct CreateBody {
+    name: String,
+    #[serde(default)]
+    size: String,
+    #[serde(default)]
+    agent: String,
+}
+
+/// F-11: create from the page, as a job the page watches — the daemon's
+/// `Create`, with its own refusals (a name in use, a size or agent it does
+/// not allow) surfacing as the job's error, which the page puts on the
+/// status line (F-3's rule). An empty size or agent takes the default the
+/// CLI takes.
+async fn create(State(state): State<Arc<UiState>>, Json(body): Json<CreateBody>) -> Response {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "a session needs a name" })),
+        )
+            .into_response();
+    }
+    let size = if body.size.is_empty() {
+        CREATE_DEFAULT_SIZE.to_string()
+    } else {
+        body.size
+    };
+    let agent = if body.agent.is_empty() {
+        CREATE_AGENTS[0].0.to_string()
+    } else {
+        body.agent
+    };
+    let engine = state.engine.clone();
+    let session = name.clone();
+    let id = state.start_job("create", &name, move |say| {
+        say(&format!("creating {session:?} ({size}, {agent})"));
+        engine.create(&session, &size, &agent)?;
+        say(&format!(
+            "created {session:?}; it is stopped — start it from its row"
+        ));
+        Ok(())
+    });
+    Json(json!({ "job": id })).into_response()
+}
+
+/// F-12: remove from THIS machine, as a job. A running session is stopped
+/// first, the way stop-and-push stops it. The cloud copy is never touched
+/// here (E-22: deleting bundles waits for the server to be able to); the
+/// page says which case this is — a copy stays in the cloud, or this was
+/// the only one — and asks accordingly before calling.
+async fn remove(State(state): State<Arc<UiState>>, UrlPath(name): UrlPath<String>) -> Response {
+    let engine = state.engine.clone();
+    let session = name.clone();
+    let id = state.start_job("remove", &name, move |say| {
+        let running = engine
+            .list()?
+            .into_iter()
+            .any(|p| p.name == session && p.running);
+        if running {
+            say(&format!("stopping {session:?} first"));
+            let outcome = engine.stop(&session)?;
+            say(&format!("stopped ({outcome})"));
+        }
+        say(&format!("removing {session:?} from this machine"));
+        engine.delete(&session)?;
+        say(&format!(
+            "removed {session:?} from this machine; nothing in the cloud was touched"
+        ));
         Ok(())
     });
     Json(json!({ "job": id })).into_response()
@@ -1122,7 +1221,7 @@ async fn index() -> Response {
     <div class="warn" id="abandon"></div>
   </section>
   <section id="list" hidden>
-    <div class="toolbar"><button id="refresh">refresh</button><span class="note" id="localnote"></span></div>
+    <div class="toolbar"><button id="refresh">refresh</button><button id="create" class="primary">create session</button><span class="note" id="localnote"></span></div>
     <div id="loginline" class="warn" hidden>No Claude login on this machine yet — attach a session and run <code>/login</code> in it; the login is written to this machine and stays here.</div>
     <table><thead><tr><th>session</th><th>agent</th><th>where</th><th>state</th><th>size</th><th>updated</th><th>last machine</th><th>open on</th><th></th></tr></thead><tbody id="rows"></tbody></table>
     <section id="job" class="login" style="max-width:40rem;margin-top:1rem" hidden>
@@ -1137,6 +1236,17 @@ async fn index() -> Response {
         <label style="display:flex;gap:.4rem;align-items:center"><input name="release" type="checkbox" style="width:auto" checked> release the lease afterwards, so another machine can take it</label>
         <label style="display:flex;gap:.4rem;align-items:center"><input name="take_over" type="checkbox" style="width:auto"> take over the lease if another machine holds it</label>
         <div style="display:flex;gap:.6rem"><button class="primary" type="submit">push</button><button type="button" id="pushcancel">cancel</button></div>
+      </form>
+      <form id="createform" style="display:grid;gap:.6rem" hidden>
+        <label>name <input name="name" autocomplete="off" required maxlength="32" pattern="[a-z0-9][a-z0-9-]*" placeholder="lowercase letters, digits and -"></label>
+        <label>agent <select name="agent" id="createagent"></select></label>
+        <label>quota (fixed at creation) <select name="size" id="createsize"></select></label>
+        <div style="display:flex;gap:.6rem"><button class="primary" type="submit">create</button><button type="button" id="createcancel">cancel</button></div>
+      </form>
+      <form id="removeform" style="display:grid;gap:.6rem" hidden>
+        <div id="removecase"></div>
+        <label id="removetypeit" hidden>type the session's name to confirm <input name="typed" autocomplete="off"></label>
+        <div style="display:flex;gap:.6rem"><button class="primary" type="submit" id="removeconfirm">remove from this machine</button><button type="button" id="removecancel">cancel</button></div>
       </form>
       <pre id="joblog" style="margin:0;white-space:pre-wrap"></pre>
       <div id="jobresult"></div>
@@ -1205,7 +1315,8 @@ async fn index() -> Response {
     if (!r.ok) { const e = await r.json().catch(() => ({})); status('could not list sessions: ' + (e.error || r.status), 'bad'); return; }
     const d = await r.json();
     const rows = $('rows'); rows.innerHTML = '';
-    if (!d.rows.length) rows.innerHTML = '<tr><td colspan="8" class="muted">no sessions anywhere. Create one with: nemr create &lt;name&gt; --size 2GB</td></tr>';
+    if (!d.rows.length) rows.innerHTML = '<tr><td colspan="9" class="muted">no sessions anywhere. Create one with the button above.</td></tr>';
+    fillCreateOptions(d.create_options);
     for (const s of d.rows) {
       const state = s.where === 'remote' ? '<span class="muted">not here</span>' : s.running ? 'running' : 'stopped';
       let open = '<span class="muted">-</span>';
@@ -1215,6 +1326,8 @@ async fn index() -> Response {
       else if (s.where === 'remote') action = '<span class="muted">no bundle yet</span>';
       else if (!s.running) action = '<button data-start="' + esc(s.name) + '">start</button> <button data-push="' + esc(s.name) + '">push</button>';
       else action = '<button data-attach="' + esc(s.name) + '">attach</button> <button data-push="' + esc(s.name) + '">stop &amp; push</button>';
+      // F-12: remove from THIS machine; the button says which case it is.
+      if (s.where !== 'remote') action += ' <button data-remove="' + esc(s.name) + '" data-bundle="' + (s.has_bundle ? '1' : '0') + '" data-running="' + (s.running ? '1' : '0') + '">' + (s.has_bundle ? 'remove from this machine' : 'remove the only copy') + '</button>';
       rows.insertAdjacentHTML('beforeend', '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.agent) + '</td><td><span class="pill ' + esc(s.where) + '">' + esc(s.where) + '</span></td><td>' + state + '</td><td>' + human(s.size_bytes) + '</td><td>' + ago(s.updated_at_unix) + '</td><td>' + esc(s.last_machine || '-') + '</td><td>' + open + '</td><td>' + action + '</td></tr>');
     }
     // E-21: the credential is a fact about this machine; any local row carries it.
@@ -1282,8 +1395,17 @@ async fn index() -> Response {
   });
   $('refresh').addEventListener('click', refresh);
 
+  // F-11: the create panel's options come with the list (the daemon's
+  // vocabulary, stated by the binary); filled once per list.
+  function fillCreateOptions(o) {
+    if (!o) return;
+    const a = $('createagent'), z = $('createsize');
+    a.innerHTML = o.agents.map(x => '<option value="' + esc(x.id) + '">' + esc(x.label) + '</option>').join('');
+    z.innerHTML = o.sizes.map(x => '<option value="' + esc(x) + '"' + (x === o.default_size ? ' selected' : '') + '>' + esc(x) + '</option>').join('');
+  }
+
   // --- step 3: pull-and-start, and start, as jobs the page watches ---
-  let pulling = null, pushing = null;
+  let pulling = null, pushing = null, removing = null;
   // Exactly one action panel is open at a time: the job panel (with one of
   // its two forms) or the terminal. Opening either closes the other; cancel
   // closes; a job that completes closes and leaves its result on the status
@@ -1297,9 +1419,10 @@ async fn index() -> Response {
   function closePanels() {
     panelGen++;
     $('job').hidden = true; $('pullform').hidden = true; $('pushform').hidden = true;
+    $('createform').hidden = true; $('removeform').hidden = true;
     if (ws) { const w = ws; ws = null; w.close(); }
     $('attach').hidden = true;
-    pulling = null; pushing = null;
+    pulling = null; pushing = null; removing = null;
   }
   function openJob(title) {
     closePanels();
@@ -1322,9 +1445,9 @@ async fn index() -> Response {
   // status line: the error in red, and for a lease held elsewhere the
   // take-over offer beside it. A superseded job (the user opened something
   // else meanwhile) closes nothing and writes nothing.
-  async function runJob(title, path, body, onRetry) {
+  async function runJob(title, path, body, onRetry, method) {
     const gen = openJob(title);
-    const r = await api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    const r = await api(path, { method: method || 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
     const d = await r.json().catch(() => ({}));
     if (gen !== panelGen) return null;
     if (!r.ok) { $('jobresult').textContent = d.error || ('refused (' + r.status + ')'); $('jobresult').className = 'bad'; return null; }
@@ -1442,6 +1565,47 @@ async fn index() -> Response {
   });
   $('jobcancel').addEventListener('click', closePanels);
   $('pushcancel').addEventListener('click', closePanels);
+  // F-11: create — one panel; on success the row appears and the panel
+  // closes (runJob); a refusal goes to the status line (F-3's rule).
+  $('create').addEventListener('click', () => {
+    openJob('create a session');
+    const f = $('createform'); f.hidden = false; f.name.value = ''; f.name.focus();
+  });
+  $('createcancel').addEventListener('click', closePanels);
+  $('createform').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const f = ev.target, name = f.name.value.trim();
+    const body = { name, size: f.size.value, agent: f.agent.value };
+    f.hidden = true;
+    await runJob('create ' + name, '/sessions', body);
+  });
+  // F-12: remove from this machine — the panel says which case it is. A
+  // copy in the cloud: one click. The only copy: the name, typed exactly,
+  // enables the button. A running session is stopped first by the job.
+  $('rows').addEventListener('click', ev => {
+    const b = ev.target.closest('button[data-remove]'); if (!b) return;
+    const name = b.dataset.remove, hasBundle = b.dataset.bundle === '1', running = b.dataset.running === '1';
+    openJob('remove ' + name + ' from this machine');
+    removing = name;
+    const f = $('removeform'); f.hidden = false; f.typed.value = '';
+    $('removecase').innerHTML = hasBundle
+      ? 'This removes <strong>' + esc(name) + '</strong> from this machine only. The copy in the cloud stays, and the row will show it as remote.' + (running ? ' It is running: it will be stopped first.' : '')
+      : '<span class="bad">This is the only copy of <strong>' + esc(name) + '</strong>.</span> There is no bundle in the cloud; removing it here deletes it for good.' + (running ? ' It is running: it will be stopped first.' : '');
+    $('removetypeit').hidden = hasBundle;
+    $('removeconfirm').disabled = !hasBundle;
+    if (!hasBundle) f.typed.focus();
+  });
+  $('removeform').typed.addEventListener('input', ev => {
+    if (!$('removetypeit').hidden) $('removeconfirm').disabled = ev.target.value !== removing;
+  });
+  $('removecancel').addEventListener('click', closePanels);
+  $('removeform').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const name = removing;
+    if ($('removeconfirm').disabled) return;
+    ev.target.hidden = true;
+    await runJob('remove ' + name, '/sessions/' + encodeURIComponent(name), null, null, 'DELETE');
+  });
   $('pushform').addEventListener('submit', async ev => {
     ev.preventDefault();
     const f = ev.target, name = pushing;
@@ -1547,6 +1711,8 @@ mod tests {
         started: Mutex<Vec<String>>,
         exported: Mutex<Vec<String>>,
         stopped: Mutex<Vec<String>>,
+        created: Mutex<Vec<(String, String, String)>>,
+        deleted: Mutex<Vec<String>>,
     }
     impl EngineOps for FakeEngine {
         fn list(&self) -> Result<Vec<LocalProject>> {
@@ -1600,6 +1766,42 @@ mod tests {
                 }
             }
             Ok("graceful".into())
+        }
+        /// The daemon's refusals, in the fake: a name in use, a size or an
+        /// agent the engine does not allow.
+        fn create(&self, name: &str, size: &str, agent: &str) -> Result<()> {
+            if self.projects.lock().unwrap().iter().any(|p| p.name == name) {
+                anyhow::bail!("project {name:?} already exists");
+            }
+            if !CREATE_SIZES.contains(&size) {
+                anyhow::bail!("unrecognised volume size {size:?}. Valid sizes: 500MB, 2GB, 10GB.");
+            }
+            if !CREATE_AGENTS.iter().any(|(id, _)| *id == agent) {
+                anyhow::bail!("unknown agent {agent:?}");
+            }
+            self.created.lock().unwrap().push((
+                name.to_string(),
+                size.to_string(),
+                agent.to_string(),
+            ));
+            self.projects.lock().unwrap().push(LocalProject {
+                name: name.to_string(),
+                agent: agent.to_string(),
+                running: false,
+                usage_known: false,
+                used_bytes: 0,
+                credential_present: None,
+            });
+            Ok(())
+        }
+        fn delete(&self, name: &str) -> Result<()> {
+            let mut projects = self.projects.lock().unwrap();
+            let Some(i) = projects.iter().position(|p| p.name == name) else {
+                anyhow::bail!("project {name:?} does not exist");
+            };
+            projects.remove(i);
+            self.deleted.lock().unwrap().push(name.to_string());
+            Ok(())
         }
         /// An echo session: stdin comes back upper-cased on stdout, a resize
         /// is reported on stderr, "exit" ends it with code 7, and a session
@@ -1931,6 +2133,12 @@ mod tests {
                 Some(json!({"password": "x"})),
             ),
             ("POST", "/api/sessions/x/stop", None),
+            (
+                "POST",
+                "/api/sessions",
+                Some(json!({"name": "x", "size": "2GB", "agent": "claude-code"})),
+            ),
+            ("DELETE", "/api/sessions/x", None),
             ("GET", "/api/jobs/abc", None),
             ("POST", "/api/sessions/x/attach-ticket", None),
         ] {
@@ -2706,6 +2914,177 @@ mod tests {
     /// anything is stopped or uploaded; the lease is released by default,
     /// so another machine can take it; and the row the pull side reads then
     /// says the bundle is there.
+    /// F-11 and F-12 through the surface, against the fake engine: create
+    /// is a job that lands a stopped row and carries the engine's refusals
+    /// (a size it does not allow, a name in use) as the job's error; remove
+    /// stops a running session first, then deletes it from this machine,
+    /// and never reaches the server. The sessions reply carries the create
+    /// panel's options.
+    #[tokio::test]
+    async fn create_and_remove_through_the_surface() {
+        let engine = fake_engine(vec![LocalProject {
+            name: "busy".into(),
+            agent: "claude-code".into(),
+            running: true,
+            usage_known: true,
+            used_bytes: 4096,
+            credential_present: None,
+        }]);
+        let (app, _) = app_with(engine.clone());
+        let cookie = establish(&app).await;
+        let c = Some(cookie.as_str());
+        let lines_of = |j: &Value| -> Vec<String> {
+            j["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l["text"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // A size the engine does not allow: the daemon's refusal is the job's error.
+        let j = finish(
+            &app,
+            &cookie,
+            send(
+                &app,
+                api_req(
+                    "POST",
+                    "/api/sessions",
+                    c,
+                    Some(json!({"name": "fresh", "size": "7GB", "agent": "claude-code"})),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(j["ok"], false, "{j}");
+        assert!(j["error"].as_str().unwrap().contains("Valid sizes"), "{j}");
+        assert!(engine.created.lock().unwrap().is_empty());
+        // A name in use.
+        let j = finish(
+            &app,
+            &cookie,
+            send(
+                &app,
+                api_req(
+                    "POST",
+                    "/api/sessions",
+                    c,
+                    Some(json!({"name": "busy", "size": "2GB", "agent": "claude-code"})),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(j["ok"], false, "{j}");
+        assert!(
+            j["error"].as_str().unwrap().contains("already exists"),
+            "{j}"
+        );
+        // No name at all is refused before any job exists.
+        let r = send(
+            &app,
+            api_req("POST", "/api/sessions", c, Some(json!({"name": "  "}))),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        // The real one, with the defaults the CLI takes when size and agent are empty.
+        let j = finish(
+            &app,
+            &cookie,
+            send(
+                &app,
+                api_req("POST", "/api/sessions", c, Some(json!({"name": "fresh"}))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "{j}");
+        assert!(
+            lines_of(&j).iter().any(|l| l.contains("created \"fresh\"")),
+            "{j}"
+        );
+        assert_eq!(
+            *engine.created.lock().unwrap(),
+            vec![(
+                "fresh".to_string(),
+                "2GB".to_string(),
+                "claude-code".to_string()
+            )]
+        );
+        let list = engine.list().unwrap();
+        let row = list
+            .iter()
+            .find(|p| p.name == "fresh")
+            .expect("the row appears");
+        assert!(
+            !row.running,
+            "created stopped; start is the row's own button"
+        );
+
+        // What the create panel offers is a constant of this binary, carried
+        // in every sessions reply (asserted end to end by the acceptance).
+        let o = create_options();
+        assert_eq!(o["default_size"], "2GB");
+        assert_eq!(o["sizes"].as_array().unwrap().len(), CREATE_SIZES.len());
+        assert_eq!(o["agents"][0]["id"], "claude-code");
+
+        // Remove: the running one is stopped first, then deleted; the stopped
+        // one just goes. Neither touches the exported list (nothing is pushed).
+        let j = finish(
+            &app,
+            &cookie,
+            send(&app, api_req("DELETE", "/api/sessions/busy", c, None)).await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "{j}");
+        let lines = lines_of(&j);
+        assert!(
+            lines.iter().any(|l| l.contains("stopping \"busy\" first")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("nothing in the cloud was touched")),
+            "{lines:?}"
+        );
+        assert_eq!(*engine.stopped.lock().unwrap(), vec!["busy".to_string()]);
+        let j = finish(
+            &app,
+            &cookie,
+            send(&app, api_req("DELETE", "/api/sessions/fresh", c, None)).await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "{j}");
+        assert!(
+            !lines_of(&j).iter().any(|l| l.contains("stopping")),
+            "a stopped session is not 'stopped' again: {j}"
+        );
+        assert_eq!(
+            *engine.deleted.lock().unwrap(),
+            vec!["busy".to_string(), "fresh".to_string()]
+        );
+        assert!(engine.list().unwrap().is_empty());
+        assert!(
+            engine.exported.lock().unwrap().is_empty(),
+            "remove never exports or pushes"
+        );
+        // An unknown name: the engine's refusal is the job's error.
+        let j = finish(
+            &app,
+            &cookie,
+            send(&app, api_req("DELETE", "/api/sessions/ghost", c, None)).await,
+        )
+        .await;
+        assert_eq!(j["ok"], false, "{j}");
+        assert!(
+            j["error"].as_str().unwrap().contains("does not exist"),
+            "{j}"
+        );
+    }
+
     #[tokio::test]
     async fn stop_and_push_through_the_surface() {
         let _serial = serial().await;

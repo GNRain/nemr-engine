@@ -388,6 +388,29 @@ async def _page_flow(launch_url, email, password, server, remote_name, local_nam
         check("F-1 after login the header shows the account", email in (who or ""), who)
         check("F-1 after login the header shows a log-out control", await b.eval(VISIBLE + "('logout')"))
         await b.wait_for(f"!!document.querySelector('button[data-pull={json.dumps(remote_name)}]')", 30, "the remote row's pull button")
+
+        # ---- F-11: create the local session through the page's own panel.
+        check("F-11 the list has no row for the session yet", not await b.eval(f"!!document.querySelector('button[data-remove={json.dumps(local_name)}]')"))
+        await b.eval("document.getElementById('create').click()")
+        await b.wait_for(VISIBLE + "('createform')", 10, "the create panel")
+        agents = await b.eval("[...document.getElementById('createagent').options].map(o => o.value)")
+        sizes = await b.eval("[...document.getElementById('createsize').options].map(o => o.value)")
+        chosen = await b.eval("document.getElementById('createsize').value")
+        check("F-11 the panel offers the agents and a quota picker, Claude Code and 2GB by default",
+              agents and agents[0] == "claude-code" and len(sizes) >= 3 and chosen == "2GB", f"agents={agents} sizes={sizes} default={chosen}")
+        await b.eval(f"(f => {{ f.name.value = {json.dumps(local_name)}; f.size.value = '500MB'; f.agent.value = 'claude-code'; f.requestSubmit(); }})(document.getElementById('createform'))")
+        await b.wait_for(f"!!document.querySelector('button[data-start={json.dumps(local_name)}]')", 120, "the new row, stopped, after create")
+        check("F-11 on success the row appears (stopped) and the panel is closed", not await b.eval(VISIBLE + "('job')"))
+        st = await b.eval("document.getElementById('status').textContent")
+        check("F-11 the outcome is on the status line", st.startswith(f"create {local_name}: created"), st)
+        # A refusal goes to the status line, as F-3 defined: the same name again.
+        await b.eval("document.getElementById('create').click()")
+        await b.wait_for(VISIBLE + "('createform')", 10, "the create panel again")
+        await b.eval(f"(f => {{ f.name.value = {json.dumps(local_name)}; f.requestSubmit(); }})(document.getElementById('createform'))")
+        await b.wait_for("document.getElementById('status').textContent.includes('failed')", 60, "the refusal on the status line")
+        st = await b.eval("document.getElementById('status').textContent")
+        check("F-11 a refusal (the name in use) goes to the status line and closes the panel",
+              st.startswith(f"create {local_name} failed:") and not await b.eval(VISIBLE + "('job')"), st)
         await b.wait_for(f"!!document.querySelector('button[data-push={json.dumps(local_name)}]')", 30, "the local row's push button")
 
         # ---- F-3: open pull, then push — only the push form is in the page.
@@ -432,6 +455,44 @@ async def _page_flow(launch_url, email, password, server, remote_name, local_nam
         await b.wait_for("document.getElementById('attachnote').textContent.startsWith('attached')", 30, "a second attach")
         check("F-2 the next attach clears the exit status", (await b.eval("document.getElementById('status').textContent")) == "")
         await b.eval("document.getElementById('detach').click()")
+
+        # ---- F-12, the only copy: the name typed exactly enables the button; the
+        # running session is stopped first; the row is gone afterwards.
+        await b.eval(f"document.querySelector('button[data-remove={json.dumps(local_name)}]').click()")
+        await b.wait_for(VISIBLE + "('removeform')", 10, "the remove panel")
+        case = await b.eval("document.getElementById('removecase').textContent")
+        check("F-12 the only copy: the panel says so, says it will be stopped first, and the button is disabled until the name is typed",
+              "only copy" in case and "stopped first" in case and await b.eval(VISIBLE + "('removetypeit')") and await b.eval("document.getElementById('removeconfirm').disabled"), case)
+        await b.eval("document.querySelector('#removeform input[name=typed]').focus()")
+        await type_keys(b, local_name[:-1])
+        check("F-12 a name that does not match keeps the button disabled", await b.eval("document.getElementById('removeconfirm').disabled"))
+        await type_keys(b, local_name[-1])
+        check("F-12 the exact name enables it", not await b.eval("document.getElementById('removeconfirm').disabled"))
+        await b.eval("document.getElementById('removeform').requestSubmit()")
+        await b.wait_for("document.getElementById('status').textContent.startsWith('remove ')", 120, "the remove outcome")
+        st = await b.eval("document.getElementById('status').textContent")
+        gone = not await b.eval(f"!!document.querySelector('button[data-remove={json.dumps(local_name)}]')")
+        check("F-12 removed: the row is gone and the outcome names this machine", gone and "removed" in st and "this machine" in st, st)
+
+        # ---- F-12, a copy in the cloud: create, push through the real push form,
+        # then remove with one click and no typing; the row stays, as remote.
+        third = local_name + "-b"
+        await b.eval("document.getElementById('create').click()")
+        await b.wait_for(VISIBLE + "('createform')", 10, "the create panel for the third session")
+        await b.eval(f"(f => {{ f.name.value = {json.dumps(third)}; f.size.value = '500MB'; f.requestSubmit(); }})(document.getElementById('createform'))")
+        await b.wait_for(f"!!document.querySelector('button[data-push={json.dumps(third)}]')", 120, "the third row")
+        await b.eval(f"document.querySelector('button[data-push={json.dumps(third)}]').click()")
+        await b.wait_for(VISIBLE + "('pushform')", 10, "the push form for the third session")
+        await b.eval(f"(f => {{ f.password.value = {json.dumps(password)}; f.release.checked = true; f.requestSubmit(); }})(document.getElementById('pushform'))")
+        await b.wait_for(f"(() => {{ const b = document.querySelector('button[data-remove={json.dumps(third)}]'); return !!b && b.dataset.bundle === '1'; }})()", 300, "the third row to carry a bundle after the push")
+        await b.eval(f"document.querySelector('button[data-remove={json.dumps(third)}]').click()")
+        await b.wait_for(VISIBLE + "('removeform')", 10, "the remove panel for the third session")
+        case = await b.eval("document.getElementById('removecase').textContent")
+        check("F-12 a copy in the cloud: the panel says the cloud copy stays, no typing, one click",
+              "cloud stays" in case and not await b.eval(VISIBLE + "('removetypeit')") and not await b.eval("document.getElementById('removeconfirm').disabled"), case)
+        await b.eval("document.getElementById('removeform').requestSubmit()")
+        await b.wait_for(f"(() => {{ const r = (window.nemrRows || []).find(x => x.name === {json.dumps(third)}); return !!r && r.where === 'remote'; }})()", 120, "the third row to read remote after the remove")
+        check("F-12 removed here: the row stays and reads remote", not await b.eval(f"!!document.querySelector('button[data-remove={json.dumps(third)}]')"))
 
         # ---- F-1, the other direction, once more at the end.
         await b.eval("document.getElementById('logout').click()")
@@ -638,6 +699,15 @@ def main():
         print(json.dumps(surface.job("POST", f"/sessions/{name}/push", {"password": password, "release": release})))
     elif op == "start":
         print(json.dumps(surface.job("POST", f"/sessions/{sys.argv[3]}/start")))
+    elif op == "create":
+        # create <name> [size] [agent] — F-11, the page's own route.
+        body = {"name": sys.argv[3]}
+        if len(sys.argv) > 4: body["size"] = sys.argv[4]
+        if len(sys.argv) > 5: body["agent"] = sys.argv[5]
+        print(json.dumps(surface.job("POST", "/sessions", body)))
+    elif op == "remove":
+        # remove <name> — F-12, from this machine; the cloud copy is never touched.
+        print(json.dumps(surface.job("DELETE", f"/sessions/{sys.argv[3]}")))
     elif op == "attach":
         # attach <name> <command> [raw-capture-path]
         name, command = sys.argv[3], sys.argv[4]

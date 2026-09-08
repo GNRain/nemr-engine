@@ -11,10 +11,9 @@
 # Nothing here reaches around the surface: if the page could not do it, this
 # does not do it either.
 #
-# The one exception, stated: `nemr create` makes the session that is later
-# pushed, because creating a project is deliberately NOT in the UI's first
-# pass (the Product Owner's scope: no settings, no project creation, no
-# ports, no theming). Making the bundle is setup, not the acceptance.
+# There is no exception any more: since F-11 the session is created through
+# the page's own route, and since F-12 removed through it. The open CLI is
+# used only to READ (nemr list, nemr status) and in the cleanup.
 #
 # The recall claim is the SPEC 1.43 form: two instructions given in one
 # conversation, in order, then asked back after the session has travelled.
@@ -47,9 +46,9 @@ PASS=0; FAIL=0
 # reads the bucket back independently (six more assertions); otherwise a
 # directory under the work dir.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=66
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=80
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=62
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=76
 fi
 # The human arm (E-21) adds its own assertions when it runs.
 [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]] && EXPECTED_ASSERTIONS=$((EXPECTED_ASSERTIONS + 4))
@@ -71,7 +70,7 @@ SYNC_PID=""; UI_PID=""; UI2_PID=""; UI3_PID=""; NOLOGIN=""
 finish() {
     printf '\n%s== Cleanup%s\n' "$BOLD" "$RESET"
     # Verify before destroying, and never touch a protected subject.
-    for p in "$PROJECT" "$LOCAL2"; do
+    for p in "$PROJECT" "$LOCAL2" "$LOCAL2-b"; do
         if refuse_protected "$p" 2>/dev/null; then
             if output_has "^$p " -- nemr list; then
                 nemr stop "$p" >/dev/null 2>&1
@@ -249,11 +248,22 @@ out=$(UI login "$EMAIL" "$PASSWORD" "$SERVER_URL") || die "login through the sur
 grep -q "$EMAIL" <<<"$out" || die "the login did not come back as $EMAIL: $out"
 pass "logged out and logged back in through the page, with the password alone"
 
-step "Create the session and hold a conversation in it (setup: create is not in the UI's first pass)"
-NEMR_NON_INTERACTIVE=1 nemr create "$PROJECT" --size 500MB >"$WORK/create.log" 2>&1 \
-    || { cat "$WORK/create.log"; die "nemr create failed"; }
-nemr start "$PROJECT" >/dev/null 2>&1 || die "nemr start failed"
-pass "created and started $PROJECT"
+step "Create the session through the page (F-11) and hold a conversation in it"
+out=$(UI create "$PROJECT" 500MB claude-code) || die "the create call failed: $out"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); [print("   |",l["text"]) for l in d["lines"]]; sys.exit(0 if d["ok"] else 1)' "$out" \
+    || die "create through the page failed"
+output_has "^$PROJECT " -- nemr list || die "the page created nothing: $_LAST_OUTPUT"
+pass "created $PROJECT through the page's own route"
+# F-11's control: what the picker offers is what the engine accepts — the
+# CLI names its valid sizes when refused one, and the page's list must be
+# exactly that list, or the two have drifted.
+cli_sizes=$(NEMR_NON_INTERACTIVE=1 nemr create "uiacc-$$-bogus" --size 7GB 2>&1 | grep -o 'Valid sizes: [^.]*' | sed 's/Valid sizes: //; s/, / /g')
+page_sizes=$(UI sessions | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["create_options"]["sizes"]))')
+[[ -n "$cli_sizes" && "$cli_sizes" == "$page_sizes" ]] || die "the page's quota picker ($page_sizes) is not what the engine accepts ($cli_sizes)"
+pass "CONTROL: the page's quota picker offers exactly the engine's sizes ($page_sizes)"
+out=$(UI start "$PROJECT") || die "the start call failed: $out"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d["ok"] else 1)' "$out" || die "start through the page failed: $out"
+pass "started $PROJECT through the page"
 
 MOUNT="$HOME/.local/share/nemr/mounts/$PROJECT"
 
@@ -344,12 +354,27 @@ if grep -aq 'projects/-workspace' "$STORED"; then
 fi
 pass "the server holds ciphertext ($(stat -c%s "$STORED") bytes); no plaintext member name is in it"
 
-step "Delete the project entirely, so the pull has to be real"
+step "Remove the project from this machine through the page (F-12), so the pull has to be real"
 refuse_protected "$PROJECT" || die "refusing to delete a protected name"
-nemr delete "$PROJECT" --yes >/dev/null 2>&1
-output_has "^$PROJECT " -- nemr list && die "the project is still listed after delete: $_LAST_OUTPUT"
-[[ -e "$HOME/.local/share/nemr/volumes/$PROJECT.img" ]] && die "the volume image survived the delete"
-pass "the project is gone from this machine"
+cloud_before=$(sha256sum "$STORED" | cut -d' ' -f1)
+out=$(UI remove "$PROJECT") || die "the remove call failed: $out"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); [print("   |",l["text"]) for l in d["lines"]]; sys.exit(0 if d["ok"] else 1)' "$out" \
+    || die "remove through the page failed"
+output_has "^$PROJECT " -- nemr list && die "the project is still listed after the remove: $_LAST_OUTPUT"
+[[ -e "$HOME/.local/share/nemr/volumes/$PROJECT.img" ]] && die "the volume image survived the remove"
+pass "the project is gone from this machine, through the page's own route"
+# F-12's control: the cloud copy is exactly as it was. Read back again from
+# where it lives (the bucket by the acceptance's own signer, or the server's
+# directory), not from memory.
+if [[ "$STORAGE_MODE" == s3 ]]; then
+    python3 "$REPO/docs/ui-acceptance.py" s3-get "$LAUNCH_URL" "$stored_key" "$WORK/from-bucket-after-remove.bin" >/dev/null \
+        || die "the object is no longer in the bucket after the remove"
+    cloud_after=$(sha256sum "$WORK/from-bucket-after-remove.bin" | cut -d' ' -f1)
+else
+    cloud_after=$(sha256sum "$STORED" | cut -d' ' -f1)
+fi
+[[ "$cloud_before" == "$cloud_after" ]] || die "the remove changed the cloud copy"
+pass "CONTROL: the cloud copy is byte for byte what it was — remove never touches it (E-22: deletion waits for the server)"
 
 step "See the list in the browser"
 list=$(UI sessions) || die "the list call failed: $list"
@@ -371,10 +396,10 @@ step "The page itself, in a headless browser: what it shows (F-1, F-3, F-2)"
 # so they are made against the real page in a real browser (Firefox,
 # headless, driven over WebDriver BiDi), with real keyboard input for the
 # `exit`. A second UI instance serves it: a launch token is single-use and
-# the page must spend its own. A second, local-only session gives the list a
-# push button beside the first session's pull button.
-NEMR_NON_INTERACTIVE=1 nemr create "$LOCAL2" --size 500MB >"$WORK/create2.log" 2>&1 \
-    || { cat "$WORK/create2.log"; die "nemr create $LOCAL2 failed"; }
+# the page must spend its own. The flow creates its own local session
+# through the page's create panel (F-11) and removes it through the remove
+# panel at the end (F-12), so the list here starts with the first session's
+# pull button alone.
 "$REPO/target/release/nemr-cloud" ui --no-open >"$WORK/ui2.log" 2>&1 &
 UI2_PID=$!
 for _ in $(seq 1 60); do grep -q 'nemr ui: http' "$WORK/ui2.log" && break; sleep 0.25; done
@@ -390,12 +415,13 @@ while IFS=$'\t' read -r ok name detail; do
     if [[ "$ok" == "True" ]]; then pass "$name"; else fail "$name${detail:+ — $detail}"; fi
 done < <(python3 -c 'import json,sys; [print(r["ok"], r["name"], " ".join(str(r.get("detail","")).split()), sep="\t") for r in json.load(open(sys.argv[1]))]' "$WORK/page.json")
 [[ "$page_rc" -eq 0 ]] || { grep -v Gtk-Message "$WORK/page.err" | tail -5 | sed 's/^/   | /'; die "the page did not show what it should (details above)"; }
-# The page started $LOCAL2 on the way; stop it and remove it now, so the
-# rest of the flow sees exactly what it saw before this block.
+# The page created, started and removed $LOCAL2 itself, and created, pushed
+# and removed $LOCAL2-b (F-12's two cases): nothing of either may be left on
+# this machine. A read, not a cleanup.
 kill "$UI2_PID" 2>/dev/null; wait "$UI2_PID" 2>/dev/null; UI2_PID=""
-nemr stop "$LOCAL2" >/dev/null 2>&1; nemr delete "$LOCAL2" --yes >/dev/null 2>&1
-output_has "^$LOCAL2 " -- nemr list && die "$LOCAL2 survived its removal"
-pass "the page block left nothing behind"
+output_has "^$LOCAL2 " -- nemr list && die "$LOCAL2 survived its removal through the page"
+output_has "^$LOCAL2-b " -- nemr list && die "$LOCAL2-b survived its removal through the page"
+pass "the page block left nothing behind on this machine"
 
 # ---------------------------------------------------------------------------
 step "The credential step on a machine with no Claude login (E-21) — the automated arm"
