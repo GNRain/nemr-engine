@@ -47,9 +47,9 @@ PASS=0; FAIL=0
 # reads the bucket back independently (six more assertions); otherwise a
 # directory under the work dir.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=65
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=66
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=61
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=62
 fi
 # The human arm (E-21) adds its own assertions when it runs.
 [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]] && EXPECTED_ASSERTIONS=$((EXPECTED_ASSERTIONS + 4))
@@ -408,13 +408,29 @@ step "The credential step on a machine with no Claude login (E-21) — the autom
 # end the seamed daemon is stopped again, and the next command starts a
 # clean one. Nothing logs in here; the human arm does that, once.
 NOCRED="$WORK/nocred/.credentials.json"
+# Stop every nemrd of this user and WAIT FOR THE LISTENER TO GO, not merely the
+# process — F-9 makes a second nemrd exit rather than displace one that is still
+# answering, so if a clean daemon is still listening when the seamed one
+# autostarts, the seamed one exits silently and every later `nemr` talks to the
+# clean daemon at the canonical path. Waiting on the process alone left a window;
+# this waits until nothing listens on the socket, then removes the file, and
+# refuses if a listener somehow survives.
+daemon_listening() { ss -xln 2>/dev/null | grep -qF "$1"; }
 stop_daemon() {
-    # Only the daemon on this user's socket, found by its socket's owner pid.
     local sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/nemr/nemrd.sock"
-    [[ -S "$sock" ]] || return 0
     for pid in $(pgrep -x nemrd -u "$(id -u)"); do kill "$pid" 2>/dev/null; done
-    for _ in $(seq 1 50); do pgrep -x nemrd -u "$(id -u)" >/dev/null || break; sleep 0.2; done
+    # Wait for the LISTENER to go, not the process: nemrd closes its socket on
+    # SIGTERM but its runtime can linger a while draining, and a not-listening
+    # process does not block a new daemon (F-9 only refuses to displace one that
+    # is still ANSWERING). Once nothing listens, remove the socket file so the
+    # seamed daemon binds cleanly.
+    local gone=0
+    for _ in $(seq 1 150); do
+        daemon_listening "$sock" || { gone=1; break; }
+        sleep 0.2
+    done
     rm -f "$sock"
+    [[ "$gone" -eq 1 ]] || die "a nemrd is still listening on $sock after stop_daemon — something keeps autostarting one (a browser or UI still polling?); a seamed daemon would exit rather than displace it (F-9)"
 }
 stop_daemon
 export NEMR_HOST_CREDENTIALS="$NOCRED"
@@ -422,6 +438,14 @@ NOLOGIN="uiacc-$$-nologin"
 NEMR_NON_INTERACTIVE=1 nemr create "$NOLOGIN" --size 500MB >"$WORK/create3.log" 2>&1 \
     || { cat "$WORK/create3.log"; die "create must succeed on a host with no login (AUTH-03 as amended by E-21)"; }
 pass "create succeeded on a host with no Claude login (AUTH-03 amended: create and restore alike)"
+# The daemon we are talking to MUST be the seamed one, or every check below is
+# about the wrong machine. Assert it names the seam credential path before any
+# credential assertion, so a daemon-takeover failure can never again read as a
+# credential failure (F-9/E-21). `nemr status` prints `path: <credential path>`.
+seam_reported=$(nemr status "$NOLOGIN" 2>/dev/null | sed -n 's/.*path: *//p' | tail -1)
+[[ "$seam_reported" == "$NOCRED" ]] \
+    || die "the seamed daemon did not take over: nemr status names $seam_reported, not the seam path $NOCRED. A clean daemon is still listening, so the seamed one exited rather than displace it (F-9) — this is a daemon-restart failure, not a credential one."
+pass "the seamed daemon took over: nemr status names the seam credential path ($NOCRED)"
 [[ -f "$NOCRED" ]] || die "no placeholder was written at $NOCRED"
 [[ "$(stat -c %a "$NOCRED")" == "600" ]] || die "the placeholder is mode $(stat -c %a "$NOCRED"), not 600"
 grep -q '_nemr_placeholder' "$NOCRED" || die "the file at the credential path is not the engine's placeholder"
@@ -490,7 +514,11 @@ if [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]]; then
     # placeholder; a person now signs in through the page's terminal, and
     # the proof the Product Owner required follows: the HOST credential file
     # must contain exactly what Claude Code wrote inside the session.
-    HOST_CRED="$HOME/.claude/.credentials.json"
+    # F-14: the host credential lives in a dedicated directory bound over
+    # /root/.claude, not ~/.claude. Read its path from the engine rather than
+    # assuming it.
+    HOST_CRED=$(nemr status "$PROJECT" 2>/dev/null | sed -n 's/.*path: *//p' | tail -1)
+    [[ -n "$HOST_CRED" ]] || HOST_CRED="$HOME/.local/share/nemr/host-credential/.credentials.json"
     if [[ -f "$HOST_CRED" ]] && ! grep -q '_nemr_placeholder' "$HOST_CRED"; then
         die "NEMR_HUMAN_LOGIN=1 needs a host with no Claude login; $HOST_CRED is a real credential"
     fi
@@ -511,10 +539,18 @@ if [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]]; then
     [[ "$landed" -eq 1 ]] || die "no login landed on this machine within 20 minutes"
     pass "a login landed on this machine: nemr status reports the credential present"
     host_sha=$(sha256sum "$HOST_CRED" | cut -d' ' -f1)
-    inside_sha=$(echo 'sha256sum /root/.claude/.credentials.json | cut -d" " -f1; exit' | nemr attach "$PROJECT" 2>&1 | tr -d '\r' | grep -oE '^[0-9a-f]{64}$' | tail -1)
-    [[ -n "$inside_sha" ]] || die "could not read the credential's hash inside the session"
-    [[ "$host_sha" == "$inside_sha" ]] || die "REQUIRED PROOF FAILED: the host file ($host_sha) is not what Claude Code wrote inside ($inside_sha) — Claude Code's write escaped the bind; bind the directory, not the file"
-    pass "REQUIRED PROOF: the host credential file contains exactly what Claude Code wrote inside the session (sha256 equal)"
+    host_ino=$(stat -c %i "$HOST_CRED")
+    # F-14: compare the INODE as well as the hash. A single-file bind could pass
+    # the hash on the login's first (in-place) write yet leave a later
+    # rename on a container-only inode; equal inodes prove the write landed on
+    # the host file itself, through the directory bind.
+    inside=$(echo 'printf "SHA=%s INO=%s\n" "$(sha256sum /root/.claude/.credentials.json | cut -d" " -f1)" "$(stat -c %i /root/.claude/.credentials.json)"; exit' | nemr attach "$PROJECT" 2>&1 | tr -d '\r')
+    inside_sha=$(grep -oE 'SHA=[0-9a-f]{64}' <<<"$inside" | head -1 | cut -d= -f2)
+    inside_ino=$(grep -oE 'INO=[0-9]+' <<<"$inside" | head -1 | cut -d= -f2)
+    [[ -n "$inside_sha" && -n "$inside_ino" ]] || die "could not read the credential's hash and inode inside the session"
+    [[ "$host_sha" == "$inside_sha" ]] || die "REQUIRED PROOF FAILED: the host file ($host_sha) is not what Claude Code wrote inside ($inside_sha) — Claude Code's write escaped the bind"
+    [[ "$host_ino" == "$inside_ino" ]] || die "REQUIRED PROOF FAILED: the host inode ($host_ino) is not the session's ($inside_ino) — a later login write took a new inode inside; the directory bind did not hold"
+    pass "REQUIRED PROOF: the host credential file is exactly what Claude Code wrote inside the session — same bytes AND same inode (F-14)"
     grep -q '_nemr_placeholder' "$HOST_CRED" && die "the host file is still the placeholder"
     answer=$(echo 'claude -p "Reply with the single word OK" --output-format json < /dev/null 2>&1 | tail -c 300; exit' | nemr attach "$PROJECT" 2>&1 | tr -d '\r')
     grep -q '"result":"OK' <<<"$answer" || { printf '%s\n' "$answer" | tail -3 | sed 's/^/   | /'; die "claude -p did not answer after the login"; }

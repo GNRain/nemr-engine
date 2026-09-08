@@ -89,7 +89,7 @@ materialization, judged now while the evidence is in hand.
 | Housekeeping | `/root/.claude/.last-cleanup` | rootfs | reconstructible | no | no |
 | Caches / GrowthBook / model caches | inside `/root/.claude.json` | rootfs | reconstructible | partly | no |
 | Runtime sockets | `/tmp/cc-socks`, `/tmp/claude-0` | rootfs (tmp) | ephemeral | yes | no |
-| **Credential** | `/root/.claude/.credentials.json` | **host bind-mount (RO)** | **never travels** | yes | **YES** |
+| **Credential** | `/root/.claude/.credentials.json` | **host bind-mount (directory over `/root/.claude`, RW — F-14)** | **never travels** | yes | **YES** |
 | MCP configuration | `/root/.claude.json` (`mcpServers`) + none present this run | rootfs | session-critical *if used* | no | no |
 
 ### Credentials and tokens — the D-02 enumeration
@@ -148,7 +148,8 @@ being on the rootfs, is left behind. Which is the whole reason for M8.
   that makes history portable and satisfies the M8 acceptance.
 - **Do not relocate wholesale** (e.g. via a blanket `CLAUDE_CONFIG_DIR` override).
   `/root/.claude.json` carries `machineID`/`oauthAccount`, and
-  `/root/.claude/.credentials.json` is the credential — a whole-directory move
+  `/root/.claude/.credentials.json` is the credential — a move of the host's
+  OWN `~/.claude`
   drags both onto the exportable layer, violating D-02 and leaking machine
   identity. Surgical bind mounts of just the history subtrees keep secrets and
   identity on the rootfs by construction.

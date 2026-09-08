@@ -142,6 +142,43 @@ pub fn make_bind_writable(oci: &mut serde_json::Value, destination: &str) -> Res
     Ok(changed)
 }
 
+/// The container-side credential paths (F-14). The single-file bind's
+/// destination, and the directory bind that replaces it.
+const CRED_FILE_DEST: &str = "/root/.claude/.credentials.json";
+const CRED_DIR_DEST: &str = "/root/.claude";
+
+/// Rewrite a recorded OCI spec's single-FILE credential bind into a directory
+/// bind of the host's dedicated credential directory over `/root/.claude`
+/// (F-14). Returns `Ok(true)` if the spec changed, `Ok(false)` if it already
+/// binds the directory (no file-bind mount is recorded) — idempotent, so the
+/// caller reports the migration exactly once. Refuses only if the spec has no
+/// mounts array at all. Every other mount — the workspace, the volume's
+/// `projects` and `sessions` binds that land inside `/root/.claude`, the
+/// cgroup path, the process arguments — is left exactly as it was, and the new
+/// mount takes the file bind's position in the array so it is still ordered
+/// before those subpath binds (OCI applies mounts in order).
+pub fn rewrite_credential_to_dir_bind(oci: &mut serde_json::Value, host_dir: &str) -> Result<bool> {
+    let mounts = oci
+        .get_mut("mounts")
+        .and_then(|m| m.as_array_mut())
+        .context("the OCI spec has no mounts array")?;
+    let Some(i) = mounts
+        .iter()
+        .position(|m| m.get("destination").and_then(|d| d.as_str()) == Some(CRED_FILE_DEST))
+    else {
+        // No file bind: either already migrated (a directory bind at
+        // `/root/.claude`) or a shape we do not touch. Idempotent.
+        return Ok(false);
+    };
+    mounts[i] = serde_json::json!({
+        "destination": CRED_DIR_DEST,
+        "type": "bind",
+        "source": host_dir,
+        "options": ["rbind", "rw"],
+    });
+    Ok(true)
+}
+
 /// A host path bind-mounted into a container.
 #[derive(Debug, Clone)]
 pub struct BindMount {
@@ -653,6 +690,58 @@ impl ContainerdClient {
                 format!("failed to make the mount at {destination:?} writable in the OCI spec of {id:?}")
             })?;
         Ok(true)
+    }
+
+    /// Migrate a recorded spec's single-FILE credential bind to a directory
+    /// bind over `/root/.claude` (F-14). Returns whether the record changed.
+    /// Idempotent: a spec that already binds the directory is left alone and
+    /// reported unchanged, so the caller can tell the user exactly once.
+    pub async fn ensure_credential_dir_bind(&self, id: &str, host_dir: &str) -> Result<bool> {
+        let (mut oci, type_url) = self.recorded_spec(id).await?;
+        if !rewrite_credential_to_dir_bind(&mut oci, host_dir)
+            .with_context(|| format!("reading the mounts in the spec for {id:?}"))?
+        {
+            return Ok(false);
+        }
+        let updated = serde_json::to_vec(&oci).context("re-serialising the OCI spec")?;
+        let request = UpdateContainerRequest {
+            container: Some(Container {
+                id: id.to_string(),
+                spec: Some(Any {
+                    type_url,
+                    value: updated,
+                }),
+                ..Default::default()
+            }),
+            update_mask: Some(prost_types::FieldMask {
+                paths: vec!["spec".to_string()],
+            }),
+        };
+        self.raw()
+            .containers()
+            .update(with_namespace!(request, self.namespace()))
+            .await
+            .with_context(|| {
+                format!("failed to rewrite the credential mount to a directory bind in the OCI spec of {id:?}")
+            })?;
+        Ok(true)
+    }
+
+    /// Does this container's spec bind the credential DIRECTORY over
+    /// `/root/.claude` (F-14), rather than the single file? Read-only, a
+    /// control: a check that migrated what it observed would not be one.
+    pub async fn has_credential_dir_bind(&self, id: &str) -> Result<bool> {
+        let (oci, _) = self.recorded_spec(id).await?;
+        let mounts = oci
+            .get("mounts")
+            .and_then(|m| m.as_array())
+            .context("the OCI spec has no mounts array")?;
+        let binds = |dest: &str| {
+            mounts
+                .iter()
+                .any(|m| m.get("destination").and_then(|d| d.as_str()) == Some(dest))
+        };
+        Ok(binds(CRED_DIR_DEST) && !binds(CRED_FILE_DEST))
     }
 
     /// Is the bind mount at `destination` recorded read-write in this
@@ -1520,6 +1609,65 @@ mod tests {
         assert!(make_bind_writable(&mut oci, "/root/.claude/elsewhere.json").is_err());
         let mut bare = serde_json::json!({ "ociVersion": "1.0.2-dev" });
         assert!(make_bind_writable(&mut bare, "/root/.claude/.credentials.json").is_err());
+    }
+
+    /// F-14: a spec with the single-FILE credential bind is rewritten to a
+    /// directory bind over `/root/.claude`, in the file bind's array position
+    /// (before the `projects` subpath bind), source set to the host's dedicated
+    /// directory. Everything else — the workspace and the M8 state binds, the
+    /// process, the cgroup path — is left exactly as it was.
+    #[test]
+    fn a_file_credential_bind_becomes_a_directory_bind() {
+        let mut oci = pre_f12_spec();
+        let before = oci.clone();
+        assert!(
+            rewrite_credential_to_dir_bind(&mut oci, "/home/u/.local/share/nemr/host-credential")
+                .unwrap(),
+            "a single-file credential bind must be rewritten"
+        );
+        assert_eq!(
+            oci["mounts"][1],
+            serde_json::json!({
+                "destination": "/root/.claude",
+                "type": "bind",
+                "source": "/home/u/.local/share/nemr/host-credential",
+                "options": ["rbind", "rw"],
+            }),
+            "the file bind's slot now holds the directory bind, rw"
+        );
+        // Ordered before the projects subpath bind (OCI applies in order), and
+        // nothing else moved.
+        assert_eq!(
+            oci["mounts"][0], before["mounts"][0],
+            "the workspace mount is untouched"
+        );
+        assert_eq!(
+            oci["mounts"][2], before["mounts"][2],
+            "the projects bind is untouched and still after"
+        );
+        assert_eq!(oci["process"], before["process"]);
+        assert_eq!(oci["linux"], before["linux"]);
+    }
+
+    /// Idempotent, and it says so: a spec that already binds the directory has
+    /// no file bind to find, so the second start reports no migration.
+    #[test]
+    fn rewriting_to_a_directory_bind_twice_changes_nothing_the_second_time() {
+        let mut oci = pre_f12_spec();
+        assert!(rewrite_credential_to_dir_bind(&mut oci, "/host/cred").unwrap());
+        let after_first = oci.clone();
+        assert!(
+            !rewrite_credential_to_dir_bind(&mut oci, "/host/cred").unwrap(),
+            "the second call must report no change"
+        );
+        assert_eq!(oci, after_first, "and must not change the spec either");
+    }
+
+    /// A spec with no mounts array at all is refused, not invented.
+    #[test]
+    fn rewriting_a_spec_without_mounts_is_refused() {
+        let mut bare = serde_json::json!({ "ociVersion": "1.0.2-dev" });
+        assert!(rewrite_credential_to_dir_bind(&mut bare, "/host/cred").is_err());
     }
 
     /// The two shapes the builder can produce. `own_network_namespace` exists so

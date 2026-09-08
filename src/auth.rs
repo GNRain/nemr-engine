@@ -11,8 +11,21 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-/// Host credential file, relative to the user's home directory.
-const HOST_CREDENTIALS_RELATIVE: &str = ".claude/.credentials.json";
+/// The dedicated host directory that holds nemr's Claude credential, relative
+/// to the user's home. It holds ONLY `.credentials.json` and the `projects`
+/// and `sessions` mount points the volume binds land on. Since F-14 this whole
+/// directory is bound over `/root/.claude` in every session (a directory bind,
+/// not a single-file one): Claude Code writes the credential by writing a temp
+/// file and renaming it over the target — measured 2026-09-08,
+/// `.credentials.json.tmp.<hex>` then `rename` — which changes the inode, and a
+/// single-file bind cannot follow a rename, so a login's later write escaped
+/// onto a container-only inode while the host kept an earlier one (the human-arm
+/// failure E-21's file bind hit). It is deliberately NOT the host's own
+/// `~/.claude`, which holds history, sessions and settings that must never
+/// enter a session (D-02): a dedicated directory is the one whose entire
+/// contents may be exposed.
+const HOST_CREDENTIAL_DIR_RELATIVE: &str = ".local/share/nemr/host-credential";
+const CREDENTIALS_FILE_NAME: &str = ".credentials.json";
 
 /// Locate the host's Claude Code credentials.
 ///
@@ -38,7 +51,7 @@ pub fn host_credentials_path() -> Result<PathBuf> {
     // nothing but the daemon's own environment — the page cannot reach a
     // process environment and the sync server never talks to the daemon. It
     // exists because "a host that has never logged in" cannot otherwise be
-    // produced on a developer host (the NEMR_TEST_PRE_F12 shape). It changes
+    // produced on a developer host (the NEMR_TEST_PRE_F14 shape). It changes
     // where the credential file is looked for, and nothing else.
     if let Some(explicit) = std::env::var_os("NEMR_HOST_CREDENTIALS") {
         if !explicit.is_empty() {
@@ -46,7 +59,19 @@ pub fn host_credentials_path() -> Result<PathBuf> {
         }
     }
     let home = std::env::var_os("HOME").context("HOME is not set; cannot locate credentials")?;
-    Ok(PathBuf::from(home).join(HOST_CREDENTIALS_RELATIVE))
+    Ok(PathBuf::from(home)
+        .join(HOST_CREDENTIAL_DIR_RELATIVE)
+        .join(CREDENTIALS_FILE_NAME))
+}
+
+/// The dedicated host directory bound over `/root/.claude` (F-14): the parent
+/// of the credential file. Under the test seam it is the seam path's parent,
+/// which is why the seam names a file inside a directory of its own.
+pub fn host_credential_dir() -> Result<PathBuf> {
+    Ok(host_credentials_path()?
+        .parent()
+        .context("the credential path has no parent directory")?
+        .to_path_buf())
 }
 
 /// The placeholder the engine writes where a host has no credential yet
@@ -56,14 +81,150 @@ pub fn host_credentials_path() -> Result<PathBuf> {
 /// in, and Claude Code's own `/login` inside it writes the real credential
 /// through the read-write bind onto this very file (D-02 (f)). Nothing in
 /// it is a secret; nothing in it authenticates.
-pub const PLACEHOLDER: &str = r#"{"_nemr_placeholder": "no Claude login on this machine yet — attach a session and run /login; the login stays on this machine (D-02, E-21)"}"#;
+///
+/// F-10 (measured on the fresh VM, 2026-09-08): Claude Code rewrites this
+/// file as a JSON object and keeps unknown top-level keys, so a marker at
+/// the top level survived a real `/login`. The marker therefore lives INSIDE
+/// `claudeAiOauth`, the object a login replaces, with no token fields beside
+/// it — measured: Claude Code answers "Not logged in · Please run /login"
+/// and leaves the file alone, where a blank token beside the marker reads as
+/// an expired session. And "still the placeholder" is never the marker's
+/// presence: it is the absence of a real token (`is_placeholder`).
+pub const PLACEHOLDER: &str = r#"{"claudeAiOauth":{"_nemr_placeholder":"no Claude login on this machine yet — attach a session and run /login; the login stays on this machine (D-02, E-21, F-10)"}}"#;
 
-/// Is this credential file's content the engine's placeholder?
+const MARKER: &str = "_nemr_placeholder";
+
+/// Serializes the unit tests that mutate process-wide environment (`HOME`,
+/// `NEMR_HOST_CREDENTIALS`); without it one test's `set_var` races another's
+/// read of the same globals (the F-71 lesson, for env instead of the state dir).
+#[cfg(test)]
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The marker, at the top level or inside `claudeAiOauth`.
+fn has_marker(v: &serde_json::Value) -> bool {
+    v.get(MARKER).is_some()
+        || v.get("claudeAiOauth")
+            .is_some_and(|o| o.get(MARKER).is_some())
+}
+
+/// A real token: `claudeAiOauth.accessToken` is a non-empty string. The
+/// one fact "logged in" rests on (F-10); the marker is not a state.
+fn has_real_token(v: &serde_json::Value) -> bool {
+    v.get("claudeAiOauth")
+        .and_then(|o| o.get("accessToken"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|t| !t.is_empty())
+}
+
+/// Is this credential file's content the engine's placeholder — the marker
+/// with no real token beside it? A real token beside a leftover marker is a
+/// login (F-10).
 pub fn is_placeholder(contents: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(contents)
         .ok()
-        .and_then(|v| v.get("_nemr_placeholder").map(|_| ()))
-        .is_some()
+        .is_some_and(|v| has_marker(&v) && !has_real_token(&v))
+}
+
+/// F-10: clear a leftover marker on first detection of a real token, so the
+/// file is what Claude Code alone would have written. Textual removal of the
+/// marker member, so every other byte stays as Claude Code wrote it; checked
+/// against the parsed value, with a re-serialisation as the fallback if the
+/// surgery ever disagrees. In place — the file is bind-mounted into running
+/// sessions and must keep its inode — and mode untouched. Returns whether
+/// anything was cleared; a placeholder, a blank clear, a clean login and an
+/// unparseable file are all left exactly alone.
+pub fn scrub_placeholder_marker(path: &std::path::Path) -> Result<bool> {
+    use std::io::Write;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(false);
+    };
+    if !(has_marker(&value) && has_real_token(&value)) {
+        return Ok(false);
+    }
+    let mut want = value.clone();
+    if let Some(o) = want.as_object_mut() {
+        o.remove(MARKER);
+        if let Some(inner) = o.get_mut("claudeAiOauth").and_then(|i| i.as_object_mut()) {
+            inner.remove(MARKER);
+        }
+    }
+    let mut cleared = text.clone();
+    while let Some(next) = remove_string_member(&cleared, MARKER) {
+        cleared = next;
+    }
+    let surgery_ok = serde_json::from_str::<serde_json::Value>(&cleared).is_ok_and(|v| v == want);
+    let cleared = if surgery_ok {
+        cleared
+    } else {
+        serde_json::to_string(&want).context("re-serialising the credential without the marker")?
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("opening {} to clear the placeholder marker", path.display()))?;
+    f.write_all(cleared.as_bytes())
+        .with_context(|| format!("clearing the placeholder marker in {}", path.display()))?;
+    Ok(true)
+}
+
+/// Remove one `"key": "string"` member from JSON text, with the comma that
+/// joined it to its neighbour. `None` when the key is not there as a member
+/// with a string value.
+fn remove_string_member(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let start = text.find(&needle)?;
+    let bytes = text.as_bytes();
+    // After the key: optional whitespace, ':', optional whitespace, a string.
+    let mut i = start + needle.len();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => break,
+            _ => i += 1,
+        }
+    }
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    let mut end = i + 1;
+    // A following comma joins this member to the next; else the comma before.
+    let mut j = end;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    let mut begin = start;
+    if bytes.get(j) == Some(&b',') {
+        end = j + 1;
+        while end < bytes.len() && bytes[end].is_ascii_whitespace() {
+            end += 1;
+        }
+    } else {
+        let mut k = start;
+        while k > 0 && bytes[k - 1].is_ascii_whitespace() {
+            k -= 1;
+        }
+        if k > 0 && bytes[k - 1] == b',' {
+            begin = k - 1;
+        }
+    }
+    Some(format!("{}{}", &text[..begin], &text[end..]))
 }
 
 /// The host credential path, with the placeholder written there when the
@@ -75,15 +236,30 @@ pub fn ensure_host_credential_file() -> Result<PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let path = host_credentials_path()?;
-    if path.exists() {
-        return Ok(path);
-    }
     let dir = path
         .parent()
         .context("the credential path has no parent directory")?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    // The directory Claude Code owns on the host is private to the user.
+    // The directory is bound whole into the session (F-14) and is the user's:
+    // private, 0700.
     let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    // The mount points the volume's session-state binds land on once this
+    // directory is bound over `/root/.claude`. Empty directories on the host;
+    // their contents come from the volume, per session (M8).
+    for sub in ["projects", "sessions"] {
+        let m = dir.join(sub);
+        std::fs::create_dir_all(&m).with_context(|| format!("creating {}", m.display()))?;
+    }
+    if path.exists() {
+        return Ok(path);
+    }
+    // No inheritance from the host's own `~/.claude` (E-21, reaffirmed by the
+    // Product Owner 2026-09-08): a credential is never copied. A second holder
+    // of one refresh token invalidates the first the moment either rotates
+    // (E-13), so nemr's login is nemr's — separate from the host's own claude.
+    // A machine that logged in before F-14 starts from the placeholder and
+    // runs `/login` once, like any device (D-02).
+    //
     // create_new: never truncate a file that appeared between the check and
     // the write (a login landing at that moment).
     match std::fs::OpenOptions::new()
@@ -299,7 +475,8 @@ pub fn credential_facts(contents: &str) -> CredentialFacts {
             placeholder: false,
         };
     };
-    let placeholder = value.get("_nemr_placeholder").is_some();
+    // F-10: the marker is not a state; no real token beside it is.
+    let placeholder = has_marker(&value) && !has_real_token(&value);
     let oauth = value.get("claudeAiOauth");
     let secs = |field: &str| {
         oauth
@@ -312,7 +489,8 @@ pub fn credential_facts(contents: &str) -> CredentialFacts {
         placeholder,
         access: secs("expiresAt"),
         refresh: secs("refreshTokenExpiresAt"),
-        blank: oauth.is_some()
+        blank: !placeholder
+            && oauth.is_some()
             && oauth
                 .and_then(|o| o.get("accessToken"))
                 .and_then(|t| t.as_str())
@@ -404,11 +582,73 @@ pub fn check_permissions(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// F-14, reaffirmed 2026-09-08: nemr never inherits the host's own
+    /// `~/.claude` login. A machine that logged in before F-14 — a real
+    /// credential sitting at `~/.claude/.credentials.json` — still comes up as
+    /// *no login yet*: the dedicated directory gets the placeholder, not a copy
+    /// (E-13: a second holder of one refresh token invalidates the first).
     #[test]
-    fn credentials_path_is_under_home() {
+    fn a_pre_f14_host_login_is_not_inherited_and_the_machine_reads_no_login_yet() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_home = std::env::var_os("HOME");
+        let saved_seam = std::env::var_os("NEMR_HOST_CREDENTIALS");
+        std::env::remove_var("NEMR_HOST_CREDENTIALS");
+        let home = std::env::temp_dir().join(format!("nemr-f14-nohc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        // The pre-F14 host: a real login at ~/.claude/.credentials.json.
+        let legacy_dir = home.join(".claude");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy = legacy_dir.join(".credentials.json");
+        std::fs::write(
+            &legacy,
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-real","refreshToken":"sk-ant-ort01-real","expiresAt":1800003600000}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::env::set_var("HOME", &home);
+
+        let path = ensure_host_credential_file().unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+
+        // Restore the environment before asserting, so a failure cannot leak it.
+        match saved_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        if let Some(seam) = saved_seam {
+            std::env::set_var("NEMR_HOST_CREDENTIALS", seam);
+        }
+
+        assert!(
+            path.ends_with(".local/share/nemr/host-credential/.credentials.json"),
+            "the credential lives in the dedicated directory, not ~/.claude: {path:?}"
+        );
+        assert!(
+            is_placeholder(&contents),
+            "a pre-F14 host must come up as NO LOGIN YET — the ~/.claude login is not inherited: {contents}"
+        );
+        assert!(
+            !contents.contains("sk-ant-oat01-real"),
+            "the real ~/.claude login must not have been copied in"
+        );
+        // The host's own login is left exactly as it was.
+        assert!(std::fs::read_to_string(&legacy)
+            .unwrap()
+            .contains("sk-ant-oat01-real"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn credentials_path_is_the_dedicated_dir_under_home() {
         let path = host_credentials_path().unwrap();
-        assert!(path.ends_with(".claude/.credentials.json"), "got {path:?}");
+        // F-14: a dedicated directory, not the host's own ~/.claude.
+        assert!(
+            path.ends_with(".local/share/nemr/host-credential/.credentials.json"),
+            "got {path:?}"
+        );
         assert!(path.is_absolute());
+        assert_eq!(host_credential_dir().unwrap(), path.parent().unwrap());
     }
 
     /// The file stores milliseconds; the engine reports seconds. A wrong unit
@@ -677,6 +917,125 @@ mod tests {
 }
 
 #[cfg(test)]
+mod f10_tests {
+    use super::*;
+
+    /// F-10 (measured on the fresh VM, 2026-09-08): Claude Code rewrites the
+    /// credential file as a JSON object and keeps unknown top-level keys, so
+    /// the old marker survived a real `/login` and the engine kept saying
+    /// "no login yet". Present means the OAuth fields; the marker is not a
+    /// state. The placeholder now keeps its marker INSIDE `claudeAiOauth`
+    /// with no token fields — measured: Claude Code answers "Not logged in ·
+    /// Please run /login" and leaves the file alone, where a blank token
+    /// beside the marker reads as an expired session.
+    #[test]
+    fn f10_a_marker_beside_a_real_token_is_a_login_not_the_placeholder() {
+        let now = 1_800_000_000;
+        // The fresh VM's file after /login: the real object, the old marker kept.
+        let survived = r#"{"_nemr_placeholder":"no Claude login on this machine yet","claudeAiOauth":{"accessToken":"sk-ant-oat01-x","refreshToken":"sk-ant-ort01-y","expiresAt":1800003600000,"scopes":["user:inference"],"subscriptionType":"max","refreshTokenExpiresAt":1802000000000}}"#;
+        assert!(
+            !is_placeholder(survived),
+            "a real token beside the marker is a login"
+        );
+        assert!(matches!(
+            credential_facts(survived).verdict(now),
+            CredentialVerdict::Fresh { .. }
+        ));
+        // The marker beside real fields inside the object is a login too.
+        let nested = r#"{"claudeAiOauth":{"_nemr_placeholder":"x","accessToken":"sk-ant-oat01-x","refreshToken":"y","expiresAt":1800003600000}}"#;
+        assert!(!is_placeholder(nested));
+        // The placeholder itself is exactly no-login-yet; the clear is still blank.
+        assert!(is_placeholder(PLACEHOLDER));
+        assert_eq!(
+            credential_facts(PLACEHOLDER).verdict(now),
+            CredentialVerdict::NoLoginYet
+        );
+        let blank = r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#;
+        assert_eq!(
+            credential_facts(blank).verdict(now),
+            CredentialVerdict::Blank
+        );
+        // Its shape: the marker inside claudeAiOauth, no token fields, nothing at the top level.
+        let v: serde_json::Value = serde_json::from_str(PLACEHOLDER).unwrap();
+        assert!(v["claudeAiOauth"]["_nemr_placeholder"].is_string());
+        assert!(v["claudeAiOauth"].get("accessToken").is_none());
+        assert!(v.get("_nemr_placeholder").is_none());
+    }
+
+    /// The leftover marker is cleared on first detection of a real token, so
+    /// the file is byte for byte what Claude Code alone would have written;
+    /// in place (the file is bind-mounted into running sessions: same inode),
+    /// mode kept. Nothing else is ever touched: not the placeholder, not a
+    /// blank clear, not garbage, not a clean login.
+    #[test]
+    fn f10_the_leftover_marker_is_cleared_once_a_real_token_is_seen() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("nemr-f10-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".credentials.json");
+        let put = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::metadata(&path).unwrap().ino()
+        };
+        let alone = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x","refreshToken":"y","expiresAt":1800003600000,"scopes":["user:inference"],"subscriptionType":"max"}}"#;
+        // Top-level marker after the object (the shape Claude Code's rewrite keeps).
+        let ino = put(
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x","refreshToken":"y","expiresAt":1800003600000,"scopes":["user:inference"],"subscriptionType":"max"},"_nemr_placeholder":"no Claude login on this machine yet"}"#,
+        );
+        assert!(
+            scrub_placeholder_marker(&path).unwrap(),
+            "a marker beside a real token is cleared"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), alone);
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            meta.ino(),
+            ino,
+            "cleared in place: the bind must still see it"
+        );
+        assert!(
+            !scrub_placeholder_marker(&path).unwrap(),
+            "nothing left to clear"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), alone);
+        // Top-level marker before the object, and a marker nested first inside it.
+        put(
+            r#"{"_nemr_placeholder":"x","claudeAiOauth":{"accessToken":"a","refreshToken":"b","expiresAt":1800003600000}}"#,
+        );
+        assert!(scrub_placeholder_marker(&path).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"b","expiresAt":1800003600000}}"#
+        );
+        put(
+            r#"{"claudeAiOauth":{"_nemr_placeholder":"x","accessToken":"a","refreshToken":"b","expiresAt":1800003600000}}"#,
+        );
+        assert!(scrub_placeholder_marker(&path).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"b","expiresAt":1800003600000}}"#
+        );
+        // Never touched: the placeholder (no token), a blank clear, garbage.
+        for text in [
+            PLACEHOLDER,
+            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#,
+            "garbage",
+        ] {
+            put(text);
+            assert!(
+                !scrub_placeholder_marker(&path).unwrap(),
+                "left alone: {text}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod e21_tests {
     use super::*;
 
@@ -714,6 +1073,8 @@ mod e21_tests {
     #[test]
     fn the_placeholder_is_written_once_and_never_over_a_file() {
         use std::os::unix::fs::PermissionsExt;
+        let _guard = super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_seam = std::env::var_os("NEMR_HOST_CREDENTIALS");
         let base = std::env::temp_dir().join(format!("nemr-e21-unit-b-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -743,9 +1104,13 @@ mod e21_tests {
             "an existing file is never touched"
         );
         std::env::remove_var("NEMR_HOST_CREDENTIALS");
-        // Unset, the path is HOME's again.
+        // Unset, the path is the dedicated directory under HOME again (F-14).
         assert!(host_credentials_path()
             .unwrap()
-            .ends_with(".claude/.credentials.json"));
+            .ends_with(".local/share/nemr/host-credential/.credentials.json"));
+        // Restore the seam the test found, so it cannot leak to another test.
+        if let Some(seam) = saved_seam {
+            std::env::set_var("NEMR_HOST_CREDENTIALS", seam);
+        }
     }
 }
