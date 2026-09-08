@@ -72,6 +72,10 @@ pub async fn connect() -> Result<Session> {
     let client = match try_connect(&path).await {
         Ok(client) => handshake(client).await?,
         Err(_) => {
+            // F-9: never autostart a daemon from inside a user namespace — it
+            // would bind the host's socket and serve everyone with a helper
+            // that cannot elevate. A read; the message names the map.
+            crate::userns::refuse_foreign_user_namespace("this nemr command")?;
             autostart(&path).await?;
             let client = try_connect(&path)
                 .await

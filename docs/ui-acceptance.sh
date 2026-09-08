@@ -129,6 +129,13 @@ else
     pass "no sync client is installed at $INSTALLED_CLIENT; nothing to gate (this run uses the build tree)"
 fi
 
+# F-9: a nemrd in another user namespace cannot run the privileged helper, and
+# `ss` cannot even see its socket from here. Name it; never talk to it.
+for pid in $(pgrep -x nemrd -u "$(id -u)" 2>/dev/null || true); do
+    [[ "$(readlink /proc/$pid/ns/user)" == "$(readlink /proc/self/ns/user)" ]] \
+        || die "nemrd pid $pid lives in another user namespace (its sudo cannot work) — kill it; a plain host shell autostarts a proper one"
+done
+
 step "Start the sync server (storage: $STORAGE_MODE)"
 # The port must be free BEFORE the server is started: a stale server from an
 # earlier run answers /health, the new one dies at bind, and every step after

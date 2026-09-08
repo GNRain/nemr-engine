@@ -34,6 +34,9 @@ async fn daemon_main() -> Result<()> {
     );
 
     let path = socket_path()?;
+    // F-9: refuse to be a daemon anywhere but the host's user namespace,
+    // before the socket path is so much as looked at.
+    nemr_engine::daemon::userns::refuse_foreign_user_namespace("nemrd")?;
     // E-21's test seam: loud, so a daemon serving a scratch credential path
     // can never pass for a normal one in anyone's log.
     if let Some(seam) = std::env::var_os("NEMR_HOST_CREDENTIALS").filter(|v| !v.is_empty()) {

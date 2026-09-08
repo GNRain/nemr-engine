@@ -25,6 +25,7 @@ pub mod credential_watch;
 // re-exported so `nemr_engine::daemon::client` and `::socket` keep working.
 pub use nemr_daemon_api::client;
 pub use nemr_daemon_api::socket;
+pub use nemr_daemon_api::userns;
 
 /// The service implementation. One containerd connection, shared.
 pub struct NemrService {

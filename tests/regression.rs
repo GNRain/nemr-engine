@@ -1044,6 +1044,21 @@ fn e11_export_and_import_work_with_no_network_and_no_credentials() {
          it inside proves nothing"
     );
 
+    // F-9: a daemon must be answering BEFORE the namespaced CLI runs. With
+    // none, the CLI used to autostart one inside the namespace, where it
+    // bound the host's socket and served every later caller with a helper
+    // that cannot elevate (measured 2026-09-08). The CLI now refuses that,
+    // so this one host-side call is what makes the offline run possible.
+    let on_host = std::process::Command::new(env!("CARGO_BIN_EXE_nemr"))
+        .arg("list")
+        .output()
+        .expect("run nemr list on the host");
+    assert!(
+        on_host.status.success(),
+        "a daemon must be reachable from the host before the offline run: {}",
+        String::from_utf8_lossy(&on_host.stderr)
+    );
+
     let export = run_offline(&["export", &source.name, "-o", &bundle.to_string_lossy()]);
     assert!(
         export.status.success(),
@@ -3609,6 +3624,51 @@ fn e21_a_host_with_no_login_gets_a_placeholder_and_the_sessions_writes_land_on_i
     });
     std::env::remove_var("NEMR_HOST_CREDENTIALS");
     let _ = std::fs::remove_dir_all(&temp);
+}
+
+/// F-9: `nemrd` refuses to become a daemon inside a user namespace. Measured
+/// 2026-09-08: a CLI run under `unshare -rmn` with no daemon answering
+/// autostarted one inside the namespace; it bound the host's socket and
+/// every later `nemr create` on the machine failed in the privileged helper
+/// (`sudo: /etc/sudo.conf is owned by uid 65534`). The daemon is run here the
+/// way that orphan was, on a scratch socket path so nothing real is touched,
+/// and must exit at once naming the namespace. Without the guard it would
+/// bind and serve, so the run would hit the timeout instead — the red.
+#[test]
+fn f9_nemrd_refuses_to_start_inside_a_user_namespace() {
+    if unit_only() {
+        return;
+    }
+    if let Err(reason) = common::namespace_probe() {
+        panic!("unprivileged namespaces are unavailable: {reason}");
+    }
+    let scratch = std::env::temp_dir().join(format!("nemr-f9-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&scratch);
+    let output = std::process::Command::new("timeout")
+        .args(["10", "unshare", "-rmn", env!("CARGO_BIN_EXE_nemrd")])
+        .env("NEMR_DAEMON_SOCKET", &scratch)
+        .output()
+        .expect("run nemrd under unshare");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _ = std::fs::remove_file(&scratch);
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "nemrd ran until the timeout inside the namespace — it is serving where it cannot \
+         elevate.\nstderr: {stderr}"
+    );
+    assert!(
+        !output.status.success(),
+        "nemrd must refuse inside a user namespace.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("inside a user namespace") && stderr.contains("0 1000 1"),
+        "the refusal must name the namespace and the map it saw.\nstderr: {stderr}"
+    );
+    assert!(
+        !scratch.exists(),
+        "the refusal came before the socket was touched"
+    );
 }
 
 /// AUTH-03 extended: `create` refuses a host credential that cannot
