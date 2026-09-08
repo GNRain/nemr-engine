@@ -47,9 +47,9 @@ PASS=0; FAIL=0
 # reads the bucket back independently (six more assertions); otherwise a
 # directory under the work dir.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=52
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=54
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=49
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=50
 fi
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS+1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
@@ -111,14 +111,37 @@ pass "Postgres is reachable"
 
 cargo build --release -p nemr-sync -p nemr-cloud --quiet || die "the release build failed"
 pass "nemr-sync and nemr-cloud built"
+# F-7: a stale install must not hide behind a run from the build tree. If a
+# sync client is installed, it has to be this build — the same gate
+# scripts/sync_acceptance.sh applies to the engine.
+INSTALLED_CLIENT="${NEMR_INSTALL_DIR:-$HOME/.local/bin}/nemr-cloud"
+if [[ -e "$INSTALLED_CLIENT" ]]; then
+    inst=$(sha256sum "$INSTALLED_CLIENT" | cut -d' ' -f1); built=$(sha256sum "$REPO/target/release/nemr-cloud" | cut -d' ' -f1)
+    [[ "$inst" == "$built" ]] || die "the installed sync client ($INSTALLED_CLIENT, $(date -r "$INSTALLED_CLIENT" +%F)) is not this build — ./scripts/install_sync_client.sh"
+    pass "the installed sync client matches this build (hash-gated, F-7)"
+else
+    pass "no sync client is installed at $INSTALLED_CLIENT; nothing to gate (this run uses the build tree)"
+fi
 
 step "Start the sync server (storage: $STORAGE_MODE)"
+# The port must be free BEFORE the server is started: a stale server from an
+# earlier run answers /health, the new one dies at bind, and every step after
+# passes against the wrong server — which happened. A read, not a repair.
+if ss -ltn 2>/dev/null | grep -q ":${SERVER_ADDR##*:} "; then
+    die "something already listens on $SERVER_ADDR (a stale sync server from an earlier run?) — stop it; this script starts its own and will not talk to another"
+fi
 # NEMR_AUTH_PEPPER=ephemeral is E-19's one escape hatch: a throwaway server
 # with a random pepper and a loud warning. A server with no pepper refuses
 # to bind, which is what a real deployment gets. NEMR_SYNC_ENV_FILE is
 # emptied so the developer's own ~/.config/nemr/sync.env is never read here.
 BUNDLE_PREFIX="ui-acceptance-$$"
 if [[ "$STORAGE_MODE" == s3 ]]; then
+    # F-8 (ruled): nobody creates buckets — not the server, not this script.
+    # A bucket that does not exist is a configuration error, refused here
+    # before anything runs, the way a server without a pepper refuses.
+    python3 "$REPO/docs/ui-acceptance.py" s3-list x "$BUNDLE_PREFIX/" >/dev/null 2>"$WORK/bucket.err" \
+        || { sed 's/^/   | /' "$WORK/bucket.err" | tail -3; die "the bucket named by NEMR_S3_BUCKET is not readable (does it exist? is the credential scoped to it?) — this script never creates one (F-8)"; }
+    pass "the bucket named by NEMR_S3_BUCKET exists and answers; nothing here will create one (F-8)"
     # The bucket's own variables select it (E-20): NEMR_S3_* are inherited
     # from the caller's environment — never echoed, never written — and
     # NEMR_BUNDLE_DIR is unset, since exactly one backend is allowed. A
@@ -166,6 +189,11 @@ done
 export PATH="$WORK/bin:$PATH"
 [[ -x "$WORK/bin/nemr-ui" ]] || die "the install script's name list does not include ui"
 command -v nemr >/dev/null || die "the open CLI (nemr) is not on PATH"
+# Say exactly which nemr-ui this run executes (F-7): the name, where it
+# points, and its hash beside the build's.
+ui_exe=$(command -v nemr-ui); ui_real=$(readlink -f "$ui_exe")
+echo "   nemr-ui → $ui_exe → $ui_real (sha256 $(sha256sum "$ui_real" | cut -c1-16)…; built $(sha256sum "$REPO/target/release/nemr-cloud" | cut -c1-16)…)"
+[[ "$ui_real" == "$(readlink -f "$REPO/target/release/nemr-cloud")" ]] || die "nemr-ui on PATH is not this build"
 nemr ui --no-open >"$WORK/ui.log" 2>&1 &
 UI_PID=$!
 for _ in $(seq 1 60); do grep -q 'nemr ui: http' "$WORK/ui.log" && break; sleep 0.25; done
@@ -347,7 +375,7 @@ fi
 printf '%s\n' "$page_out" > "$WORK/page.json"
 while IFS=$'\t' read -r ok name detail; do
     if [[ "$ok" == "True" ]]; then pass "$name"; else fail "$name${detail:+ — $detail}"; fi
-done < <(python3 -c 'import json,sys; [print(r["ok"], r["name"], r.get("detail",""), sep="\t") for r in json.load(open(sys.argv[1]))]' "$WORK/page.json")
+done < <(python3 -c 'import json,sys; [print(r["ok"], r["name"], " ".join(str(r.get("detail","")).split()), sep="\t") for r in json.load(open(sys.argv[1]))]' "$WORK/page.json")
 [[ "$page_rc" -eq 0 ]] || { grep -v Gtk-Message "$WORK/page.err" | tail -5 | sed 's/^/   | /'; die "the page did not show what it should (details above)"; }
 # The page started $LOCAL2 on the way; stop it and remove it now, so the
 # rest of the flow sees exactly what it saw before this block.
