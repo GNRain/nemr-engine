@@ -34,6 +34,15 @@ async fn daemon_main() -> Result<()> {
     );
 
     let path = socket_path()?;
+    // E-21's test seam: loud, so a daemon serving a scratch credential path
+    // can never pass for a normal one in anyone's log.
+    if let Some(seam) = std::env::var_os("NEMR_HOST_CREDENTIALS").filter(|v| !v.is_empty()) {
+        tracing::warn!(
+            "NEMR_HOST_CREDENTIALS={} — TEST SEAM: the host credential is looked for at that path \
+             instead of ~/.claude/.credentials.json. Test-only; never for real use.",
+            std::path::Path::new(&seam).display()
+        );
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;

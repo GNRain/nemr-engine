@@ -34,8 +34,72 @@ const HOST_CREDENTIALS_RELATIVE: &str = ".claude/.credentials.json";
 /// This narrowing is recorded in SPEC.md Section 11; the read-write change
 /// under D-02's (f), with the enumeration of `~/.claude`, in DECISIONS.md.
 pub fn host_credentials_path() -> Result<PathBuf> {
+    // E-21's test seam, as ruled: TEST-ONLY, PATH-ONLY, and settable by
+    // nothing but the daemon's own environment — the page cannot reach a
+    // process environment and the sync server never talks to the daemon. It
+    // exists because "a host that has never logged in" cannot otherwise be
+    // produced on a developer host (the NEMR_TEST_PRE_F12 shape). It changes
+    // where the credential file is looked for, and nothing else.
+    if let Some(explicit) = std::env::var_os("NEMR_HOST_CREDENTIALS") {
+        if !explicit.is_empty() {
+            return Ok(PathBuf::from(explicit));
+        }
+    }
     let home = std::env::var_os("HOME").context("HOME is not set; cannot locate credentials")?;
     Ok(PathBuf::from(home).join(HOST_CREDENTIALS_RELATIVE))
+}
+
+/// The placeholder the engine writes where a host has no credential yet
+/// (E-21, ruled 2026-09-08): a regular 0600 file in a shape this build
+/// recognises as "no login yet" — never as expired, never as blank — so a
+/// session can be created and started on a machine that has never logged
+/// in, and Claude Code's own `/login` inside it writes the real credential
+/// through the read-write bind onto this very file (D-02 (f)). Nothing in
+/// it is a secret; nothing in it authenticates.
+pub const PLACEHOLDER: &str = r#"{"_nemr_placeholder": "no Claude login on this machine yet — attach a session and run /login; the login stays on this machine (D-02, E-21)"}"#;
+
+/// Is this credential file's content the engine's placeholder?
+pub fn is_placeholder(contents: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(contents)
+        .ok()
+        .and_then(|v| v.get("_nemr_placeholder").map(|_| ()))
+        .is_some()
+}
+
+/// The host credential path, with the placeholder written there when the
+/// file does not exist (E-21). `create` and `start` both call this, so a
+/// machine that has never logged in behaves the same whichever way a
+/// project arrived — the AUTH-03 amendment. A file that exists is left
+/// exactly as it is.
+pub fn ensure_host_credential_file() -> Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let path = host_credentials_path()?;
+    if path.exists() {
+        return Ok(path);
+    }
+    let dir = path
+        .parent()
+        .context("the credential path has no parent directory")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    // The directory Claude Code owns on the host is private to the user.
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    // create_new: never truncate a file that appeared between the check and
+    // the write (a login landing at that moment).
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            f.write_all(PLACEHOLDER.as_bytes())
+                .with_context(|| format!("writing the placeholder to {}", path.display()))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+    }
+    Ok(path)
 }
 
 /// Resolve the host credential file, failing per AUTH-03 if absent.
@@ -169,12 +233,18 @@ pub struct CredentialFacts {
     /// The OAuth object is present but its `accessToken` is empty: the shape
     /// Claude Code leaves behind after a dead-token clear.
     pub blank: bool,
+    /// The engine's own placeholder (E-21): no login on this machine yet.
+    pub placeholder: bool,
 }
 
 /// What the facts mean right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialVerdict {
-    /// No OAuth shape to judge: an API key, a placeholder, or unparseable.
+    /// The engine's placeholder (E-21): this machine has never logged in.
+    /// Not dead, not expired — a session starts and `/login` inside it is
+    /// the remedy.
+    NoLoginYet,
+    /// No OAuth shape to judge: an API key, a CI placeholder, or unparseable.
     NotOauth,
     /// The access token is live.
     Fresh { access_left: i64 },
@@ -190,6 +260,9 @@ pub enum CredentialVerdict {
 
 impl CredentialFacts {
     pub fn verdict(self, now_unix: i64) -> CredentialVerdict {
+        if self.placeholder {
+            return CredentialVerdict::NoLoginYet;
+        }
         if self.blank {
             return CredentialVerdict::Blank;
         }
@@ -223,8 +296,10 @@ pub fn credential_facts(contents: &str) -> CredentialFacts {
             access: CredentialExpiry::Unknown,
             refresh: CredentialExpiry::Unknown,
             blank: false,
+            placeholder: false,
         };
     };
+    let placeholder = value.get("_nemr_placeholder").is_some();
     let oauth = value.get("claudeAiOauth");
     let secs = |field: &str| {
         oauth
@@ -234,6 +309,7 @@ pub fn credential_facts(contents: &str) -> CredentialFacts {
             .unwrap_or(CredentialExpiry::Unknown)
     };
     CredentialFacts {
+        placeholder,
         access: secs("expiresAt"),
         refresh: secs("refreshTokenExpiresAt"),
         blank: oauth.is_some()
@@ -597,5 +673,79 @@ mod tests {
             error.contains("Authenticate on the host"),
             "should say what to do: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod e21_tests {
+    use super::*;
+
+    /// The placeholder is recognised as "no login yet" — never as expired,
+    /// never as blank — and a real credential is not mistaken for it.
+    #[test]
+    fn the_placeholder_is_no_login_yet_and_nothing_else_is() {
+        assert!(is_placeholder(PLACEHOLDER));
+        assert_eq!(
+            credential_facts(PLACEHOLDER).verdict(1_800_000_000),
+            CredentialVerdict::NoLoginYet
+        );
+        let real = r#"{"claudeAiOauth":{"accessToken":"x","refreshToken":"y","expiresAt":1800003600000,"refreshTokenExpiresAt":1802000000000}}"#;
+        assert!(!is_placeholder(real));
+        assert!(matches!(
+            credential_facts(real).verdict(1_800_000_000),
+            CredentialVerdict::Fresh { .. }
+        ));
+        let blank = r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#;
+        assert_eq!(
+            credential_facts(blank).verdict(1_800_000_000),
+            CredentialVerdict::Blank
+        );
+        // The placeholder is not "dead": create must not refuse it.
+        let dir = std::env::temp_dir().join(format!("nemr-e21-unit-a-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".credentials.json");
+        std::fs::write(&path, PLACEHOLDER).unwrap();
+        refuse_dead_credential(&path, 1_800_000_000)
+            .expect("a placeholder is a fresh machine, not a dead login");
+    }
+
+    /// `ensure_host_credential_file` writes the placeholder 0600 where the
+    /// path names nothing, and leaves an existing file exactly alone.
+    #[test]
+    fn the_placeholder_is_written_once_and_never_over_a_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("nemr-e21-unit-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("claude").join(".credentials.json");
+        // The seam is path-only: everything below happens at this path.
+        std::env::set_var("NEMR_HOST_CREDENTIALS", &path);
+        let got = ensure_host_credential_file().unwrap();
+        assert_eq!(got, path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), PLACEHOLDER);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        std::fs::write(&path, "a real login").unwrap();
+        ensure_host_credential_file().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a real login",
+            "an existing file is never touched"
+        );
+        std::env::remove_var("NEMR_HOST_CREDENTIALS");
+        // Unset, the path is HOME's again.
+        assert!(host_credentials_path()
+            .unwrap()
+            .ends_with(".claude/.credentials.json"));
     }
 }

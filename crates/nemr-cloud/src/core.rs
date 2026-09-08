@@ -239,6 +239,8 @@ pub struct SessionRow {
     /// Held right now, per the server (SPEC 1.108).
     pub held_by: Option<String>,
     pub lease_expires_at_unix: Option<i64>,
+    /// E-21: `Some(false)` on a machine that has never logged in.
+    pub credential_present: Option<bool>,
 }
 
 /// Merge the server's index with the local projects. Pure; `local` is
@@ -281,6 +283,7 @@ pub fn merge_rows(remote: &[SessionEntry], local: Option<&[LocalProject]>) -> Ve
                 has_bundle: r.is_some_and(|s| s.has_bundle),
                 held_by: r.and_then(|s| s.held_by.clone()),
                 lease_expires_at_unix: r.and_then(|s| s.lease_expires_at_unix),
+                credential_present: l.and_then(|p| p.credential_present),
                 name,
             }
         })
@@ -822,6 +825,7 @@ mod tests {
             running,
             usage_known: true,
             used_bytes: 500,
+            credential_present: None,
         }
     }
 

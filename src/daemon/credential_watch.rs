@@ -108,6 +108,10 @@ pub fn describe(facts: CredentialFacts, now_unix: i64) -> (String, bool) {
             "NOT a credential — it does not parse as one".to_string(),
             false,
         ),
+        CredentialVerdict::NoLoginYet => (
+            "the engine's placeholder — no login on this machine yet (E-21)".to_string(),
+            false,
+        ),
     }
 }
 
@@ -355,6 +359,7 @@ mod tests {
             access: CredentialExpiry::At(now + 3600),
             refresh: CredentialExpiry::At(now + 86_400),
             blank: false,
+            placeholder: false,
         };
         assert!(describe(good, now).1);
         let junk = crate::auth::credential_facts("garbage written by a session");

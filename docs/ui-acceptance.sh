@@ -47,10 +47,12 @@ PASS=0; FAIL=0
 # reads the bucket back independently (six more assertions); otherwise a
 # directory under the work dir.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=54
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=65
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=50
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=61
 fi
+# The human arm (E-21) adds its own assertions when it runs.
+[[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]] && EXPECTED_ASSERTIONS=$((EXPECTED_ASSERTIONS + 4))
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS+1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
 fail() { FAIL=$((FAIL+1)); printf '   %sFAIL%s %s\n' "$RED" "$RESET" "$1"; }
@@ -64,7 +66,7 @@ SERVER_URL="http://$SERVER_ADDR"
 EMAIL="ui-acceptance-$$@example.com"
 PASSWORD="ui acceptance horse battery staple $$"
 SKIP_API="${NEMR_SKIP_API:-0}"
-SYNC_PID=""; UI_PID=""; UI2_PID=""
+SYNC_PID=""; UI_PID=""; UI2_PID=""; UI3_PID=""; NOLOGIN=""
 
 finish() {
     printf '\n%s== Cleanup%s\n' "$BOLD" "$RESET"
@@ -81,7 +83,11 @@ finish() {
             echo "   REFUSED to touch $p: it is a protected subject"
         fi
     done
-    for pid in "$UI_PID" "$UI2_PID" "$SYNC_PID"; do
+    for p in "${NOLOGIN:-}"; do
+        [[ -n "$p" ]] && refuse_protected "$p" 2>/dev/null && output_has "^$p " -- nemr list && { nemr stop "$p" >/dev/null 2>&1; nemr delete "$p" --yes >/dev/null 2>&1 && echo "   removed $p"; }
+    done
+    if [[ -n "${NEMR_HOST_CREDENTIALS:-}" ]]; then unset NEMR_HOST_CREDENTIALS; stop_daemon 2>/dev/null || true; echo "   stopped the seamed daemon; the next nemr command starts a clean one"; fi
+    for pid in "$UI_PID" "$UI2_PID" "${UI3_PID:-}" "$SYNC_PID"; do
         [[ -n "$pid" && "$pid" -gt 1 ]] && kill "$pid" 2>/dev/null
     done
     wait 2>/dev/null
@@ -384,6 +390,67 @@ nemr stop "$LOCAL2" >/dev/null 2>&1; nemr delete "$LOCAL2" --yes >/dev/null 2>&1
 output_has "^$LOCAL2 " -- nemr list && die "$LOCAL2 survived its removal"
 pass "the page block left nothing behind"
 
+# ---------------------------------------------------------------------------
+step "The credential step on a machine with no Claude login (E-21) — the automated arm"
+# ---------------------------------------------------------------------------
+# A host that has never logged in cannot be produced on this host any other
+# way: the ruled test seam (NEMR_HOST_CREDENTIALS, path-only) points the
+# daemon at a scratch path. The seam reaches the daemon only through its
+# environment, so the running daemon is stopped and the next `nemr` command
+# autostarts one that inherits it — the move install_engine.sh makes. At the
+# end the seamed daemon is stopped again, and the next command starts a
+# clean one. Nothing logs in here; the human arm does that, once.
+NOCRED="$WORK/nocred/.credentials.json"
+stop_daemon() {
+    # Only the daemon on this user's socket, found by its socket's owner pid.
+    local sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/nemr/nemrd.sock"
+    [[ -S "$sock" ]] || return 0
+    for pid in $(pgrep -x nemrd -u "$(id -u)"); do kill "$pid" 2>/dev/null; done
+    for _ in $(seq 1 50); do pgrep -x nemrd -u "$(id -u)" >/dev/null || break; sleep 0.2; done
+    rm -f "$sock"
+}
+stop_daemon
+export NEMR_HOST_CREDENTIALS="$NOCRED"
+NOLOGIN="uiacc-$$-nologin"
+NEMR_NON_INTERACTIVE=1 nemr create "$NOLOGIN" --size 500MB >"$WORK/create3.log" 2>&1 \
+    || { cat "$WORK/create3.log"; die "create must succeed on a host with no login (AUTH-03 as amended by E-21)"; }
+pass "create succeeded on a host with no Claude login (AUTH-03 amended: create and restore alike)"
+[[ -f "$NOCRED" ]] || die "no placeholder was written at $NOCRED"
+[[ "$(stat -c %a "$NOCRED")" == "600" ]] || die "the placeholder is mode $(stat -c %a "$NOCRED"), not 600"
+grep -q '_nemr_placeholder' "$NOCRED" || die "the file at the credential path is not the engine's placeholder"
+pass "the engine wrote its placeholder at the credential path, mode 600"
+nemr status "$NOLOGIN" 2>/dev/null | grep -q 'NO LOGIN YET' || die "nemr status does not say NO LOGIN YET"
+pass "nemr status says: no login yet on this machine"
+nemr start "$NOLOGIN" >/dev/null 2>&1 || die "start must succeed against the placeholder"
+pass "the session started against the placeholder"
+attach_out=$(echo 'claude -p "Reply with OK" --output-format json < /dev/null 2>&1 | tail -c 300; exit' | nemr attach "$NOLOGIN" 2>&1 | tr -d '\r')
+grep -qi 'not logged in\|login\|authenticate' <<<"$attach_out" || { printf '%s\n' "$attach_out" | tail -5 | sed 's/^/   | /'; die "claude -p should say it is not logged in (the control that a placeholder is not a login)"; }
+pass "CONTROL: inside the session, claude -p says it is not logged in — the placeholder is not a login"
+grep -q 'no Claude login on this machine yet' <<<"$(echo 'true' | nemr attach "$NOLOGIN" 2>&1)" \
+    || die "nemr attach did not print the no-login-yet notice"
+pass "nemr attach names the state: no Claude login on this machine yet, run /login"
+"$REPO/target/release/nemr-cloud" ui --no-open >"$WORK/ui3.log" 2>&1 &
+UI3_PID=$!
+for _ in $(seq 1 60); do grep -q 'nemr ui: http' "$WORK/ui3.log" && break; sleep 0.25; done
+LAUNCH3=$(grep -o 'http://127.0.0.1:[0-9]*/#token=[0-9a-f]*' "$WORK/ui3.log" | head -1)
+[[ -n "$LAUNCH3" ]] || { cat "$WORK/ui3.log"; die "the third UI did not print a launch URL"; }
+cred_out=$(python3 "$REPO/docs/ui-acceptance.py" credential-step "$LAUNCH3" "$NOLOGIN" 2>"$WORK/cred.err"); cred_rc=$?
+if [[ -z "$cred_out" ]]; then grep -v Gtk-Message "$WORK/cred.err" | tail -10 | sed 's/^/   | /'; die "the credential-step driver produced no result (rc=$cred_rc)"; fi
+printf '%s\n' "$cred_out" > "$WORK/cred.json"
+while IFS=$'\t' read -r ok name detail; do
+    if [[ "$ok" == "True" ]]; then pass "$name"; else fail "$name${detail:+ — $detail}"; fi
+done < <(python3 -c 'import json,sys; [print(r["ok"], r["name"], r.get("detail",""), sep="\t") for r in json.load(open(sys.argv[1]))["checks"]]' "$WORK/cred.json")
+SIGNIN_URL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["url"])' "$WORK/cred.json")
+[[ "$cred_rc" -eq 0 ]] || die "the page did not show the credential step as ruled (details above)"
+kill "$UI3_PID" 2>/dev/null; wait "$UI3_PID" 2>/dev/null; UI3_PID=""
+nemr stop "$NOLOGIN" >/dev/null 2>&1; nemr delete "$NOLOGIN" --yes >/dev/null 2>&1
+output_has "^$NOLOGIN " -- nemr list && die "$NOLOGIN survived its removal"
+unset NEMR_HOST_CREDENTIALS
+stop_daemon
+nemr list >/dev/null 2>&1 || die "a clean daemon did not come back after the seamed one was stopped"
+nemr status "$PROJECT" 2>/dev/null | grep -q 'NO LOGIN YET' && die "the clean daemon still sees the seam"
+pass "the seamed daemon is gone; a clean one serves the real credential again"
+
 step "Pull it into a fresh project and start it, from the browser"
 out=$(UI pull "$PROJECT" "$PASSWORD") || die "the pull call failed: $out"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); [print("   |",l["text"]) for l in d["lines"]]; sys.exit(0 if d["ok"] else 1)' "$out" \
@@ -406,6 +473,47 @@ assert row["held_by"] == d["this_machine"], f"this machine now holds the lease: 
 print(f"   row: {name} where={row['where']} running={row['running']} held_by={row['held_by']}")
 PY
 pass "the browser's list now says both, running, held by this machine"
+
+if [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]]; then
+    # -----------------------------------------------------------------------
+    step "The credential step — the human arm (E-21): /login inside the pulled session, on this machine"
+    # -----------------------------------------------------------------------
+    # Only where the ruling's words are literally true: a host with no Claude
+    # login. The pulled session above started against the engine's
+    # placeholder; a person now signs in through the page's terminal, and
+    # the proof the Product Owner required follows: the HOST credential file
+    # must contain exactly what Claude Code wrote inside the session.
+    HOST_CRED="$HOME/.claude/.credentials.json"
+    if [[ -f "$HOST_CRED" ]] && ! grep -q '_nemr_placeholder' "$HOST_CRED"; then
+        die "NEMR_HUMAN_LOGIN=1 needs a host with no Claude login; $HOST_CRED is a real credential"
+    fi
+    nemr status "$PROJECT" 2>/dev/null | grep -q 'NO LOGIN YET' || die "the pulled session should be waiting for a login"
+    pass "the pulled session started on this machine against the placeholder (no login yet)"
+    "$REPO/target/release/nemr-cloud" ui --no-open >"$WORK/ui-human.log" 2>&1 &
+    UI3_PID=$!
+    for _ in $(seq 1 60); do grep -q 'nemr ui: http' "$WORK/ui-human.log" && break; sleep 0.25; done
+    HUMAN_URL=$(grep -o 'http://127.0.0.1:[0-9]*/#token=[0-9a-f]*' "$WORK/ui-human.log" | head -1)
+    printf '\n   >>> Open this in your browser:  %s\n' "$HUMAN_URL"
+    printf '   >>> Attach %s, run  claude  then  /login , open the sign-in link the page shows, paste the code.\n' "$PROJECT"
+    printf '   >>> Waiting up to 20 minutes for the login to land on this machine...\n'
+    landed=0
+    for _ in $(seq 1 240); do
+        if nemr status "$PROJECT" 2>/dev/null | grep -q 'credential:   present at'; then landed=1; break; fi
+        sleep 5
+    done
+    [[ "$landed" -eq 1 ]] || die "no login landed on this machine within 20 minutes"
+    pass "a login landed on this machine: nemr status reports the credential present"
+    host_sha=$(sha256sum "$HOST_CRED" | cut -d' ' -f1)
+    inside_sha=$(echo 'sha256sum /root/.claude/.credentials.json | cut -d" " -f1; exit' | nemr attach "$PROJECT" 2>&1 | tr -d '\r' | grep -oE '^[0-9a-f]{64}$' | tail -1)
+    [[ -n "$inside_sha" ]] || die "could not read the credential's hash inside the session"
+    [[ "$host_sha" == "$inside_sha" ]] || die "REQUIRED PROOF FAILED: the host file ($host_sha) is not what Claude Code wrote inside ($inside_sha) — Claude Code's write escaped the bind; bind the directory, not the file"
+    pass "REQUIRED PROOF: the host credential file contains exactly what Claude Code wrote inside the session (sha256 equal)"
+    grep -q '_nemr_placeholder' "$HOST_CRED" && die "the host file is still the placeholder"
+    answer=$(echo 'claude -p "Reply with the single word OK" --output-format json < /dev/null 2>&1 | tail -c 300; exit' | nemr attach "$PROJECT" 2>&1 | tr -d '\r')
+    grep -q '"result":"OK' <<<"$answer" || { printf '%s\n' "$answer" | tail -3 | sed 's/^/   | /'; die "claude -p did not answer after the login"; }
+    pass "claude -p answers inside the session after the login"
+    kill "$UI3_PID" 2>/dev/null; wait "$UI3_PID" 2>/dev/null; UI3_PID=""
+fi
 
 step "Attach in the browser and continue the conversation"
 if [[ "$SKIP_API" == "1" ]]; then

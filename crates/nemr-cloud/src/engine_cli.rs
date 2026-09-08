@@ -42,6 +42,11 @@ pub struct LocalProject {
     pub running: bool,
     pub usage_known: bool,
     pub used_bytes: u64,
+    /// E-21: whether this machine has a Claude login for its sessions (the
+    /// daemon's `credential_present`). `None` when the source cannot say —
+    /// the CLI's `nemr list --json` does not carry it.
+    #[serde(default)]
+    pub credential_present: Option<bool>,
 }
 
 #[derive(Deserialize)]

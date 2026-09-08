@@ -351,12 +351,21 @@ fn human_duration(secs: i64) -> String {
 fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<String>) {
     use nemr_engine::auth::{CredentialExpiry, CredentialFacts, CredentialVerdict};
 
-    if d.credential_path.is_empty() {
+    if d.credential_path.is_empty() || !d.credential_present {
+        // E-21: a machine that has never logged in. `start` writes the
+        // placeholder and the session starts; the login happens inside it.
         return (
-            "  credential:   ABSENT — `nemr start` will fail (AUTH-03).\n\
-             \x20               Authenticate on this host by running `claude`."
-                .to_string(),
-            None,
+            format!(
+                "  credential:   NO LOGIN YET on this machine — attach and run /login inside the session;\n\
+                 \x20               the login is written to this host and stays here (D-02).\n\
+                 \x20               path: {}",
+                if d.credential_path.is_empty() { "(will be created at start)".to_string() } else { d.credential_path.clone() }
+            ),
+            Some(format!(
+                "[nemr] no Claude login on this machine yet. Run /login inside this session; it opens a URL\n\
+                 \x20      to sign in with and asks for the code. The login stays on this machine (D-02, E-21).\n\
+                 \x20      (nemr status {name} shows the credential's state)"
+            )),
         );
     }
     let at = |secs: i64| {
@@ -370,6 +379,7 @@ fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<S
         access: at(d.credential_expires_at_secs),
         refresh: at(d.credential_refresh_expires_at_secs),
         blank: d.credential_blank,
+        placeholder: !d.credential_present,
     };
     let path = &d.credential_path;
     let host_fix = format!(
@@ -377,6 +387,7 @@ fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<S
          file: nemr stop {name} && nemr start {name}"
     );
     let (mut line, mut warning) = match facts.verdict(unix_now()) {
+        CredentialVerdict::NoLoginYet => unreachable!("handled above"),
         CredentialVerdict::NotOauth => (
             format!("  credential:   present at {path} (no OAuth expiry to check — API-key auth or a placeholder)"),
             None,

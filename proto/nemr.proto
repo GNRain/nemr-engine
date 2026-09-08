@@ -181,6 +181,10 @@ message StatusResponse {
   string credential_last_write_by = 26;
   string credential_last_write_verdict = 27;
   bool credential_last_write_valid = 28;
+  // E-21: the credential file is not the engine's placeholder — false on a
+  // machine that has never logged in. Additive; the protocol version is
+  // unchanged (an old client ignores it, an old daemon leaves it false).
+  bool credential_present = 29;
 }
 
 message SwitchAgentRequest { string name = 1; string agent = 2; }
