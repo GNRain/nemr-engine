@@ -1902,6 +1902,15 @@ pub async fn status(client: &ContainerdClient, name: &str) -> crate::error::Resu
     let mounted = crate::engine::volume::is_mounted(&mount_point);
 
     let credential = auth::host_credentials_path().ok().filter(|p| p.exists());
+    // F-10: a login that landed beside a leftover marker is cleaned on first
+    // detection, so the file is what Claude Code alone would have written.
+    if let Some(p) = &credential {
+        match auth::scrub_placeholder_marker(p) {
+            Ok(true) => tracing::info!("[nemr] cleared the engine's placeholder marker from {} — a login landed beside it (F-10)", p.display()),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("[nemr] could not clear the placeholder marker from {}: {e:#}", p.display()),
+        }
+    }
     // E-21: present means a file that is not the engine's placeholder — the
     // page and `status` say "no login yet" from this, not from a verdict.
     let credential_present = credential

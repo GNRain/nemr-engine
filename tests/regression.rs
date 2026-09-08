@@ -3598,11 +3598,27 @@ fn e21_a_host_with_no_login_gets_a_placeholder_and_the_sessions_writes_land_on_i
         let (_, inside) = project::exec_capture(&client, &project.name, &["cat", "/root/.claude/.credentials.json"]).await.unwrap();
         assert!(nemr_engine::auth::is_placeholder(&inside), "the session sees the placeholder: {inside}");
 
-        // The measurement: a store write by Claude Code lands on the host.
-        // A fake, expired credential provokes the dead-refresh clear — the
-        // same store code path that a login uses, with no browser needed.
+        // F-10 (measured on the fresh VM): Claude Code's rewrite keeps unknown
+        // top-level keys, so a real login lands NEXT TO the old marker. Written
+        // here in that shape — a real-shaped (expired) object, the marker kept —
+        // status must say a login is present, and the first detection clears
+        // the marker in place so the file is what Claude Code alone wrote.
         let fake = r#"{"claudeAiOauth":{"accessToken":"FAKE-EXPIRED","refreshToken":"FAKE-REFRESH","expiresAt":1700000000000,"scopes":["user:inference","user:profile"],"subscriptionType":"max"}}"#;
-        std::fs::write(&scratch, fake).unwrap();
+        let survived = format!("{},\"_nemr_placeholder\":\"no Claude login on this machine yet\"}}", &fake[..fake.len() - 1]);
+        std::fs::write(&scratch, &survived).unwrap();
+        let ino_survived = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&scratch).unwrap());
+        let detail = project::status(&client, &project.name).await.expect("status");
+        assert!(detail.credential_present, "F-10: a real token beside the marker is a login, not the placeholder");
+        let host_now = std::fs::read_to_string(&scratch).unwrap();
+        assert_eq!(host_now, fake, "F-10: the first detection cleared the marker; the file is what Claude Code alone would have written");
+        assert_eq!(std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&scratch).unwrap()), ino_survived, "cleared in place: the session's bind still sees it");
+        assert_eq!(std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777, 0o600);
+        let (_, inside_now) = project::exec_capture(&client, &project.name, &["cat", "/root/.claude/.credentials.json"]).await.unwrap();
+        assert_eq!(inside_now.trim(), fake, "the session sees the cleared file through the bind");
+
+        // The measurement: a store write by Claude Code lands on the host.
+        // The fake, expired credential provokes the dead-refresh clear — the
+        // same store code path that a login uses, with no browser needed.
         let before = std::fs::metadata(&scratch).unwrap();
         let (_, out) = project::exec_capture(
             &client,

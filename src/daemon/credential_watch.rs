@@ -248,6 +248,13 @@ pub fn spawn(
             let running = running_sessions(&client).await;
             let names: Vec<String> = running.iter().map(|s| s.name.clone()).collect();
             let now = unix_now();
+            // F-10: the write that just landed may be a login beside the
+            // leftover marker; clear it now, at the first detection.
+            match crate::auth::scrub_placeholder_marker(&host) {
+                Ok(true) => tracing::info!("[nemrd] cleared the engine's placeholder marker from {} — a login landed beside it (F-10)", host.display()),
+                Ok(false) => {}
+                Err(e) => tracing::warn!("[nemrd] could not clear the placeholder marker from {}: {e:#}", host.display()),
+            }
             let facts = crate::auth::credential_facts_at(&host);
             let (verdict, valid) = describe(facts, now);
             let by = attribute(ev.kind, &names);
