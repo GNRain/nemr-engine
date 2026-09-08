@@ -194,6 +194,7 @@ async fn create_with_auth(
     // credential that IS present is still held to what it says: readable,
     // and not dead (a spent refresh token or a blanked file — F-129).
     let credentials = auth::ensure_host_credential_file()?;
+    let credential_dir = auth::host_credential_dir()?;
     auth::check_permissions(&credentials)?;
     auth::refuse_dead_credential(&credentials, unix_now())?;
 
@@ -232,24 +233,29 @@ async fn create_with_auth(
     let mut mounts = vec![
         // The project volume becomes the container's working directory.
         BindMount::read_write(&mount_point, config::CONTAINER_WORKDIR),
-        // AUTH-02, as revised by D-02's (f): the credential file is bound
-        // READ-WRITE — so Claude Code can refresh the access token inside the
-        // session, which a read-only bind made impossible (it fails the write
-        // silently and then sends the dead token; F-130) — and it is still
-        // ONLY the credential file, nothing else from ~/.claude. It stays a host
-        // bind mount and is NOT relocated onto the volume: the credential must
-        // never travel. The write surface a session gains is exactly this one
-        // file, which every process in it could already read.
+        // AUTH-02, as revised by D-02's (f) and F-14: the host's DEDICATED
+        // credential DIRECTORY is bound over `/root/.claude`, read-write. A
+        // directory, not the single file, because Claude Code writes the
+        // credential by writing `.credentials.json.tmp.<hex>` and renaming it
+        // over the target (measured 2026-09-08), which changes the inode; a
+        // single-file bind cannot follow a rename, so a login's later write
+        // escaped onto a container-only inode while the host kept an earlier
+        // one (the human-arm failure, E-21). The directory holds ONLY the
+        // credential and the `projects`/`sessions` mount points — never the
+        // host's own `~/.claude`, which carries history and settings that must
+        // not travel (D-02). It is a host bind and is NOT on the volume: the
+        // credential never leaves the machine.
         //
-        // NEMR_TEST_PRE_F12 is a test seam like NEMR_TEST_PRE_NET02 below: it
-        // creates the pre-(f) read-only shape, which no fresh container can
-        // otherwise have, so the migration every existing project takes at its
-        // next start is exercised end to end (F-112's lesson). Production never
+        // NEMR_TEST_PRE_F14 is a test seam like NEMR_TEST_PRE_NET02 below: it
+        // creates the pre-F14 single-FILE bind, the shape no fresh container
+        // can otherwise have, so the directory-bind migration every existing
+        // project takes at its next start is exercised end to end (F-112's
+        // lesson) and the file bind's failure is provable. Production never
         // sets it.
-        if std::env::var_os("NEMR_TEST_PRE_F12").is_some() {
-            BindMount::read_only(&credentials, config::CONTAINER_CREDENTIALS)
-        } else {
+        if std::env::var_os("NEMR_TEST_PRE_F14").is_some() {
             BindMount::read_write(&credentials, config::CONTAINER_CREDENTIALS)
+        } else {
+            BindMount::read_write(&credential_dir, config::CONTAINER_CLAUDE_DIR)
         },
     ];
     // M8: bind the session-critical subtrees from the volume over their rootfs
@@ -485,20 +491,32 @@ pub async fn start(client: &ContainerdClient, name: &str) -> Result<u32> {
         );
     }
 
-    // D-02 (f) / F-12 migration, also BEFORE the task exists and for the same
-    // reason: the credential mount's `ro` is frozen in the record of every
-    // project created before the mount became writable, and a task started
-    // from that record cannot refresh its login. Additive and idempotent —
-    // it flips one option on one mount and reports the change once.
-    if client
-        .ensure_bind_writable(&container_id, config::CONTAINER_CREDENTIALS)
-        .await
-        .with_context(|| format!("migrating {name:?} to a writable credential mount"))?
+    // D-02 (f) / F-14 migration, also BEFORE the task exists and for the same
+    // reason: the credential mount is frozen in the record of every project
+    // created before F-14 as a single-FILE bind of `.credentials.json`, which
+    // a login's rename escapes (the human-arm failure, E-21). Rewrite it to a
+    // read-write bind of the host's dedicated credential DIRECTORY over
+    // `/root/.claude`, so every write — in place or by rename — lands on the
+    // host. Idempotent, and it reports the change once. The directory and its
+    // `projects`/`sessions` mount points exist by now (ensure above).
+    // NEMR_TEST_SKIP_F14_MIGRATION leaves a pre-F14 single-file bind in place
+    // at start, so a genuinely file-bound RUNNING session can be produced — the
+    // shape the migration otherwise always repairs — and the file bind's
+    // failure (a login's rename refused on the mount point) is provable end to
+    // end. A test seam like NEMR_TEST_PRE_F14; production never sets it.
+    if std::env::var_os("NEMR_TEST_SKIP_F14_MIGRATION").is_none()
+        && client
+            .ensure_credential_dir_bind(
+                &container_id,
+                &auth::host_credential_dir()?.to_string_lossy(),
+            )
+            .await
+            .with_context(|| format!("migrating {name:?} to a directory credential mount"))?
     {
         tracing::warn!(
             nemr_audit = "warning",
-            "[nemr] {name}: the credential mount is now read-write, so Claude Code can \
-             refresh its login inside the session (D-02 migration)"
+            "[nemr] {name}: the credential is now bound as a directory over /root/.claude, so \
+             Claude Code's login writes (which rename) land on this host (F-14 migration)"
         );
     }
 

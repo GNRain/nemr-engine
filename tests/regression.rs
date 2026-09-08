@@ -3293,188 +3293,287 @@ fn net02_a_project_created_before_net02_is_migrated_and_starts_wired() {
     });
 }
 
-/// D-02 (f): a project created while the credential was bound read-only carries
-/// `ro` in its frozen spec, and a task started from that record cannot refresh
-/// its login — the F-130 loop for ever, whatever the engine does afterwards.
-/// `start` must repair the record first. `NEMR_TEST_PRE_F12` creates the old
-/// shape, because no fresh container can have it and an untested upgrade path
-/// is how NET-02's migration broke `htmltest` (F-112).
-///
-/// The proof of the running task's mount is read from its `mountinfo` on the
-/// host — no exec, and above all NO WRITE to the credential, which is the
-/// user's real login.
+/// F-14: a project created before F-14 carries a single-FILE credential bind
+/// in its frozen spec (`/root/.claude/.credentials.json`), which a login's
+/// write — a temp file renamed over the target (measured 2026-09-08) — cannot
+/// land through: the rename is refused on the mount point (EBUSY), so a login's
+/// later write escaped onto a container-only inode and the host kept an earlier
+/// one (the human-arm failure, E-21). `start` must rewrite the record to a
+/// directory bind of the host's dedicated credential directory over
+/// `/root/.claude` first. `NEMR_TEST_PRE_F14` creates the old shape, because no
+/// fresh container can have it (F-112's lesson: an untested upgrade path is how
+/// NET-02's migration broke htmltest). Read from the running task's `mountinfo`
+/// on the host; no write to the credential.
 #[test]
-fn f12_a_project_created_with_a_read_only_credential_is_migrated_at_start() {
+fn f14_a_project_created_before_f14_is_migrated_to_a_directory_bind_at_start() {
     if unit_only() {
         return;
     }
     if !require_host(HostRequirements::FULL) {
         return;
     }
-
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
 
-        std::env::set_var("NEMR_TEST_PRE_F12", "1");
-        let project = TestProject::create(&client, "f12pre", VolumeSize::Small).await;
-        std::env::remove_var("NEMR_TEST_PRE_F12");
+        std::env::set_var("NEMR_TEST_PRE_F14", "1");
+        let project = TestProject::create(&client, "f14pre", VolumeSize::Small).await;
+        std::env::remove_var("NEMR_TEST_PRE_F14");
 
         let id = nemr_engine::config::container_id(&project.name);
-        let cred = nemr_engine::config::CONTAINER_CREDENTIALS;
-        // Control, READ-ONLY: the subject really has the old shape (the NET-02
-        // lesson — a control that migrates what it observes is not a control).
+        // Control, READ-ONLY: the subject really has the old single-file shape.
         assert!(
             !client
-                .bind_is_writable(&id, cred)
+                .has_credential_dir_bind(&id)
                 .await
                 .expect("read the spec"),
-            "the subject must START with a read-only credential mount, or this proves nothing"
+            "the subject must START with the single-file credential bind, or this proves nothing"
         );
 
         let pid = project::start(&client, &project.name)
             .await
-            .expect("a project created before (f) must still start");
+            .expect("a project created before F-14 must still start");
 
         assert!(
             client
-                .bind_is_writable(&id, cred)
+                .has_credential_dir_bind(&id)
                 .await
                 .expect("read the spec"),
-            "start must have repaired the container record"
+            "start must have rewritten the record to a directory bind"
         );
         assert_eq!(
-            mount_option(pid, cred).as_deref(),
+            mount_option(pid, nemr_engine::config::CONTAINER_CLAUDE_DIR).as_deref(),
             Some("rw"),
-            "the RUNNING task's credential mount must be rw (read from /proc/{pid}/mountinfo)"
+            "the RUNNING task's /root/.claude mount must be a rw directory bind"
         );
 
         let _ = project::stop(&client, &project.name).await;
     });
 }
 
-/// The control's control: a fresh project is writable from create, so the seam
-/// above is what made the subject read-only, not the engine.
+/// The control's control: a fresh project binds the directory from create, so
+/// the seam above is what made the subject the old shape, not the engine.
 #[test]
-fn f12_a_fresh_project_mounts_the_credential_read_write() {
+fn f14_a_fresh_project_binds_the_credential_directory() {
     if unit_only() {
         return;
     }
     if !require_host(HostRequirements::FULL) {
         return;
     }
-
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "f12new", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "f14new", VolumeSize::Small).await;
         let id = nemr_engine::config::container_id(&project.name);
-        let cred = nemr_engine::config::CONTAINER_CREDENTIALS;
         assert!(
             client
-                .bind_is_writable(&id, cred)
+                .has_credential_dir_bind(&id)
                 .await
                 .expect("read the spec"),
-            "a fresh project must record the credential mount as writable"
+            "a fresh project must record the credential directory bind"
         );
         let pid = project::start(&client, &project.name).await.expect("start");
-        assert_eq!(mount_option(pid, cred).as_deref(), Some("rw"));
-        // And the F-12 detector reads "current" for a session started from the
-        // host's present file.
-        let detail = project::status(&client, &project.name)
-            .await
-            .expect("status");
         assert_eq!(
-            detail.credential_stale,
-            Some(false),
-            "a session just started from the host's file must not read as stale"
+            mount_option(pid, nemr_engine::config::CONTAINER_CLAUDE_DIR).as_deref(),
+            Some("rw")
         );
         let _ = project::stop(&client, &project.name).await;
     });
 }
 
-/// F-12 dies: a host-side replacement of the credential (the rename the
-/// host's Claude Code performs on every refresh) reaches a RUNNING session
-/// without a restart. The replacement here keeps the content byte-identical
-/// — `cp -p` then `mv` — so the user's real login is untouched in substance;
-/// only the inode changes, which is exactly what F-12 is about.
-///
-/// Control first, read-only: after the rename the session is stale (the
-/// detector, not the repair, says so). Then the repair; then the session and
-/// the host agree, and the mount is still read-write.
+/// F-14, the property the ruling required: a login's write — a temp file
+/// renamed over `/root/.claude/.credentials.json`, the pattern measured of
+/// Claude Code 2.1.x — lands on the HOST, with the host and the session seeing
+/// the SAME inode. Under the seam, so no real login is needed and the user's
+/// own credential is never touched. The two writes a login makes are simulated
+/// exactly: one in place, then one by temp-file-and-rename. Then the same
+/// sequence under the OLD single-file bind (`NEMR_TEST_PRE_F14`), where the
+/// rename is refused on the mount point — the login write cannot land: the red
+/// the directory bind turns green.
 #[test]
-fn f12_dies_a_host_rename_reaches_a_running_session_without_restart() {
+fn f14_a_login_write_by_rename_lands_on_the_host_through_the_directory_bind() {
     if unit_only() {
         return;
     }
     if !require_host(HostRequirements::FULL) {
         return;
     }
-    let host = nemr_engine::auth::host_credentials_path().expect("credential path");
-    if !host.exists() {
-        eprintln!("skipping: no host credential to re-bind");
-        return;
-    }
+    use std::os::unix::fs::MetadataExt;
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
 
-    // The re-bind runs in a child of the DAEMON binary; in this process
-    // `current_exe()` is the test harness, so name the built daemon explicitly.
-    std::env::set_var(
-        "NEMR_REBIND_HELPER",
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/nemrd"),
+    // The measured login write pattern, as a shell the session runs: write #1
+    // in place, then write #2 to a temp file renamed over the target. It prints
+    // the session's view (inode + sha + the mv outcome) between sentinels the
+    // shell assembles, so the capture cannot match its own echo.
+    let l1 = r#"{"claudeAiOauth":{"accessToken":"L1-in-place","refreshToken":"r","expiresAt":9999999999000}}"#;
+    let l2 = r#"{"claudeAiOauth":{"accessToken":"L2-by-rename","refreshToken":"r","expiresAt":9999999999000}}"#;
+    let script = format!(
+        "C=/root/.claude/.credentials.json;          printf '%s' '{l1}' > \"$C\";          t=/root/.claude/.credentials.json.tmp.abcd1234; printf '%s' '{l2}' > \"$t\";          if mv \"$t\" \"$C\" 2>/dev/null; then MV=ok; else MV=refused; rm -f \"$t\"; fi;          printf 'INSIDE inode=%s sha=%s mv=%s END\n' \"$(stat -c %i \"$C\")\" \"$(sha256sum \"$C\" | cut -d\" \" -f1)\" \"$MV\""
     );
 
+    let measure = |pre_f14: bool| {
+        let script = script.clone();
+        runtime.block_on(async move {
+            let temp = std::env::temp_dir().join(format!(
+                "nemr-f14-{}-{}",
+                if pre_f14 { "file" } else { "dir" },
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&temp);
+            std::fs::create_dir_all(&temp).unwrap();
+            let scratch = temp.join("claude").join(".credentials.json");
+            std::env::set_var("NEMR_HOST_CREDENTIALS", &scratch);
+            if pre_f14 {
+                // Create the single-file bind, AND keep start from migrating it,
+                // so a genuinely file-bound running session tests the old shape.
+                std::env::set_var("NEMR_TEST_PRE_F14", "1");
+                std::env::set_var("NEMR_TEST_SKIP_F14_MIGRATION", "1");
+            }
+            let client = ContainerdClient::connect().await.expect("connect");
+            let name = if pre_f14 {
+                "f14login-file"
+            } else {
+                "f14login-dir"
+            };
+            let project = TestProject::create(&client, name, VolumeSize::Small).await;
+            std::env::remove_var("NEMR_TEST_PRE_F14");
+            project::start(&client, &project.name).await.expect("start");
+            std::env::remove_var("NEMR_TEST_SKIP_F14_MIGRATION");
+            let (_, out) = project::exec_capture(&client, &project.name, &["sh", "-c", &script])
+                .await
+                .unwrap();
+            let line = out
+                .lines()
+                .find(|l| l.contains("INSIDE "))
+                .unwrap_or("")
+                .to_string();
+            let field = |k: &str| {
+                line.split_whitespace()
+                    .find_map(|tok| tok.strip_prefix(k))
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let inside_inode = field("inode=");
+            let inside_sha = field("sha=");
+            let mv = field("mv=");
+            let host_meta = std::fs::metadata(&scratch).unwrap();
+            let host_inode = host_meta.ino().to_string();
+            let host_content = std::fs::read_to_string(&scratch).unwrap();
+            let host_sha = {
+                use std::process::Command;
+                let o = Command::new("sha256sum").arg(&scratch).output().unwrap();
+                String::from_utf8_lossy(&o.stdout)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            };
+            drop(project);
+            std::env::remove_var("NEMR_HOST_CREDENTIALS");
+            let _ = std::fs::remove_dir_all(&temp);
+            (
+                mv,
+                inside_inode,
+                inside_sha,
+                host_inode,
+                host_sha,
+                host_content,
+            )
+        })
+    };
+
+    // The directory bind (the fix): the rename lands on the host, and the host
+    // and the session see the same inode and the same bytes — the login's
+    // final write (L2).
+    let (mv, inside_inode, inside_sha, host_inode, host_sha, host_content) = measure(false);
+    assert_eq!(
+        mv, "ok",
+        "the rename must succeed through the directory bind"
+    );
+    assert!(
+        host_content.contains("L2-by-rename"),
+        "the host holds the login's final write: {host_content}"
+    );
+    assert_eq!(
+        host_inode, inside_inode,
+        "host and session must see the SAME inode after the rename"
+    );
+    assert_eq!(
+        host_sha, inside_sha,
+        "host and session must hold the same bytes (E-21's required proof)"
+    );
+
+    // The old single-file bind (the red): the rename is refused on the mount
+    // point, so the login's write cannot land — the host never sees L2.
+    let (mv, _inside_inode, _inside_sha, _host_inode, _host_sha, host_content) = measure(true);
+    assert_eq!(
+        mv, "refused",
+        "a rename over the single-file bind mount point must be refused (EBUSY)"
+    );
+    assert!(
+        !host_content.contains("L2-by-rename"),
+        "the single-file bind cannot land the login's rename write — this is the failure the directory bind fixes: {host_content}"
+    );
+}
+
+/// F-14 makes the F-12 scenario trivial: a host-side replacement of the
+/// credential (the rename the host performs on a refresh) reaches a RUNNING
+/// session with no re-bind at all, because the whole directory is bound — the
+/// session sees the host directory live. Under the seam, so no real credential
+/// is touched.
+#[test]
+fn f14_a_host_rename_reaches_a_running_session_without_a_rebind() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
-        use std::os::unix::fs::MetadataExt;
+        let temp = std::env::temp_dir().join(format!("nemr-f14-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let scratch = temp.join("claude").join(".credentials.json");
+        std::env::set_var("NEMR_HOST_CREDENTIALS", &scratch);
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "f12live", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "f14live", VolumeSize::Small).await;
         let pid = project::start(&client, &project.name).await.expect("start");
         let container = std::path::Path::new(nemr_engine::config::CONTAINER_CREDENTIALS);
-        let seen_by_task =
-            |pid: u32| std::fs::metadata(format!("/proc/{pid}/root{}", container.display())).map(|m| m.ino());
-
+        let seen_by_task = |pid: u32| {
+            std::fs::metadata(format!("/proc/{pid}/root{}", container.display())).map(|m| m.ino())
+        };
+        // A real credential in the dedicated dir, then the host's rename pattern.
+        let real = r#"{"claudeAiOauth":{"accessToken":"before","refreshToken":"r","expiresAt":9999999999000}}"#;
+        std::fs::write(&scratch, real).unwrap();
+        let before_ino = seen_by_task(pid).expect("task view");
+        let tmp = scratch.with_extension("json.f14live");
+        std::fs::write(&tmp, r#"{"claudeAiOauth":{"accessToken":"after","refreshToken":"r","expiresAt":9999999999000}}"#).unwrap();
+        std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        std::fs::rename(&tmp, &scratch).expect("rename over the credential in the dedicated dir");
+        let host_ino = std::fs::metadata(&scratch).unwrap().ino();
+        assert_ne!(host_ino, before_ino, "the rename must have changed the host inode");
+        // No re-bind: the running session sees the new inode live, because the
+        // directory is bound, not the file.
         assert_eq!(
-            nemr_engine::auth::credential_is_stale(pid, container, &host),
+            seen_by_task(pid).expect("task view"),
+            host_ino,
+            "the directory bind makes the host's rename visible to the running session at once"
+        );
+        assert_eq!(
+            nemr_engine::auth::credential_is_stale(pid, container, &scratch),
             Some(false),
-            "a session just started must see the host's current file"
+            "with the directory bind there is no stale file bind to repair"
         );
-
-        // The host's pattern: a new inode under the same name, same bytes.
-        let tmp = host.with_extension("json.f12live");
-        std::fs::copy(&host, &tmp).expect("copy the credential");
-        std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-            .expect("chmod 600");
-        std::fs::rename(&tmp, &host).expect("rename over the credential");
-        let host_ino = std::fs::metadata(&host).expect("stat host").ino();
-
-        // Control, read-only: stale now.
-        assert_eq!(
-            nemr_engine::auth::credential_is_stale(pid, container, &host),
-            Some(true),
-            "after the host rename the running session must read as STALE, or the repair proves nothing"
+        assert!(
+            !project::rebind_credential(&client, &project.name).await.expect("rebind check"),
+            "nothing to re-bind: the session already sees the host's current file"
         );
-        assert_ne!(seen_by_task(pid).expect("task view"), host_ino);
-
-        // The repair — no stop, no start, no recreate.
-        let rebound = project::rebind_credential(&client, &project.name)
-            .await
-            .expect("re-bind must not fail");
-        assert!(rebound, "a stale session must be re-bound");
-
-        assert_eq!(seen_by_task(pid).expect("task view"), host_ino, "the session now sees the host's file");
-        assert_eq!(
-            nemr_engine::auth::credential_is_stale(pid, container, &host),
-            Some(false)
-        );
-        assert_eq!(
-            mount_option(pid, nemr_engine::config::CONTAINER_CREDENTIALS).as_deref(),
-            Some("rw"),
-            "the re-bound mount must still be writable"
-        );
-        // Idempotent: a current session is left alone.
-        assert!(!project::rebind_credential(&client, &project.name).await.expect("second call"));
-
         let _ = project::stop(&client, &project.name).await;
+        std::env::remove_var("NEMR_HOST_CREDENTIALS");
+        let _ = std::fs::remove_dir_all(&temp);
     });
 }
 

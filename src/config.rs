@@ -80,6 +80,13 @@ pub const CONTAINER_WORKDIR: &str = "/workspace";
 /// The base image runs as root, so `HOME` is `/root`.
 pub const CONTAINER_CREDENTIALS: &str = "/root/.claude/.credentials.json";
 
+/// The container's Claude Code home directory, `/root/.claude`. Since F-14 the
+/// host's dedicated credential directory is bound HERE (a directory bind, rw),
+/// not just the credential file: Claude Code rewrites `.credentials.json` by
+/// writing a temp file and renaming it over the target, which a single-file
+/// bind cannot follow. See [`crate::auth::host_credential_dir`].
+pub const CONTAINER_CLAUDE_DIR: &str = "/root/.claude";
+
 /// Session-critical Claude Code state, relocated onto the portable volume (M8).
 ///
 /// WP-C1 measured that Claude Code writes its conversation history and session

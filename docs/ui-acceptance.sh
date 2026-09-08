@@ -490,7 +490,11 @@ if [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]]; then
     # placeholder; a person now signs in through the page's terminal, and
     # the proof the Product Owner required follows: the HOST credential file
     # must contain exactly what Claude Code wrote inside the session.
-    HOST_CRED="$HOME/.claude/.credentials.json"
+    # F-14: the host credential lives in a dedicated directory bound over
+    # /root/.claude, not ~/.claude. Read its path from the engine rather than
+    # assuming it.
+    HOST_CRED=$(nemr status "$PROJECT" 2>/dev/null | sed -n 's/.*path: *//p' | tail -1)
+    [[ -n "$HOST_CRED" ]] || HOST_CRED="$HOME/.local/share/nemr/host-credential/.credentials.json"
     if [[ -f "$HOST_CRED" ]] && ! grep -q '_nemr_placeholder' "$HOST_CRED"; then
         die "NEMR_HUMAN_LOGIN=1 needs a host with no Claude login; $HOST_CRED is a real credential"
     fi
@@ -511,10 +515,18 @@ if [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]]; then
     [[ "$landed" -eq 1 ]] || die "no login landed on this machine within 20 minutes"
     pass "a login landed on this machine: nemr status reports the credential present"
     host_sha=$(sha256sum "$HOST_CRED" | cut -d' ' -f1)
-    inside_sha=$(echo 'sha256sum /root/.claude/.credentials.json | cut -d" " -f1; exit' | nemr attach "$PROJECT" 2>&1 | tr -d '\r' | grep -oE '^[0-9a-f]{64}$' | tail -1)
-    [[ -n "$inside_sha" ]] || die "could not read the credential's hash inside the session"
-    [[ "$host_sha" == "$inside_sha" ]] || die "REQUIRED PROOF FAILED: the host file ($host_sha) is not what Claude Code wrote inside ($inside_sha) — Claude Code's write escaped the bind; bind the directory, not the file"
-    pass "REQUIRED PROOF: the host credential file contains exactly what Claude Code wrote inside the session (sha256 equal)"
+    host_ino=$(stat -c %i "$HOST_CRED")
+    # F-14: compare the INODE as well as the hash. A single-file bind could pass
+    # the hash on the login's first (in-place) write yet leave a later
+    # rename on a container-only inode; equal inodes prove the write landed on
+    # the host file itself, through the directory bind.
+    inside=$(echo 'printf "SHA=%s INO=%s\n" "$(sha256sum /root/.claude/.credentials.json | cut -d" " -f1)" "$(stat -c %i /root/.claude/.credentials.json)"; exit' | nemr attach "$PROJECT" 2>&1 | tr -d '\r')
+    inside_sha=$(grep -oE 'SHA=[0-9a-f]{64}' <<<"$inside" | head -1 | cut -d= -f2)
+    inside_ino=$(grep -oE 'INO=[0-9]+' <<<"$inside" | head -1 | cut -d= -f2)
+    [[ -n "$inside_sha" && -n "$inside_ino" ]] || die "could not read the credential's hash and inode inside the session"
+    [[ "$host_sha" == "$inside_sha" ]] || die "REQUIRED PROOF FAILED: the host file ($host_sha) is not what Claude Code wrote inside ($inside_sha) — Claude Code's write escaped the bind"
+    [[ "$host_ino" == "$inside_ino" ]] || die "REQUIRED PROOF FAILED: the host inode ($host_ino) is not the session's ($inside_ino) — a later login write took a new inode inside; the directory bind did not hold"
+    pass "REQUIRED PROOF: the host credential file is exactly what Claude Code wrote inside the session — same bytes AND same inode (F-14)"
     grep -q '_nemr_placeholder' "$HOST_CRED" && die "the host file is still the placeholder"
     answer=$(echo 'claude -p "Reply with the single word OK" --output-format json < /dev/null 2>&1 | tail -c 300; exit' | nemr attach "$PROJECT" 2>&1 | tr -d '\r')
     grep -q '"result":"OK' <<<"$answer" || { printf '%s\n' "$answer" | tail -3 | sed 's/^/   | /'; die "claude -p did not answer after the login"; }

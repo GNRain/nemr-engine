@@ -11,8 +11,29 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-/// Host credential file, relative to the user's home directory.
-const HOST_CREDENTIALS_RELATIVE: &str = ".claude/.credentials.json";
+/// The dedicated host directory that holds nemr's Claude credential, relative
+/// to the user's home. It holds ONLY `.credentials.json` and the `projects`
+/// and `sessions` mount points the volume binds land on. Since F-14 this whole
+/// directory is bound over `/root/.claude` in every session (a directory bind,
+/// not a single-file one): Claude Code writes the credential by writing a temp
+/// file and renaming it over the target — measured 2026-09-08,
+/// `.credentials.json.tmp.<hex>` then `rename` — which changes the inode, and a
+/// single-file bind cannot follow a rename, so a login's later write escaped
+/// onto a container-only inode while the host kept an earlier one (the human-arm
+/// failure E-21's file bind hit). It is deliberately NOT the host's own
+/// `~/.claude`, which holds history, sessions and settings that must never
+/// enter a session (D-02): a dedicated directory is the one whose entire
+/// contents may be exposed.
+const HOST_CREDENTIAL_DIR_RELATIVE: &str = ".local/share/nemr/host-credential";
+const CREDENTIALS_FILE_NAME: &str = ".credentials.json";
+
+/// The host directory that predates F-14 (`~/.claude`), where a login used to
+/// live. An existing login there is inherited once into the dedicated
+/// directory (a host-local copy; the credential never travels — D-02), so a
+/// machine that logged in before F-14 keeps its session login.
+fn legacy_host_credentials_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude").join(CREDENTIALS_FILE_NAME))
+}
 
 /// Locate the host's Claude Code credentials.
 ///
@@ -38,7 +59,7 @@ pub fn host_credentials_path() -> Result<PathBuf> {
     // nothing but the daemon's own environment — the page cannot reach a
     // process environment and the sync server never talks to the daemon. It
     // exists because "a host that has never logged in" cannot otherwise be
-    // produced on a developer host (the NEMR_TEST_PRE_F12 shape). It changes
+    // produced on a developer host (the NEMR_TEST_PRE_F14 shape). It changes
     // where the credential file is looked for, and nothing else.
     if let Some(explicit) = std::env::var_os("NEMR_HOST_CREDENTIALS") {
         if !explicit.is_empty() {
@@ -46,7 +67,26 @@ pub fn host_credentials_path() -> Result<PathBuf> {
         }
     }
     let home = std::env::var_os("HOME").context("HOME is not set; cannot locate credentials")?;
-    Ok(PathBuf::from(home).join(HOST_CREDENTIALS_RELATIVE))
+    Ok(PathBuf::from(home)
+        .join(HOST_CREDENTIAL_DIR_RELATIVE)
+        .join(CREDENTIALS_FILE_NAME))
+}
+
+/// The dedicated host directory bound over `/root/.claude` (F-14): the parent
+/// of the credential file. Under the test seam it is the seam path's parent,
+/// which is why the seam names a file inside a directory of its own.
+pub fn host_credential_dir() -> Result<PathBuf> {
+    Ok(host_credentials_path()?
+        .parent()
+        .context("the credential path has no parent directory")?
+        .to_path_buf())
+}
+
+/// Whether the path is being overridden by the test seam.
+fn under_seam() -> bool {
+    std::env::var_os("NEMR_HOST_CREDENTIALS")
+        .filter(|v| !v.is_empty())
+        .is_some()
 }
 
 /// The placeholder the engine writes where a host has no credential yet
@@ -205,15 +245,50 @@ pub fn ensure_host_credential_file() -> Result<PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let path = host_credentials_path()?;
-    if path.exists() {
-        return Ok(path);
-    }
     let dir = path
         .parent()
         .context("the credential path has no parent directory")?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    // The directory Claude Code owns on the host is private to the user.
+    // The directory is bound whole into the session (F-14) and is the user's:
+    // private, 0700.
     let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    // The mount points the volume's session-state binds land on once this
+    // directory is bound over `/root/.claude`. Empty directories on the host;
+    // their contents come from the volume, per session (M8).
+    for sub in ["projects", "sessions"] {
+        let m = dir.join(sub);
+        std::fs::create_dir_all(&m).with_context(|| format!("creating {}", m.display()))?;
+    }
+    if path.exists() {
+        return Ok(path);
+    }
+    // AUTH-02, preserved across F-14's relocation: a machine that logged in
+    // before F-14 has its credential at `~/.claude/.credentials.json`. Inherit
+    // it once, here, by a host-local copy — the credential never leaves the
+    // machine, so D-02 holds. Never under the test seam (which must produce a
+    // machine with no login), and never a placeholder.
+    if !under_seam() {
+        if let Some(legacy) = legacy_host_credentials_path() {
+            if legacy != path {
+                if let Ok(text) = std::fs::read_to_string(&legacy) {
+                    if !is_placeholder(&text) {
+                        let mut f = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&path)
+                            .with_context(|| {
+                                format!("inheriting the login into {}", path.display())
+                            })?;
+                        f.write_all(text.as_bytes()).with_context(|| {
+                            format!("writing the inherited login to {}", path.display())
+                        })?;
+                        return Ok(path);
+                    }
+                }
+            }
+        }
+    }
     // create_new: never truncate a file that appeared between the check and
     // the write (a login landing at that moment).
     match std::fs::OpenOptions::new()
@@ -537,10 +612,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn credentials_path_is_under_home() {
+    fn credentials_path_is_the_dedicated_dir_under_home() {
         let path = host_credentials_path().unwrap();
-        assert!(path.ends_with(".claude/.credentials.json"), "got {path:?}");
+        // F-14: a dedicated directory, not the host's own ~/.claude.
+        assert!(
+            path.ends_with(".local/share/nemr/host-credential/.credentials.json"),
+            "got {path:?}"
+        );
         assert!(path.is_absolute());
+        assert_eq!(host_credential_dir().unwrap(), path.parent().unwrap());
     }
 
     /// The file stores milliseconds; the engine reports seconds. A wrong unit
@@ -994,9 +1074,9 @@ mod e21_tests {
             "an existing file is never touched"
         );
         std::env::remove_var("NEMR_HOST_CREDENTIALS");
-        // Unset, the path is HOME's again.
+        // Unset, the path is the dedicated directory under HOME again (F-14).
         assert!(host_credentials_path()
             .unwrap()
-            .ends_with(".claude/.credentials.json"));
+            .ends_with(".local/share/nemr/host-credential/.credentials.json"));
     }
 }
