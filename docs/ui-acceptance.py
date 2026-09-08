@@ -297,6 +297,15 @@ class Browser:
             raise RuntimeError(f"page threw: {r.get('exceptionDetails', {}).get('text')}")
         return _bidi_value(r["result"])
 
+    async def screenshot(self, path):
+        """Capture the page as a PNG (F-13: one shot from the headless run for
+        the PR, so the design that shipped can be seen before it is run)."""
+        r = await self.cmd("browsingContext.captureScreenshot", {"context": self.ctx})
+        import base64
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(r["data"]))
+        return path
+
     async def wait_for(self, expression, timeout=30, what=None):
         """Poll a JS expression until it is truthy, the way a user waits."""
         deadline = time.time() + timeout
@@ -449,12 +458,22 @@ async def _page_flow(launch_url, email, password, server, remote_name, local_nam
         except SystemExit:
             st = await b.eval("document.getElementById('status').textContent")
         check("F-2 the exit code is one line of status above the table", st == "the shell exited (0)", st)
-        row = await b.wait_for(f"(() => {{ const b = document.querySelector('button[data-attach={json.dumps(local_name)}]'); return b ? b.closest('tr').children[3].textContent : ''; }})()", 30, "the row after the exit")
+        row = await b.wait_for(f"(() => {{ const r = document.querySelector('tr.srow[data-name={json.dumps(local_name)}]'); return r ? r.children[3].textContent : ''; }})()", 30, "the row after the exit")
         check("F-2 the row still says running: shell exit is not stop", row == "running", row)
         await b.eval(f"document.querySelector('button[data-attach={json.dumps(local_name)}]').click()")
         await b.wait_for("document.getElementById('attachnote').textContent.startsWith('attached')", 30, "a second attach")
         check("F-2 the next attach clears the exit status", (await b.eval("document.getElementById('status').textContent")) == "")
         await b.eval("document.getElementById('detach').click()")
+
+        # F-13: one screenshot of the list from this headless run, for the PR.
+        # Not an assertion (so it never shifts the count) — a capture, gated by
+        # an env var, used only when preparing the PR.
+        shot = os.environ.get("NEMR_UI_SCREENSHOT")
+        if shot:
+            try:
+                await b.screenshot(shot)
+            except Exception as e:
+                sys.stderr.write(f"screenshot failed: {e}\n")
 
         # ---- F-12, the only copy: the name typed exactly enables the button; the
         # running session is stopped first; the row is gone afterwards.

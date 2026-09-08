@@ -1158,43 +1158,129 @@ async fn index() -> Response {
 <script src="/assets/addon-fit.js"></script>
 <script src="/assets/addon-web-links.js"></script>
 <style>
-  /* The hidden attribute only works through the browser's default `display:
-     none`, and any author `display` rule on the same element outranks it —
-     so `form.login { display: grid }` kept the register form on screen with
-     hidden set (F-1), and the inline display on the pull and push forms kept
-     both open at once (F-3). Measured in Firefox before this rule existed:
-     hidden=true, computed display=grid. This makes hidden mean hidden. */
+  /* F-13 design pass. One page, three regions (header, the session list as the
+     centrepiece, one bounded panel region), dense and calm. One type scale, one
+     grey ramp, two accents (green for running, amber for a warning or a lease
+     held elsewhere, red only for errors). Everything is served from the binary;
+     nothing is fetched.
+
+     [hidden] must win over any author `display` (F-1/F-3: `hidden` works only
+     through the UA `display:none`, and an author rule outranks it). */
   [hidden] { display: none !important; }
-  body { font: 14px/1.4 system-ui, sans-serif; margin: 0; background: #f6f7f8; color: #1a1a1a; }
-  header { display: flex; align-items: baseline; gap: 1rem; padding: .75rem 1.25rem; background: #fff; border-bottom: 1px solid #ddd; }
-  header h1 { font-size: 1.1rem; margin: 0; }
-  header .who { margin-left: auto; color: #555; }
-  main { max-width: 64rem; margin: 1.5rem auto; padding: 0 1.25rem; }
-  form.login { max-width: 22rem; display: grid; gap: .6rem; background: #fff; border: 1px solid #ddd; padding: 1.25rem; border-radius: 6px; }
-  label { display: grid; gap: .2rem; color: #444; }
-  input { font: inherit; padding: .4rem .5rem; border: 1px solid #bbb; border-radius: 4px; }
-  button { font: inherit; padding: .4rem .8rem; border: 1px solid #888; border-radius: 4px; background: #fff; cursor: pointer; }
-  button.primary { background: #1a1a1a; color: #fff; border-color: #1a1a1a; }
-  table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #ddd; }
-  th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid #eee; white-space: nowrap; }
-  th { font-weight: 600; color: #444; background: #fafafa; }
-  .muted { color: #777; }
-  .warn { color: #8a4b00; }
-  .bad { color: #a40000; }
-  .pill { display: inline-block; padding: 0 .45rem; border-radius: 999px; border: 1px solid #bbb; font-size: .85em; }
-  .pill.both { border-color: #2a7; color: #186; }
-  .pill.remote { border-color: #58c; color: #269; }
-  .pill.local { border-color: #999; color: #555; }
-  .toolbar { display: flex; gap: .6rem; align-items: center; margin: 0 0 .8rem; }
-  .toolbar .note { color: #777; margin-left: auto; }
-  #status { min-height: 1.4em; margin: .8rem 0; }
-  #termwrap { margin-top: 1rem; background: #000; padding: .5rem; border-radius: 6px; }
-  #term { height: 60vh; }
+  :root {
+    --fg: #16181d; --muted: #6b7280; --faint: #9aa1ab;
+    --line: #e3e6ea; --line-strong: #cfd4da;
+    --bg: #f4f5f7; --panel: #ffffff; --raise: #fafbfc;
+    --ink: #16181d; --run: #1a7f4b; --warn: #9a5b00; --bad: #b3261e;
+    --accent: #16181d;
+    --s0: 12px; --s1: 13px; --s2: 15px; --s3: 19px;
+    --radius: 7px;
+  }
+  * { box-sizing: border-box; }
+  body { font: var(--s1)/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: var(--bg); color: var(--fg); }
+  code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  header {
+    display: flex; align-items: center; gap: .9rem;
+    padding: .6rem 1.1rem; background: var(--panel); border-bottom: 1px solid var(--line-strong);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: var(--s2); font-weight: 650; letter-spacing: .02em; margin: 0; }
+  header .who { margin-left: auto; color: var(--muted); font-size: var(--s0); text-align: right; line-height: 1.25; }
+  header .who .acct { color: var(--fg); }
+  header .who .srv { color: var(--faint); }
+
+  main { max-width: 68rem; margin: 1.1rem auto; padding: 0 1.1rem 3rem; }
+
+  /* The status line: always the same place, a slim bar under the header. */
+  #status { min-height: 1.5em; margin: 0 0 1rem; padding: .45rem .7rem; font-size: var(--s0);
+            color: var(--muted); background: var(--raise); border: 1px solid var(--line); border-radius: var(--radius); }
+  #status.bad { color: var(--bad); border-color: #ecccc9; background: #fdf3f2; }
+  #status.warn { color: var(--warn); border-color: #eaddc2; background: #fdf8ef; }
+  #status:empty { visibility: hidden; }
+
+  /* The logged-out page: one centred card. */
+  .login { max-width: 23rem; margin: 3.5rem auto; display: grid; gap: .65rem;
+           background: var(--panel); border: 1px solid var(--line-strong); padding: 1.4rem; border-radius: var(--radius);
+           box-shadow: 0 1px 2px rgba(16,24,40,.04); }
+  .login h2 { font-size: var(--s3); font-weight: 600; margin: 0 0 .2rem; }
+  label { display: grid; gap: .25rem; color: var(--muted); font-size: var(--s0); }
+  input, select { font: inherit; font-size: var(--s1); padding: .42rem .55rem; border: 1px solid var(--line-strong);
+                  border-radius: 5px; background: #fff; color: var(--fg); }
+  input:focus, select:focus, button:focus-visible { outline: 2px solid #b9c2cf; outline-offset: 1px; }
+
+  button { font: inherit; font-size: var(--s0); padding: .38rem .7rem; border: 1px solid var(--line-strong);
+           border-radius: 5px; background: #fff; color: var(--fg); cursor: pointer; }
+  button:hover { background: var(--raise); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.primary:hover { background: #000; }
+  /* A subdued, text-only button — for remove, which names its own case. */
+  button.linkish { border-color: transparent; background: transparent; color: var(--muted); padding: .38rem .4rem; }
+  button.linkish:hover { color: var(--bad); background: transparent; text-decoration: underline; }
+
+  .toolbar { display: flex; gap: .55rem; align-items: center; margin: 0 0 .7rem; }
+  .toolbar h2 { font-size: var(--s2); font-weight: 600; margin: 0; }
+  .toolbar .spacer { margin-left: auto; }
+  .toolbar .note { color: var(--faint); font-size: var(--s0); }
+
+  /* The E-21 machine-state line: amber, like a lease held elsewhere, and the
+     one place that says the remedy. Not a result — those go to #status. */
+  #loginline { margin: 0 0 .7rem; padding: .5rem .7rem; font-size: var(--s0);
+               color: var(--warn); background: #fdf8ef; border: 1px solid #eaddc2; border-radius: var(--radius); }
+
+  .tablewrap { overflow-x: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--panel); }
+  table { width: 100%; border-collapse: collapse; font-size: var(--s1); }
+  th, td { text-align: left; padding: .5rem .65rem; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: middle; }
+  td.wrap, th.wrap { white-space: normal; }
+  tr:last-child td { border-bottom: 0; }
+  th { font-size: var(--s0); font-weight: 600; color: var(--muted); background: var(--raise); text-transform: uppercase; letter-spacing: .03em; }
+  tr.srow td { border-bottom: 0; padding-bottom: .2rem; }
+  tr.arow td { padding: .2rem .65rem .6rem 1.3rem; white-space: normal; }
+  tr.arow td.actions { text-align: left; }
+  td.actions button { margin: .1rem .4rem .1rem 0; }
+  tr.srow:not(:first-child) td { border-top: 1px solid var(--line); padding-top: .55rem; }
+  .muted { color: var(--muted); }
+  .warn { color: var(--warn); }
+  .bad { color: var(--bad); }
+  /* State as a dot + word: green running, grey stopped, blue not-here. */
+  .state { display: inline-flex; align-items: center; gap: .4rem; }
+  .dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--faint); flex: none; }
+  .dot.run { background: var(--run); }
+  .dot.stop { background: var(--faint); }
+  .dot.remote { background: #3b74c4; }
+  .pill { display: inline-block; padding: .02rem .45rem; border-radius: 999px; border: 1px solid var(--line-strong);
+          font-size: var(--s0); color: var(--muted); }
+  .pill.both { border-color: #9fd6bb; color: var(--run); }
+  .pill.remote { border-color: #b7cdec; color: #2c5aa0; }
+  .pill.local { border-color: var(--line-strong); color: var(--muted); }
+
+  /* One bounded panel region below the list: the job/forms, or the terminal.
+     A left rule marks it as "the thing you are doing". At most one is open. */
+  #job, #attach { margin-top: 1rem; background: var(--panel); border: 1px solid var(--line-strong);
+                  border-left: 3px solid var(--accent); border-radius: var(--radius); padding: .9rem 1rem; }
+  #job form, #removeform, #createform, #pullform, #pushform { display: grid; gap: .6rem; max-width: 34rem; }
+  #jobtitle, #attachtitle { font-size: var(--s2); font-weight: 600; }
+  #joblog { margin: .3rem 0 0; white-space: pre-wrap; font-size: var(--s0); color: var(--muted); max-height: 12rem; overflow: auto; }
+  .checkline { display: flex; gap: .45rem; align-items: center; color: var(--muted); font-size: var(--s0); }
+  .checkline input { width: auto; }
+  .cardform { display: grid; gap: .6rem; }
+  #signin { margin: 0 0 .6rem; padding: .5rem .7rem; font-size: var(--s0); color: var(--warn);
+            background: #fdf8ef; border: 1px solid #eaddc2; border-radius: var(--radius); }
+  #signinurl { word-break: break-all; }
+
+  /* The terminal fills the viewport height (never fewer than ~24 rows); a form
+     or the job log sizes to content, and the list scrolls under it. */
+  #attach .bar { display: flex; align-items: center; gap: .7rem; margin: 0 0 .5rem; }
+  #attach .bar .note { color: var(--faint); font-size: var(--s0); }
+  #attach .bar .spacer { margin-left: auto; }
+  #termwrap { background: #0b0d10; padding: .55rem; border-radius: 6px; }
+  #term { height: max(26rem, calc(100vh - 15rem)); }
 </style>
 <header><h1>nemr</h1><span class="who" id="who"></span><button id="logout" hidden>log out</button></header>
 <main>
   <div id="status">connecting…</div>
   <form class="login" id="login" hidden>
+    <h2>Log in</h2>
     <label>server <input name="server" autocomplete="url"></label>
     <label>email <input name="email" type="email" autocomplete="username" required></label>
     <label>password <input name="password" type="password" autocomplete="current-password" required></label>
@@ -1203,6 +1289,7 @@ async fn index() -> Response {
     <div class="muted">No account yet? <a href="#" id="to-register">register</a></div>
   </form>
   <form class="login" id="register" hidden>
+    <h2>Create an account</h2>
     <label>server <input name="server" autocomplete="url"></label>
     <label>email <input name="email" type="email" autocomplete="username" required></label>
     <label>password <input name="password" type="password" autocomplete="new-password" required></label>
@@ -1214,16 +1301,16 @@ async fn index() -> Response {
     <div><strong>Your recovery code</strong> — the ONLY way back in if you forget your password:</div>
     <pre id="code" style="font-size:1.2em;user-select:all"></pre>
     <div class="muted">Store it now (password manager, paper — not this machine). A forgotten password with no recovery code means your data is unrecoverable, permanently: the server cannot read it.</div>
-    <form id="confirm" style="display:grid;gap:.6rem">
+    <form id="confirm" class="cardform">
       <label>type the code back to confirm you stored it <input name="code" autocomplete="off" required></label>
       <button class="primary" type="submit">confirm</button>
     </form>
     <div class="warn" id="abandon"></div>
   </section>
   <section id="list" hidden>
-    <div class="toolbar"><button id="refresh">refresh</button><button id="create" class="primary">create session</button><span class="note" id="localnote"></span></div>
-    <div id="loginline" class="warn" hidden>No Claude login on this machine yet — attach a session and run <code>/login</code> in it; the login is written to this machine and stays here.</div>
-    <table><thead><tr><th>session</th><th>agent</th><th>where</th><th>state</th><th>size</th><th>updated</th><th>last machine</th><th>open on</th><th></th></tr></thead><tbody id="rows"></tbody></table>
+    <div class="toolbar"><h2>Sessions</h2><span class="spacer"></span><button id="create" class="primary">create session</button><button id="refresh">refresh</button><span class="note" id="localnote"></span></div>
+    <div id="loginline" hidden>No Claude login on this machine yet — attach a session and run <code>/login</code> in it; the login is written to this machine and stays here.</div>
+    <div class="tablewrap"><table><thead><tr><th>session</th><th>agent</th><th>where</th><th>state</th><th>size</th><th>updated</th><th>last machine</th><th>held by</th></tr></thead><tbody id="rows"></tbody></table></div>
     <section id="job" class="login" style="max-width:40rem;margin-top:1rem" hidden>
       <div><strong id="jobtitle"></strong></div>
       <form id="pullform" style="display:grid;gap:.6rem" hidden>
@@ -1252,8 +1339,8 @@ async fn index() -> Response {
       <div id="jobresult"></div>
     </section>
     <section id="attach" hidden>
-      <div class="toolbar" style="margin-top:1rem"><strong id="attachtitle"></strong><span class="note" id="attachnote"></span><button id="detach">detach</button></div>
-      <div id="signin" hidden>Sign in: open <a id="signinlink" href="#" target="_blank" rel="noopener"></a> in your browser, then paste the code it shows into the terminal. <span class="muted">The URL as Claude Code printed it:</span> <code id="signinurl" style="user-select:all;word-break:break-all"></code></div>
+      <div class="bar"><strong id="attachtitle"></strong><span class="note" id="attachnote"></span><span class="spacer"></span><button id="detach">detach</button></div>
+      <div id="signin" hidden>Sign in: open <a id="signinlink" href="#" target="_blank" rel="noopener"></a> in your browser, then paste the code it shows into the terminal. <span class="muted">The URL as Claude Code printed it:</span> <code id="signinurl" style="user-select:all">&nbsp;</code></div>
       <div id="termwrap"><div id="term"></div></div>
     </section>
   </section>
@@ -1315,10 +1402,13 @@ async fn index() -> Response {
     if (!r.ok) { const e = await r.json().catch(() => ({})); status('could not list sessions: ' + (e.error || r.status), 'bad'); return; }
     const d = await r.json();
     const rows = $('rows'); rows.innerHTML = '';
-    if (!d.rows.length) rows.innerHTML = '<tr><td colspan="9" class="muted">no sessions anywhere. Create one with the button above.</td></tr>';
+    if (!d.rows.length) rows.innerHTML = '<tr><td colspan="8" class="muted">no sessions anywhere. Create one with the button above.</td></tr>';
     fillCreateOptions(d.create_options);
     for (const s of d.rows) {
-      const state = s.where === 'remote' ? '<span class="muted">not here</span>' : s.running ? 'running' : 'stopped';
+      const state = s.where === 'remote'
+        ? '<span class="state"><span class="dot remote"></span>not here</span>'
+        : s.running ? '<span class="state"><span class="dot run"></span>running</span>'
+                    : '<span class="state"><span class="dot stop"></span>stopped</span>';
       let open = '<span class="muted">-</span>';
       if (s.held_by) open = s.held_by === d.this_machine ? 'this machine' : '<span class="warn">' + esc(s.held_by) + '</span>';
       let action = '';
@@ -1327,8 +1417,14 @@ async fn index() -> Response {
       else if (!s.running) action = '<button data-start="' + esc(s.name) + '">start</button> <button data-push="' + esc(s.name) + '">push</button>';
       else action = '<button data-attach="' + esc(s.name) + '">attach</button> <button data-push="' + esc(s.name) + '">stop &amp; push</button>';
       // F-12: remove from THIS machine; the button says which case it is.
-      if (s.where !== 'remote') action += ' <button data-remove="' + esc(s.name) + '" data-bundle="' + (s.has_bundle ? '1' : '0') + '" data-running="' + (s.running ? '1' : '0') + '">' + (s.has_bundle ? 'remove from this machine' : 'remove the only copy') + '</button>';
-      rows.insertAdjacentHTML('beforeend', '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.agent) + '</td><td><span class="pill ' + esc(s.where) + '">' + esc(s.where) + '</span></td><td>' + state + '</td><td>' + human(s.size_bytes) + '</td><td>' + ago(s.updated_at_unix) + '</td><td>' + esc(s.last_machine || '-') + '</td><td>' + open + '</td><td>' + action + '</td></tr>');
+      if (s.where !== 'remote') action += ' <button class="linkish" data-remove="' + esc(s.name) + '" data-bundle="' + (s.has_bundle ? '1' : '0') + '" data-running="' + (s.running ? '1' : '0') + '">' + (s.has_bundle ? 'remove from this machine' : 'remove the only copy') + '</button>';
+      // The session's data on one row, then its actions on their own row
+      // beneath (grouped, fixed order) — so a long remove label never widens
+      // the table (F-13). The data row carries data-name so the acceptance can
+      // read a session's state from its own row regardless of the actions row.
+      rows.insertAdjacentHTML('beforeend',
+        '<tr class="srow" data-name="' + esc(s.name) + '"><td>' + esc(s.name) + '</td><td>' + esc(s.agent) + '</td><td><span class="pill ' + esc(s.where) + '">' + esc(s.where) + '</span></td><td>' + state + '</td><td>' + human(s.size_bytes) + '</td><td class="wrap">' + ago(s.updated_at_unix) + '</td><td class="wrap">' + esc(s.last_machine || '-') + '</td><td class="wrap">' + open + '</td></tr>' +
+        '<tr class="arow"><td colspan="8" class="actions">' + action + '</td></tr>');
     }
     // E-21: the credential is a fact about this machine; any local row carries it.
     window.nemrRows = d.rows; // read by the acceptance as evidence when a check fails
