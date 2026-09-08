@@ -27,14 +27,6 @@ use anyhow::{bail, Context, Result};
 const HOST_CREDENTIAL_DIR_RELATIVE: &str = ".local/share/nemr/host-credential";
 const CREDENTIALS_FILE_NAME: &str = ".credentials.json";
 
-/// The host directory that predates F-14 (`~/.claude`), where a login used to
-/// live. An existing login there is inherited once into the dedicated
-/// directory (a host-local copy; the credential never travels — D-02), so a
-/// machine that logged in before F-14 keeps its session login.
-fn legacy_host_credentials_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude").join(CREDENTIALS_FILE_NAME))
-}
-
 /// Locate the host's Claude Code credentials.
 ///
 /// # Why a single file rather than the whole `~/.claude` directory
@@ -82,13 +74,6 @@ pub fn host_credential_dir() -> Result<PathBuf> {
         .to_path_buf())
 }
 
-/// Whether the path is being overridden by the test seam.
-fn under_seam() -> bool {
-    std::env::var_os("NEMR_HOST_CREDENTIALS")
-        .filter(|v| !v.is_empty())
-        .is_some()
-}
-
 /// The placeholder the engine writes where a host has no credential yet
 /// (E-21, ruled 2026-09-08): a regular 0600 file in a shape this build
 /// recognises as "no login yet" — never as expired, never as blank — so a
@@ -108,6 +93,12 @@ fn under_seam() -> bool {
 pub const PLACEHOLDER: &str = r#"{"claudeAiOauth":{"_nemr_placeholder":"no Claude login on this machine yet — attach a session and run /login; the login stays on this machine (D-02, E-21, F-10)"}}"#;
 
 const MARKER: &str = "_nemr_placeholder";
+
+/// Serializes the unit tests that mutate process-wide environment (`HOME`,
+/// `NEMR_HOST_CREDENTIALS`); without it one test's `set_var` races another's
+/// read of the same globals (the F-71 lesson, for env instead of the state dir).
+#[cfg(test)]
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The marker, at the top level or inside `claudeAiOauth`.
 fn has_marker(v: &serde_json::Value) -> bool {
@@ -262,33 +253,13 @@ pub fn ensure_host_credential_file() -> Result<PathBuf> {
     if path.exists() {
         return Ok(path);
     }
-    // AUTH-02, preserved across F-14's relocation: a machine that logged in
-    // before F-14 has its credential at `~/.claude/.credentials.json`. Inherit
-    // it once, here, by a host-local copy — the credential never leaves the
-    // machine, so D-02 holds. Never under the test seam (which must produce a
-    // machine with no login), and never a placeholder.
-    if !under_seam() {
-        if let Some(legacy) = legacy_host_credentials_path() {
-            if legacy != path {
-                if let Ok(text) = std::fs::read_to_string(&legacy) {
-                    if !is_placeholder(&text) {
-                        let mut f = std::fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .mode(0o600)
-                            .open(&path)
-                            .with_context(|| {
-                                format!("inheriting the login into {}", path.display())
-                            })?;
-                        f.write_all(text.as_bytes()).with_context(|| {
-                            format!("writing the inherited login to {}", path.display())
-                        })?;
-                        return Ok(path);
-                    }
-                }
-            }
-        }
-    }
+    // No inheritance from the host's own `~/.claude` (E-21, reaffirmed by the
+    // Product Owner 2026-09-08): a credential is never copied. A second holder
+    // of one refresh token invalidates the first the moment either rotates
+    // (E-13), so nemr's login is nemr's — separate from the host's own claude.
+    // A machine that logged in before F-14 starts from the placeholder and
+    // runs `/login` once, like any device (D-02).
+    //
     // create_new: never truncate a file that appeared between the check and
     // the write (a login landing at that moment).
     match std::fs::OpenOptions::new()
@@ -610,6 +581,63 @@ pub fn check_permissions(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-14, reaffirmed 2026-09-08: nemr never inherits the host's own
+    /// `~/.claude` login. A machine that logged in before F-14 — a real
+    /// credential sitting at `~/.claude/.credentials.json` — still comes up as
+    /// *no login yet*: the dedicated directory gets the placeholder, not a copy
+    /// (E-13: a second holder of one refresh token invalidates the first).
+    #[test]
+    fn a_pre_f14_host_login_is_not_inherited_and_the_machine_reads_no_login_yet() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_home = std::env::var_os("HOME");
+        let saved_seam = std::env::var_os("NEMR_HOST_CREDENTIALS");
+        std::env::remove_var("NEMR_HOST_CREDENTIALS");
+        let home = std::env::temp_dir().join(format!("nemr-f14-nohc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        // The pre-F14 host: a real login at ~/.claude/.credentials.json.
+        let legacy_dir = home.join(".claude");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy = legacy_dir.join(".credentials.json");
+        std::fs::write(
+            &legacy,
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-real","refreshToken":"sk-ant-ort01-real","expiresAt":1800003600000}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::env::set_var("HOME", &home);
+
+        let path = ensure_host_credential_file().unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+
+        // Restore the environment before asserting, so a failure cannot leak it.
+        match saved_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        if let Some(seam) = saved_seam {
+            std::env::set_var("NEMR_HOST_CREDENTIALS", seam);
+        }
+
+        assert!(
+            path.ends_with(".local/share/nemr/host-credential/.credentials.json"),
+            "the credential lives in the dedicated directory, not ~/.claude: {path:?}"
+        );
+        assert!(
+            is_placeholder(&contents),
+            "a pre-F14 host must come up as NO LOGIN YET — the ~/.claude login is not inherited: {contents}"
+        );
+        assert!(
+            !contents.contains("sk-ant-oat01-real"),
+            "the real ~/.claude login must not have been copied in"
+        );
+        // The host's own login is left exactly as it was.
+        assert!(std::fs::read_to_string(&legacy)
+            .unwrap()
+            .contains("sk-ant-oat01-real"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn credentials_path_is_the_dedicated_dir_under_home() {
@@ -1045,6 +1073,8 @@ mod e21_tests {
     #[test]
     fn the_placeholder_is_written_once_and_never_over_a_file() {
         use std::os::unix::fs::PermissionsExt;
+        let _guard = super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_seam = std::env::var_os("NEMR_HOST_CREDENTIALS");
         let base = std::env::temp_dir().join(format!("nemr-e21-unit-b-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -1078,5 +1108,9 @@ mod e21_tests {
         assert!(host_credentials_path()
             .unwrap()
             .ends_with(".local/share/nemr/host-credential/.credentials.json"));
+        // Restore the seam the test found, so it cannot leak to another test.
+        if let Some(seam) = saved_seam {
+            std::env::set_var("NEMR_HOST_CREDENTIALS", seam);
+        }
     }
 }
