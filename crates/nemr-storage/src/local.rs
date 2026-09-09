@@ -177,6 +177,43 @@ impl ObjectStore for LocalStore {
         Ok(())
     }
 
+    /// Read the object off disk in chunks, so answering a download for a
+    /// multi-gigabyte bundle costs a chunk of memory rather than the object
+    /// (F-16).
+    async fn get_stream(&self, key: &ObjectKey) -> Result<(u64, crate::ByteStream)> {
+        use tokio::io::AsyncReadExt as _;
+
+        const CHUNK: usize = 1024 * 1024;
+        let path = self.path_for(key)?;
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|e| Self::map_io("get", key, e))?;
+        let size = file
+            .metadata()
+            .await
+            .map_err(|e| Self::map_io("get", key, e))?
+            .len();
+        let key = key.clone();
+        // `None` ends the stream: a read error is yielded once and then the
+        // stream stops, rather than being retried forever by the consumer.
+        let stream = futures::stream::unfold(Some(file), move |state| {
+            let key = key.clone();
+            async move {
+                let mut file = state?;
+                let mut buffer = vec![0u8; CHUNK];
+                match file.read(&mut buffer).await {
+                    Ok(0) => None,
+                    Ok(n) => {
+                        buffer.truncate(n);
+                        Some((Ok(bytes::Bytes::from(buffer)), Some(file)))
+                    }
+                    Err(e) => Some((Err(Self::map_io("get", &key, e)), None)),
+                }
+            }
+        });
+        Ok((size, Box::pin(stream)))
+    }
+
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
         let path = self.path_for(key)?;
         match tokio::fs::remove_file(&path).await {

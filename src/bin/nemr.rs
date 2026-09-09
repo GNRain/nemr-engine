@@ -245,24 +245,36 @@ fn parse_size(input: &str) -> Result<VolumeSize, String> {
 
 use nemr_engine::interactive::{decide, Resolution};
 
+/// A directory basename as a session name: lowercased, every run of anything
+/// else collapsed to one `-`, and the leading and trailing `-` trimmed.
+///
+/// One function because there are two callers — the `create` prompt's
+/// suggestion and `add`'s derived name — and they were not the same: without
+/// the trim, a folder whose name starts with a dot (`.claude`, `.config`)
+/// derived `-claude`, which the engine's `[a-z0-9][a-z0-9-]*` rule rejects, so
+/// `nemr add .claude` failed deep in the daemon with a validation error instead
+/// of defaulting to something usable. It also matches what the page's panel
+/// fills in for the same folder.
+fn name_from_basename(base: &str) -> String {
+    let mut out = String::with_capacity(base.len());
+    for c in base.to_ascii_lowercase().chars() {
+        if c.is_ascii_alphanumeric() || c == '-' {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
 /// A name suggested from the current directory — the common case is that the
 /// project you want is named after where you are.
 fn name_from_cwd() -> Option<String> {
     let raw = std::env::current_dir().ok()?;
-    let base = raw.file_name()?.to_string_lossy().to_ascii_lowercase();
+    let base = raw.file_name()?.to_string_lossy().into_owned();
     // Only offer it if it is already a valid project name; never silently
     // mangle a directory name into something that only half resembles it.
-    let cleaned: String = base
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let cleaned = cleaned.trim_matches('-').to_string();
+    let cleaned = name_from_basename(&base);
     (nemr_engine::engine::volume::validate_name(&cleaned).is_ok()).then_some(cleaned)
 }
 
@@ -730,19 +742,15 @@ async fn main() -> Result<()> {
                 None => {
                     let base = source
                         .file_name()
-                        .map(|s| s.to_string_lossy().to_lowercase())
+                        .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    let derived: String = base
-                        .chars()
-                        .map(|c| {
-                            if c.is_ascii_alphanumeric() || c == '-' {
-                                c
-                            } else {
-                                '-'
-                            }
-                        })
-                        .collect();
-                    resolve_name(Some(derived).filter(|s| !s.is_empty()), interactive)?
+                    let derived = name_from_basename(&base);
+                    // Offer it only if it is actually a name the engine accepts;
+                    // otherwise ask (or say --name is required), rather than
+                    // sending a name that fails validation in the daemon.
+                    let usable = Some(derived)
+                        .filter(|s| nemr_engine::engine::volume::validate_name(s).is_ok());
+                    resolve_name(usable, interactive)?
                 }
             };
             let size = resolve_size(size, interactive)?;
@@ -804,6 +812,19 @@ async fn main() -> Result<()> {
                     eprintln!(
                         "  excluded:  anything .gitignore ignores, and target/ and node_modules/"
                     );
+                    if plan.git_dir_external {
+                        eprintln!(
+                            "  note:      this is a git worktree or submodule — its git directory \
+                             lives outside"
+                        );
+                        eprintln!(
+                            "             the folder, so only the .git marker travels and the \
+                             session will not"
+                        );
+                        eprintln!(
+                            "             be a working git repository (no history, no commits)."
+                        );
+                    }
                 } else {
                     eprintln!("  excluded:  target/ and node_modules/ (not a git repo — nothing else is ignored)");
                 }
@@ -855,6 +876,17 @@ async fn main() -> Result<()> {
                         String::new()
                     }
                 );
+                if summary.history_lines_corrupt > 0 {
+                    println!(
+                        "  note:      {} line(s) in those transcripts do not parse as JSON and \
+                         were copied as they are",
+                        summary.history_lines_corrupt
+                    );
+                    println!(
+                        "             (they are not a torn last write, so they were not dropped \
+                         — the host's copy has them too)"
+                    );
+                }
             } else {
                 println!("  history:   none found for this directory (a fresh session)");
             }
@@ -1570,4 +1602,37 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `nemr add <dir>` derives a session name from the folder, and the derived
+    /// name has to be one the engine accepts: `[a-z0-9][a-z0-9-]*`. Mapping
+    /// every other character to `-` without trimming produced `-claude` for
+    /// `.claude`, which the daemon then rejected — a default that cannot work.
+    /// The page's panel derives the same way, so both offer the same name.
+    #[test]
+    fn a_folder_name_becomes_a_name_the_engine_accepts() {
+        for (folder, expected) in [
+            ("nemr-engine", "nemr-engine"),
+            ("My Project", "my-project"),
+            (".claude", "claude"),
+            ("_scratch_", "scratch"),
+            ("a..b", "a-b"),
+            ("Ünicode", "nicode"),
+        ] {
+            let derived = name_from_basename(folder);
+            assert_eq!(derived, expected, "deriving from {folder:?}");
+            assert!(
+                nemr_engine::engine::volume::validate_name(&derived).is_ok(),
+                "{folder:?} derived {derived:?}, which the engine refuses"
+            );
+        }
+        // Nothing usable is left: the caller must ask or require --name rather
+        // than send an invalid one.
+        assert_eq!(name_from_basename("..."), "");
+        assert_eq!(name_from_basename("—"), "");
+    }
 }

@@ -27,7 +27,29 @@ pub trait DynStore: Send + Sync {
     async fn get(&self, key: &ObjectKey) -> Result<Vec<u8>>;
     async fn put(&self, key: &ObjectKey, bytes: &[u8]) -> Result<()>;
     /// F-16: store an object by streaming it from a staged file.
-    async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> Result<()>;
+    ///
+    /// Defaulted, like [`ObjectStore::put_file`] and for the same reason: the
+    /// real backends override it through the forwarding macro below, and a test
+    /// double that only needs `list` to fail should not have to implement the
+    /// streaming paths — a required method here breaks every double in the tree
+    /// the day it is added.
+    async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> Result<()> {
+        let bytes = tokio::fs::read(path).await.map_err(|e| {
+            nemr_storage::StorageError::Other(
+                anyhow::Error::from(e).context("reading the staged object"),
+            )
+        })?;
+        self.put(key, &bytes).await
+    }
+
+    /// F-16: read an object as a stream of chunks, with its size, so answering
+    /// a download never buffers a multi-gigabyte bundle in the server.
+    async fn get_stream(&self, key: &ObjectKey) -> Result<(u64, nemr_storage::ByteStream)> {
+        let bytes = self.get(key).await?;
+        let size = bytes.len() as u64;
+        let once = futures::stream::once(async move { Ok(bytes::Bytes::from(bytes)) });
+        Ok((size, Box::pin(once)))
+    }
     async fn delete(&self, key: &ObjectKey) -> Result<()>;
     /// Keys under a prefix. The start-up probe lists a prefix no bundle key
     /// can match: a reachable store answers with an empty page, an
@@ -53,6 +75,9 @@ macro_rules! impl_dyn_store {
             }
             async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> Result<()> {
                 ObjectStore::put_file(self, key, path).await
+            }
+            async fn get_stream(&self, key: &ObjectKey) -> Result<(u64, nemr_storage::ByteStream)> {
+                ObjectStore::get_stream(self, key).await
             }
             async fn delete(&self, key: &ObjectKey) -> Result<()> {
                 ObjectStore::delete(self, key).await

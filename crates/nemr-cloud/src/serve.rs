@@ -117,8 +117,7 @@ pub trait UiEngine: EngineOps {
     /// F-12: remove a session from this machine. Never the cloud copy.
     fn delete(&self, name: &str) -> Result<()>;
     /// F-21: what adding `source_dir` would copy — provisions nothing.
-    /// Returns (files, bytes, history_sessions, git_bytes, is_git_repo, source).
-    fn add_plan(&self, source_dir: &str) -> Result<(u64, u64, u64, u64, bool, String)>;
+    fn add_plan(&self, source_dir: &str) -> Result<AddPlan>;
     /// F-21: add an existing host directory as a session.
     fn add(&self, name: &str, size: &str, agent: &str, source_dir: &str)
         -> Result<(u64, u64, u64)>;
@@ -127,6 +126,23 @@ pub trait UiEngine: EngineOps {
         &self,
         start: AttachStart,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AttachLink>> + Send + '_>>;
+}
+
+/// What adding a folder would copy, as the panel shows it before the confirm
+/// (F-21). A struct rather than a tuple: the fields are five numbers and two
+/// flags, and the day one was added in the wrong position nothing would have
+/// caught it.
+#[derive(Debug, Clone)]
+pub struct AddPlan {
+    pub files: u64,
+    pub bytes: u64,
+    pub history_sessions: u64,
+    pub git_bytes: u64,
+    pub is_git_repo: bool,
+    /// The git directory lives outside the folder (worktree or submodule), so
+    /// only the `.git` marker travels.
+    pub git_dir_external: bool,
+    pub source: String,
 }
 
 /// An open attach stream, both directions, as the bridge drives it.
@@ -924,13 +940,14 @@ async fn add_plan(State(state): State<Arc<UiState>>, Json(body): Json<AddPlanBod
     }
     let engine = state.engine.clone();
     match tokio::task::spawn_blocking(move || engine.add_plan(&dir)).await {
-        Ok(Ok((files, bytes, history_sessions, git_bytes, is_git_repo, source))) => Json(json!({
-            "files": files,
-            "bytes": bytes,
-            "history_sessions": history_sessions,
-            "git_bytes": git_bytes,
-            "is_git_repo": is_git_repo,
-            "source": source,
+        Ok(Ok(plan)) => Json(json!({
+            "files": plan.files,
+            "bytes": plan.bytes,
+            "history_sessions": plan.history_sessions,
+            "git_bytes": plan.git_bytes,
+            "is_git_repo": plan.is_git_repo,
+            "git_dir_external": plan.git_dir_external,
+            "source": plan.source,
         }))
         .into_response(),
         Ok(Err(e)) => failed(StatusCode::BAD_REQUEST, e),
@@ -1889,7 +1906,8 @@ async fn index() -> Response {
       '<strong>' + esc(d.source) + '</strong> would travel as ' + human(d.bytes) + ' in ' + d.files + ' file(s)'
       + (d.git_bytes > 0 ? ', including ' + human(d.git_bytes) + ' of .git' : '')
       + '.<br>Excluded: ' + (d.is_git_repo ? 'anything .gitignore ignores, and target/ and node_modules/' : 'target/ and node_modules/ (not a git repo — nothing else is ignored)')
-      + '.<br>' + d.history_sessions + ' Claude Code session transcript(s) come with it. The folder is copied, not moved.';
+      + '.<br>' + d.history_sessions + ' Claude Code session transcript(s) come with it. The folder is copied, not moved.'
+      + (d.git_dir_external ? '<br>This is a git worktree or submodule: its git directory lives outside the folder, so only the .git marker travels and the session will not be a working git repository.' : '');
     $('addconfirm').disabled = false;
     if (!$('addform').elements.sessionname.value) {
       const base = (d.source || '').split('/').filter(Boolean).pop() || '';
@@ -2144,11 +2162,19 @@ mod tests {
             });
             Ok(())
         }
-        fn add_plan(&self, source_dir: &str) -> Result<(u64, u64, u64, u64, bool, String)> {
+        fn add_plan(&self, source_dir: &str) -> Result<AddPlan> {
             if source_dir.contains("missing") {
                 anyhow::bail!("the source directory {source_dir} does not exist");
             }
-            Ok((31, 24_300, 2, 12_000, true, source_dir.to_string()))
+            Ok(AddPlan {
+                files: 31,
+                bytes: 24_300,
+                history_sessions: 2,
+                git_bytes: 12_000,
+                is_git_repo: true,
+                git_dir_external: source_dir.contains("worktree"),
+                source: source_dir.to_string(),
+            })
         }
         fn add(
             &self,

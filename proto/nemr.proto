@@ -94,6 +94,14 @@ message AdoptResponse {
   string source = 9;
   uint64 git_bytes = 10;
   bool is_git_repo = 11;
+  // The git directory lives OUTSIDE the folder (a git worktree checkout or a
+  // submodule): only the `.git` marker travels, so the session will not be a
+  // working repository. Plan-only.
+  bool git_dir_external = 12;
+  // Lines that did not parse and were not a torn tail: carried over as they
+  // are, never dropped. Reported so a summary can say the transcript arrived
+  // with damage the host already had.
+  uint64 history_lines_corrupt = 13;
 }
 
 message StartRequest { string name = 1; }

@@ -5034,6 +5034,112 @@ fn e23_adopt_copies_the_tree_and_history_excludes_the_derived_and_leaves_the_sou
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// E-23: a copy that fails AFTER the session was provisioned must take the
+/// session with it.
+///
+/// The size check refuses an over-quota tree before anything is created, and
+/// that was the whole of the "a refusal must not leave a half-created project"
+/// invariant. But the copy can still fail for something no pre-check sees — a
+/// file that cannot be read, a filesystem that fills, a `.git` that changes
+/// under it — and until this, that left a provisioned, half-populated session
+/// behind whose obvious retry (`nemr add` again) was then refused for a name
+/// that already exists.
+#[test]
+fn e23_a_copy_failure_after_provisioning_leaves_no_half_created_session() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("nemr-e23rb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let source = tmp.join("proj");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("README.md"), "readable").unwrap();
+    std::fs::write(source.join("locked.txt"), "unreadable in a moment").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "-A"],
+        vec!["commit", "-qm", "initial"],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(&args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    // The injected failure: one tracked file the copy cannot read. It is listed
+    // by ls-files and measured by symlink_metadata, so the adoption gets all the
+    // way past provisioning before it fails.
+    use std::os::unix::fs::PermissionsExt as _;
+    let locked = source.join("locked.txt");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&locked).is_ok() {
+        // Running as a user that ignores the mode (root): there is no failure to
+        // inject, and asserting one would fail for the wrong reason.
+        eprintln!("SKIP: this user can read a 0o000 file, so no copy failure can be injected");
+        let _ = std::fs::remove_dir_all(&tmp);
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let _ = project::stop(&client, "e23rollback").await;
+        let _ = project::delete(&client, "e23rollback").await;
+    });
+
+    let failed = runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        project::adopt(
+            &client,
+            "e23rollback",
+            nemr_engine::engine::volume::VolumeSize::Small,
+            nemr_engine::engine::agent::Agent::ClaudeCode,
+            &source,
+        )
+        .await
+    });
+    let err = failed.expect_err("a file that cannot be copied must fail the adoption");
+    assert!(
+        format!("{err:#}").contains("was removed"),
+        "the failure says the half-created session was taken back down: {err:#}"
+    );
+
+    // The session is gone: no volume image, and the name is free to retry.
+    let image = nemr_engine::engine::volume::VolumePaths::from_env()
+        .unwrap()
+        .image_file("e23rollback");
+    assert!(
+        !image.exists(),
+        "a failed adoption must not leave {} behind",
+        image.display()
+    );
+    let exists = runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        client
+            .container_exists(&nemr_engine::config::container_id("e23rollback"))
+            .await
+            .expect("container_exists")
+    });
+    assert!(
+        !exists,
+        "a failed adoption must not leave the container record behind — the retry is \
+         refused with ProjectExists for a session that was never usable"
+    );
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// F-15: `add` copies a whole tree, so it says what and how big and asks —
 /// on a terminal. Where a confirmation cannot be drawn or answered (the
 /// acceptance drives the CLI with stderr redirected), it must REFUSE and name

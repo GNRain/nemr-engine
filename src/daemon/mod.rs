@@ -165,9 +165,11 @@ impl Nemr for NemrService {
                 bytes_copied: plan.bytes,
                 history_sessions: plan.history_sessions,
                 history_lines_dropped: 0,
+                history_lines_corrupt: 0,
                 source: plan.source.to_string_lossy().into_owned(),
                 git_bytes: plan.git_bytes,
                 is_git_repo: plan.is_git_repo,
+                git_dir_external: plan.git_dir_external,
             }));
         }
         let size = req
@@ -196,9 +198,11 @@ impl Nemr for NemrService {
             bytes_copied: summary.bytes_copied,
             history_sessions: summary.history_sessions,
             history_lines_dropped: summary.history_lines_dropped,
+            history_lines_corrupt: summary.history_lines_corrupt,
             source: summary.source.to_string_lossy().into_owned(),
             git_bytes: 0,
             is_git_repo: false,
+            git_dir_external: false,
         }))
     }
 

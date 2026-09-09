@@ -5,7 +5,7 @@
 //! holder and fence it holds, so a client that lost the lease cannot write even
 //! if it ignores its own heartbeat failure (D-03).
 
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -269,16 +269,23 @@ pub async fn download(
     let key =
         ObjectKey::new(storage_key).map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
 
-    let bytes = state
+    // F-16: stream the object out. The upload side accepts gigabytes, so the
+    // download side cannot buffer the object to answer — `get` into a `Vec` here
+    // would make every pull of a large bundle an allocation the size of the
+    // bundle, and a handful of concurrent pulls the end of the server.
+    let (size, stream) = state
         .store
-        .get(&key)
+        .get_stream(&key)
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("store get: {e}")))?;
 
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/octet-stream")],
-        bytes,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_LENGTH, size.to_string()),
+        ],
+        Body::from_stream(stream),
     )
         .into_response())
 }

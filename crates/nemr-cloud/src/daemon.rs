@@ -244,16 +244,17 @@ impl crate::serve::UiEngine for DaemonEngine {
     fn delete(&self, name: &str) -> Result<()> {
         self.rt.block_on(Self::delete_project(name))
     }
-    fn add_plan(&self, source_dir: &str) -> Result<(u64, u64, u64, u64, bool, String)> {
+    fn add_plan(&self, source_dir: &str) -> Result<crate::serve::AddPlan> {
         let p = self.rt.block_on(Self::add_plan(source_dir))?;
-        Ok((
-            p.files_copied,
-            p.bytes_copied,
-            p.history_sessions,
-            p.git_bytes,
-            p.is_git_repo,
-            p.source,
-        ))
+        Ok(crate::serve::AddPlan {
+            files: p.files_copied,
+            bytes: p.bytes_copied,
+            history_sessions: p.history_sessions,
+            git_bytes: p.git_bytes,
+            is_git_repo: p.is_git_repo,
+            git_dir_external: p.git_dir_external,
+            source: p.source,
+        })
     }
     fn add(
         &self,
