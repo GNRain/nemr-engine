@@ -28,7 +28,7 @@ PASS=0; FAIL=0
 # Asserted, not merely printed: a run that skipped a case would otherwise say
 # PASS with fewer assertions — the green-over-nothing shape this project keeps
 # guarding against. Raise this when a case is added.
-EXPECTED_ASSERTIONS=37
+EXPECTED_ASSERTIONS=39
 
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS + 1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
@@ -172,8 +172,10 @@ check "$([[ "$esc" == "0" ]] && echo 0 || echo 1)" "a piped run emits no escape 
 # 3. On a terminal it draws, hides the cursor, and gives it back.
 raw="$WORK/pty.raw"
 script -qec './scripts/install.sh --yes' /dev/null >"$raw" 2>&1
-frames="$(grep -c '(")_(")' "$raw" || true)"
-check "$([[ "$frames" -gt 10 ]] && echo 0 || echo 1)" "on a terminal the cat plays ($frames frames drawn)"
+frames="$(grep -c '\*-\*' "$raw" || true)"
+check "$([[ "$frames" -gt 10 ]] && echo 0 || echo 1)" \
+    "on a terminal the cat plays ($frames frames drawn)" \
+    "if this terminal has fewer than $(( $(bash -c '. scripts/lib/cat.sh; _nemr_cat_height') + 2 )) rows the animation is off BY DESIGN"
 hide="$(grep -o $'\033\[?25l' "$raw" | wc -l)"; show="$(grep -o $'\033\[?25h' "$raw" | wc -l)"
 check "$([[ "$hide" -gt 0 && "$hide" == "$show" ]] && echo 0 || echo 1)" \
     "the cursor is hidden and given back the same number of times ($hide/$show)"
@@ -188,9 +190,16 @@ for way in "NO_COLOR=1" "TERM=dumb" "--quiet"; do
     else
         script -qec "env $way ./scripts/install.sh --yes" /dev/null >"$WORK/off.raw" 2>&1
     fi
-    n="$(grep -c '(")_(")' "$WORK/off.raw" || true)"
+    n="$(grep -c '\*-\*' "$WORK/off.raw" || true)"
     check "$([[ "$n" == "0" ]] && echo 0 || echo 1)" "$way draws nothing" "$n frames"
 done
+
+# 4b. A terminal too short to hold the drawing: nothing, rather than a block
+#     that scrolls and leaves the cursor arithmetic walking over the step lines.
+script -qec 'stty rows 10 2>/dev/null; ./scripts/lib/cat.sh --demo 1' /dev/null >"$WORK/short.raw" 2>&1
+n="$(grep -c '\*-\*' "$WORK/short.raw" || true)"
+check "$([[ "$n" == "0" ]] && echo 0 || echo 1)" \
+    "a terminal too short for the drawing gets no animation at all" "$n frames"
 
 # 5. Interrupted, it leaves no hidden cursor and no half a cat.
 script -qec './scripts/lib/cat.sh --demo 20' /dev/null >"$WORK/int.raw" 2>&1 &
@@ -225,11 +234,20 @@ frames_out="$(./scripts/lib/cat.sh --show)"
 n_frames="$(grep -c '^frame ' <<<"$frames_out")"
 check "$([[ "$n_frames" == "4" ]] && echo 0 || echo 1)" "four frames" "$n_frames"
 widest="$(awk '{ if (length($0) > m) m = length($0) } END { print m }' <<<"$frames_out")"
-check "$([[ "$widest" -le 40 ]] && echo 0 || echo 1)" "no frame is wider than 40 columns ($widest)"
+check "$([[ "$widest" -le 78 ]] && echo 0 || echo 1)" \
+    "no frame is wider than 78 columns, so it renders the same in any 80-column terminal ($widest)"
 LC_ALL=C grep -q '[^ -~]' <<<"$frames_out" && r=1 || r=0
 check $r "plain ASCII only — no wide characters, nothing that renders differently"
-heights="$(awk '/^frame /{if (n) print n; n=0; next} NF{n++} END{print n}' <<<"$frames_out" | sort -u | tr '\n' ' ')"
-check "$([[ "$heights" == "3 " ]] && echo 0 || echo 1)" "every frame is exactly 3 lines high ($heights)"
+# Same height for every frame, or the redraw walks up the terminal leaving a
+# trail. The number itself is the art's business; that they AGREE is not.
+heights="$(awk '/^frame /{if (n) print n; n=0; next} {n++} END{print n}' <<<"$frames_out" | sort -u | tr '\n' ' ')"
+check "$([[ "$(wc -w <<<"$heights")" == "1" ]] && echo 0 || echo 1)" \
+    "every frame is the same height ($heights lines)"
+# And the drawer moves back by exactly that many lines — the erase is pinned to
+# the art, not to a constant that can drift from it.
+up="$(grep -o $'\033\[[0-9]*A' "$raw" | sort -u | tr -d '\033[A' | tr '\n' ' ')"
+check "$([[ "$(echo $up)" == "$(echo $heights)" ]] && echo 0 || echo 1)" \
+    "the cursor is moved back exactly one frame-height each time (${up}vs ${heights})"
 
 # ---------------------------------------------------------------------------
 printf '\n'

@@ -108,9 +108,12 @@ and `systemctl --user list-unit-files | grep nemr` should all be empty.
 ## The cat
 
 During the long steps — the packages, the build, the image pull, the smoke test
-— a small ASCII cat plays with a cable where a spinner would be. It is drawn by
-a separate process, so the install runs at exactly the same speed with or
-without it; it disappears when the step finishes, leaving only the tick.
+— Nemr plays with a cable where a spinner would be: four frames, 15 lines, 37
+columns of plain ASCII, drawn after the reference you sent. He is drawn by a
+separate process, so the install runs at exactly the same speed with or without
+him; he disappears when the step finishes, leaving only the tick. The cat is
+byte-identical in all four frames — only the cable moves, and his near front
+paw, once per cycle, to bat it.
 
 To see the frames without installing anything:
 
@@ -120,5 +123,6 @@ To see the frames without installing anything:
 ```
 
 If any of these is true, it draws nothing at all and you get only step lines:
-the output is not a terminal, `TERM=dumb`, `NO_COLOR` is set, or `--quiet` was
-passed. Ctrl-C at any point must leave the cursor visible and no cat behind.
+the output is not a terminal, `TERM=dumb`, `NO_COLOR` is set, `--quiet` was
+passed, or the terminal has fewer than 17 rows (too short to hold him without
+scrolling). Ctrl-C at any point must leave the cursor visible and no cat behind.

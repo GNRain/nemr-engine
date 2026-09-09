@@ -3,8 +3,14 @@
 # The install progress animation: Nemr, playing with a cable (D-14).
 #
 # Nemr is the cat this project is named for, and he spent his life doing
-# exactly this. He is honoured by the quality of the thing, so this is small:
-# four frames, three lines, plain ASCII, no dependency, no colour.
+# exactly this. Four frames, 15 lines, 37 columns, plain ASCII, no dependency,
+# no colour.
+#
+# CREDIT. The drawing follows a reference the Product Owner supplied, which is
+# signed "Samamine". It is a redrawing in that cat's pose and idiom, not a
+# lift of a file — but the likeness is deliberate and close, so if this ships
+# beyond the private preview the credit belongs in the README, or the cat
+# should be redrawn from scratch. Raised with the Product Owner (D-14).
 #
 # See the frames without installing anything:
 #
@@ -22,33 +28,107 @@
 #   3. It cleans up after itself — cursor restored, its own lines erased — on
 #      normal exit, on failure, and on Ctrl-C. A killed install must not leave a
 #      hidden cursor or half a cat.
-#   4. It stays small: 4 frames, 3 lines, ASCII only, under 30 columns, so it
-#      renders the same in any 80-column terminal.
+#   4. It stays within one screen: 4 frames, all the same height, ASCII only,
+#      37 columns, so it renders the same in any 80-column terminal — and it
+#      refuses to draw at all in a terminal too short to hold it, where the
+#      cursor arithmetic would scroll and leave a trail of half-cats.
 
-# Frames are 3 lines each, separated by a line of "%%". The cat is fixed; the
-# cable is what moves — lying at paw level, then flicked up into an arc, with
-# the wave travelling left each frame. His eye follows it up.
+# Nemr, sitting, with a cable swinging past his paw.
+#
+# The drawing follows a reference the Product Owner sent (an ASCII-art cat
+# signed "Samamine"): same pose, same sparse dotted-outline idiom, same
+# character vocabulary — ears and the `)` inner ear, one `o` eye under its brow
+# bar, the back sloping down to the rump, the tail curling forward, three
+# `*-*` paw clusters on the floor. See the note above about crediting it.
+#
+# Frames are separated by a line of "%%" and are all the same height (the
+# drawer reads the height from the art). The CAT IS BYTE-IDENTICAL in all four
+# frames: only the cable's free end moves, and the near front paw, once per
+# cycle. The cable swings as a pendulum — out to the left with its tip lifted
+# (1), down through the bottom of the arc trailing left (2), out to the right
+# where the paw comes off the floor to meet it (3), and back down through the
+# bottom trailing right (4). Both extremes lift the tip by the same amount, so
+# the cable never appears to stretch.
 _nemr_cat_frames() {
     cat <<'FRAMES'
-   /\_/\
-  ( o.o )
-  (")_(")_.-~-._.-~-._
+            _
+            \`*-.
+             )  _`-.
+            .  : `. .
+`-._        : _   '  \
+    `-.\    ; o` _.   `*-._
+        |   `-.-'          `-.
+        |     ;       `       `.
+        /     :.       .        \
+       /      . \  .   :   .-'   .
+      /       '  `+.;  ;  '      :
+     |        :  '  |    ;       ;-.
+     _)       ; '   : :`-:     _.`* ;
+             /  .*' ; .*`- +'  `*'
+            *-*   `*-*  `*-*'
 %%
-   /\_/\    _.-~-.
-  ( o.O )_-'       `-._
-  (")_(")
+            _
+            \`*-.
+             )  _`-.
+            .  : `. .
+`-._        : _   '  \
+    `-.\    ; o` _.   `*-._
+        |   `-.-'          `-.
+        |     ;       `       `.
+       /      :.       .        \
+      |       . \  .   :   .-'   .
+      \       '  `+.;  ;  '      :
+       \      :  '  |    ;       ;-.
+        |     ; '   : :`-:     _.`* ;
+        _)   /  .*' ; .*`- +'  `*'
+            *-*   `*-*  `*-*'
 %%
-   /\_/\
-  ( o.o )
-  (")_(")-._.-~-._.-~-.
+            _
+            \`*-.
+             )  _`-.
+            .  : `. .
+`-._        : _   '  \
+    `-.\    ; o` _.   `*-._
+        |   `-.-'          `-.
+        |     ;       `       `.
+        \     :.       .        \
+         \    . \  .   :   .-'   .
+          \   '  `+.;  ;  '      :
+           |  :  '  |    ;       ;-.
+           _) ; '   : :`-:     _.`* ;
+            *-* .*' ; .*`- +'  `*'
+                  `*-*  `*-*'
 %%
-   /\_/\   _.-~-._
-  ( o.O )-'       `-._.
-  (")_(")
+            _
+            \`*-.
+             )  _`-.
+            .  : `. .
+`-._        : _   '  \
+    `-.\    ; o` _.   `*-._
+        |   `-.-'          `-.
+        |     ;       `       `.
+         \    :.       .        \
+          |   . \  .   :   .-'   .
+          /   '  `+.;  ;  '      :
+         /    :  '  |    ;       ;-.
+        |     ; '   : :`-:     _.`* ;
+        _)   /  .*' ; .*`- +'  `*'
+            *-*   `*-*  `*-*'
 FRAMES
 }
 
-NEMR_CAT_HEIGHT=3
+# The height is READ FROM THE FRAMES, never assumed: the drawer moves the cursor
+# back by exactly as many lines as it wrote, and a hardcoded number that drifted
+# from the art would leave a trail of half-cats up the terminal.
+_nemr_cat_height() {
+    local n=0 line
+    while IFS= read -r line; do
+        [[ "$line" == "%%" ]] && break
+        n=$((n + 1))
+    done < <(_nemr_cat_frames)
+    printf '%s' "$n"
+}
+
 NEMR_CAT_DELAY="${NEMR_CAT_DELAY:-0.16}"
 
 # May we draw? Every "no" is a deliberate one (rule 2). NEMR_CAT=0 is the
@@ -60,6 +140,13 @@ nemr_cat_enabled() {
     [[ -t 1 ]] || return 1
     [[ -n "${NO_COLOR:-}" ]] && return 1
     case "${TERM:-dumb}" in dumb|"") return 1 ;; esac
+    # Too short a terminal and the block scrolls: the cursor-up would then walk
+    # over the step lines instead of its own, leaving a trail. Rather than draw
+    # something broken, draw nothing.
+    local rows
+    rows="$(tput lines 2>/dev/null || echo 0)"
+    [[ "$rows" =~ ^[0-9]+$ ]] || rows=0
+    (( rows >= $(_nemr_cat_height) + 2 )) || return 1
     return 0
 }
 
@@ -75,14 +162,15 @@ _nemr_cat_loop() {
     done < <(_nemr_cat_frames)
     [[ -n "$frame" ]] && frames+=("$frame")
 
-    local i=0 n=${#frames[@]}
+    local i=0 n=${#frames[@]} height
+    height="$(printf '%s' "${frames[0]}" | grep -c '')"
     while :; do
         # Erase each line before writing it, so a shorter frame cannot leave
         # the tail of a longer one behind.
         printf '%s' "${frames[$((i % n))]}" | while IFS= read -r line; do
             printf '\033[2K%s\n' "$line"
         done
-        printf '\033[%dA' "$NEMR_CAT_HEIGHT"
+        printf '\033[%dA' "$height"
         i=$((i + 1))
         sleep "$NEMR_CAT_DELAY"
     done
@@ -129,9 +217,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         --show)
             n=1
             printf 'frame 1\n'
+            # No blank line between frames: a reader counting lines here (the
+            # acceptance does) must see exactly the art, so the header is the
+            # only separator and a blank line in the art counts as art.
             while IFS= read -r line; do
                 if [[ "$line" == "%%" ]]; then
-                    n=$((n + 1)); printf '\nframe %d\n' "$n"; continue
+                    n=$((n + 1)); printf 'frame %d\n' "$n"; continue
                 fi
                 printf '%s\n' "$line"
             done < <(_nemr_cat_frames)
