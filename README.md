@@ -311,6 +311,16 @@ lists every one of them in the plan it shows before it does anything, and
 
 ---
 
+## Credits
+
+Nemr is named for a cat who spent his life playing with cables, and he plays
+with one on screen while the installer works. That drawing follows an ASCII-art
+cat by **Samamine** — same pose, same sparse dotted-outline style. It is redrawn
+rather than copied, but the likeness is deliberate, and the credit is theirs.
+See `scripts/lib/cat.sh`, or run `./scripts/lib/cat.sh --show`.
+
+---
+
 ## Getting help
 
 Something wrong? `nemr status <name>` and `nemr --verbose <command>` show what's

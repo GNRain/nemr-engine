@@ -6,11 +6,11 @@
 # exactly this. Four frames, 15 lines, 37 columns, plain ASCII, no dependency,
 # no colour.
 #
-# CREDIT. The drawing follows a reference the Product Owner supplied, which is
-# signed "Samamine". It is a redrawing in that cat's pose and idiom, not a
-# lift of a file — but the likeness is deliberate and close, so if this ships
-# beyond the private preview the credit belongs in the README, or the cat
-# should be redrawn from scratch. Raised with the Product Owner (D-14).
+# CREDIT. The drawing follows an ASCII-art cat by **Samamine**, the reference
+# the Product Owner supplied — same pose, same sparse dotted-outline idiom. It
+# is redrawn rather than copied, but the likeness is deliberate and close, so
+# the credit is theirs: ruled 2026-09-09, and carried in README.md under
+# Credits. If the art here changes, that line changes with it (D-14).
 #
 # See the frames without installing anything:
 #
