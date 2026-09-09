@@ -46,9 +46,9 @@ PASS=0; FAIL=0
 # reads the bucket back independently (six more assertions); otherwise a
 # directory under the work dir.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=86
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=98
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=82
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=94
 fi
 # The human arm (E-21) adds its own assertions when it runs.
 [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]] && EXPECTED_ASSERTIONS=$((EXPECTED_ASSERTIONS + 4))
@@ -59,7 +59,9 @@ die()  { fail "$1"; finish; exit 1; }
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/nemr-ui-acceptance.XXXXXX")
 PROJECT="uiacc-$$"
-LOCAL2="uiacc-$$-local"   # a second, local-only session for the page block (a push button beside a pull button)
+LOCAL2="uiacc-$$-local"
+ADOPTED="uiacc-$$-adopted"   # E-23: a session adopted from a host directory
+BIG="uiacc-$$-big"           # F-16: a session far above the old 2MB body limit   # a second, local-only session for the page block (a push button beside a pull button)
 SERVER_ADDR=127.0.0.1:18090
 SERVER_URL="http://$SERVER_ADDR"
 EMAIL="ui-acceptance-$$@example.com"
@@ -70,7 +72,7 @@ SYNC_PID=""; UI_PID=""; UI2_PID=""; UI3_PID=""; NOLOGIN=""
 finish() {
     printf '\n%s== Cleanup%s\n' "$BOLD" "$RESET"
     # Verify before destroying, and never touch a protected subject.
-    for p in "$PROJECT" "$LOCAL2" "$LOCAL2-b"; do
+    for p in "$PROJECT" "$LOCAL2" "$LOCAL2-b" "$ADOPTED" "$BIG"; do
         if refuse_protected "$p" 2>/dev/null; then
             if output_has "^$p " -- nemr list; then
                 nemr stop "$p" >/dev/null 2>&1
@@ -405,7 +407,9 @@ UI2_PID=$!
 for _ in $(seq 1 60); do grep -q 'nemr ui: http' "$WORK/ui2.log" && break; sleep 0.25; done
 LAUNCH2=$(grep -o 'http://127.0.0.1:[0-9]*/#token=[0-9a-f]*' "$WORK/ui2.log" | head -1)
 [[ -n "$LAUNCH2" ]] || { cat "$WORK/ui2.log"; die "the second UI did not print a launch URL"; }
-page_out=$(python3 "$REPO/docs/ui-acceptance.py" page "$LAUNCH2" "$EMAIL" "$PASSWORD" "$SERVER_URL" "$PROJECT" "$LOCAL2" 2>"$WORK/page.err"); page_rc=$?
+# The last argument is a real folder for F-21's add panel to measure (the repo
+# itself): the panel's plan is a read, so nothing is created by measuring it.
+page_out=$(python3 "$REPO/docs/ui-acceptance.py" page "$LAUNCH2" "$EMAIL" "$PASSWORD" "$SERVER_URL" "$PROJECT" "$LOCAL2" "$REPO" 2>"$WORK/page.err"); page_rc=$?
 if [[ -z "$page_out" ]]; then
     sed 's/^/   | /' "$WORK/page.err" | grep -v Gtk-Message | tail -15
     die "the page-driving half produced no result (its stderr above; rc=$page_rc)"
@@ -639,6 +643,120 @@ else
     [[ "$after" -gt "$before" ]] || die "the stored bundle was not rewritten by the second push"
     pass "the list shows it stopped, pushed and released; the stored bundle was rewritten"
 fi
+step "Add an existing host folder, push it, and continue it across a pull (E-23)"
+# A throwaway git repo with a derived directory that must NOT travel, and a
+# Claude Code history holding a marker planted BEFORE adoption. The marker is
+# unique and does not appear in the recall question, so a pass is real recall.
+ADOPT_SRC="$WORK/adopt-src"; mkdir -p "$ADOPT_SRC/target/debug" "$ADOPT_SRC/src"
+( cd "$ADOPT_SRC" \
+  && git init -q && git config user.email t@t && git config user.name t \
+  && printf 'target/\n' > .gitignore \
+  && printf 'add me\n' > README.md && printf 'fn main() {}\n' > src/main.rs \
+  && head -c 200000 /dev/zero > target/debug/blob \
+  && git add -A && git commit -qm initial ) || die "could not build the source repo to add"
+ADOPT_MARK="ADOPT-RECALL-$$-$RANDOM"
+# Plant the marker in the source directory's OWN Claude Code history, on the host.
+( cd "$ADOPT_SRC" && timeout 150 claude -p "Remember this token exactly for later: $ADOPT_MARK . Acknowledge with just OK." --output-format json < /dev/null ) >"$WORK/adopt-plant.json" 2>&1
+grep -q '"result"' "$WORK/adopt-plant.json" || { sed 's/^/   | /' "$WORK/adopt-plant.json" | tail -5; die "could not plant the marker in the host history (is the host logged in?)"; }
+pass "planted a marker in the host directory's Claude Code history (before adoption)"
+# Adopt it (CLI — the user names the directory; E-23).
+nemr add "$ADOPT_SRC" --name "$ADOPTED" --size 500MB --yes >"$WORK/adopt.log" 2>&1 || { cat "$WORK/adopt.log"; die "nemr add failed"; }
+MNT="$HOME/.local/share/nemr/mounts/$ADOPTED"
+[[ -f "$MNT/README.md" && -d "$MNT/.git" ]] || die "the adopted tree is missing README.md or .git"
+[[ ! -e "$MNT/target" ]] || die "target/ must never be adopted (it is 11G of derived output on the real tree)"
+ls "$MNT"/.nemr-state/projects/-workspace/*.jsonl >/dev/null 2>&1 || die "the adopted history did not land at the -workspace key"
+pass "added the folder: the tree (README + .git, no target/) and the history at the -workspace key"
+# Push the adopted session through the page.
+out=$(UI push "$ADOPTED" "$PASSWORD" release) || die "the adopt push call failed: $out"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d["ok"] else 1)' "$out" || { echo "$out"; die "pushing the adopted session failed"; }
+pass "pushed the adopted session to the cloud"
+# Another machine: remove it here, then pull it back and start it.
+out=$(UI remove "$ADOPTED") || die "the adopt remove call failed: $out"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d["ok"] else 1)' "$out" || die "removing the adopted session locally failed"
+out=$(UI pull "$ADOPTED" "$PASSWORD") || die "the adopt pull call failed: $out"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); [print("   |",l["text"]) for l in d["lines"]]; sys.exit(0 if d["ok"] else 1)' "$out" || die "pulling the adopted session (another machine) failed"
+pass "removed it here and pulled it back — the cross-machine round trip"
+# Continue the adopted conversation: recall the marker. The question does not
+# contain it; only the adopted history does.
+# --model: the host's Claude Code (2.1.263) records its default model
+# (claude-fable-5-1) in the history it writes; the base image's Claude Code
+# (2.1.240) refuses that model ("2.1.251 or newer is required"), so a bare
+# --continue on an adopted history 400s before it recalls anything. The
+# override resumes the same conversation on a model the session supports —
+# measured 2026-09-08. The real fix is a base image with a newer Claude Code.
+UI attach "$ADOPTED" \
+    'claude --continue --model claude-opus-5 --permission-mode acceptEdits -p "Without reading any files, what exact token did I ask you to remember earlier? Answer with only the token."' \
+    "$WORK/adopt-recall.raw" > "$WORK/adopt-recall.txt" 2>&1
+if grep -q "$ADOPT_MARK" "$WORK/adopt-recall.txt"; then
+    pass "claude --continue recalled the marker planted on the host before adoption ($ADOPT_MARK) — adoption travelled across the pull (E-23)"
+else
+    echo "   --- what the continued adopted session answered:"; sed 's/^/   | /' "$WORK/adopt-recall.txt" | tail -20
+    die "the adopted conversation did not recall the marker (raw screen in $WORK/adopt-recall.raw)"
+fi
+# Clean the adopted session's cloud copy now (E-22), so only its local copy remains for finish().
+out=$(UI cloud-delete "$ADOPTED"); python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d["ok"] else 1)' "$out" 2>/dev/null || true
+# Remove the host history the plant created (leave the host as found).
+rm -rf ~/.claude/projects/$(echo "$ADOPT_SRC" | sed 's#[/.]#-#g') 2>/dev/null || true
+
+step "Push a session far above the old 2MB body limit (F-16), with the compression ratio"
+# Every push this acceptance proved until F-16 was under 10KB, which is why
+# axum's 2MB default limit survived undetected and no bundle with real content
+# had ever moved. This one carries a real source tree, well over 100MB.
+NEMR_NON_INTERACTIVE=1 nemr create "$BIG" --size 2GB >"$WORK/big-create.log" 2>&1 \
+    || { cat "$WORK/big-create.log"; die "could not create the large session"; }
+BIGMNT="$HOME/.local/share/nemr/mounts/$BIG"
+git -C "$REPO" ls-files -z > "$WORK/big-files"
+i=0
+while [[ $(du -sb --exclude=lost+found "$BIGMNT" | cut -f1) -lt 110000000 && $i -lt 60 ]]; do
+    dest="$BIGMNT/copy-$i"; mkdir -p "$dest"
+    tar -C "$REPO" --null -T "$WORK/big-files" -cf - 2>/dev/null | tar -C "$dest" -xf - 2>/dev/null
+    i=$((i+1))
+done
+# F-19: --exclude lost+found. It is root-owned on a fresh ext4, so walking it
+# emits a page of permission-denied lines into the log and measures nothing this
+# step cares about. This number is the TREE's bytes — the thing that gets
+# compressed — not the volume's usage.
+PLAIN=$(du -sb --exclude=lost+found "$BIGMNT" | cut -f1)
+[[ "$PLAIN" -gt 100000000 ]] || die "the large session is only $PLAIN bytes; the point is to exceed 100MB"
+pass "built a $((PLAIN/1024/1024))MB session from real source ($i copies of the tracked tree)"
+# F-17: the row's size column is what this session is using ON THIS MACHINE, so
+# a 110MB local session must read ~110MB — not 0, and not the size of a push
+# that has not happened yet. It used to show the last pushed ciphertext size and
+# never move on refresh.
+row_size=$(UI sessions | python3 -c 'import json,sys; d=json.load(sys.stdin); r=[x for x in d["rows"] if x["name"]==sys.argv[1]]; print(r[0]["size_bytes"] if r and r[0]["size_bytes"] is not None else 0)' "$BIG")
+# What the two numbers are (F-17/F-19). The column is the VOLUME's usage, read
+# with statvfs exactly as `nemr status` and `df` read it: the filesystem's used
+# blocks, which include ext4's metadata and journal, lost+found, and block
+# rounding. PLAIN is the TREE's bytes, summed by du. So the column is expected
+# to be somewhat LARGER than the tree — that gap is filesystem overhead, not
+# staleness. What F-17 fixed is that the column used to show the last PUSH's
+# ciphertext size, which is unrelated to either and never moved on refresh.
+[[ "$row_size" -ge "$PLAIN" ]] \
+    || die "the size column reads $row_size for a tree of $PLAIN bytes — a volume's usage cannot be less than the tree it holds, so this is not live usage (F-17)"
+[[ "$row_size" -lt $((PLAIN*2)) ]] \
+    || die "the size column reads $row_size for a tree of $PLAIN bytes — more than twice the tree is not filesystem overhead, it is the wrong number"
+pass "F-17 the size column is this machine's live volume usage (statvfs, as nemr status and df read it): $((row_size/1024/1024))MiB of volume for a $((PLAIN/1024/1024))MiB tree — the difference is filesystem overhead, not staleness"
+out=$(UI push "$BIG" "$PASSWORD" release) || die "the large push call failed: $out"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); [print("   |",l["text"]) for l in d["lines"]]; sys.exit(0 if d["ok"] else 1)' "$out" \
+    || die "the large push failed — this is exactly what F-16 fixed; check the server ceiling and its log"
+if [[ "$STORAGE_MODE" == s3 ]]; then
+    big_key=$(server_log | sed -n 's/.*stored bundle key=\([^ ]*\) bytes=\([0-9]*\).*/\1/p' | tail -1)
+    CIPHER=$(server_log | sed -n 's/.*stored bundle key=\([^ ]*\) bytes=\([0-9]*\).*/\2/p' | tail -1)
+    python3 "$REPO/docs/ui-acceptance.py" s3-get "$LAUNCH_URL" "$big_key" "$WORK/big-from-bucket.bin" >/dev/null \
+        || die "the large object is not in the bucket at $big_key"
+    got=$(stat -c%s "$WORK/big-from-bucket.bin")
+    [[ "$got" == "$CIPHER" ]] || die "the bucket holds $got bytes at $big_key; the server logged $CIPHER"
+else
+    CIPHER=$(find "$WORK/bundles" -type f -printf '%s\n' | sort -n | tail -1)
+fi
+[[ "$CIPHER" -gt 2097152 ]] || die "the stored bundle is only $CIPHER bytes — at or below the old 2MB limit, so nothing was proven"
+pass "the large push landed: $((PLAIN/1024/1024))MiB plaintext -> $((CIPHER/1024/1024))MiB ciphertext ($((CIPHER*100/PLAIN))% of plaintext — what D-06's zstd buys on a real source tree), read back whole"
+# Leave the store as this step found it: the large bundle is this step's, and
+# the E-22 step below asserts what is left there.
+out=$(UI cloud-delete "$BIG"); python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d["ok"] else 1)' "$out" 2>/dev/null \
+    || die "could not remove the large session's cloud copy"
+nemr delete "$BIG" --yes >/dev/null 2>&1
+
 step "Delete the cloud copy through the page (E-22), and see it gone"
 # $PROJECT exists here AND in the cloud (local + bundle), so deleting the cloud
 # copy is the one-click case: the row becomes local, no bundle, and the object
@@ -680,8 +798,12 @@ if [[ "$STORAGE_MODE" == s3 ]]; then
     removed=$(python3 "$REPO/docs/ui-acceptance.py" s3-delete-prefix "$LAUNCH_URL" "$BUNDLE_PREFIX/") \
         || die "could not remove this run's objects from the bucket"
     left=$(python3 "$REPO/docs/ui-acceptance.py" s3-list "$LAUNCH_URL" "$BUNDLE_PREFIX/" | grep -c . || true)
-    [[ "$removed" -ge 1 && "$left" -eq 0 ]] || die "cleanup: removed $removed, $left left under $BUNDLE_PREFIX/"
-    pass "the bucket is left as it was found: $removed object(s) under this run's prefix removed, none left"
+    # F-18: the end state is what matters — NOTHING of this run left in the
+    # bucket. Removing none is a correct outcome, not a failure: E-22 deletes
+    # objects earlier in the same run, so by here the prefix can already be
+    # empty. Only objects that REMAIN are a failure.
+    [[ "$left" -eq 0 ]] || die "cleanup: $left object(s) still under $BUNDLE_PREFIX/ after removing $removed"
+    pass "the bucket is left as it was found: nothing under this run's prefix ($removed removed here, the rest already deleted by the run)"
 fi
 
 printf '\n'

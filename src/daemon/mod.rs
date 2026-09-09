@@ -144,6 +144,68 @@ impl Nemr for NemrService {
         }))
     }
 
+    async fn adopt(
+        &self,
+        request: Request<AdoptRequest>,
+    ) -> Result<Response<AdoptResponse>, Status> {
+        let req = request.into_inner();
+        // F-15/F-21: the plan is a READ — it provisions nothing and needs no
+        // size or agent, so it is answered BEFORE those are parsed. The page's
+        // panel measures a folder before the user has picked either; parsing
+        // first refused every plan with "unrecognised volume size """.
+        if req.plan_only {
+            let plan = crate::engine::project::adopt_plan(std::path::Path::new(&req.source_dir))
+                .map_err(status_from_anyhow)?;
+            return Ok(Response::new(AdoptResponse {
+                name: String::new(),
+                container_id: String::new(),
+                size: req.size.clone(),
+                agent: req.agent.clone(),
+                files_copied: plan.files,
+                bytes_copied: plan.bytes,
+                history_sessions: plan.history_sessions,
+                history_lines_dropped: 0,
+                history_lines_corrupt: 0,
+                source: plan.source.to_string_lossy().into_owned(),
+                git_bytes: plan.git_bytes,
+                is_git_repo: plan.is_git_repo,
+                git_dir_external: plan.git_dir_external,
+            }));
+        }
+        let size = req
+            .size
+            .parse::<crate::engine::volume::VolumeSize>()
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let agent = req
+            .agent
+            .parse::<crate::engine::agent::Agent>()
+            .map_err(status_from_typed)?;
+        let summary = crate::engine::project::adopt(
+            &self.client,
+            &req.name,
+            size,
+            agent,
+            std::path::Path::new(&req.source_dir),
+        )
+        .await
+        .map_err(status_from_anyhow)?;
+        Ok(Response::new(AdoptResponse {
+            name: summary.name,
+            container_id: summary.container_id,
+            size: summary.size.to_string(),
+            agent: summary.agent.id().to_string(),
+            files_copied: summary.files_copied,
+            bytes_copied: summary.bytes_copied,
+            history_sessions: summary.history_sessions,
+            history_lines_dropped: summary.history_lines_dropped,
+            history_lines_corrupt: summary.history_lines_corrupt,
+            source: summary.source.to_string_lossy().into_owned(),
+            git_bytes: 0,
+            is_git_repo: false,
+            git_dir_external: false,
+        }))
+    }
+
     async fn start(
         &self,
         request: Request<StartRequest>,

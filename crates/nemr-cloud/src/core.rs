@@ -274,9 +274,20 @@ pub fn merge_rows(remote: &[SessionEntry], local: Option<&[LocalProject]>) -> Ve
                     .unwrap_or_default(),
                 location,
                 running: l.is_some_and(|p| p.running),
-                size_bytes: r
-                    .and_then(|s| s.ciphertext_bytes)
-                    .or_else(|| l.filter(|p| p.usage_known).map(|p| p.used_bytes as i64))
+                // F-17: what the session is using ON THIS MACHINE when it is
+                // here, and what is stored in the cloud when it is not.
+                //
+                // It used to prefer the stored ciphertext size, so a local
+                // session showed the size of its LAST PUSH — 980KB beside a
+                // `nemr status` reading 5.8MiB — and the number never moved on
+                // refresh, because a ciphertext size only changes when a push
+                // does. Live usage is the number the row is asked for: it is
+                // what `nemr status` reports, it answers "how big is this
+                // session", and it changes as the session does.
+                size_bytes: l
+                    .filter(|p| p.usage_known)
+                    .map(|p| p.used_bytes as i64)
+                    .or_else(|| r.and_then(|s| s.ciphertext_bytes))
                     .or_else(|| r.map(|s| s.size_bytes).filter(|n| *n > 0)),
                 updated_at_unix: r.map(|s| s.updated_at_unix),
                 last_machine: r.and_then(|s| s.last_machine.clone()),
@@ -904,9 +915,43 @@ mod tests {
         assert_eq!(rows[2].held_by, None);
         assert_eq!(
             rows[2].size_bytes,
-            Some(1234),
-            "the server's ciphertext size wins when both exist"
+            Some(500),
+            "F-17: a session that is HERE shows what it is using on this machine, \
+             not the size of its last push"
         );
+    }
+
+    /// F-17: the size column means "what this session is using on this machine"
+    /// when it is here, and "what is stored" when it is not. It used to prefer
+    /// the stored ciphertext size for every row, so a local session showed the
+    /// size of its last push (980KB beside a `nemr status` reading 5.8MiB) and
+    /// never moved on refresh.
+    #[test]
+    fn the_size_column_is_live_local_usage_here_and_the_stored_size_when_it_is_not() {
+        // Local only: live usage, even though nothing is stored.
+        let rows = merge_rows(&[], Some(&[local("here", false)]));
+        assert_eq!(rows[0].size_bytes, Some(500));
+
+        // Both: live usage wins over the stored ciphertext size, and it tracks
+        // the volume as it grows — the same list on a bigger session reports
+        // the bigger number, which is what "does not update on refresh" meant.
+        let mut grown = local("here", false);
+        grown.used_bytes = 6_082_887;
+        let rows = merge_rows(&[remote("here", None)], Some(&[grown]));
+        assert_eq!(rows[0].location, Where::Both);
+        assert_eq!(rows[0].size_bytes, Some(6_082_887));
+
+        // Remote only: nothing local to measure, so the stored size.
+        let rows = merge_rows(&[remote("gone", None)], Some(&[]));
+        assert_eq!(rows[0].location, Where::Remote);
+        assert_eq!(rows[0].size_bytes, Some(1234));
+
+        // Local but usage unknown (the daemon could not measure): fall back to
+        // what is stored rather than showing nothing.
+        let mut unknown = local("here", false);
+        unknown.usage_known = false;
+        let rows = merge_rows(&[remote("here", None)], Some(&[unknown]));
+        assert_eq!(rows[0].size_bytes, Some(1234));
     }
 
     /// No engine: the server's list alone still renders — remote rows, none

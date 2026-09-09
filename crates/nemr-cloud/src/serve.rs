@@ -116,11 +116,33 @@ pub trait UiEngine: EngineOps {
     fn create(&self, name: &str, size: &str, agent: &str) -> Result<()>;
     /// F-12: remove a session from this machine. Never the cloud copy.
     fn delete(&self, name: &str) -> Result<()>;
+    /// F-21: what adding `source_dir` would copy — provisions nothing.
+    fn add_plan(&self, source_dir: &str) -> Result<AddPlan>;
+    /// F-21: add an existing host directory as a session.
+    fn add(&self, name: &str, size: &str, agent: &str, source_dir: &str)
+        -> Result<(u64, u64, u64)>;
     /// Open an attach stream: the daemon's, or a fake's in the tests.
     fn attach(
         &self,
         start: AttachStart,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AttachLink>> + Send + '_>>;
+}
+
+/// What adding a folder would copy, as the panel shows it before the confirm
+/// (F-21). A struct rather than a tuple: the fields are five numbers and two
+/// flags, and the day one was added in the wrong position nothing would have
+/// caught it.
+#[derive(Debug, Clone)]
+pub struct AddPlan {
+    pub files: u64,
+    pub bytes: u64,
+    pub history_sessions: u64,
+    pub git_bytes: u64,
+    pub is_git_repo: bool,
+    /// The git directory lives outside the folder (worktree or submodule), so
+    /// only the `.git` marker travels.
+    pub git_dir_external: bool,
+    pub source: String,
 }
 
 /// An open attach stream, both directions, as the bridge drives it.
@@ -284,6 +306,8 @@ pub fn router(state: Arc<UiState>) -> Router {
         .route("/sessions", get(sessions).post(create))
         .route("/sessions/{name}", delete(remove))
         .route("/sessions/{name}/cloud", delete(delete_cloud))
+        .route("/add/plan", post(add_plan))
+        .route("/add", post(add_folder))
         .route("/sessions/{name}/pull", post(pull))
         .route("/sessions/{name}/start", post(start))
         .route("/sessions/{name}/push", post(push))
@@ -897,6 +921,101 @@ async fn delete_cloud(
     Json(json!({ "job": id })).into_response()
 }
 
+#[derive(Deserialize)]
+struct AddPlanBody {
+    dir: String,
+}
+
+/// F-21: what adding a folder would copy. A read — it provisions nothing — so
+/// the panel can show what travels, what is excluded, how many transcripts and
+/// the total size BEFORE the user confirms.
+async fn add_plan(State(state): State<Arc<UiState>>, Json(body): Json<AddPlanBody>) -> Response {
+    let dir = body.dir.trim().to_string();
+    if dir.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "name the folder to add" })),
+        )
+            .into_response();
+    }
+    let engine = state.engine.clone();
+    match tokio::task::spawn_blocking(move || engine.add_plan(&dir)).await {
+        Ok(Ok(plan)) => Json(json!({
+            "files": plan.files,
+            "bytes": plan.bytes,
+            "history_sessions": plan.history_sessions,
+            "git_bytes": plan.git_bytes,
+            "is_git_repo": plan.is_git_repo,
+            "git_dir_external": plan.git_dir_external,
+            "source": plan.source,
+        }))
+        .into_response(),
+        Ok(Err(e)) => failed(StatusCode::BAD_REQUEST, e),
+        Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, anyhow::anyhow!("{e}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddBody {
+    dir: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    size: String,
+    #[serde(default)]
+    agent: String,
+}
+
+/// F-21: add an existing host directory as a session, as a job the page
+/// watches. Not destructive — the folder is copied, never moved — so the panel
+/// itself is the confirmation; there is no typed name.
+async fn add_folder(State(state): State<Arc<UiState>>, Json(body): Json<AddBody>) -> Response {
+    let dir = body.dir.trim().to_string();
+    if dir.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "name the folder to add" })),
+        )
+            .into_response();
+    }
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "a session needs a name" })),
+        )
+            .into_response();
+    }
+    let size = if body.size.is_empty() {
+        CREATE_DEFAULT_SIZE.to_string()
+    } else {
+        body.size
+    };
+    let agent = if body.agent.is_empty() {
+        CREATE_AGENTS[0].0.to_string()
+    } else {
+        body.agent
+    };
+    let engine = state.engine.clone();
+    let session = name.clone();
+    let id = state.start_job("add", &name, move |say| {
+        say(&format!("adding {dir} as {session:?} ({size}, {agent})"));
+        let (files, bytes, history) = engine.add(&session, &size, &agent, &dir)?;
+        say(&format!(
+            "copied {files} file(s), {}",
+            crate::core::human_bytes(bytes as i64)
+        ));
+        say(&format!(
+            "carried {history} Claude Code session transcript(s); the folder was copied, not moved"
+        ));
+        say(&format!(
+            "added {session:?}; it is stopped — start it from its row"
+        ));
+        Ok(())
+    });
+    Json(json!({ "job": id })).into_response()
+}
+
 /// What a job has said so far, and whether it is done.
 async fn job(State(state): State<Arc<UiState>>, UrlPath(id): UrlPath<String>) -> Response {
     let job = state
@@ -1339,7 +1458,7 @@ async fn index() -> Response {
     <div class="warn" id="abandon"></div>
   </section>
   <section id="list" hidden>
-    <div class="toolbar"><h2>Sessions</h2><span class="spacer"></span><button id="create" class="primary">create session</button><button id="refresh">refresh</button><span class="note" id="localnote"></span></div>
+    <div class="toolbar"><h2>Sessions</h2><span class="spacer"></span><button id="create" class="primary">create session</button><button id="addfolder">add existing folder</button><button id="refresh">refresh</button><span class="note" id="localnote"></span></div>
     <div id="loginline" hidden>No Claude login on this machine yet — attach a session and run <code>/login</code> in it; the login is written to this machine and stays here.</div>
     <div class="tablewrap"><table><thead><tr><th>session</th><th>agent</th><th>where</th><th>state</th><th>size</th><th>updated</th><th>last machine</th><th>held by</th></tr></thead><tbody id="rows"></tbody></table></div>
     <section id="job" class="login" style="max-width:40rem;margin-top:1rem" hidden>
@@ -1360,6 +1479,15 @@ async fn index() -> Response {
         <label>agent <select name="agent" id="createagent"></select></label>
         <label>quota (fixed at creation) <select name="size" id="createsize"></select></label>
         <div style="display:flex;gap:.6rem"><button class="primary" type="submit">create</button><button type="button" id="createcancel">cancel</button></div>
+      </form>
+      <form id="addform" style="display:grid;gap:.6rem" hidden>
+        <label>folder on this machine <input name="folder" autocomplete="off" placeholder="/home/you/projects/thing" required></label>
+        <div style="display:flex;gap:.6rem;align-items:end">
+          <label style="flex:1">name <input name="sessionname" autocomplete="off" maxlength="32" pattern="[a-z0-9][a-z0-9-]*" placeholder="from the folder's name"></label>
+          <label>quota (fixed at creation) <select name="size" id="addsize"></select></label>
+        </div>
+        <div id="addplan" class="muted">Give a folder and this says what would travel before anything is copied.</div>
+        <div style="display:flex;gap:.6rem"><button class="primary" type="submit" id="addconfirm" disabled>add this folder</button><button type="button" id="addcancel">cancel</button></div>
       </form>
       <form id="removeform" style="display:grid;gap:.6rem" hidden>
         <div id="removecase"></div>
@@ -1536,7 +1664,8 @@ async fn index() -> Response {
   // vocabulary, stated by the binary); filled once per list.
   function fillCreateOptions(o) {
     if (!o) return;
-    const a = $('createagent'), z = $('createsize');
+    const a = $('createagent'), z = $('createsize'), z2 = $('addsize');
+    if (z2) z2.innerHTML = o.sizes.map(x => '<option value="' + esc(x) + '"' + (x === o.default_size ? ' selected' : '') + '>' + esc(x) + '</option>').join('');
     a.innerHTML = o.agents.map(x => '<option value="' + esc(x.id) + '">' + esc(x.label) + '</option>').join('');
     z.innerHTML = o.sizes.map(x => '<option value="' + esc(x) + '"' + (x === o.default_size ? ' selected' : '') + '>' + esc(x) + '</option>').join('');
   }
@@ -1556,7 +1685,7 @@ async fn index() -> Response {
   function closePanels() {
     panelGen++;
     $('job').hidden = true; $('pullform').hidden = true; $('pushform').hidden = true;
-    $('createform').hidden = true; $('removeform').hidden = true; $('cloudform').hidden = true;
+    $('createform').hidden = true; $('removeform').hidden = true; $('cloudform').hidden = true; $('addform').hidden = true;
     if (ws) { const w = ws; ws = null; w.close(); }
     $('attach').hidden = true;
     pulling = null; pushing = null; removing = null;
@@ -1706,13 +1835,14 @@ async fn index() -> Response {
   // closes (runJob); a refusal goes to the status line (F-3's rule).
   $('create').addEventListener('click', () => {
     openJob('create a session');
-    const f = $('createform'); f.hidden = false; f.name.value = ''; f.name.focus();
+    const f = $('createform'); f.hidden = false;
+    f.elements.name.value = ''; f.elements.name.focus();
   });
   $('createcancel').addEventListener('click', closePanels);
   $('createform').addEventListener('submit', async ev => {
     ev.preventDefault();
-    const f = ev.target, name = f.name.value.trim();
-    const body = { name, size: f.size.value, agent: f.agent.value };
+    const f = ev.target, name = f.elements.name.value.trim();
+    const body = { name, size: f.elements.size.value, agent: f.elements.agent.value };
     f.hidden = true;
     await runJob('create ' + name, '/sessions', body);
   });
@@ -1743,6 +1873,60 @@ async fn index() -> Response {
     ev.target.hidden = true;
     await runJob('remove ' + name, '/sessions/' + encodeURIComponent(name), null, null, 'DELETE');
   });
+  // F-21: add an existing folder. The panel IS the confirmation — adding is not
+  // destructive, the folder is copied, never moved — so there is no typed name.
+  // What it shows before the confirm is enabled is the plan the daemon
+  // measured: what travels, what is excluded, how many transcripts, how big.
+  let addPlanSeq = 0;
+  $('addfolder').addEventListener('click', () => {
+    openJob('add an existing folder');
+    const f = $('addform'); f.hidden = false;
+    f.elements.folder.value = ''; f.elements.sessionname.value = '';
+    $('addplan').className = 'muted';
+    $('addplan').textContent = 'Give a folder and this says what would travel before anything is copied.';
+    $('addconfirm').disabled = true;
+    f.elements.folder.focus();
+  });
+  $('addcancel').addEventListener('click', closePanels);
+  // form.elements, not form.folder: `dir` and `name` are IDL attributes on the
+  // form element itself, so `form.dir` is the text-direction string and
+  // addEventListener on it throws — taking the rest of the page script with it.
+  $('addform').elements.folder.addEventListener('input', async ev => {
+    const dir = ev.target.value.trim();
+    const seq = ++addPlanSeq;
+    $('addconfirm').disabled = true;
+    if (!dir) { $('addplan').className = 'muted'; $('addplan').textContent = 'Give a folder and this says what would travel before anything is copied.'; return; }
+    $('addplan').className = 'muted'; $('addplan').textContent = 'measuring ' + dir + '…';
+    const r = await api('/add/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dir }) });
+    if (seq !== addPlanSeq) return;
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { $('addplan').className = 'bad'; $('addplan').textContent = d.error || ('cannot read that folder (' + r.status + ')'); return; }
+    $('addplan').className = '';
+    $('addplan').innerHTML =
+      '<strong>' + esc(d.source) + '</strong> would travel as ' + human(d.bytes) + ' in ' + d.files + ' file(s)'
+      + (d.git_bytes > 0 ? ', including ' + human(d.git_bytes) + ' of .git' : '')
+      + '.<br>Excluded: ' + (d.is_git_repo ? 'anything .gitignore ignores, and target/ and node_modules/' : 'target/ and node_modules/ (not a git repo — nothing else is ignored)')
+      + '.<br>' + d.history_sessions + ' Claude Code session transcript(s) come with it. The folder is copied, not moved.'
+      + (d.git_dir_external ? '<br>This is a git worktree or submodule: its git directory lives outside the folder, so only the .git marker travels and the session will not be a working git repository.' : '');
+    $('addconfirm').disabled = false;
+    if (!$('addform').elements.sessionname.value) {
+      const base = (d.source || '').split('/').filter(Boolean).pop() || '';
+      $('addform').elements.sessionname.value = base.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+    }
+  });
+  $('addform').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const f = ev.target;
+    if ($('addconfirm').disabled) return;
+    const body = {
+      dir: f.elements.folder.value.trim(),
+      name: f.elements.sessionname.value.trim(),
+      size: f.elements.size.value,
+    };
+    f.hidden = true;
+    await runJob('add ' + body.dir, '/add', body);
+  });
+
   // E-22: delete the cloud copy. One click when a local copy survives; the
   // typed name when the cloud is the only copy (F-12's rule). On a lease held
   // elsewhere the job carries held_by and runJob offers the take-over.
@@ -1880,6 +2064,10 @@ mod tests {
         stopped: Mutex<Vec<String>>,
         created: Mutex<Vec<(String, String, String)>>,
         deleted: Mutex<Vec<String>>,
+        added: Mutex<Vec<(String, String)>>,
+        /// F-16: how many bytes `export` writes, so a test can produce a bundle
+        /// far above axum's old 2MB default body limit.
+        export_bytes: Mutex<usize>,
     }
     impl EngineOps for FakeEngine {
         fn list(&self) -> Result<Vec<LocalProject>> {
@@ -1887,7 +2075,20 @@ mod tests {
         }
         fn export(&self, name: &str, dest: &std::path::Path) -> Result<()> {
             self.exported.lock().unwrap().push(name.to_string());
-            std::fs::write(dest, format!("bundle-of-{name}"))?;
+            let want = *self.export_bytes.lock().unwrap();
+            if want == 0 {
+                std::fs::write(dest, format!("bundle-of-{name}"))?;
+            } else {
+                // Compressible, like a real source tree, so the ciphertext is
+                // not simply the plaintext size.
+                let unit = format!("bundle-of-{name} ");
+                let mut body = String::with_capacity(want + unit.len());
+                while body.len() < want {
+                    body.push_str(&unit);
+                }
+                body.truncate(want);
+                std::fs::write(dest, body.as_bytes())?;
+            }
             Ok(())
         }
         fn import(&self, bundle: &std::path::Path, name: &str) -> Result<String> {
@@ -1960,6 +2161,47 @@ mod tests {
                 credential_present: None,
             });
             Ok(())
+        }
+        fn add_plan(&self, source_dir: &str) -> Result<AddPlan> {
+            if source_dir.contains("missing") {
+                anyhow::bail!("the source directory {source_dir} does not exist");
+            }
+            Ok(AddPlan {
+                files: 31,
+                bytes: 24_300,
+                history_sessions: 2,
+                git_bytes: 12_000,
+                is_git_repo: true,
+                git_dir_external: source_dir.contains("worktree"),
+                source: source_dir.to_string(),
+            })
+        }
+        fn add(
+            &self,
+            name: &str,
+            size: &str,
+            agent: &str,
+            source_dir: &str,
+        ) -> Result<(u64, u64, u64)> {
+            if self.projects.lock().unwrap().iter().any(|p| p.name == name) {
+                anyhow::bail!("project {name:?} already exists");
+            }
+            if !CREATE_SIZES.contains(&size) {
+                anyhow::bail!("unrecognised volume size {size:?}. Valid sizes: 500MB, 2GB, 10GB.");
+            }
+            self.added
+                .lock()
+                .unwrap()
+                .push((name.to_string(), source_dir.to_string()));
+            self.projects.lock().unwrap().push(LocalProject {
+                name: name.to_string(),
+                agent: agent.to_string(),
+                running: false,
+                usage_known: true,
+                used_bytes: 24_300,
+                credential_present: None,
+            });
+            Ok((31, 24_300, 2))
         }
         fn delete(&self, name: &str) -> Result<()> {
             let mut projects = self.projects.lock().unwrap();
@@ -2307,6 +2549,12 @@ mod tests {
             ),
             ("DELETE", "/api/sessions/x", None),
             ("DELETE", "/api/sessions/x/cloud", None),
+            ("POST", "/api/add/plan", Some(json!({"dir": "/tmp/x"}))),
+            (
+                "POST",
+                "/api/add",
+                Some(json!({"dir": "/tmp/x", "name": "x"})),
+            ),
             ("GET", "/api/jobs/abc", None),
             ("POST", "/api/sessions/x/attach-ticket", None),
         ] {
@@ -3265,6 +3513,226 @@ mod tests {
         assert_eq!(j["ok"], false, "{j}");
         assert!(
             j["error"].as_str().unwrap().contains("does not exist"),
+            "{j}"
+        );
+    }
+
+    /// F-16: nothing in the server set a body limit, so axum's 2MB default was
+    /// in force and every push above it failed — a 6MB session answered 413 and
+    /// anything larger had the connection closed mid-stream. Every push proven
+    /// until then was under 10KB, which is why it survived so long. A bundle far
+    /// above that default must now land, and a ceiling must refuse a bundle
+    /// above IT by name rather than by closing the connection.
+    #[tokio::test]
+    async fn f16_a_push_far_above_the_old_body_limit_lands_and_the_ceiling_refuses_by_name() {
+        let _serial = serial().await;
+        let (server, store) = spawn_sync_server();
+        let state_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", state_home.path());
+        std::env::set_var("NEMR_CLOUD_KDF_FAST", "1");
+        std::env::set_var("NEMR_CLOUD_HOLDER", "this-laptop");
+        std::env::set_var("NEMR_CLOUD_HOLDER_BIN", "/bin/true");
+        std::env::remove_var("NEMR_MAX_BUNDLE_BYTES");
+        let email = format!("big-{}@example.com", &hex(&random_bytes())[..12]);
+        const PASSWORD: &str = "correct horse battery staple";
+        blocking(|| {
+            let pending = core::register_begin(&server, &email, PASSWORD).unwrap();
+            let mk = core::register_check_code(&pending, &pending.recovery_code.display()).unwrap();
+            core::register_confirm(&pending, &mk).unwrap();
+        });
+
+        let engine = fake_engine(vec![LocalProject {
+            name: "big".into(),
+            agent: "claude-code".into(),
+            running: false,
+            usage_known: true,
+            used_bytes: 0,
+            credential_present: None,
+        }]);
+        // Six megabytes of plaintext: three times axum's old default, and the
+        // exact size the Product Owner measured answering 413.
+        const PLAINTEXT: usize = 6 * 1024 * 1024;
+        *engine.export_bytes.lock().unwrap() = PLAINTEXT;
+        let (app, _) = app_with(engine.clone());
+        let cookie = establish(&app).await;
+        let c = Some(cookie.as_str());
+        let push = |body: Value| api_req("POST", "/api/sessions/big/push", c, Some(body));
+
+        let j = finish(
+            &app,
+            &cookie,
+            send(&app, push(json!({"password": PASSWORD}))).await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "a 6MB push must land now: {j}");
+        let stored = stored_ciphertext(store.path());
+        assert!(
+            stored.len() > 2 * 1024 * 1024,
+            "the stored object is far above the old 2MB default: {} bytes",
+            stored.len()
+        );
+        // And it is this session's bundle, not a truncation: it decrypts to the
+        // bytes the engine exported.
+        let plaintext = blocking(|| {
+            let account = crate::state::load_account().unwrap();
+            let mk = crate::keys::master_key(&account, PASSWORD).unwrap();
+            nemr_crypto::decrypt_bundle(&mk, &stored).expect("the stored bundle decrypts")
+        });
+        assert_eq!(
+            plaintext.len(),
+            PLAINTEXT,
+            "the whole bundle arrived, not a prefix"
+        );
+
+        // The ceiling: a bundle above it is refused by NAME, and nothing new is
+        // stored. This is the neuter that restores the old behaviour.
+        std::env::set_var("NEMR_MAX_BUNDLE_BYTES", "1000000");
+        let j = finish(
+            &app,
+            &cookie,
+            send(&app, push(json!({"password": PASSWORD}))).await,
+        )
+        .await;
+        std::env::remove_var("NEMR_MAX_BUNDLE_BYTES");
+        assert_eq!(
+            j["ok"], false,
+            "a bundle above the ceiling must be refused: {j}"
+        );
+        let err = j["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("too large") || err.contains("1000000"),
+            "the refusal must name the size or the ceiling, not close the connection: {err}"
+        );
+    }
+
+    /// F-21: adding an existing folder from the page. The plan is a read that
+    /// provisions nothing and is what the panel shows before the confirm; the
+    /// add itself is a job. Adding is not destructive — the folder is copied,
+    /// never moved — so there is no typed name to defeat.
+    #[tokio::test]
+    async fn f21_the_page_measures_a_folder_before_adding_it() {
+        let engine = fake_engine(vec![LocalProject {
+            name: "taken".into(),
+            agent: "claude-code".into(),
+            running: false,
+            usage_known: true,
+            used_bytes: 10,
+            credential_present: None,
+        }]);
+        let (app, _) = app_with(engine.clone());
+        let cookie = establish(&app).await;
+        let c = Some(cookie.as_str());
+
+        // The plan: what would travel, measured, with nothing provisioned.
+        let r = send(
+            &app,
+            api_req(
+                "POST",
+                "/api/add/plan",
+                c,
+                Some(json!({"dir": "/tmp/thing"})),
+            ),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let plan = json_of(r).await;
+        assert_eq!(plan["files"], 31, "{plan}");
+        assert_eq!(
+            plan["history_sessions"], 2,
+            "the panel says how many transcripts come with it: {plan}"
+        );
+        assert_eq!(plan["source"], "/tmp/thing");
+        assert!(
+            engine.added.lock().unwrap().is_empty(),
+            "a plan provisions nothing"
+        );
+
+        // A folder that cannot be read is named, not guessed at.
+        let r = send(
+            &app,
+            api_req(
+                "POST",
+                "/api/add/plan",
+                c,
+                Some(json!({"dir": "/tmp/missing"})),
+            ),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+        // An empty folder, or an empty name, is refused before any job exists.
+        for body in [
+            json!({"dir": "  "}),
+            json!({"dir": "/tmp/thing", "name": " "}),
+        ] {
+            let r = send(&app, api_req("POST", "/api/add", c, Some(body))).await;
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        }
+
+        // The add itself: a job, and the row lands stopped.
+        let j = finish(
+            &app,
+            &cookie,
+            send(
+                &app,
+                api_req(
+                    "POST",
+                    "/api/add",
+                    c,
+                    Some(json!({"dir": "/tmp/thing", "name": "thing"})),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "{j}");
+        let lines: Vec<String> = j["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["text"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            lines.iter().any(|l| l.contains("copied, not moved")),
+            "the job says the folder was copied, not moved: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("transcript")),
+            "and how many transcripts came with it: {lines:?}"
+        );
+        assert_eq!(
+            *engine.added.lock().unwrap(),
+            vec![("thing".to_string(), "/tmp/thing".to_string())]
+        );
+        let row = engine.list().unwrap();
+        let added = row
+            .iter()
+            .find(|p| p.name == "thing")
+            .expect("the row appears");
+        assert!(
+            !added.running,
+            "added stopped; start is the row's own button"
+        );
+
+        // A name already in use is the job's error, not a silent overwrite.
+        let j = finish(
+            &app,
+            &cookie,
+            send(
+                &app,
+                api_req(
+                    "POST",
+                    "/api/add",
+                    c,
+                    Some(json!({"dir": "/tmp/other", "name": "taken"})),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(j["ok"], false, "{j}");
+        assert!(
+            j["error"].as_str().unwrap().contains("already exists"),
             "{j}"
         );
     }

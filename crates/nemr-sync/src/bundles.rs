@@ -5,7 +5,7 @@
 //! holder and fence it holds, so a client that lost the lease cannot write even
 //! if it ignores its own heartbeat failure (D-03).
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -16,6 +16,24 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::error::{ApiError, ApiResult};
 use crate::{index, lease, AppState};
+
+/// The largest bundle the server accepts (F-16), overridable with
+/// `NEMR_MAX_BUNDLE_BYTES`.
+///
+/// It is a product ceiling, not a framework default. The quota presets go to
+/// 10GB, so a legitimate bundle can be gigabytes; the server therefore never
+/// buffers one — it streams the body to a staged file and streams that to the
+/// storage backend, so memory is bounded by the chunk size. The ceiling exists
+/// to bound DISK and to answer a too-large push with a clear 413 instead of
+/// filling the volume. Above it the upload is refused, named, and nothing is
+/// stored; the session keeps whatever bundle it already had.
+fn max_bundle_bytes() -> u64 {
+    const DEFAULT: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
+    std::env::var("NEMR_MAX_BUNDLE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT)
+}
 
 fn storage_key(state: &AppState, user_id: Uuid, session_id: Uuid) -> ApiResult<ObjectKey> {
     let key = format!("{}/{}/{}", state.config.bundle_prefix, user_id, session_id);
@@ -37,8 +55,11 @@ pub async fn upload(
     user: AuthUser,
     Path(name): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> ApiResult<Json<UploadResponse>> {
+    use futures::StreamExt as _;
+    use tokio::io::AsyncWriteExt as _;
+
     let session_id = index::resolve(&state, user.id, &name).await?;
 
     let holder = header_str(&headers, "x-nemr-lease-holder")?;
@@ -49,16 +70,65 @@ pub async fn upload(
     // not transfer its body first.
     lease::require_held(&state, session_id, &holder, fence).await?;
 
-    let digest = Sha256::digest(&body);
+    let ceiling = max_bundle_bytes();
+    // Content-Length lets a too-large push be refused before a byte of it is
+    // transferred; the streaming check below is what actually enforces the
+    // ceiling, because a chunked body declares no length.
+    if let Some(declared) = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if declared > ceiling {
+            return Err(ApiError::PayloadTooLarge(format!(
+                "the bundle is {declared} bytes; this server accepts at most {ceiling} \
+                 (NEMR_MAX_BUNDLE_BYTES). Nothing was stored."
+            )));
+        }
+    }
+
+    // F-16: stream the body to a staged file, hashing as it goes. The server
+    // never holds the bundle in memory — a 10GB quota's bundle would not fit.
+    let staged = tempfile::NamedTempFile::new()
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("staging the upload: {e}")))?;
+    let staged_path = staged.path().to_path_buf();
+    let mut file = tokio::fs::File::create(&staged_path)
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("staging the upload: {e}")))?;
+    let mut hasher = Sha256::new();
+    let mut received: u64 = 0;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| ApiError::BadRequest(format!("reading the uploaded body: {e}")))?;
+        received += chunk.len() as u64;
+        if received > ceiling {
+            return Err(ApiError::PayloadTooLarge(format!(
+                "the bundle exceeds {ceiling} bytes (NEMR_MAX_BUNDLE_BYTES); the upload was \
+                 stopped at {received}. Nothing was stored."
+            )));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("staging the upload: {e}")))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("staging the upload: {e}")))?;
+    drop(file);
+    let digest = hasher.finalize();
+    let body_len = received;
+
     let key = storage_key(&state, user.id, session_id)?;
     state
         .store
-        .put(&key, &body)
+        .put_file(&key, &staged_path)
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("store put: {e}")))?;
     // The operator's read-control for E-20: which key, how many bytes, in
     // which store — never the bytes, never a credential.
-    tracing::info!(key = %key.as_str(), bytes = body.len(), store = %state.store.describe(), "stored bundle");
+    tracing::info!(key = %key.as_str(), bytes = body_len, store = %state.store.describe(), "stored bundle");
 
     // F-92: re-check the fence **inside the metadata write itself**. The check
     // above is a separate read, so a takeover landing between it and here would
@@ -80,7 +150,7 @@ pub async fn upload(
     .bind(session_id)
     .bind(key.as_str())
     .bind(digest.as_slice())
-    .bind(body.len() as i64)
+    .bind(body_len as i64)
     .bind(&holder)
     .bind(fence)
     .execute(&state.pool)
@@ -96,7 +166,7 @@ pub async fn upload(
     }
 
     Ok(Json(UploadResponse {
-        bytes: body.len() as i64,
+        bytes: body_len as i64,
         sha256: hex_lower(&digest),
     }))
 }
@@ -199,16 +269,23 @@ pub async fn download(
     let key =
         ObjectKey::new(storage_key).map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
 
-    let bytes = state
+    // F-16: stream the object out. The upload side accepts gigabytes, so the
+    // download side cannot buffer the object to answer — `get` into a `Vec` here
+    // would make every pull of a large bundle an allocation the size of the
+    // bundle, and a handful of concurrent pulls the end of the server.
+    let (size, stream) = state
         .store
-        .get(&key)
+        .get_stream(&key)
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("store get: {e}")))?;
 
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/octet-stream")],
-        bytes,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_LENGTH, size.to_string()),
+        ],
+        Body::from_stream(stream),
     )
         .into_response())
 }

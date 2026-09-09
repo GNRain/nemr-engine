@@ -75,6 +75,7 @@ pub fn export(request: &ExportRequest<'_>, destination: &Path) -> Result<ExportS
             path: item.path.clone(),
             class: item.class.as_str().to_string(),
             mode: item.mode,
+            mtime: item.mtime,
             size: bytes.len() as u64,
             sha256: hex(&Sha256::digest(&bytes)),
             span: Span {
@@ -161,6 +162,18 @@ fn write_archive(destination: &Path, manifest: &Manifest, chunks: &[Vec<u8>]) ->
     Ok(())
 }
 
+/// A file's mtime in whole seconds since the epoch, or `None` when the
+/// filesystem cannot say. Pre-epoch times (a clock skew artefact) are dropped
+/// rather than wrapped.
+fn mtime_of(metadata: &std::fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
+}
+
 fn append<W: Write>(archive: &mut tar::Builder<W>, name: &str, bytes: &[u8]) -> Result<()> {
     let mut header = tar::Header::new_gnu();
     header.set_size(bytes.len() as u64);
@@ -190,6 +203,10 @@ struct PlannedMember {
     path: String,
     class: Class,
     mode: u32,
+    /// F-20: the file's own mtime, so the resume list keeps its order across a
+    /// push and a pull. Taken from the file, never from `now()`, so a bundle of
+    /// unchanged input is still byte-identical.
+    mtime: Option<i64>,
     content: Content,
 }
 
@@ -271,6 +288,7 @@ fn plan_members(request: &ExportRequest<'_>, destination: &Path) -> Result<Plan>
                         path: relative,
                         class,
                         mode: mode_of(&metadata),
+                        mtime: mtime_of(&metadata),
                         content: Content::File(path),
                     });
                 }

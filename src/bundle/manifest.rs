@@ -130,6 +130,15 @@ pub struct MemberEntry {
     pub class: String,
     /// Unix mode bits.
     pub mode: u32,
+    /// Modification time, seconds since the epoch (F-20).
+    ///
+    /// Claude Code's resume list sorts transcripts by mtime, so a bundle that
+    /// drops them lands every session on the same age and the list loses its
+    /// order — with a real history the user cannot tell which session they were
+    /// last in. Optional so a bundle written before F-20 still imports: absent
+    /// means "leave whatever the extraction produced".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<i64>,
     pub size: u64,
     pub sha256: String,
     /// Where the member's bytes live in the chunk stream.
@@ -387,6 +396,7 @@ mod tests {
                 path: "workspace/notes.md".into(),
                 class: Class::SessionCritical.as_str().into(),
                 mode: 0o100644,
+                mtime: None,
                 size: 10,
                 sha256: "a".into(),
                 span: Span {
@@ -398,6 +408,7 @@ mod tests {
                 path: "root/.claude/backups/x".into(),
                 class: Class::Reconstructible.as_str().into(),
                 mode: 0o100644,
+                mtime: None,
                 size: 5,
                 sha256: "b".into(),
                 span: Span {

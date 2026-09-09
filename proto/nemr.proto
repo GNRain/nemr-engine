@@ -14,6 +14,7 @@ service Nemr {
   rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
 
   rpc Create(CreateRequest) returns (CreateResponse);
+  rpc Adopt(AdoptRequest) returns (AdoptResponse);
   rpc Start(StartRequest) returns (StartResponse);
   rpc Stop(StopRequest) returns (StopResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
@@ -68,6 +69,39 @@ message CreateResponse {
   string volume_path = 3;
   string size = 4;
   string agent = 5;
+}
+
+// E-23: adopt an existing host directory into a fresh session.
+message AdoptRequest {
+  string name = 1;
+  string size = 2;
+  string agent = 3;
+  string source_dir = 4;  // an absolute path on the host
+  // F-15: measure what the copy WOULD be, provisioning nothing, so the CLI can
+  // show it and ask before adopting. The engine is the single writer; the CLI
+  // must not reach into it (E-09), so the plan comes through the daemon too.
+  bool plan_only = 5;
+}
+message AdoptResponse {
+  string name = 1;
+  string container_id = 2;
+  string size = 3;
+  string agent = 4;
+  uint64 files_copied = 5;
+  uint64 bytes_copied = 6;
+  uint64 history_sessions = 7;
+  uint64 history_lines_dropped = 8;
+  string source = 9;
+  uint64 git_bytes = 10;
+  bool is_git_repo = 11;
+  // The git directory lives OUTSIDE the folder (a git worktree checkout or a
+  // submodule): only the `.git` marker travels, so the session will not be a
+  // working repository. Plan-only.
+  bool git_dir_external = 12;
+  // Lines that did not parse and were not a torn tail: carried over as they
+  // are, never dropped. Reported so a summary can say the transcript arrived
+  // with damage the host already had.
+  uint64 history_lines_corrupt = 13;
 }
 
 message StartRequest { string name = 1; }

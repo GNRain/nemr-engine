@@ -25,7 +25,13 @@ path = "src/main.rs"
 nemr-storage = { path = "../nemr-storage", version = "0.1.0" }
 
 axum = { version = "0.8", features = ["json"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "fs", "io-util"] }
+futures = "0.3"
+# F-16: chunks on both transfer paths — the staged upload and the streamed
+# download — are `Bytes`, so nothing is copied to cross the storage seam.
+bytes = "1"
+# F-16: the upload streams to a staged file rather than buffering the bundle.
+tempfile = "3"
 tower = "0.5"
 # An object-safe façade over nemr-storage's ObjectStore (which uses native
 # async-fn-in-trait and so is not dyn-compatible), so the backend can be chosen

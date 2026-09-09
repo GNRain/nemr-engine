@@ -1629,6 +1629,7 @@ name = "nemr-storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "futures",
  "object_store",
  "sha2 0.11.0",
@@ -1647,6 +1648,8 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "bytes",
+ "futures",
  "hex",
  "hmac",
  "nemr-crypto",
