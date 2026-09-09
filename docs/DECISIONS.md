@@ -1749,7 +1749,7 @@ as the case every test passes.
 
 ### E-22 — Deleting a session's cloud copy: not from the page until the server can delete bundles
 
-**Status:** Open — recorded with F-12 (2026-09-08); no code
+**Status:** Ruled · 2026-09-08 (Product Owner) — built the same day
 **Raised by:** Rain (F-12, the UI's second pass: "Deleting the cloud copy is out of scope until the server can delete bundles; record that as its own decision row") · **Relates to:** F-12 (remove from this machine), WP-J (the sync server), D-05/E-20 (the object store), E-16 (the key envelope: a bundle is opaque to the server)
 
 **Question.** F-12 removes a session from *this machine* only. When may the page (or the CLI) delete the copy in the cloud — the bundle in the object store and the row in the server's index — and what must be true first?
@@ -1762,6 +1762,16 @@ as the case every test passes.
 **Options.** (a) Never from the page: a CLI-only `nemr sessions delete <name>` once the server has the route. (b) From the page, as a third remove case ("delete everywhere") with the typed name, once the server has the route. (c) Soft delete first: the index row marked deleted and the object kept for a grace period, then a sweep.
 
 **Proposal.** Out of scope until the server can delete bundles. Then (b) with the typed name for every cloud delete (never one click), refused while another machine holds the lease, and the index row kept for a grace period (c) so D-04 can name what was lost. To be ruled when the server route is built.
+
+**Ruling (Product Owner, 2026-09-08), answering the four questions.**
+
+1. *The row after the cloud copy is deleted, session still local.* It reads **local, no bundle**, and nothing else changes. Deleting the cloud copy removes the object AND the session's server index row, so the merge sees only the local project: `where = local`, `has_bundle = false`. The local session, its volume and its (absent) lease are untouched. A later push re-upserts the server row and re-uploads — the ordinary path.
+
+2. *Confirmation shape, by whether a copy survives (F-12's rule, extended to the cloud).* The destructive case is deleting the ONLY copy; the safe case is deleting a copy while another survives. So: a session that also exists **locally** (`where = both`) → the cloud copy is not the only one → **one click**, no typing (the row becomes local, no bundle). A session that exists **only in the cloud** (`where = remote`) → the cloud copy IS the only copy → the **typed name**, exactly as F-12 guards the only local copy. The button says which: *delete from cloud* on a both-row, *delete the only copy* on a remote-row.
+
+3. *The lease.* A cloud delete is refused while an **active lease is held by another machine** — deleting a bundle another machine holds would let its next push write into a deleted key and leave a half-state (the D-03 shape). The server refuses with the holder named; the driver offers **take-over** (D-03), exactly as pull and push do. With no active lease, or one this machine holds, the delete proceeds. The row-delete carries the lease test in its `WHERE` clause (fenced, atomic), so a lease acquired mid-delete is refused rather than raced.
+
+4. *What the server does with the object: removed, not tombstoned.* The object is **removed from the store synchronously**, in the request, and the index row is deleted in the same operation. Not tombstoned-and-reaped: a storage tier bills what the store holds, so "what exists" should be exactly the store's live contents with no separate tombstone ledger to reconcile, and no reaper to build and operate; and the acceptance's proof — the object is *gone from the bucket*, read back by something that is not the server — is only true immediately if the removal is synchronous. The cost is that "what did I lose?" (D-04) cannot later name a bundle this delete erased; that is D-04's to solve with its own tombstone table if it wants one, and it is told so here. On the reference host the delete is proven end to end and, in R2 mode, the object is confirmed absent from the bucket by the acceptance's own signer.
 
 ## Log
 
@@ -1824,3 +1834,4 @@ as the case every test passes.
 | 2026-09-08 | E-21 | **Opened** — the credential step on a second machine: placeholder at start when the host has no credential, login inside the session through the page's terminal (Claude Code's own OAuth URL rendered as a link; measured: the manual flow exists), the write landing on the host through the rw bind; acceptance in two arms (automated with a test seam; human-completed once on the fresh VM). Proposed, not ruled; three questions listed (Claude Code) |
 | 2026-09-08 | E-21 | **Ruled and built** — create and restore identical on a host with no login (AUTH-03 amended); the placeholder at create and start, bound rw; the page's login line, the sign-in URL as text and link; the seam test-only and path-only; the write-through measured under the real bind (SPEC 1.125) (Rain; built by Claude Code) |
 | 2026-09-08 | E-22 | **Opened** — deleting a session's cloud copy waits for a server route; F-12 removes from this machine only, the cloud copy never touched (Claude Code, on F-12) |
+| 2026-09-08 | E-22 | **Ruled and built** — delete the cloud copy: removes the object AND the index row (row reads local, no bundle); one click when a local copy survives, the typed name when it is the only copy (F-12's rule); refused while another machine holds the lease, take-over offered; the object removed synchronously, not tombstoned (bill what exists); proven in both storage modes and the object confirmed gone from the R2 bucket (Rain; built by Claude Code) |

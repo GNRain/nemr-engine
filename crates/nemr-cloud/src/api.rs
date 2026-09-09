@@ -273,6 +273,19 @@ impl Api {
         Self::decode(resp, "uploading the bundle", true)
     }
 
+    /// E-22: delete a session's cloud copy — the object and the index row.
+    /// Sends this machine's holder id so the server can allow the delete when
+    /// this machine holds the lease (or none is held) and refuse, naming the
+    /// holder, when another machine does. A 409 is a lease conflict.
+    pub fn delete_cloud(&self, name: &str, holder: &str) -> Result<()> {
+        let resp = self
+            .auth(self.http.delete(self.url(&format!("/v1/sessions/{name}"))))
+            .header("x-nemr-lease-holder", holder)
+            .send()
+            .context("reaching the server")?;
+        Self::decode::<serde_json::Value>(resp, "deleting the cloud copy", true).map(|_| ())
+    }
+
     pub fn download_bundle(&self, name: &str) -> Result<Vec<u8>> {
         let resp = self
             .auth(

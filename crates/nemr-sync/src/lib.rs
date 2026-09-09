@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use sqlx::postgres::PgPool;
 use time::Duration;
@@ -117,6 +117,9 @@ pub fn router(state: AppState) -> Router {
             "/v1/sessions/{name}/bundle",
             put(bundles::upload).get(bundles::download),
         )
+        // E-22: delete the cloud copy — the object AND the index row. Refused
+        // while another machine holds the lease (take over first).
+        .route("/v1/sessions/{name}", delete(bundles::delete_cloud))
         .route("/v1/sessions/{name}/lease", post(lease::acquire))
         .route(
             "/v1/sessions/{name}/lease/heartbeat",

@@ -46,9 +46,9 @@ PASS=0; FAIL=0
 # reads the bucket back independently (six more assertions); otherwise a
 # directory under the work dir.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=80
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=86
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=76
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=82
 fi
 # The human arm (E-21) adds its own assertions when it runs.
 [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]] && EXPECTED_ASSERTIONS=$((EXPECTED_ASSERTIONS + 4))
@@ -639,6 +639,39 @@ else
     [[ "$after" -gt "$before" ]] || die "the stored bundle was not rewritten by the second push"
     pass "the list shows it stopped, pushed and released; the stored bundle was rewritten"
 fi
+step "Delete the cloud copy through the page (E-22), and see it gone"
+# $PROJECT exists here AND in the cloud (local + bundle), so deleting the cloud
+# copy is the one-click case: the row becomes local, no bundle, and the object
+# is removed from the store (E-22: removed, not tombstoned).
+out=$(UI cloud-delete "$PROJECT") || die "the cloud-delete call failed: $out"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); [print("   |",l["text"]) for l in d["lines"]]; sys.exit(0 if d["ok"] else 1)' "$out" \
+    || die "cloud-delete through the page failed"
+list=$(UI sessions)
+python3 - "$list" "$PROJECT" <<'PYEOF' || exit 1
+import json, sys
+d = json.loads(sys.argv[1]); name = sys.argv[2]
+row = next((r for r in d["rows"] if r["name"] == name), None)
+assert row, f"the session must still be listed (it is still local): {d['rows']}"
+assert row["where"] == "local", f"after the cloud copy is deleted the row reads local: {row}"
+assert not row["has_bundle"], f"and carries no bundle: {row}"
+print(f"   row: {name} where={row['where']} bundle={row['has_bundle']}")
+PYEOF
+output_has "^$PROJECT " -- nemr list || die "the local project must be untouched by the cloud delete"
+pass "the cloud copy is deleted: the row reads local with no bundle, the local project untouched"
+if [[ "$STORAGE_MODE" == s3 ]]; then
+    # THE R2 arm: the object is gone from the bucket, read back by the
+    # acceptance's own signer — not the server.
+    if python3 "$REPO/docs/ui-acceptance.py" s3-get "$LAUNCH_URL" "$stored_key" "$WORK/after-delete.bin" >/dev/null 2>&1; then
+        die "the object is STILL in the bucket at $stored_key after the cloud delete (E-22 requires it removed, not tombstoned)"
+    fi
+    left=$(python3 "$REPO/docs/ui-acceptance.py" s3-list "$LAUNCH_URL" "$stored_key" | grep -c . || true)
+    [[ "$left" -eq 0 ]] || die "the bucket still lists $left object(s) at $stored_key after the cloud delete"
+    pass "R2: the object is gone from the bucket at the key the server logged (read back by the acceptance's own signer)"
+else
+    [[ -z "$(find "$WORK/bundles" -type f)" ]] || die "the stored bundle is still on disk after the cloud delete"
+    pass "the stored bundle is gone from the server's directory after the cloud delete"
+fi
+
 if [[ "$STORAGE_MODE" == s3 ]]; then
     # The pull that came back byte-identical above came from the bucket:
     # nothing else held the bundle once the local project was deleted.

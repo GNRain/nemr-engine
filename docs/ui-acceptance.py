@@ -513,6 +513,23 @@ async def _page_flow(launch_url, email, password, server, remote_name, local_nam
         await b.wait_for(f"(() => {{ const r = (window.nemrRows || []).find(x => x.name === {json.dumps(third)}); return !!r && r.where === 'remote'; }})()", 120, "the third row to read remote after the remove")
         check("F-12 removed here: the row stays and reads remote", not await b.eval(f"!!document.querySelector('button[data-remove={json.dumps(third)}]')"))
 
+        # ---- E-22, the only-copy case on the real page: the cloud copy of a
+        # remote-only session is the only copy, so the typed name is required
+        # (F-12's rule), and deleting it drops the row entirely.
+        await b.eval(f"document.querySelector('button[data-cloud={json.dumps(third)}]').click()")
+        await b.wait_for(VISIBLE + "('cloudform')", 10, "the cloud-delete panel")
+        case = await b.eval("document.getElementById('cloudcase').textContent")
+        check("E-22 the only copy: the panel says so and the button is disabled until the name is typed",
+              "only copy" in case and await b.eval(VISIBLE + "('cloudtypeit')") and await b.eval("document.getElementById('cloudconfirm').disabled"), case)
+        await b.eval("document.querySelector('#cloudform input[name=typed]').focus()")
+        await type_keys(b, third[:-1])
+        check("E-22 a name that does not match keeps the button disabled", await b.eval("document.getElementById('cloudconfirm').disabled"))
+        await type_keys(b, third[-1])
+        check("E-22 the exact name enables it", not await b.eval("document.getElementById('cloudconfirm').disabled"))
+        await b.eval("document.getElementById('cloudform').requestSubmit()")
+        await b.wait_for(f"(() => {{ const r = (window.nemrRows || []).find(x => x.name === {json.dumps(third)}); return !r; }})()", 120, "the third row to vanish after the cloud copy is deleted")
+        check("E-22 deleting the only copy drops the row entirely", not await b.eval(f"!!document.querySelector('button[data-cloud={json.dumps(third)}]')"))
+
         # ---- F-1, the other direction, once more at the end.
         await b.eval("document.getElementById('logout').click()")
         await b.wait_for(VISIBLE + "('login')", 30, "the login form after the final logout")
@@ -727,6 +744,10 @@ def main():
     elif op == "remove":
         # remove <name> — F-12, from this machine; the cloud copy is never touched.
         print(json.dumps(surface.job("DELETE", f"/sessions/{sys.argv[3]}")))
+    elif op == "cloud-delete":
+        # cloud-delete <name> [take-over] — E-22, delete the cloud copy.
+        take_over = len(sys.argv) > 4 and sys.argv[4] == "take-over"
+        print(json.dumps(surface.job("DELETE", f"/sessions/{sys.argv[3]}/cloud", {"take_over": take_over})))
     elif op == "attach":
         # attach <name> <command> [raw-capture-path]
         name, command = sys.argv[3], sys.argv[4]
