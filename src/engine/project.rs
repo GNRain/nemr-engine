@@ -436,8 +436,26 @@ fn walkdir_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(out)
 }
 
-/// Recursively copy `src` to `dst` (files and directories), preserving nothing
-/// but the bytes. Used for `.git`.
+/// Copy `from`'s modification time onto `to` (F-20).
+///
+/// Claude Code's resume list sorts transcripts by mtime, so a copy that stamps
+/// everything with "now" lands every session on the same age and the list loses
+/// its order. Best effort: a filesystem that will not say, or will not set, is
+/// not worth failing an adoption over.
+fn preserve_mtime(from: &Path, to: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(from) else {
+        return;
+    };
+    let Ok(modified) = meta.modified() else {
+        return;
+    };
+    if let Ok(file) = std::fs::File::options().write(true).open(to) {
+        let _ = file.set_times(std::fs::FileTimes::new().set_modified(modified));
+    }
+}
+
+/// Recursively copy `src` to `dst` (files and directories), preserving the
+/// bytes and each file's mtime (F-20). Used for `.git`.
 fn copy_tree(src: &Path, dst: &Path) -> Result<(u64, u64)> {
     let mut files = 0u64;
     let mut bytes = 0u64;
@@ -462,6 +480,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(u64, u64)> {
                 }
                 let n = std::fs::copy(&path, &target)
                     .with_context(|| format!("copying {}", path.display()))?;
+                preserve_mtime(&path, &target);
                 files += 1;
                 bytes += n;
             }
@@ -643,6 +662,7 @@ pub async fn adopt(
             Ok(m) if m.is_file() => {
                 let n = std::fs::copy(&from, &to)
                     .with_context(|| format!("copying {}", from.display()))?;
+                preserve_mtime(&from, &to);
                 files_copied += 1;
                 bytes_copied += n;
             }
@@ -696,6 +716,12 @@ pub async fn adopt(
                         }
                         std::fs::copy(&path, &target).ok();
                     }
+                    // F-20: every transcript keeps the time it was last written
+                    // on the host, so `claude --resume`'s list — which sorts by
+                    // mtime — comes back in the order the user left it. A
+                    // rewritten .jsonl gets it too: dropping a torn last line
+                    // is not the session being touched.
+                    preserve_mtime(&path, &target);
                 }
             }
         }

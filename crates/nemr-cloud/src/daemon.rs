@@ -12,8 +12,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use nemr_daemon_api::proto::{
-    attach_client, AttachClient, AttachStart, CreateRequest, DeleteRequest, ExportRequest,
-    ImportRequest, ListRequest, StartRequest, StatusRequest, StopRequest,
+    attach_client, AdoptRequest, AdoptResponse, AttachClient, AttachStart, CreateRequest,
+    DeleteRequest, ExportRequest, ImportRequest, ListRequest, StartRequest, StatusRequest,
+    StopRequest,
 };
 
 use crate::core::EngineOps;
@@ -142,6 +143,49 @@ impl DaemonEngine {
         Ok(())
     }
 
+    /// F-21: what adding a host directory would copy — the daemon's `Adopt`
+    /// with `plan_only`, which provisions nothing. The page shows this before
+    /// the confirm.
+    pub async fn add_plan(source_dir: &str) -> Result<AdoptResponse> {
+        let mut s = Self::session().await?;
+        let req = s.req(AdoptRequest {
+            name: String::new(),
+            size: String::new(),
+            agent: String::new(),
+            source_dir: source_dir.to_string(),
+            plan_only: true,
+        });
+        Ok(s.client()
+            .adopt(req)
+            .await
+            .map_err(|st| anyhow::anyhow!("{}", st.message()))
+            .context("measuring what would be added")?
+            .into_inner())
+    }
+
+    /// F-21: add an existing host directory as a session.
+    pub async fn add_project(
+        name: &str,
+        size: &str,
+        agent: &str,
+        source_dir: &str,
+    ) -> Result<AdoptResponse> {
+        let mut s = Self::session().await?;
+        let req = s.req(AdoptRequest {
+            name: name.to_string(),
+            size: size.to_string(),
+            agent: agent.to_string(),
+            source_dir: source_dir.to_string(),
+            plan_only: false,
+        });
+        Ok(s.client()
+            .adopt(req)
+            .await
+            .map_err(|st| anyhow::anyhow!("{}", st.message()))
+            .context("adding the directory as a session")?
+            .into_inner())
+    }
+
     /// F-12: remove from this machine through the daemon's `Delete` — the
     /// same RPC `nemr delete` uses. The cloud copy is never touched here.
     pub async fn delete_project(name: &str) -> Result<()> {
@@ -199,6 +243,29 @@ impl crate::serve::UiEngine for DaemonEngine {
     }
     fn delete(&self, name: &str) -> Result<()> {
         self.rt.block_on(Self::delete_project(name))
+    }
+    fn add_plan(&self, source_dir: &str) -> Result<(u64, u64, u64, u64, bool, String)> {
+        let p = self.rt.block_on(Self::add_plan(source_dir))?;
+        Ok((
+            p.files_copied,
+            p.bytes_copied,
+            p.history_sessions,
+            p.git_bytes,
+            p.is_git_repo,
+            p.source,
+        ))
+    }
+    fn add(
+        &self,
+        name: &str,
+        size: &str,
+        agent: &str,
+        source_dir: &str,
+    ) -> Result<(u64, u64, u64)> {
+        let s = self
+            .rt
+            .block_on(Self::add_project(name, size, agent, source_dir))?;
+        Ok((s.files_copied, s.bytes_copied, s.history_sessions))
     }
     fn attach(
         &self,

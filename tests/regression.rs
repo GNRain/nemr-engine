@@ -5034,13 +5034,13 @@ fn e23_adopt_copies_the_tree_and_history_excludes_the_derived_and_leaves_the_sou
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// F-15: `adopt` copies a whole tree, so it says what and how big and asks —
+/// F-15: `add` copies a whole tree, so it says what and how big and asks —
 /// on a terminal. Where a confirmation cannot be drawn or answered (the
 /// acceptance drives the CLI with stderr redirected), it must REFUSE and name
 /// the flag, never prompt into a pipe and never proceed silently. With the flag
 /// it adopts without asking.
 #[test]
-fn f15_adopt_refuses_without_a_terminal_and_names_the_flag_and_yes_adopts() {
+fn f15_add_refuses_without_a_terminal_and_names_the_flag_and_yes_adds() {
     if unit_only() {
         return;
     }
@@ -5067,7 +5067,7 @@ fn f15_adopt_refuses_without_a_terminal_and_names_the_flag_and_yes_adopts() {
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
         !refused.status.success(),
-        "adopt must refuse without a terminal and without --yes.\nstderr: {stderr}"
+        "add must refuse without a terminal and without --yes.\nstderr: {stderr}"
     );
     assert!(
         stderr.contains("--yes"),
@@ -5108,18 +5108,197 @@ fn f15_adopt_refuses_without_a_terminal_and_names_the_flag_and_yes_adopts() {
     let err = String::from_utf8_lossy(&adopted.stderr);
     assert!(
         adopted.status.success(),
-        "adopt --yes must proceed without a terminal.\nstdout: {out}\nstderr: {err}"
+        "add --yes must proceed without a terminal.\nstdout: {out}\nstderr: {err}"
     );
     assert!(
-        !err.contains("Adopt it?") && !out.contains("Adopt it?"),
+        !err.contains("Add it?") && !out.contains("Add it?"),
         "--yes must not print the confirmation at all.\nstdout: {out}\nstderr: {err}"
     );
-    assert!(out.contains("adopted"), "it reports what it did: {out}");
+    assert!(out.contains("added"), "it reports what it did: {out}");
 
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
         let _ = project::stop(&client, "f15adopt").await;
         let _ = project::delete(&client, "f15adopt").await;
     });
+
+    // F-21: `adopt` stays as a hidden alias for one release, so a script that
+    // used it still works — same refusal, naming the same flag.
+    let aliased = std::process::Command::new(env!("CARGO_BIN_EXE_nemr"))
+        .args([
+            "adopt",
+            &source.to_string_lossy(),
+            "--name",
+            "f15alias",
+            "--size",
+            "500MB",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run nemr adopt (alias)");
+    let alias_err = String::from_utf8_lossy(&aliased.stderr);
+    assert!(
+        !aliased.status.success() && alias_err.contains("--yes"),
+        "the adopt alias must still resolve and refuse the same way.\nstderr: {alias_err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// F-20: Claude Code's resume list sorts transcripts by mtime, so adoption that
+/// stamps every file with the moment of import lands all of them on the same
+/// age and the list loses its order — with a real history the user cannot tell
+/// which session they were last in. The order must survive the whole journey:
+/// adopt, export (push), import (pull).
+#[test]
+fn f20_the_resume_lists_order_survives_adopt_push_and_pull() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let tmp = std::env::temp_dir().join(format!("nemr-f20-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let source = tmp.join("proj");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("README.md"), "f20").unwrap();
+
+    // A host history of five sessions, each last written a day apart, in a
+    // deliberately jumbled filename order so only the mtimes carry the order.
+    let key: String = source
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect();
+    let home = std::env::var("HOME").unwrap();
+    let host_hist = std::path::PathBuf::from(&home)
+        .join(".claude/projects")
+        .join(&key);
+    let _ = std::fs::remove_dir_all(&host_hist);
+    std::fs::create_dir_all(&host_hist).unwrap();
+    const DAY: u64 = 86_400;
+    let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    // name -> age in days (0 = most recent)
+    let sessions = [
+        ("zulu", 0u64),
+        ("alpha", 1),
+        ("mike", 2),
+        ("bravo", 3),
+        ("kilo", 4),
+    ];
+    for (name, age) in sessions {
+        let path = host_hist.join(format!("{name}.jsonl"));
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::json!({"type":"user","content":name})),
+        )
+        .unwrap();
+        let when = base - std::time::Duration::from_secs(age * DAY);
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+    // The order the resume list would show on the host: newest first.
+    let order_of = |dir: &std::path::Path| -> Vec<String> {
+        let mut v: Vec<(i64, String)> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+            .map(|e| {
+                let m = e.metadata().unwrap();
+                (m.mtime(), e.file_name().to_string_lossy().into_owned())
+            })
+            .collect();
+        v.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+        v.into_iter().map(|(_, n)| n).collect()
+    };
+    let host_order = order_of(&host_hist);
+    assert_eq!(
+        host_order,
+        vec![
+            "zulu.jsonl",
+            "alpha.jsonl",
+            "mike.jsonl",
+            "bravo.jsonl",
+            "kilo.jsonl"
+        ],
+        "control: the host's own order is the one we planted"
+    );
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        for n in ["f20adopt", "f20pulled"] {
+            let _ = project::stop(&client, n).await;
+            let _ = project::delete(&client, n).await;
+        }
+    });
+
+    // Adopt.
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        project::adopt(
+            &client,
+            "f20adopt",
+            nemr_engine::engine::volume::VolumeSize::Small,
+            nemr_engine::engine::agent::Agent::ClaudeCode,
+            &source,
+        )
+        .await
+        .expect("adopt");
+    });
+    let mount = nemr_engine::engine::volume::VolumePaths::from_env()
+        .unwrap()
+        .mount_point("f20adopt");
+    let adopted_hist = mount.join(".nemr-state/projects/-workspace");
+    assert_eq!(
+        order_of(&adopted_hist),
+        host_order,
+        "F-20: the order must survive the adoption — every transcript keeps the time it was last written"
+    );
+
+    // Push and pull: export the session and import it as another.
+    let bundle = tmp.join("f20.nemr");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        project::export(
+            &client,
+            "f20adopt",
+            &bundle,
+            nemr_engine::bundle::policy::Policy::default(),
+        )
+        .await
+        .expect("export");
+        project::import_creating(
+            &client,
+            &bundle,
+            Some("f20pulled"),
+            Some(nemr_engine::engine::volume::VolumeSize::Small),
+        )
+        .await
+        .expect("import");
+    });
+    let pulled_hist = nemr_engine::engine::volume::VolumePaths::from_env()
+        .unwrap()
+        .mount_point("f20pulled")
+        .join(".nemr-state/projects/-workspace");
+    assert_eq!(
+        order_of(&pulled_hist),
+        host_order,
+        "F-20: the order must survive the push and the pull too — the bundle carries each member's mtime"
+    );
+
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        for n in ["f20adopt", "f20pulled"] {
+            let _ = project::stop(&client, n).await;
+            let _ = project::delete(&client, n).await;
+        }
+    });
+    let _ = std::fs::remove_dir_all(&host_hist);
     let _ = std::fs::remove_dir_all(&tmp);
 }

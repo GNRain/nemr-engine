@@ -46,9 +46,9 @@ PASS=0; FAIL=0
 # reads the bucket back independently (six more assertions); otherwise a
 # directory under the work dir.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=94
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=98
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=90
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=94
 fi
 # The human arm (E-21) adds its own assertions when it runs.
 [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]] && EXPECTED_ASSERTIONS=$((EXPECTED_ASSERTIONS + 4))
@@ -407,7 +407,9 @@ UI2_PID=$!
 for _ in $(seq 1 60); do grep -q 'nemr ui: http' "$WORK/ui2.log" && break; sleep 0.25; done
 LAUNCH2=$(grep -o 'http://127.0.0.1:[0-9]*/#token=[0-9a-f]*' "$WORK/ui2.log" | head -1)
 [[ -n "$LAUNCH2" ]] || { cat "$WORK/ui2.log"; die "the second UI did not print a launch URL"; }
-page_out=$(python3 "$REPO/docs/ui-acceptance.py" page "$LAUNCH2" "$EMAIL" "$PASSWORD" "$SERVER_URL" "$PROJECT" "$LOCAL2" 2>"$WORK/page.err"); page_rc=$?
+# The last argument is a real folder for F-21's add panel to measure (the repo
+# itself): the panel's plan is a read, so nothing is created by measuring it.
+page_out=$(python3 "$REPO/docs/ui-acceptance.py" page "$LAUNCH2" "$EMAIL" "$PASSWORD" "$SERVER_URL" "$PROJECT" "$LOCAL2" "$REPO" 2>"$WORK/page.err"); page_rc=$?
 if [[ -z "$page_out" ]]; then
     sed 's/^/   | /' "$WORK/page.err" | grep -v Gtk-Message | tail -15
     die "the page-driving half produced no result (its stderr above; rc=$page_rc)"
@@ -641,7 +643,7 @@ else
     [[ "$after" -gt "$before" ]] || die "the stored bundle was not rewritten by the second push"
     pass "the list shows it stopped, pushed and released; the stored bundle was rewritten"
 fi
-step "Adopt a host directory, push it, and continue it across a pull (E-23)"
+step "Add an existing host folder, push it, and continue it across a pull (E-23)"
 # A throwaway git repo with a derived directory that must NOT travel, and a
 # Claude Code history holding a marker planted BEFORE adoption. The marker is
 # unique and does not appear in the recall question, so a pass is real recall.
@@ -649,21 +651,21 @@ ADOPT_SRC="$WORK/adopt-src"; mkdir -p "$ADOPT_SRC/target/debug" "$ADOPT_SRC/src"
 ( cd "$ADOPT_SRC" \
   && git init -q && git config user.email t@t && git config user.name t \
   && printf 'target/\n' > .gitignore \
-  && printf 'adopt me\n' > README.md && printf 'fn main() {}\n' > src/main.rs \
+  && printf 'add me\n' > README.md && printf 'fn main() {}\n' > src/main.rs \
   && head -c 200000 /dev/zero > target/debug/blob \
-  && git add -A && git commit -qm initial ) || die "could not build the adopt source repo"
+  && git add -A && git commit -qm initial ) || die "could not build the source repo to add"
 ADOPT_MARK="ADOPT-RECALL-$$-$RANDOM"
 # Plant the marker in the source directory's OWN Claude Code history, on the host.
 ( cd "$ADOPT_SRC" && timeout 150 claude -p "Remember this token exactly for later: $ADOPT_MARK . Acknowledge with just OK." --output-format json < /dev/null ) >"$WORK/adopt-plant.json" 2>&1
 grep -q '"result"' "$WORK/adopt-plant.json" || { sed 's/^/   | /' "$WORK/adopt-plant.json" | tail -5; die "could not plant the marker in the host history (is the host logged in?)"; }
 pass "planted a marker in the host directory's Claude Code history (before adoption)"
 # Adopt it (CLI — the user names the directory; E-23).
-nemr adopt "$ADOPT_SRC" --name "$ADOPTED" --size 500MB --yes >"$WORK/adopt.log" 2>&1 || { cat "$WORK/adopt.log"; die "nemr adopt failed"; }
+nemr add "$ADOPT_SRC" --name "$ADOPTED" --size 500MB --yes >"$WORK/adopt.log" 2>&1 || { cat "$WORK/adopt.log"; die "nemr add failed"; }
 MNT="$HOME/.local/share/nemr/mounts/$ADOPTED"
 [[ -f "$MNT/README.md" && -d "$MNT/.git" ]] || die "the adopted tree is missing README.md or .git"
 [[ ! -e "$MNT/target" ]] || die "target/ must never be adopted (it is 11G of derived output on the real tree)"
 ls "$MNT"/.nemr-state/projects/-workspace/*.jsonl >/dev/null 2>&1 || die "the adopted history did not land at the -workspace key"
-pass "adopted the tree (README + .git, no target/) and the history at the -workspace key"
+pass "added the folder: the tree (README + .git, no target/) and the history at the -workspace key"
 # Push the adopted session through the page.
 out=$(UI push "$ADOPTED" "$PASSWORD" release) || die "the adopt push call failed: $out"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d["ok"] else 1)' "$out" || { echo "$out"; die "pushing the adopted session failed"; }

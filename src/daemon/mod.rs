@@ -149,24 +149,18 @@ impl Nemr for NemrService {
         request: Request<AdoptRequest>,
     ) -> Result<Response<AdoptResponse>, Status> {
         let req = request.into_inner();
-        let size = req
-            .size
-            .parse::<crate::engine::volume::VolumeSize>()
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let agent = req
-            .agent
-            .parse::<crate::engine::agent::Agent>()
-            .map_err(status_from_typed)?;
-        // F-15: the plan is a read — it provisions nothing — so the CLI can ask
-        // for it, show what and how big, and confirm before adopting.
+        // F-15/F-21: the plan is a READ — it provisions nothing and needs no
+        // size or agent, so it is answered BEFORE those are parsed. The page's
+        // panel measures a folder before the user has picked either; parsing
+        // first refused every plan with "unrecognised volume size """.
         if req.plan_only {
             let plan = crate::engine::project::adopt_plan(std::path::Path::new(&req.source_dir))
                 .map_err(status_from_anyhow)?;
             return Ok(Response::new(AdoptResponse {
                 name: String::new(),
                 container_id: String::new(),
-                size: size.to_string(),
-                agent: agent.id().to_string(),
+                size: req.size.clone(),
+                agent: req.agent.clone(),
                 files_copied: plan.files,
                 bytes_copied: plan.bytes,
                 history_sessions: plan.history_sessions,
@@ -176,6 +170,14 @@ impl Nemr for NemrService {
                 is_git_repo: plan.is_git_repo,
             }));
         }
+        let size = req
+            .size
+            .parse::<crate::engine::volume::VolumeSize>()
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let agent = req
+            .agent
+            .parse::<crate::engine::agent::Agent>()
+            .map_err(status_from_typed)?;
         let summary = crate::engine::project::adopt(
             &self.client,
             &req.name,

@@ -53,12 +53,15 @@ enum Command {
         agent: Option<Agent>,
     },
 
-    /// Adopt an existing host directory into a fresh session: copy its tree
-    /// (respecting .gitignore, always excluding target/ and node_modules/, .git
-    /// carried whole) and its Claude Code history, so it can be pushed and
-    /// continued on another machine (E-23). The directory is copied, not moved.
-    Adopt {
-        /// The host directory to adopt (its tree and Claude Code history).
+    /// Add an existing host directory as a session: copy its tree (respecting
+    /// .gitignore, always excluding target/ and node_modules/, .git carried
+    /// whole) and its Claude Code history, so it can be pushed and continued on
+    /// another machine (E-23). The directory is copied, not moved.
+    ///
+    /// `adopt` is a hidden alias for one release (F-21).
+    #[command(alias = "adopt")]
+    Add {
+        /// The host directory to add (its tree and Claude Code history).
         dir: String,
 
         /// Project name. Omitted, derived from the directory's basename.
@@ -75,7 +78,7 @@ enum Command {
 
         /// Skip the confirmation. Required when stdin or stderr is not a
         /// terminal, because the confirmation cannot be shown or answered there
-        /// (F-15) — adopt never proceeds silently.
+        /// (F-15) — add never proceeds silently.
         #[arg(long)]
         yes: bool,
     },
@@ -710,7 +713,7 @@ async fn main() -> Result<()> {
             println!("  next:      nemr start {}", project.name);
         }
 
-        Command::Adopt {
+        Command::Add {
             dir,
             name,
             size,
@@ -745,7 +748,7 @@ async fn main() -> Result<()> {
             let size = resolve_size(size, interactive)?;
             let agent = resolve_agent(agent, interactive)?;
 
-            // F-15: adopt copies a whole tree, so it says what and how big and
+            // F-15: add copies a whole tree, so it says what and how big and
             // asks — on a terminal. Without one it REFUSES and names the flag;
             // it never proceeds silently, and it never tries to prompt where a
             // prompt cannot be drawn.
@@ -771,17 +774,17 @@ async fn main() -> Result<()> {
                 };
                 if !interactive {
                     anyhow::bail!(
-                        "adopt would copy {} in {} file(s) from {} into a new session, and asks \
+                        "adding {} would copy {} in {} file(s) into a new session, and asks \
                          before it does.\n\
                          stdin or stderr is not a terminal, so the confirmation cannot be shown \
                          or answered here.\n\
-                         Re-run with --yes to adopt without confirming.",
+                         Re-run with --yes to add it without confirming.",
+                        plan.source,
                         volume::human_bytes(plan.bytes_copied),
-                        plan.files_copied,
-                        plan.source
+                        plan.files_copied
                     );
                 }
-                eprintln!("About to adopt {} into a new session:", plan.source);
+                eprintln!("About to add {} as a new session:", plan.source);
                 eprintln!("  name:      {name}");
                 eprintln!("  quota:     {size}");
                 eprintln!(
@@ -809,12 +812,12 @@ async fn main() -> Result<()> {
                     plan.history_sessions
                 );
                 eprintln!("  the host directory is COPIED, not moved — it stays as it is.");
-                eprint!("Adopt it? [y/N]: ");
+                eprint!("Add it? [y/N]: ");
                 std::io::Write::flush(&mut std::io::stderr())?;
                 let mut answer = String::new();
                 std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut answer)?;
                 if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
-                    eprintln!("Cancelled. Nothing was adopted.");
+                    eprintln!("Cancelled. Nothing was added.");
                     std::process::exit(1);
                 }
             }
@@ -834,7 +837,7 @@ async fn main() -> Result<()> {
                     .map_err(status_err)?
                     .into_inner()
             };
-            println!("adopted {} into session {:?}", summary.source, summary.name);
+            println!("added {} as session {:?}", summary.source, summary.name);
             println!("  agent:     {}", agent_label(&summary.agent));
             println!("  container: {}", summary.container_id);
             println!(
@@ -844,7 +847,7 @@ async fn main() -> Result<()> {
             );
             if summary.history_sessions > 0 {
                 println!(
-                    "  history:   {} session transcript(s) adopted{}",
+                    "  history:   {} session transcript(s) carried over{}",
                     summary.history_sessions,
                     if summary.history_lines_dropped > 0 {
                         format!(" ({} torn line(s) dropped)", summary.history_lines_dropped)
