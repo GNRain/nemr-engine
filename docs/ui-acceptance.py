@@ -673,6 +673,8 @@ async def credential_step_flow(launch_url, local_name):
             check("E-21 the page says this machine has no Claude login yet", await b.eval(VISIBLE + "('loginline')"), _rows)
             text = await b.eval("document.getElementById('loginline').textContent")
             check("E-21 the line says what to do: attach and run /login", "/login" in (text or ""), text)
+            check("F-25 the line says what the login costs elsewhere (E-13)",
+                  "logged out" in (text or ""), text)
             await b.eval(f"document.querySelector('button[data-attach={json.dumps(local_name)}]').click()")
             await b.wait_for("document.getElementById('attachnote').textContent.startsWith('attached')", 30, "the terminal to attach")
             await b.eval("document.querySelector('#term textarea').focus()")

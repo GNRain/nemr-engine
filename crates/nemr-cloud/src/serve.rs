@@ -1459,7 +1459,7 @@ async fn index() -> Response {
   </section>
   <section id="list" hidden>
     <div class="toolbar"><h2>Sessions</h2><span class="spacer"></span><button id="create" class="primary">create session</button><button id="addfolder">add existing folder</button><button id="refresh">refresh</button><span class="note" id="localnote"></span></div>
-    <div id="loginline" hidden>No Claude login on this machine yet — attach a session and run <code>/login</code> in it; the login is written to this machine and stays here.</div>
+    <div id="loginline" hidden>No Claude login on this machine yet — attach a session and run <code>/login</code> in it; the login is written to this machine and stays here. Logging in spends the account's refresh token, so this account's other machines are logged out by it (upstream, unavoidable).</div>
     <div class="tablewrap"><table><thead><tr><th>session</th><th>agent</th><th>where</th><th>state</th><th>size</th><th>updated</th><th>last machine</th><th>held by</th></tr></thead><tbody id="rows"></tbody></table></div>
     <section id="job" class="login" style="max-width:40rem;margin-top:1rem" hidden>
       <div><strong id="jobtitle"></strong></div>

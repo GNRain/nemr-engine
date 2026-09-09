@@ -1984,6 +1984,40 @@ fn import_refuses_to_clobber_an_existing_project() {
 /// "authenticate on the host") is called from nowhere in the engine's
 /// project code — so the amendment cannot silently regress into a create
 /// that refuses again.
+/// F-24: no message sends the user to log in on the host.
+///
+/// Since F-14 nemr's credential lives at `~/.local/share/nemr/host-credential/`
+/// and a host `claude` login writes `~/.claude` — a file the engine neither
+/// reads nor travels. "Run `claude` on this host and log in" was therefore
+/// advice that could not work, and it was the only thing the Product Owner was
+/// told when a credential went blank (F-24). The remedy is `/login` inside a
+/// session; this guards the text of every file that speaks to the user.
+#[test]
+fn f24_nothing_tells_the_user_to_log_in_on_the_host() {
+    let files = [
+        "src/auth.rs",
+        "src/bin/nemr.rs",
+        "src/engine/project.rs",
+        "crates/nemr-cloud/src/serve.rs",
+    ];
+    let forbidden = [
+        "Authenticate on the host",
+        "authenticate on the host",
+        "Authenticate on this host",
+        "Run `claude` on this host",
+        "run `claude` on the host",
+    ];
+    for f in files {
+        let text = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("read {f}: {e}"));
+        for phrase in forbidden {
+            assert!(
+                !text.contains(phrase),
+                "{f} still sends the user to a host login ({phrase:?});                  the login that counts is /login inside a session (F-24)"
+            );
+        }
+    }
+}
+
 #[test]
 fn create_and_restore_take_one_credential_path() {
     let source = std::fs::read_to_string("src/engine/project.rs").expect("read project.rs");
@@ -2013,6 +2047,14 @@ fn create_and_restore_take_one_credential_path() {
     assert!(
         !source.contains("auth::resolve_credentials("),
         "the pre-amendment refusal must not be called from the engine's project code"
+    );
+    // F-24: and the refusal it named is gone from the engine altogether — with
+    // the credential at nemr's own path (F-14), a host `claude` login writes a
+    // file the engine never reads, so sending the user there is a dead end.
+    let auth = std::fs::read_to_string("src/auth.rs").expect("read auth.rs");
+    assert!(
+        !auth.contains("pub fn resolve_credentials"),
+        "resolve_credentials, whose remedy was a host login, must not come back (F-24)"
     );
     // Both public entry points route through it: `create` directly, a restore
     // through import_creating.
@@ -3786,51 +3828,78 @@ fn f9_nemrd_refuses_to_start_inside_a_user_namespace() {
     );
 }
 
-/// AUTH-03 extended: `create` refuses a host credential that cannot
-/// authenticate — blanked, or refresh token spent — before provisioning
-/// anything. HOME is pointed at a temp directory holding the dead file; the
-/// refusal must come before any volume exists there. Serial by the harness
-/// (F-71), and HOME is restored on every path.
+/// F-24: a credential that cannot authenticate is a machine with NO LOGIN, not
+/// a dead end. `create` used to refuse a blanked credential and tell the user to
+/// run `claude` on the host — but since F-14 the engine reads its own file, not
+/// `~/.claude`, so that advice pointed at a file it does not read and the only
+/// way out was deleting the blank one by hand (found on the VMs). Now the
+/// engine resets it to the placeholder, `create` succeeds, and `status` says
+/// "no login yet", so the proven in-session `/login` applies.
 #[test]
-fn create_refuses_a_dead_host_credential_before_provisioning() {
+fn f24_a_blank_credential_becomes_no_login_yet_and_create_succeeds() {
     if unit_only() {
         return;
     }
     if !require_host(HostRequirements::FULL) {
         return;
     }
-    let temp = std::env::temp_dir().join(format!("nemr-dead-cred-{}", std::process::id()));
-    std::fs::create_dir_all(temp.join(".claude")).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    let temp = std::env::temp_dir().join(format!("nemr-f24-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp);
+    let cred = temp.join("host-credential/.credentials.json");
+    std::fs::create_dir_all(cred.parent().unwrap()).unwrap();
+    // Exactly what Claude Code leaves behind after a refresh is refused.
     std::fs::write(
-        temp.join(".claude/.credentials.json"),
+        &cred,
         r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"refreshTokenExpiresAt":1900000000000}}"#,
     )
     .unwrap();
-    let previous = std::env::var_os("HOME");
-    std::env::set_var("HOME", &temp);
+    let before_ino = std::fs::metadata(&cred).unwrap().ino();
+    std::env::set_var("NEMR_HOST_CREDENTIALS", &cred);
+
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let result = runtime.block_on(async {
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let _ = project::stop(&client, "f24blank").await;
+        let _ = project::delete(&client, "f24blank").await;
+    });
+    let detail = runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
         project::create(
             &client,
-            "deadcred",
+            "f24blank",
             VolumeSize::Small,
             nemr_engine::engine::agent::Agent::ClaudeCode,
         )
         .await
-        .map(|_| ())
+        .expect("create must SUCCEED on a blanked credential — it is no login, not a fault");
+        project::status(&client, "f24blank").await.expect("status")
     });
-    match previous {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
-    }
-    let err = result.expect_err("create must refuse a blanked credential");
-    let text = format!("{err:#}");
-    assert!(text.contains("BLANK") && text.contains("log in"), "{text}");
+
+    // The file itself: the placeholder, in place, so a running session's bind
+    // keeps seeing it.
+    let after = std::fs::read_to_string(&cred).unwrap();
     assert!(
-        !temp.join(".local/share/nemr/volumes/deadcred.img").exists(),
-        "the refusal must come before any volume is provisioned"
+        nemr_engine::auth::is_placeholder(&after),
+        "the blanked credential must be reset to the placeholder: {after}"
     );
+    assert_eq!(
+        std::fs::metadata(&cred).unwrap().ino(),
+        before_ino,
+        "reset in place: a session bound to this inode must keep seeing it"
+    );
+    // And what the user is told: no login yet, so `/login` inside applies.
+    assert!(
+        !detail.credential_present,
+        "status must say there is no login on this machine yet"
+    );
+
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let _ = project::stop(&client, "f24blank").await;
+        let _ = project::delete(&client, "f24blank").await;
+    });
+    std::env::remove_var("NEMR_HOST_CREDENTIALS");
     let _ = std::fs::remove_dir_all(&temp);
 }
 
