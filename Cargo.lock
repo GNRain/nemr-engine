@@ -1647,6 +1647,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "futures",
  "hex",
  "hmac",
  "nemr-crypto",

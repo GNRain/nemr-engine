@@ -25,6 +25,11 @@ pub enum ApiError {
     /// A precondition failed — a name already taken, or a lost lease.
     #[error("{0}")]
     Conflict(String),
+
+    /// F-16: the bundle is larger than this server accepts. A product ceiling,
+    /// answered as 413 with the limit named, so the client can say why.
+    #[error("{0}")]
+    PayloadTooLarge(String),
     #[error("too many attempts; try again later")]
     TooManyRequests,
     /// Anything the client cannot act on. The detail is logged, never returned.
@@ -40,6 +45,7 @@ impl ApiError {
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }

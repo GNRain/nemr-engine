@@ -504,6 +504,69 @@ fn copy_history_jsonl(src: &Path, dst: &Path) -> Result<(u64, u64)> {
     Ok((lines, dropped))
 }
 
+/// What an adoption would copy, computed without provisioning anything (F-15:
+/// the confirmation has to say what and how big before the copy runs).
+#[derive(Debug, Clone)]
+pub struct AdoptPlan {
+    pub source: std::path::PathBuf,
+    pub files: u64,
+    pub bytes: u64,
+    pub git_bytes: u64,
+    pub history_sessions: u64,
+    pub is_git_repo: bool,
+}
+
+/// Measure what `adopt` would copy from `source`: the `.gitignore`-respecting
+/// file set (with `target/` and `node_modules/` always excluded), `.git`, and
+/// the Claude Code history for that directory. A read; it provisions nothing.
+pub fn adopt_plan(source: &Path) -> Result<AdoptPlan> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("the source directory {} does not exist", source.display()))?;
+    if !source.is_dir() {
+        bail!("{} is not a directory", source.display());
+    }
+    let rels = adopt_copy_set(&source)?;
+    let mut bytes = 0u64;
+    for rel in &rels {
+        if let Ok(m) = std::fs::symlink_metadata(source.join(rel)) {
+            if m.is_file() {
+                bytes += m.len();
+            }
+        }
+    }
+    let git_dir = source.join(".git");
+    let mut git_bytes = 0u64;
+    if git_dir.is_dir() {
+        for f in walkdir_files(&git_dir)? {
+            if let Ok(m) = std::fs::symlink_metadata(&f) {
+                git_bytes += m.len();
+            }
+        }
+    }
+    let mut history_sessions = 0u64;
+    if let Some(home) = std::env::var_os("HOME") {
+        let hist = std::path::PathBuf::from(&home)
+            .join(".claude/projects")
+            .join(history_key(&source));
+        if hist.is_dir() {
+            for f in walkdir_files(&hist).unwrap_or_default() {
+                if f.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                    history_sessions += 1;
+                }
+            }
+        }
+    }
+    Ok(AdoptPlan {
+        files: rels.len() as u64,
+        bytes: bytes + git_bytes,
+        git_bytes,
+        history_sessions,
+        is_git_repo: git_dir.exists(),
+        source,
+    })
+}
+
 /// E-23: adopt an existing host directory into a fresh session — copy its tree
 /// (`.gitignore`-respecting, `target/`/`node_modules/` always excluded, `.git`
 /// carried whole) and its Claude Code history (rewritten to the `-workspace`

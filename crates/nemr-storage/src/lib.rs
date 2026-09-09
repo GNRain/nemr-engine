@@ -180,6 +180,21 @@ pub trait ObjectStore: Send + Sync {
     /// Store an object, replacing any existing one.
     async fn put(&self, key: &ObjectKey, bytes: &[u8]) -> Result<()>;
 
+    /// Store an object by streaming it from a file on disk (F-16).
+    ///
+    /// A bundle can be gigabytes: the quota presets go to 10GB. Holding one in
+    /// memory to `put` it is not viable in the server, so the upload path
+    /// streams the request body to a temporary file and hands the file here.
+    /// The default implementation reads the file and calls [`Self::put`] — good
+    /// enough for a test double; the real backends override it with a streaming
+    /// write, so memory stays bounded by the chunk size, not the object.
+    async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> Result<()> {
+        let bytes = tokio::fs::read(path).await.map_err(|e| {
+            StorageError::Other(anyhow::Error::from(e).context("reading the staged object"))
+        })?;
+        self.put(key, &bytes).await
+    }
+
     /// Remove an object. Absent is success — deletion is idempotent, so a
     /// retried cleanup after a partial failure does not fail.
     async fn delete(&self, key: &ObjectKey) -> Result<()>;

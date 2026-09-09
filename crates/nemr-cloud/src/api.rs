@@ -5,7 +5,7 @@
 //! verbatim leaks nothing), and lease conflicts are a distinct error variant so
 //! callers can react to "you lost the lease" differently from "network down".
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -260,6 +260,7 @@ impl Api {
         fence: i64,
         ciphertext: Vec<u8>,
     ) -> Result<serde_json::Value> {
+        let bytes = ciphertext.len();
         let resp = self
             .auth(
                 self.http
@@ -269,7 +270,40 @@ impl Api {
             .header("x-nemr-lease-fence", fence.to_string())
             .body(ciphertext)
             .send()
-            .context("reaching the server")?;
+            // F-16: a server that refuses the size mid-stream closes the
+            // connection, and reqwest reports that as a body-write error
+            // ("Broken pipe") that names nothing. Say what it almost always
+            // means, with the size, so the user is not left guessing.
+            .map_err(|e| {
+                if e.is_body() || e.is_request() {
+                    anyhow!(
+                        "the server closed the connection while this {} bundle was being \
+                         uploaded ({e}).\n\
+                         That is what a server refusing the size looks like from here: it stops \
+                         reading before it can answer. Check the server's bundle ceiling \
+                         (NEMR_MAX_BUNDLE_BYTES) and its log.",
+                        crate::core::human_bytes(bytes as i64)
+                    )
+                } else {
+                    anyhow::Error::from(e).context("reaching the server")
+                }
+            })?;
+        if resp.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            let said = resp
+                .json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v["error"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            bail!(
+                "the server refused this bundle as too large ({}){}",
+                crate::core::human_bytes(bytes as i64),
+                if said.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {said}")
+                }
+            );
+        }
         Self::decode(resp, "uploading the bundle", true)
     }
 

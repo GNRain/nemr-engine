@@ -46,9 +46,9 @@ PASS=0; FAIL=0
 # reads the bucket back independently (six more assertions); otherwise a
 # directory under the work dir.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=91
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=94
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=87
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=90
 fi
 # The human arm (E-21) adds its own assertions when it runs.
 [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]] && EXPECTED_ASSERTIONS=$((EXPECTED_ASSERTIONS + 4))
@@ -60,7 +60,8 @@ die()  { fail "$1"; finish; exit 1; }
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/nemr-ui-acceptance.XXXXXX")
 PROJECT="uiacc-$$"
 LOCAL2="uiacc-$$-local"
-ADOPTED="uiacc-$$-adopted"   # E-23: a session adopted from a host directory   # a second, local-only session for the page block (a push button beside a pull button)
+ADOPTED="uiacc-$$-adopted"   # E-23: a session adopted from a host directory
+BIG="uiacc-$$-big"           # F-16: a session far above the old 2MB body limit   # a second, local-only session for the page block (a push button beside a pull button)
 SERVER_ADDR=127.0.0.1:18090
 SERVER_URL="http://$SERVER_ADDR"
 EMAIL="ui-acceptance-$$@example.com"
@@ -71,7 +72,7 @@ SYNC_PID=""; UI_PID=""; UI2_PID=""; UI3_PID=""; NOLOGIN=""
 finish() {
     printf '\n%s== Cleanup%s\n' "$BOLD" "$RESET"
     # Verify before destroying, and never touch a protected subject.
-    for p in "$PROJECT" "$LOCAL2" "$LOCAL2-b" "$ADOPTED"; do
+    for p in "$PROJECT" "$LOCAL2" "$LOCAL2-b" "$ADOPTED" "$BIG"; do
         if refuse_protected "$p" 2>/dev/null; then
             if output_has "^$p " -- nemr list; then
                 nemr stop "$p" >/dev/null 2>&1
@@ -657,7 +658,7 @@ ADOPT_MARK="ADOPT-RECALL-$$-$RANDOM"
 grep -q '"result"' "$WORK/adopt-plant.json" || { sed 's/^/   | /' "$WORK/adopt-plant.json" | tail -5; die "could not plant the marker in the host history (is the host logged in?)"; }
 pass "planted a marker in the host directory's Claude Code history (before adoption)"
 # Adopt it (CLI — the user names the directory; E-23).
-nemr adopt "$ADOPT_SRC" --name "$ADOPTED" --size 500MB >"$WORK/adopt.log" 2>&1 || { cat "$WORK/adopt.log"; die "nemr adopt failed"; }
+nemr adopt "$ADOPT_SRC" --name "$ADOPTED" --size 500MB --yes >"$WORK/adopt.log" 2>&1 || { cat "$WORK/adopt.log"; die "nemr adopt failed"; }
 MNT="$HOME/.local/share/nemr/mounts/$ADOPTED"
 [[ -f "$MNT/README.md" && -d "$MNT/.git" ]] || die "the adopted tree is missing README.md or .git"
 [[ ! -e "$MNT/target" ]] || die "target/ must never be adopted (it is 11G of derived output on the real tree)"
@@ -695,7 +696,55 @@ out=$(UI cloud-delete "$ADOPTED"); python3 -c 'import json,sys; d=json.loads(sys
 # Remove the host history the plant created (leave the host as found).
 rm -rf ~/.claude/projects/$(echo "$ADOPT_SRC" | sed 's#[/.]#-#g') 2>/dev/null || true
 
-step "Delete the cloud copy through the page (E-22), and see it gone"
+step "Push a session far above the old 2MB body limit (F-16), with the compression ratio"
+# Every push this acceptance proved until F-16 was under 10KB, which is why
+# axum's 2MB default limit survived undetected and no bundle with real content
+# had ever moved. This one carries a real source tree, well over 100MB.
+NEMR_NON_INTERACTIVE=1 nemr create "$BIG" --size 2GB >"$WORK/big-create.log" 2>&1 \
+    || { cat "$WORK/big-create.log"; die "could not create the large session"; }
+BIGMNT="$HOME/.local/share/nemr/mounts/$BIG"
+git -C "$REPO" ls-files -z > "$WORK/big-files"
+i=0
+while [[ $(du -sb "$BIGMNT" | cut -f1) -lt 110000000 && $i -lt 60 ]]; do
+    dest="$BIGMNT/copy-$i"; mkdir -p "$dest"
+    tar -C "$REPO" --null -T "$WORK/big-files" -cf - 2>/dev/null | tar -C "$dest" -xf - 2>/dev/null
+    i=$((i+1))
+done
+PLAIN=$(du -sb "$BIGMNT" | cut -f1)
+[[ "$PLAIN" -gt 100000000 ]] || die "the large session is only $PLAIN bytes; the point is to exceed 100MB"
+pass "built a $((PLAIN/1024/1024))MB session from real source ($i copies of the tracked tree)"
+# F-17: the row's size column is what this session is using ON THIS MACHINE, so
+# a 110MB local session must read ~110MB — not 0, and not the size of a push
+# that has not happened yet. It used to show the last pushed ciphertext size and
+# never move on refresh.
+row_size=$(UI sessions | python3 -c 'import json,sys; d=json.load(sys.stdin); r=[x for x in d["rows"] if x["name"]==sys.argv[1]]; print(r[0]["size_bytes"] if r and r[0]["size_bytes"] is not None else 0)' "$BIG")
+used_bytes=$(nemr list --json 2>/dev/null | python3 -c 'import json,sys; 
+try:
+  d=json.load(sys.stdin); r=[x for x in d if x.get("name")==sys.argv[1]]; print(r[0].get("used_bytes",0) if r else 0)
+except Exception: print(0)' "$BIG" 2>/dev/null || echo 0)
+[[ "$row_size" -gt $((PLAIN*80/100)) ]] \
+    || die "the page's size column reads $row_size for a $(echo $PLAIN)-byte local session — it is not live usage (F-17)"
+pass "F-17 the size column is this machine's live usage: the row reads $((row_size/1024/1024))MiB for a $((PLAIN/1024/1024))MiB session"
+out=$(UI push "$BIG" "$PASSWORD" release) || die "the large push call failed: $out"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); [print("   |",l["text"]) for l in d["lines"]]; sys.exit(0 if d["ok"] else 1)' "$out" \
+    || die "the large push failed — this is exactly what F-16 fixed; check the server ceiling and its log"
+if [[ "$STORAGE_MODE" == s3 ]]; then
+    big_key=$(server_log | sed -n 's/.*stored bundle key=\([^ ]*\) bytes=\([0-9]*\).*/\1/p' | tail -1)
+    CIPHER=$(server_log | sed -n 's/.*stored bundle key=\([^ ]*\) bytes=\([0-9]*\).*/\2/p' | tail -1)
+    python3 "$REPO/docs/ui-acceptance.py" s3-get "$LAUNCH_URL" "$big_key" "$WORK/big-from-bucket.bin" >/dev/null \
+        || die "the large object is not in the bucket at $big_key"
+    got=$(stat -c%s "$WORK/big-from-bucket.bin")
+    [[ "$got" == "$CIPHER" ]] || die "the bucket holds $got bytes at $big_key; the server logged $CIPHER"
+else
+    CIPHER=$(find "$WORK/bundles" -type f -printf '%s\n' | sort -n | tail -1)
+fi
+[[ "$CIPHER" -gt 2097152 ]] || die "the stored bundle is only $CIPHER bytes — at or below the old 2MB limit, so nothing was proven"
+pass "the large push landed: $((PLAIN/1024/1024))MiB plaintext -> $((CIPHER/1024/1024))MiB ciphertext ($((CIPHER*100/PLAIN))% of plaintext — what D-06's zstd buys on a real source tree), read back whole"
+# Leave the store as this step found it: the large bundle is this step's, and
+# the E-22 step below asserts what is left there.
+out=$(UI cloud-delete "$BIG"); python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d["ok"] else 1)' "$out" 2>/dev/null \
+    || die "could not remove the large session's cloud copy"
+nemr delete "$BIG" --yes >/dev/null 2>&1
 
 step "Delete the cloud copy through the page (E-22), and see it gone"
 # $PROJECT exists here AND in the cloud (local + bundle), so deleting the cloud

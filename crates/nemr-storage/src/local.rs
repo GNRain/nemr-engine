@@ -146,6 +146,37 @@ impl ObjectStore for LocalStore {
         Ok(())
     }
 
+    /// Stream the staged file into place: copy in chunks to a temporary, then
+    /// rename, so memory stays bounded and a reader never sees a partial object.
+    async fn put_file(&self, key: &ObjectKey, source: &std::path::Path) -> Result<()> {
+        let path = self.path_for(key)?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| Self::map_io("put", key, e))?;
+        }
+        let temporary = path.with_extension("partial");
+        let mut input = tokio::fs::File::open(source)
+            .await
+            .map_err(|e| Self::map_io("put", key, e))?;
+        let mut output = tokio::fs::File::create(&temporary)
+            .await
+            .map_err(|e| Self::map_io("put", key, e))?;
+        tokio::io::copy(&mut input, &mut output)
+            .await
+            .map_err(|e| Self::map_io("put", key, e))?;
+        use tokio::io::AsyncWriteExt as _;
+        output
+            .flush()
+            .await
+            .map_err(|e| Self::map_io("put", key, e))?;
+        drop(output);
+        tokio::fs::rename(&temporary, &path)
+            .await
+            .map_err(|e| Self::map_io("put", key, e))?;
+        Ok(())
+    }
+
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
         let path = self.path_for(key)?;
         match tokio::fs::remove_file(&path).await {

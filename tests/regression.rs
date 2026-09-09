@@ -5033,3 +5033,93 @@ fn e23_adopt_copies_the_tree_and_history_excludes_the_derived_and_leaves_the_sou
     let _ = std::fs::remove_dir_all(&host_hist);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// F-15: `adopt` copies a whole tree, so it says what and how big and asks —
+/// on a terminal. Where a confirmation cannot be drawn or answered (the
+/// acceptance drives the CLI with stderr redirected), it must REFUSE and name
+/// the flag, never prompt into a pipe and never proceed silently. With the flag
+/// it adopts without asking.
+#[test]
+fn f15_adopt_refuses_without_a_terminal_and_names_the_flag_and_yes_adopts() {
+    if unit_only() {
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("nemr-f15-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let source = tmp.join("proj");
+    std::fs::create_dir_all(source.join("src")).unwrap();
+    std::fs::write(source.join("README.md"), "adopt me").unwrap();
+    std::fs::write(source.join("src/main.rs"), "fn main() {}").unwrap();
+
+    // No terminal (piped stdio) and no flag: refused, naming --yes.
+    let refused = std::process::Command::new(env!("CARGO_BIN_EXE_nemr"))
+        .args([
+            "adopt",
+            &source.to_string_lossy(),
+            "--name",
+            "f15adopt",
+            "--size",
+            "500MB",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run nemr adopt");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "adopt must refuse without a terminal and without --yes.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("--yes"),
+        "the refusal must name the flag that makes it non-interactive.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("not a terminal"),
+        "the refusal must say why.\nstderr: {stderr}"
+    );
+
+    if !require_host(HostRequirements::FULL) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return;
+    }
+    // Clear any project a previous failed run left behind.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let _ = project::stop(&client, "f15adopt").await;
+        let _ = project::delete(&client, "f15adopt").await;
+    });
+
+    // With the flag: adopts, without prompting, on the same piped stdio.
+    let adopted = std::process::Command::new(env!("CARGO_BIN_EXE_nemr"))
+        .args([
+            "adopt",
+            &source.to_string_lossy(),
+            "--name",
+            "f15adopt",
+            "--size",
+            "500MB",
+            "--yes",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run nemr adopt --yes");
+    let out = String::from_utf8_lossy(&adopted.stdout);
+    let err = String::from_utf8_lossy(&adopted.stderr);
+    assert!(
+        adopted.status.success(),
+        "adopt --yes must proceed without a terminal.\nstdout: {out}\nstderr: {err}"
+    );
+    assert!(
+        !err.contains("Adopt it?") && !out.contains("Adopt it?"),
+        "--yes must not print the confirmation at all.\nstdout: {out}\nstderr: {err}"
+    );
+    assert!(out.contains("adopted"), "it reports what it did: {out}");
+
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let _ = project::stop(&client, "f15adopt").await;
+        let _ = project::delete(&client, "f15adopt").await;
+    });
+    let _ = std::fs::remove_dir_all(&tmp);
+}

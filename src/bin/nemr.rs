@@ -72,6 +72,12 @@ enum Command {
         /// Coding agent to run. Omitted, Claude Code.
         #[arg(long, value_parser = parse_agent)]
         agent: Option<Agent>,
+
+        /// Skip the confirmation. Required when stdin or stderr is not a
+        /// terminal, because the confirmation cannot be shown or answered there
+        /// (F-15) — adopt never proceeds silently.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Start a project's container.
@@ -709,6 +715,7 @@ async fn main() -> Result<()> {
             name,
             size,
             agent,
+            yes,
         } => {
             let source = std::path::Path::new(&dir)
                 .canonicalize()
@@ -738,13 +745,87 @@ async fn main() -> Result<()> {
             let size = resolve_size(size, interactive)?;
             let agent = resolve_agent(agent, interactive)?;
 
+            // F-15: adopt copies a whole tree, so it says what and how big and
+            // asks — on a terminal. Without one it REFUSES and names the flag;
+            // it never proceeds silently, and it never tries to prompt where a
+            // prompt cannot be drawn.
             let mut session = daemon::connect().await?;
+            if !yes {
+                // The plan comes from the daemon: the CLI has no path into the
+                // engine (E-09), and the daemon is the one that would do the
+                // copying.
+                let plan = {
+                    let __req = session.req(proto::AdoptRequest {
+                        name: name.clone(),
+                        size: size.to_string(),
+                        agent: agent.id().to_string(),
+                        source_dir: source.to_string_lossy().into_owned(),
+                        plan_only: true,
+                    });
+                    session
+                        .client()
+                        .adopt(__req)
+                        .await
+                        .map_err(status_err)?
+                        .into_inner()
+                };
+                if !interactive {
+                    anyhow::bail!(
+                        "adopt would copy {} in {} file(s) from {} into a new session, and asks \
+                         before it does.\n\
+                         stdin or stderr is not a terminal, so the confirmation cannot be shown \
+                         or answered here.\n\
+                         Re-run with --yes to adopt without confirming.",
+                        volume::human_bytes(plan.bytes_copied),
+                        plan.files_copied,
+                        plan.source
+                    );
+                }
+                eprintln!("About to adopt {} into a new session:", plan.source);
+                eprintln!("  name:      {name}");
+                eprintln!("  quota:     {size}");
+                eprintln!(
+                    "  copies:    {} in {} file(s){}",
+                    volume::human_bytes(plan.bytes_copied),
+                    plan.files_copied,
+                    if plan.git_bytes > 0 {
+                        format!(
+                            ", including {} of .git",
+                            volume::human_bytes(plan.git_bytes)
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
+                if plan.is_git_repo {
+                    eprintln!(
+                        "  excluded:  anything .gitignore ignores, and target/ and node_modules/"
+                    );
+                } else {
+                    eprintln!("  excluded:  target/ and node_modules/ (not a git repo — nothing else is ignored)");
+                }
+                eprintln!(
+                    "  history:   {} Claude Code session transcript(s) for this directory",
+                    plan.history_sessions
+                );
+                eprintln!("  the host directory is COPIED, not moved — it stays as it is.");
+                eprint!("Adopt it? [y/N]: ");
+                std::io::Write::flush(&mut std::io::stderr())?;
+                let mut answer = String::new();
+                std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut answer)?;
+                if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+                    eprintln!("Cancelled. Nothing was adopted.");
+                    std::process::exit(1);
+                }
+            }
+
             let summary = {
                 let __req = session.req(proto::AdoptRequest {
                     name,
                     size: size.to_string(),
                     agent: agent.id().to_string(),
                     source_dir: source.to_string_lossy().into_owned(),
+                    plan_only: false,
                 });
                 session
                     .client()
@@ -963,6 +1044,18 @@ async fn main() -> Result<()> {
             // AC-6.2: deletion is destructive and irreversible — the volume and
             // everything written to it goes. Confirm unless explicitly waived.
             if !yes {
+                // F-15's audit: a confirmation that cannot be shown or answered
+                // must refuse and name the flag, not read EOF and call it a
+                // mismatch.
+                if !nemr_engine::interactive::is_interactive() {
+                    anyhow::bail!(
+                        "deleting {name:?} destroys its volume and everything in it, and asks \
+                         before it does.\n\
+                         stdin or stderr is not a terminal, so the confirmation cannot be shown \
+                         or answered here.\n\
+                         Re-run with --yes to delete without confirming."
+                    );
+                }
                 let projects = {
                     let __req = session.req(proto::ListRequest {});
                     session

@@ -26,6 +26,8 @@ pub trait DynStore: Send + Sync {
     fn describe(&self) -> String;
     async fn get(&self, key: &ObjectKey) -> Result<Vec<u8>>;
     async fn put(&self, key: &ObjectKey, bytes: &[u8]) -> Result<()>;
+    /// F-16: store an object by streaming it from a staged file.
+    async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> Result<()>;
     async fn delete(&self, key: &ObjectKey) -> Result<()>;
     /// Keys under a prefix. The start-up probe lists a prefix no bundle key
     /// can match: a reachable store answers with an empty page, an
@@ -48,6 +50,9 @@ macro_rules! impl_dyn_store {
             }
             async fn put(&self, key: &ObjectKey, bytes: &[u8]) -> Result<()> {
                 ObjectStore::put(self, key, bytes).await
+            }
+            async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> Result<()> {
+                ObjectStore::put_file(self, key, path).await
             }
             async fn delete(&self, key: &ObjectKey) -> Result<()> {
                 ObjectStore::delete(self, key).await

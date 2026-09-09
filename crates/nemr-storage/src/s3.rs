@@ -284,6 +284,52 @@ impl ObjectStore for S3Store {
         Ok(())
     }
 
+    /// Stream the staged file to the object store as a multipart upload, so a
+    /// multi-gigabyte bundle never sits in memory (F-16). Parts are 16 MiB; the
+    /// upload is aborted on failure so no half-object is left behind.
+    async fn put_file(&self, key: &ObjectKey, source: &std::path::Path) -> Result<()> {
+        use object_store::ObjectStoreExt as _;
+        use tokio::io::AsyncReadExt as _;
+
+        const PART: usize = 16 * 1024 * 1024;
+        let mut file = tokio::fs::File::open(source).await.map_err(|e| {
+            StorageError::Other(anyhow::Error::from(e).context("opening the staged object"))
+        })?;
+        let mut upload = self
+            .inner
+            .put_multipart(&Self::path(key))
+            .await
+            .map_err(|e| Self::map("put", key, e))?;
+        let mut buf = vec![0u8; PART];
+        loop {
+            let mut filled = 0;
+            while filled < PART {
+                let n = file.read(&mut buf[filled..]).await.map_err(|e| {
+                    StorageError::Other(anyhow::Error::from(e).context("reading the staged object"))
+                })?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            if filled == 0 {
+                break;
+            }
+            if let Err(e) = upload.put_part(buf[..filled].to_vec().into()).await {
+                let _ = upload.abort().await;
+                return Err(Self::map("put", key, e));
+            }
+            if filled < PART {
+                break;
+            }
+        }
+        upload
+            .complete()
+            .await
+            .map_err(|e| Self::map("put", key, e))?;
+        Ok(())
+    }
+
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
         use object_store::ObjectStoreExt as _;
         match self.inner.delete(&Self::path(key)).await {

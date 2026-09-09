@@ -1880,6 +1880,9 @@ mod tests {
         stopped: Mutex<Vec<String>>,
         created: Mutex<Vec<(String, String, String)>>,
         deleted: Mutex<Vec<String>>,
+        /// F-16: how many bytes `export` writes, so a test can produce a bundle
+        /// far above axum's old 2MB default body limit.
+        export_bytes: Mutex<usize>,
     }
     impl EngineOps for FakeEngine {
         fn list(&self) -> Result<Vec<LocalProject>> {
@@ -1887,7 +1890,20 @@ mod tests {
         }
         fn export(&self, name: &str, dest: &std::path::Path) -> Result<()> {
             self.exported.lock().unwrap().push(name.to_string());
-            std::fs::write(dest, format!("bundle-of-{name}"))?;
+            let want = *self.export_bytes.lock().unwrap();
+            if want == 0 {
+                std::fs::write(dest, format!("bundle-of-{name}"))?;
+            } else {
+                // Compressible, like a real source tree, so the ciphertext is
+                // not simply the plaintext size.
+                let unit = format!("bundle-of-{name} ");
+                let mut body = String::with_capacity(want + unit.len());
+                while body.len() < want {
+                    body.push_str(&unit);
+                }
+                body.truncate(want);
+                std::fs::write(dest, body.as_bytes())?;
+            }
             Ok(())
         }
         fn import(&self, bundle: &std::path::Path, name: &str) -> Result<String> {
@@ -3266,6 +3282,94 @@ mod tests {
         assert!(
             j["error"].as_str().unwrap().contains("does not exist"),
             "{j}"
+        );
+    }
+
+    /// F-16: nothing in the server set a body limit, so axum's 2MB default was
+    /// in force and every push above it failed — a 6MB session answered 413 and
+    /// anything larger had the connection closed mid-stream. Every push proven
+    /// until then was under 10KB, which is why it survived so long. A bundle far
+    /// above that default must now land, and a ceiling must refuse a bundle
+    /// above IT by name rather than by closing the connection.
+    #[tokio::test]
+    async fn f16_a_push_far_above_the_old_body_limit_lands_and_the_ceiling_refuses_by_name() {
+        let _serial = serial().await;
+        let (server, store) = spawn_sync_server();
+        let state_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", state_home.path());
+        std::env::set_var("NEMR_CLOUD_KDF_FAST", "1");
+        std::env::set_var("NEMR_CLOUD_HOLDER", "this-laptop");
+        std::env::set_var("NEMR_CLOUD_HOLDER_BIN", "/bin/true");
+        std::env::remove_var("NEMR_MAX_BUNDLE_BYTES");
+        let email = format!("big-{}@example.com", &hex(&random_bytes())[..12]);
+        const PASSWORD: &str = "correct horse battery staple";
+        blocking(|| {
+            let pending = core::register_begin(&server, &email, PASSWORD).unwrap();
+            let mk = core::register_check_code(&pending, &pending.recovery_code.display()).unwrap();
+            core::register_confirm(&pending, &mk).unwrap();
+        });
+
+        let engine = fake_engine(vec![LocalProject {
+            name: "big".into(),
+            agent: "claude-code".into(),
+            running: false,
+            usage_known: true,
+            used_bytes: 0,
+            credential_present: None,
+        }]);
+        // Six megabytes of plaintext: three times axum's old default, and the
+        // exact size the Product Owner measured answering 413.
+        const PLAINTEXT: usize = 6 * 1024 * 1024;
+        *engine.export_bytes.lock().unwrap() = PLAINTEXT;
+        let (app, _) = app_with(engine.clone());
+        let cookie = establish(&app).await;
+        let c = Some(cookie.as_str());
+        let push = |body: Value| api_req("POST", "/api/sessions/big/push", c, Some(body));
+
+        let j = finish(
+            &app,
+            &cookie,
+            send(&app, push(json!({"password": PASSWORD}))).await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "a 6MB push must land now: {j}");
+        let stored = stored_ciphertext(store.path());
+        assert!(
+            stored.len() > 2 * 1024 * 1024,
+            "the stored object is far above the old 2MB default: {} bytes",
+            stored.len()
+        );
+        // And it is this session's bundle, not a truncation: it decrypts to the
+        // bytes the engine exported.
+        let plaintext = blocking(|| {
+            let account = crate::state::load_account().unwrap();
+            let mk = crate::keys::master_key(&account, PASSWORD).unwrap();
+            nemr_crypto::decrypt_bundle(&mk, &stored).expect("the stored bundle decrypts")
+        });
+        assert_eq!(
+            plaintext.len(),
+            PLAINTEXT,
+            "the whole bundle arrived, not a prefix"
+        );
+
+        // The ceiling: a bundle above it is refused by NAME, and nothing new is
+        // stored. This is the neuter that restores the old behaviour.
+        std::env::set_var("NEMR_MAX_BUNDLE_BYTES", "1000000");
+        let j = finish(
+            &app,
+            &cookie,
+            send(&app, push(json!({"password": PASSWORD}))).await,
+        )
+        .await;
+        std::env::remove_var("NEMR_MAX_BUNDLE_BYTES");
+        assert_eq!(
+            j["ok"], false,
+            "a bundle above the ceiling must be refused: {j}"
+        );
+        let err = j["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("too large") || err.contains("1000000"),
+            "the refusal must name the size or the ceiling, not close the connection: {err}"
         );
     }
 

@@ -77,6 +77,10 @@ message AdoptRequest {
   string size = 2;
   string agent = 3;
   string source_dir = 4;  // an absolute path on the host
+  // F-15: measure what the copy WOULD be, provisioning nothing, so the CLI can
+  // show it and ask before adopting. The engine is the single writer; the CLI
+  // must not reach into it (E-09), so the plan comes through the daemon too.
+  bool plan_only = 5;
 }
 message AdoptResponse {
   string name = 1;
@@ -88,6 +92,8 @@ message AdoptResponse {
   uint64 history_sessions = 7;
   uint64 history_lines_dropped = 8;
   string source = 9;
+  uint64 git_bytes = 10;
+  bool is_git_repo = 11;
 }
 
 message StartRequest { string name = 1; }

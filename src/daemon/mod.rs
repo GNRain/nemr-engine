@@ -157,6 +157,25 @@ impl Nemr for NemrService {
             .agent
             .parse::<crate::engine::agent::Agent>()
             .map_err(status_from_typed)?;
+        // F-15: the plan is a read — it provisions nothing — so the CLI can ask
+        // for it, show what and how big, and confirm before adopting.
+        if req.plan_only {
+            let plan = crate::engine::project::adopt_plan(std::path::Path::new(&req.source_dir))
+                .map_err(status_from_anyhow)?;
+            return Ok(Response::new(AdoptResponse {
+                name: String::new(),
+                container_id: String::new(),
+                size: size.to_string(),
+                agent: agent.id().to_string(),
+                files_copied: plan.files,
+                bytes_copied: plan.bytes,
+                history_sessions: plan.history_sessions,
+                history_lines_dropped: 0,
+                source: plan.source.to_string_lossy().into_owned(),
+                git_bytes: plan.git_bytes,
+                is_git_repo: plan.is_git_repo,
+            }));
+        }
         let summary = crate::engine::project::adopt(
             &self.client,
             &req.name,
@@ -176,6 +195,8 @@ impl Nemr for NemrService {
             history_sessions: summary.history_sessions,
             history_lines_dropped: summary.history_lines_dropped,
             source: summary.source.to_string_lossy().into_owned(),
+            git_bytes: 0,
+            is_git_repo: false,
         }))
     }
 
