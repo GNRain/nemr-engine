@@ -1999,6 +1999,10 @@ fn f24_nothing_tells_the_user_to_log_in_on_the_host() {
         "src/bin/nemr.rs",
         "src/engine/project.rs",
         "crates/nemr-cloud/src/serve.rs",
+        // Where a new user actually reads it (D-14: install.sh is what they run,
+        // and README.md step 2 is where the login is explained).
+        "README.md",
+        "scripts/install.sh",
     ];
     let forbidden = [
         "Authenticate on the host",
@@ -2006,6 +2010,7 @@ fn f24_nothing_tells_the_user_to_log_in_on_the_host() {
         "Authenticate on this host",
         "Run `claude` on this host",
         "run `claude` on the host",
+        "log in on the host",
     ];
     for f in files {
         let text = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("read {f}: {e}"));

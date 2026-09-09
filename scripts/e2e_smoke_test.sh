@@ -216,8 +216,14 @@ assert_eq "credentials mounted (AUTH-02)" "1" "$creds"
 # posture ("touch fails with Read-only") for a day after the ruling changed —
 # a control asserting the world before the ruling. Two reads, no write: the
 # mount's own flag from the task's mountinfo, and `test -w` on the file.
-rw_creds=$(echo 'grep " /root/.claude/.credentials.json " /proc/self/mountinfo | awk "{print \$6}" | cut -d, -f1' | in_container | tr -d '\r' | grep -E '^(rw|ro)$' | head -1 || true)
-assert_eq "credential mount is read-write (AUTH-02, D-02 (f))" "rw" "$rw_creds"
+#
+# F-14 moved the mountpoint from the FILE to the DIRECTORY (measured: Claude
+# Code writes the credential by temp+rename, which a file bind cannot see), so
+# the mount to read the flag from is /root/.claude. This assertion still named
+# the file, and had been red since F-14 landed with nobody running it — found
+# by scripts/install.sh, which verifies with this suite (D-14).
+rw_creds=$(echo 'grep " /root/.claude " /proc/self/mountinfo | awk "{print \$6}" | cut -d, -f1' | in_container | tr -d '\r' | grep -E '^(rw|ro)$' | head -1 || true)
+assert_eq "credential directory mount is read-write (AUTH-02, D-02 (f), F-14)" "rw" "$rw_creds"
 writable_creds=$(echo 'test -w /root/.claude/.credentials.json && echo WRITABLE' | in_container | tr -d '\r' | grep -c WRITABLE || true)
 assert_eq "credential file is writable by the session, so it can refresh its login" "1" "$writable_creds"
 

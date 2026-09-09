@@ -55,30 +55,33 @@ it prints a line telling you whenever that happens. It does not need Docker.
 
 ## Getting started
 
-Setup is a one-time thing and takes roughly an hour, mostly unattended — it
-installs some system pieces, builds the starter image every project is based on,
-and **reboots your machine once** in the middle. After that, working with
-projects takes seconds.
+Setup is a one-time thing: one command, mostly unattended, with **one reboot**
+in the middle. After that, working with projects takes seconds.
 
 Nemr is private preview, so you first need access to the source. If you have it:
 
-**1. Set up your machine** — one command, safe to run again:
+**1. Install it** — one command, safe to run twice:
 
 ```bash
-./scripts/setup_host.sh
+./scripts/install.sh
 ```
 
-It first checks your machine can run Nemr and **stops without changing anything**
-if it can't, telling you exactly what's wrong and how to fix it. Part-way through
+It checks your machine can run Nemr and **stops without changing anything** if it
+can't, saying exactly what is missing and how to get it. Then it shows you the
+whole plan — every file it will write, every command it runs with `sudo`, and
+everything it downloads — and asks once before doing any of it. Part-way through
 it asks you to reboot; run it again afterwards and it continues where it left
-off. When it finishes, the `nemr` command is installed — check with `nemr --help`.
+off, skipping everything already done. It finishes by testing the machine it
+just set up.
 
-**2. Log in to Claude Code** (once per machine — install Claude Code first if you
-haven't):
+**2. Log in to Claude Code** — inside your first project, not on your machine.
+Nemr keeps its own login, separate from any `claude` you run on the host, so
+`/login` inside a session is the one that counts. Step 3 makes that session;
+run `/login` in it the first time.
 
-```bash
-claude
-```
+Note: an Anthropic login is one machine at a time. Logging in here signs this
+account out on any other machine using it — that is Anthropic's OAuth model,
+not something Nemr can work around.
 
 **3. Make a project and open it.** Run `nemr create` on its own to be walked
 through the name, size and agent (Claude Code or Codex), or give them directly:
@@ -179,8 +182,12 @@ The file remembers the project's name and size, so you don't have to.
 - **Your password (sudo) for setup only** — to install system pieces and one
   small helper. Day-to-day use doesn't need it.
 - **Claude Code installed, and a subscription** — you log in on each machine you
-  use ([Claude Code install guide](https://docs.anthropic.com/en/docs/claude-code)).
-- **A few hundred MB of free disk for setup**, plus whatever you give your
+  use, with `/login` inside a project
+  ([Claude Code install guide](https://docs.anthropic.com/en/docs/claude-code)).
+  Nemr detects Claude Code; it never installs it for you.
+- **The Rust toolchain** ([rustup](https://rustup.rs)) — Nemr is built from
+  source on your machine. The installer refuses, and says so, without it.
+- **About 5 GB of free disk for the install**, plus whatever you give your
   projects. Note that project disks are thin — a `2GB` project doesn't take 2 GB
   until you fill it (see [limitations](#known-limitations)).
 
@@ -293,13 +300,14 @@ There's no uninstall command yet. To remove Nemr by hand:
 ```bash
 nemr list                            # note your projects
 nemr delete <name>                   # for each, to release its disk (export first to keep anything)
-rm ~/.local/bin/nemr                 # the command
+rm ~/.local/bin/nemr ~/.local/bin/nemrd ~/.local/bin/nemr-*   # the commands
 sudo rm /usr/local/libexec/nemr-volume /etc/sudoers.d/nemr-volume   # the helper and its grant
 ```
 
-Setup also installed system packages, two background services and a reboot-time
-setting; those are standard components and are left in place. `PREREQUISITES.md`
-lists exactly what was changed.
+The installer also added system packages, a user service and a cgroup setting;
+those are standard components and are left in place. `./scripts/install.sh`
+lists every one of them in the plan it shows before it does anything, and
+`PREREQUISITES.md` explains why each exists.
 
 ---
 

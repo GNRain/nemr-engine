@@ -189,8 +189,8 @@ async fn create_with_auth(
     // spent by a login on another machine (E-13) — is the same state as never
     // having logged in, and `ensure_host_credential_file` resets it to the
     // placeholder in place. Refusing there was a dead end: since F-14 this
-    // file is nemr's own, and the refusal's remedy ("log in on the host")
-    // named `~/.claude`, which the engine does not read.
+    // file is nemr's own, and the refusal's remedy pointed at a host `claude`
+    // login, which writes `~/.claude` — a file the engine does not read.
     //
     // A credential that IS present and usable is still held to what it says:
     // readable, and this machine's alone (D-02 — it is never copied into a

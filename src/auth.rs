@@ -625,6 +625,12 @@ mod tests {
 
     #[test]
     fn credentials_path_is_the_dedicated_dir_under_home() {
+        // The seam is process-wide, so a test that reads the DEFAULT path must
+        // hold the lock the seam-setting tests hold — otherwise it reads
+        // whichever seam a concurrent test had set and fails at random. Found
+        // as a flake once F-24's test made the window reachable.
+        let _guard = super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("NEMR_HOST_CREDENTIALS");
         let path = host_credentials_path().unwrap();
         // F-14: a dedicated directory, not the host's own ~/.claude.
         assert!(
