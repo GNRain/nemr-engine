@@ -705,12 +705,16 @@ NEMR_NON_INTERACTIVE=1 nemr create "$BIG" --size 2GB >"$WORK/big-create.log" 2>&
 BIGMNT="$HOME/.local/share/nemr/mounts/$BIG"
 git -C "$REPO" ls-files -z > "$WORK/big-files"
 i=0
-while [[ $(du -sb "$BIGMNT" | cut -f1) -lt 110000000 && $i -lt 60 ]]; do
+while [[ $(du -sb --exclude=lost+found "$BIGMNT" | cut -f1) -lt 110000000 && $i -lt 60 ]]; do
     dest="$BIGMNT/copy-$i"; mkdir -p "$dest"
     tar -C "$REPO" --null -T "$WORK/big-files" -cf - 2>/dev/null | tar -C "$dest" -xf - 2>/dev/null
     i=$((i+1))
 done
-PLAIN=$(du -sb "$BIGMNT" | cut -f1)
+# F-19: --exclude lost+found. It is root-owned on a fresh ext4, so walking it
+# emits a page of permission-denied lines into the log and measures nothing this
+# step cares about. This number is the TREE's bytes — the thing that gets
+# compressed — not the volume's usage.
+PLAIN=$(du -sb --exclude=lost+found "$BIGMNT" | cut -f1)
 [[ "$PLAIN" -gt 100000000 ]] || die "the large session is only $PLAIN bytes; the point is to exceed 100MB"
 pass "built a $((PLAIN/1024/1024))MB session from real source ($i copies of the tracked tree)"
 # F-17: the row's size column is what this session is using ON THIS MACHINE, so
@@ -718,13 +722,18 @@ pass "built a $((PLAIN/1024/1024))MB session from real source ($i copies of the 
 # that has not happened yet. It used to show the last pushed ciphertext size and
 # never move on refresh.
 row_size=$(UI sessions | python3 -c 'import json,sys; d=json.load(sys.stdin); r=[x for x in d["rows"] if x["name"]==sys.argv[1]]; print(r[0]["size_bytes"] if r and r[0]["size_bytes"] is not None else 0)' "$BIG")
-used_bytes=$(nemr list --json 2>/dev/null | python3 -c 'import json,sys; 
-try:
-  d=json.load(sys.stdin); r=[x for x in d if x.get("name")==sys.argv[1]]; print(r[0].get("used_bytes",0) if r else 0)
-except Exception: print(0)' "$BIG" 2>/dev/null || echo 0)
-[[ "$row_size" -gt $((PLAIN*80/100)) ]] \
-    || die "the page's size column reads $row_size for a $(echo $PLAIN)-byte local session — it is not live usage (F-17)"
-pass "F-17 the size column is this machine's live usage: the row reads $((row_size/1024/1024))MiB for a $((PLAIN/1024/1024))MiB session"
+# What the two numbers are (F-17/F-19). The column is the VOLUME's usage, read
+# with statvfs exactly as `nemr status` and `df` read it: the filesystem's used
+# blocks, which include ext4's metadata and journal, lost+found, and block
+# rounding. PLAIN is the TREE's bytes, summed by du. So the column is expected
+# to be somewhat LARGER than the tree — that gap is filesystem overhead, not
+# staleness. What F-17 fixed is that the column used to show the last PUSH's
+# ciphertext size, which is unrelated to either and never moved on refresh.
+[[ "$row_size" -ge "$PLAIN" ]] \
+    || die "the size column reads $row_size for a tree of $PLAIN bytes — a volume's usage cannot be less than the tree it holds, so this is not live usage (F-17)"
+[[ "$row_size" -lt $((PLAIN*2)) ]] \
+    || die "the size column reads $row_size for a tree of $PLAIN bytes — more than twice the tree is not filesystem overhead, it is the wrong number"
+pass "F-17 the size column is this machine's live volume usage (statvfs, as nemr status and df read it): $((row_size/1024/1024))MiB of volume for a $((PLAIN/1024/1024))MiB tree — the difference is filesystem overhead, not staleness"
 out=$(UI push "$BIG" "$PASSWORD" release) || die "the large push call failed: $out"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); [print("   |",l["text"]) for l in d["lines"]]; sys.exit(0 if d["ok"] else 1)' "$out" \
     || die "the large push failed — this is exactly what F-16 fixed; check the server ceiling and its log"
@@ -787,8 +796,12 @@ if [[ "$STORAGE_MODE" == s3 ]]; then
     removed=$(python3 "$REPO/docs/ui-acceptance.py" s3-delete-prefix "$LAUNCH_URL" "$BUNDLE_PREFIX/") \
         || die "could not remove this run's objects from the bucket"
     left=$(python3 "$REPO/docs/ui-acceptance.py" s3-list "$LAUNCH_URL" "$BUNDLE_PREFIX/" | grep -c . || true)
-    [[ "$removed" -ge 1 && "$left" -eq 0 ]] || die "cleanup: removed $removed, $left left under $BUNDLE_PREFIX/"
-    pass "the bucket is left as it was found: $removed object(s) under this run's prefix removed, none left"
+    # F-18: the end state is what matters — NOTHING of this run left in the
+    # bucket. Removing none is a correct outcome, not a failure: E-22 deletes
+    # objects earlier in the same run, so by here the prefix can already be
+    # empty. Only objects that REMAIN are a failure.
+    [[ "$left" -eq 0 ]] || die "cleanup: $left object(s) still under $BUNDLE_PREFIX/ after removing $removed"
+    pass "the bucket is left as it was found: nothing under this run's prefix ($removed removed here, the rest already deleted by the run)"
 fi
 
 printf '\n'
