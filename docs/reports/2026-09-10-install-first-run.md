@@ -115,14 +115,19 @@ XX Install stopped unexpectedly.
 ### Asserted
 
 `scripts/test_install.sh` drives all eleven paths and asks two questions of
-each: **is stdout non-empty**, and does it say the right thing. One more
-assertion covers the authority being single — every result path prints exactly
-one outcome block, never two.
+each: **is stdout non-empty and is the screen it leaves not blank**, and does
+it say the right thing. Both halves of the first, because under a live region
+stdout is never literally empty — the renderer writes thousands of bytes and
+erases them, which is how the reported run was silent with a busy stdout. One
+more assertion covers the authority being single: every result path prints
+exactly one outcome block, never two.
 
-Two test-only seams were added to make the unreachable reachable:
+Three test-only seams were added to make the unreachable reachable:
 `NEMR_TEST_FORCE_REBOOT_GATE` takes the gate on a machine where delegation is
-already live, and `NEMR_TEST_FORCE_ABRUPT` exits with nothing recorded while
-the region is open — the shape of a path nobody wired.
+already live, `NEMR_TEST_FORCE_ABRUPT` exits with nothing recorded while the
+region is open — the shape of a path nobody wired — and
+`NEMR_TEST_FORCE_SUDO_ASK` drives the password prompt so a refusing `sudo`
+shim on `PATH` can exercise the refusal. The real `sudo` is never touched.
 
 ---
 
