@@ -41,13 +41,26 @@ readonly HELPER="/usr/local/libexec/nemr-volume"
 
 STEP=0
 FAILED=0
+PASSED=0
+# F-6, applied here after the gate audit (2026-09-09) found this script — the
+# standing regression test for every engine change — printing a step tally and
+# exiting 0 without ever asserting how many assertions it made. A run that
+# silently stopped asserting halfway would have read as PASS.
+#
+# The count is mode-dependent: NEMR_SKIP_API=1 replaces the live API round-trip
+# (one assertion) with a skip that asserts nothing.
+if [[ "${NEMR_SKIP_API:-0}" == "1" ]]; then
+    EXPECTED_ASSERTIONS=43
+else
+    EXPECTED_ASSERTIONS=44
+fi
 
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
 
 step()  { STEP=$((STEP + 1)); printf '\n\033[1m[%02d] %s\033[0m\n' "$STEP" "$*"; }
-ok()    { printf '     \033[32mok\033[0m   %s\n' "$*"; }
+ok()    { PASSED=$((PASSED + 1)); printf '     \033[32mok\033[0m   %s\n' "$*"; }
 fail()  { printf '     \033[31mFAIL\033[0m %s\n' "$*"; FAILED=$((FAILED + 1)); }
 info()  { printf '          %s\n' "$*"; }
 
@@ -118,7 +131,13 @@ command -v "$NEMR" >/dev/null || { fail "$NEMR not found — run ./scripts/insta
 # and be reported as a milestone closing. The gate lives in the Rust harness so
 # there is one implementation, not two that can drift.
 if command -v "$NEMR" >/dev/null; then
-    if ! cargo test --test regression the_installed_engine_matches_its_source \
+    # A filter that matches nothing exits 0. Without this line, renaming that
+    # test turns the whole freshness gate into a no-op that reports success —
+    # the shape the gate audit found in five scripts at once.
+    if ! require_test_exists the_installed_engine_matches_its_source --test regression; then
+        fail "the freshness gate cannot run: its test has been renamed or deleted"
+        missing=1
+    elif ! cargo test --test regression the_installed_engine_matches_its_source \
          --quiet >/dev/null 2>&1; then
         fail "the installed nemr is not this source — run ./scripts/install_engine.sh"
         cargo test --test regression the_installed_engine_matches_its_source 2>&1 \
@@ -391,7 +410,16 @@ fi
 
 printf '\n'
 if [[ $FAILED -eq 0 ]]; then
-    printf '\033[32mPASS\033[0m — %d steps, all assertions passed\n' "$STEP"
+    if [[ "$PASSED" -ne "$EXPECTED_ASSERTIONS" ]]; then
+        printf '\033[31mFAIL\033[0m — %d assertions passed, %d expected.\n' \
+            "$PASSED" "$EXPECTED_ASSERTIONS"
+        printf '        A step was skipped, or one was added without raising\n'
+        printf '        EXPECTED_ASSERTIONS. Zero failures over too few assertions is\n'
+        printf '        not a pass (F-6). Mode: NEMR_SKIP_API=%s\n' "${NEMR_SKIP_API:-0}"
+        exit 1
+    fi
+    printf '\033[32mPASS\033[0m — %d steps, %d assertions, all %d expected\n' \
+        "$STEP" "$PASSED" "$EXPECTED_ASSERTIONS"
     exit 0
 fi
 printf '\033[31mFAIL\033[0m — %d assertion(s) failed across %d steps\n' "$FAILED" "$STEP"

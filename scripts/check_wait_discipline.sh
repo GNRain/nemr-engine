@@ -33,6 +33,21 @@ wait_discipline_holds() {
     local file="$1"
     grep -qE '(^|[^a-zA-Z0-9_])\$!' "$file" 2>/dev/null || return 0   # no background pid: not our business
     grep -q 'wait_for_service' "$file" 2>/dev/null && return 0
+    # F-95 is about a hand-rolled READINESS poll — a loop that asks "is it up
+    # yet?" and, when the answer stays no, reports nothing useful. Backgrounding
+    # a process and then waiting for it to FINISH is not that: bash's own `wait`
+    # returns its exit status, which is the opposite of a wait that cannot
+    # explain itself. This distinction was added on 2026-09-10, when the gate —
+    # unrun since CI stopped — flagged three files that background work and
+    # `wait` on it (the installer's step runner, the progress animation, and the
+    # acceptance that interrupts it). The control below covers both shapes.
+    # Comments stripped first: "Draw until killed." is prose, not a poll.
+    local code
+    code="$(grep -vE '^[[:space:]]*#' "$file" 2>/dev/null)"
+    if grep -qE '(^|[^a-zA-Z0-9_])wait "?\$' <<<"$code" &&
+       ! grep -qE 'for .*(seq|\{1\.\.)|until |while .*(curl|nc |ss |test -|\[\[)' <<<"$code"; then
+        return 0
+    fi
     return 1
 }
 
@@ -89,6 +104,15 @@ cat > "$probe/innocent.sh" <<'PROBE'
 echo "this script starts nothing in the background"
 PROBE
 
+# Backgrounds work and waits for it to FINISH — bash's `wait` gives the exit
+# status, so there is nothing to hand-roll and nothing to explain badly.
+cat > "$probe/waits_for_exit.sh" <<'PROBE'
+#!/usr/bin/env bash
+long_running_thing >>"$LOG" 2>&1 &
+work=$!
+wait "$work" || rc=$?
+PROBE
+
 if wait_discipline_holds "$probe/offender.sh"; then
     report "control failed: a hand-rolled wait loop was NOT flagged. The check \
 matches nothing, so its 'ok' above is meaningless."
@@ -97,9 +121,13 @@ elif ! wait_discipline_holds "$probe/compliant.sh"; then
 check is too broad and would reject the very pattern it exists to require."
 elif ! wait_discipline_holds "$probe/innocent.sh"; then
     report "control failed: a script that backgrounds nothing was flagged."
+elif ! wait_discipline_holds "$probe/waits_for_exit.sh"; then
+    report "control failed: backgrounding work and waiting for it to finish WAS \
+flagged. That is not a readiness poll, and rejecting it would push authors to \
+wrap `wait` in wait_for_service, which is not what it is for."
 else
-    ok "control: a hand-rolled loop is caught, a compliant script and a script \
-that backgrounds nothing are not — the check discriminates"
+    ok "control: a hand-rolled readiness loop is caught; wait_for_service, \
+waiting for exit, and backgrounding nothing are not — the check discriminates"
 fi
 
 printf '\n'

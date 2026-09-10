@@ -23,7 +23,7 @@ const GRACE_PERIOD: Duration = nemr_engine::containerd::config::SIGTERM_GRACE;
 
 use common::{
     ensure_base_image_present, extracted_plaintext, installed_helper_matches_built, require_host,
-    run_offline, unit_only, write_hostile_bundle, HostRequirements, TestProject,
+    run_offline, run_offline_probe, unit_only, write_hostile_bundle, HostRequirements, TestProject,
 };
 use nemr_engine::containerd::client::ContainerdClient;
 use nemr_engine::containerd::containers::StopOutcome;
@@ -1044,6 +1044,26 @@ fn e11_export_and_import_work_with_no_network_and_no_credentials() {
          it inside proves nothing"
     );
 
+    // CONTROL, the other half: the credential must actually be HIDDEN inside
+    // the namespace. Without this the test's own name is unproven — masking the
+    // wrong directory hides nothing, export never needed a credential anyway,
+    // and the test goes green while establishing only "no network". That is
+    // exactly what happened between F-14 and the gate audit.
+    let probe = run_offline_probe(&format!(
+        "test -e '{}' && echo VISIBLE || echo HIDDEN",
+        credential.display()
+    ));
+    let seen = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        seen.contains("HIDDEN"),
+        "control: the credential at {} is still readable inside the offline \
+         namespace, so this test proves nothing about running without one.\n\
+         probe said: {}{}",
+        credential.display(),
+        seen.trim(),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+
     // F-9: a daemon must be answering BEFORE the namespaced CLI runs. With
     // none, the CLI used to autostart one inside the namespace, where it
     // bound the host's socket and served every later caller with a helper
@@ -1984,6 +2004,166 @@ fn import_refuses_to_clobber_an_existing_project() {
 /// "authenticate on the host") is called from nowhere in the engine's
 /// project code — so the amendment cannot silently regress into a create
 /// that refuses again.
+/// A check that CANNOT RUN must fail, not pass — the three mechanisms.
+///
+/// This is the class the gate audit (2026-09-09) measured, not one of its
+/// instances. Three shapes made "it did not run" indistinguishable from "it
+/// passed", and each now has a mechanism. This test guards the mechanisms, so
+/// removing one is a red suite rather than a quiet loss of coverage.
+#[test]
+fn a_check_that_cannot_run_must_fail_not_pass() {
+    // 1. A NAME FILTER THAT MATCHES NOTHING. `cargo test <filter>` exits 0 when
+    //    it matches no test, so five scripts gated their whole run on a filter
+    //    that a rename would have silently disarmed.
+    let proc_lib = std::fs::read_to_string("scripts/lib/proc.sh").expect("read lib/proc.sh");
+    assert!(
+        proc_lib.contains("require_test_exists()"),
+        "scripts/lib/proc.sh must define require_test_exists — the one place that \
+         refuses a cargo-test filter matching nothing"
+    );
+    let mut unguarded = Vec::new();
+    for script in shell_scripts() {
+        let text = std::fs::read_to_string(&script).expect("read a script");
+        for filter in cargo_test_filters(&text) {
+            // The script must check the filter names something before trusting
+            // the result, and the filter must name a test that exists now.
+            if !text.contains(&format!("require_test_exists {filter}")) {
+                unguarded.push(format!(
+                    "{script}: `cargo test … {filter}` with no require_test_exists"
+                ));
+            }
+            let suite = std::fs::read_to_string("tests/regression.rs").expect("read regression.rs");
+            assert!(
+                suite.contains(&format!("fn {filter}(")),
+                "{script} filters on `{filter}`, which is not a test in this suite any \
+                 more — whatever it guards is not being checked"
+            );
+        }
+    }
+    assert!(
+        unguarded.is_empty(),
+        "a filtered `cargo test` exits 0 when the filter matches nothing:\n  {}",
+        unguarded.join("\n  ")
+    );
+
+    // 2. A RUNTIME SKIP COUNTED AS A PASS. `NEMR_TEST_UNIT_ONLY` makes
+    //    host-backed tests return early, and cargo reports them as passed. The
+    //    announcement must reach the real stderr (libtest captures the print
+    //    macros for a passing test) and a ledger a harness can count.
+    let common = std::fs::read_to_string("tests/common/mod.rs").expect("read common");
+    assert!(
+        common.contains("std::io::stderr().write_all"),
+        "the skip announcement must go straight to the stderr handle: libtest \
+         captures eprintln! for a test that passes, which is every skipped test"
+    );
+    assert!(
+        common.contains("fn unit_only_ledger()") && common.contains("unit-only-skips.txt"),
+        "a unit-only run must leave a ledger of what it did not run"
+    );
+    assert!(
+        common.contains("pub fn unit_only() -> bool {")
+            && common
+                .split("pub fn unit_only() -> bool {")
+                .nth(1)
+                .is_some_and(|body| body[..body.find("\n}").unwrap_or(body.len())]
+                    .contains("announce_unit_only_skip()")),
+        "asking whether to skip must announce it: 28 callers asked and returned \
+         early without ever reaching require_host's message"
+    );
+
+    // 3. AN ACCEPTANCE THAT PASSES OVER NOTHING. Every script that reports
+    //    assertions must assert how many it expected to make (F-6).
+    let mut uncounted = Vec::new();
+    for script in shell_scripts() {
+        let text = std::fs::read_to_string(&script).expect("read a script");
+        let reports_assertions =
+            text.contains("PASS") && (text.contains("$PASS") || text.contains("assertions"));
+        if !reports_assertions {
+            continue;
+        }
+        // The DEFINITION and a COMPARISON, not a mention: the first version of
+        // this guard accepted any occurrence of the name, so a script that had
+        // lost its constant still passed on the strength of naming it in a
+        // failure message. Found by neutering it (2026-09-10).
+        // An ASSIGNMENT (the name followed by `=`, wherever it sits on the
+        // line — ui-acceptance.sh sets it after a `;`) and a COMPARISON
+        // against it, in any quoting.
+        let defines = text.contains("EXPECTED_ASSERTIONS=");
+        let compares = text.contains("$EXPECTED_ASSERTIONS");
+        if !defines || !compares {
+            uncounted.push(format!(
+                "{script}{}",
+                match (defines, compares) {
+                    (false, false) => " (no EXPECTED_ASSERTIONS= and no comparison)",
+                    (false, true) => " (compares against an EXPECTED_ASSERTIONS it never sets)",
+                    _ => " (sets EXPECTED_ASSERTIONS but never compares against it)",
+                }
+            ));
+        }
+    }
+    assert!(
+        uncounted.is_empty(),
+        "these scripts report a pass without asserting how many assertions they made, \
+         so a skipped step still reads as success (F-6):\n  {}",
+        uncounted.join("\n  ")
+    );
+}
+
+/// Every shell script in the repo, so a guard cannot be scoped to the files
+/// someone remembered.
+fn shell_scripts() -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![
+        std::path::PathBuf::from("scripts"),
+        std::path::PathBuf::from("docs"),
+    ];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap_or_else(|e| panic!("read {d:?}: {e}")) {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "sh") {
+                found.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    assert!(
+        found.len() > 25,
+        "the walk found only {} scripts",
+        found.len()
+    );
+    found
+}
+
+/// The name filters a script passes to `cargo test` — the words after
+/// `--test <target>` that are not flags.
+fn cargo_test_filters(text: &str) -> Vec<String> {
+    let mut filters = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || !line.contains("cargo test") {
+            continue;
+        }
+        let after = match line.split_once("--test ") {
+            Some((_, rest)) => rest,
+            None => continue,
+        };
+        let mut words = after.split_whitespace();
+        let _target = words.next();
+        if let Some(word) = words.next() {
+            if !word.starts_with('-')
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+                && word.len() > 4
+            {
+                filters.push(word.to_string());
+            }
+        }
+    }
+    filters
+}
+
 /// F-24: no message sends the user to log in on the host.
 ///
 /// Since F-14 nemr's credential lives at `~/.local/share/nemr/host-credential/`
@@ -1994,16 +2174,38 @@ fn import_refuses_to_clobber_an_existing_project() {
 /// session; this guards the text of every file that speaks to the user.
 #[test]
 fn f24_nothing_tells_the_user_to_log_in_on_the_host() {
-    let files = [
-        "src/auth.rs",
-        "src/bin/nemr.rs",
-        "src/engine/project.rs",
-        "crates/nemr-cloud/src/serve.rs",
-        // Where a new user actually reads it (D-14: install.sh is what they run,
-        // and README.md step 2 is where the login is explained).
-        "README.md",
-        "scripts/install.sh",
+    // EVERY file that speaks to a user, not a list someone has to remember to
+    // extend. The named-list version of this guard shipped with F-24 and did
+    // not cover scripts/setup_host.sh, which went on telling developers to run
+    // `claude` on the host for another day (the gate audit, 2026-09-09) — a
+    // guard that only watches where you thought to point it is the shape this
+    // audit is about.
+    let mut files: Vec<String> = vec![
+        "src/auth.rs".into(),
+        "src/bin/nemr.rs".into(),
+        "src/engine/project.rs".into(),
+        "crates/nemr-cloud/src/serve.rs".into(),
+        "README.md".into(),
+        "PREREQUISITES.md".into(),
     ];
+    for dir in ["scripts", "docs"] {
+        let mut stack = vec![std::path::PathBuf::from(dir)];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap_or_else(|e| panic!("read {d:?}: {e}")) {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "sh" || e == "py") {
+                    files.push(path.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    assert!(
+        files.len() > 30,
+        "the walk found only {} files — it is not looking where it thinks it is",
+        files.len()
+    );
     let forbidden = [
         "Authenticate on the host",
         "authenticate on the host",
@@ -2012,13 +2214,28 @@ fn f24_nothing_tells_the_user_to_log_in_on_the_host() {
         "run `claude` on the host",
         "log in on the host",
     ];
-    for f in files {
+    for f in &files {
         let text = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("read {f}: {e}"));
         for phrase in forbidden {
             assert!(
                 !text.contains(phrase),
-                "{f} still sends the user to a host login ({phrase:?});                  the login that counts is /login inside a session (F-24)"
+                "{f} still sends the user to a host login ({phrase:?}); the login that counts is /login inside a session (F-24)"
             );
+        }
+        // And the path itself: since F-14 the engine's login lives in its own
+        // directory, so a SCRIPT reading ~/.claude/.credentials.json is reading
+        // a file the engine neither writes nor reads. Rust prose is exempt —
+        // src/auth.rs has to be able to name the path it deliberately is not.
+        if f.ends_with(".sh") || f.ends_with(".py") {
+            for form in [
+                "$HOME/.claude/.credentials.json",
+                "~/.claude/.credentials.json",
+            ] {
+                assert!(
+                    !text.contains(form),
+                    "{f} reads {form} — the HOST's own Claude login. The engine's is at ~/.local/share/nemr/host-credential (F-14), and a script that reads the old path is measuring something the engine never looks at."
+                );
+            }
         }
     }
 }

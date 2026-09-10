@@ -23,6 +23,12 @@ REPO="$PWD"
 
 BLUE=$'\033[34m'; RED=$'\033[31m'; GREEN=$'\033[32m'; RESET=$'\033[0m'
 STEP=0; ASSERTS=0
+# F-6: the count is ASSERTED, not printed. The gate audit (2026-09-09) found
+# six of this project's eight acceptance scripts exiting 0 over a tally nobody
+# checked — a run that skipped a step read exactly like a run that made every
+# assertion. Raise this number when a step is added; a run that counts anything
+# else fails.
+EXPECTED_ASSERTIONS=19
 step() { STEP=$((STEP+1)); printf '\n%s== %d. %s%s\n' "$BLUE" "$STEP" "$1" "$RESET"; }
 pass() { ASSERTS=$((ASSERTS+1)); printf '   %sok%s %s\n' "$GREEN" "$RESET" "$1"; }
 fail() { printf '   %sFAIL%s %s\n' "$RED" "$RESET" "$1" >&2; exit 1; }
@@ -73,6 +79,10 @@ in_session() { echo "$2" | timeout 180 nemr attach "$1" 2>/dev/null | tr -d '\r'
 step "Prerequisites"
 # ---------------------------------------------------------------------------
 command -v nemr >/dev/null || fail "nemr is not on PATH — ./scripts/install_engine.sh"
+# A filter that matches nothing exits 0, so check it names a real test BEFORE
+# trusting its result — otherwise a rename disarms this gate in silence.
+require_test_exists the_installed_engine_matches_its_source --test regression \
+    || fail "the freshness gate cannot run (see above)"
 if ! cargo test --test regression the_installed_engine_matches_its_source --quiet >/dev/null 2>&1; then
     fail "the installed nemr/nemrd is not this source — ./scripts/install_engine.sh"
 fi
@@ -293,7 +303,15 @@ for p in "$PORT_A" "$PORT_B"; do
 done
 pass "both host ports released"
 
-printf '\n%sPASS%s — %d steps, %d assertions.\n' "$GREEN" "$RESET" "$STEP" "$ASSERTS"
+if [[ "$ASSERTS" -ne "$EXPECTED_ASSERTIONS" ]]; then
+    printf '\n%sFAIL%s — %d assertions, %d expected: a step was skipped, or one was\n' \
+        "$RED" "$RESET" "$ASSERTS" "$EXPECTED_ASSERTIONS"
+    printf '       added without raising EXPECTED_ASSERTIONS. Zero failures over too\n'
+    printf '       few assertions is not a pass (F-6).\n'
+    exit 1
+fi
+printf '\n%sPASS%s — %d steps, %d assertions, all %d expected.\n' \
+    "$GREEN" "$RESET" "$STEP" "$ASSERTS" "$EXPECTED_ASSERTIONS"
 if [[ "$SKIP_API" == "1" ]]; then
     echo "mode: NEMR_SKIP_API=1 — egress and DNS proven, but the live API round-trip"
     echo "      was NOT exercised. Run without NEMR_SKIP_API for the full claim."

@@ -434,20 +434,23 @@ fi
 # ---------------------------------------------------------------------------
 # 9. Credential
 # ---------------------------------------------------------------------------
-step "Claude Code credential (AUTH-01/02/03)"
-if [[ -e "$HOME/.claude/.credentials.json" ]]; then
-    ok "credential present at ~/.claude/.credentials.json"
+step "Claude Code credential (AUTH-03, as amended by E-21 and F-24)"
+# The engine keeps its OWN login, at its own path — not the host's ~/.claude,
+# which it neither writes nor reads (F-14). And a machine with no login is the
+# normal first state, not a fault: the engine writes a placeholder and the user
+# logs in with /login INSIDE a session (E-21, F-24). So this step reports; it
+# never sends anyone to a host `claude` login, which would write a file nothing
+# here consults.
+NEMR_CREDENTIAL="$HOME/.local/share/nemr/host-credential/.credentials.json"
+if [[ -e "$NEMR_CREDENTIAL" ]] && ! grep -q '_nemr_placeholder' "$NEMR_CREDENTIAL"; then
+    ok "this machine has a nemr login at ~/.local/share/nemr/host-credential/"
 else
-    cat <<EOF
+    ok "no login on this machine yet — nemr writes its placeholder at create/start,
+        and you log this machine in by running /login inside a session:
 
-    No credential at ~/.claude/.credentials.json.
+            nemr create myproject && nemr attach myproject     # then: /login
 
-    \`nemr create\` fails without one, deliberately (AUTH-03): there is no point
-    provisioning storage for a container that cannot authenticate.
-
-        claude   # log in, then re-run this script
-
-EOF
+        The login stays on this machine (D-02); it is never copied anywhere."
 fi
 
 # ---------------------------------------------------------------------------
