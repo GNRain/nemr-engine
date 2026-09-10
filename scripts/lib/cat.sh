@@ -152,56 +152,98 @@ nemr_cat_enabled() {
 
 _NEMR_CAT_PID=""
 _NEMR_CAT_HID=""
+_NEMR_CAT_STOP=""
 
-# Draw until killed. A separate process, so nothing here can hold up the work.
+# THE DRAWER OWNS ITS OWN LINES, AND ITS OWN EXIT.
+#
+# The first version let the parent kill the drawer and then erase from wherever
+# the cursor happened to be. A kill lands mid-frame roughly half the time, so
+# the cursor sat part-way down the block and `\033[J` erased from there —
+# leaving every line above it on the screen for good. Measured before the fix:
+# 9 of 20 stops left a cat behind (2026-09-10). Nothing counted escape
+# sequences wrongly; the assertion simply was not about the screen.
+#
+# So: the drawer stops only at a FRAME BOUNDARY, where the cursor is provably
+# back at the top of its block, and it erases its own lines on the way out. If
+# it is signalled instead — Ctrl-C reaches the whole process group — its trap
+# knows how many lines of the current frame it has written and erases exactly
+# those. Either way nothing else has to guess where the cursor is.
 _nemr_cat_loop() {
-    local frames=() frame="" line
+    local frames=() frame="" line written=0 height
     while IFS= read -r line; do
         if [[ "$line" == "%%" ]]; then frames+=("$frame"); frame=""
         else frame+="$line"$'\n'; fi
     done < <(_nemr_cat_frames)
     [[ -n "$frame" ]] && frames+=("$frame")
-
-    local i=0 n=${#frames[@]} height
     height="$(printf '%s' "${frames[0]}" | grep -c '')"
+
+    # Signalled mid-frame: erase what this frame has written, and only that.
+    # shellcheck disable=SC2064
+    trap 'if (( written > 0 )); then printf "\033[%dA\r\033[J" "$written"; else printf "\r\033[J"; fi; exit 0' TERM INT
+
+    # The stop channel. `read -t` on it is the frame delay AND the stop check in
+    # one: a byte arrives and the read returns at once, so stopping costs
+    # nothing — the animation must never make the install wait for it.
+    exec 9<>"$_NEMR_CAT_STOP"
+
+    local i=0 n=${#frames[@]}
     while :; do
-        # Erase each line before writing it, so a shorter frame cannot leave
-        # the tail of a longer one behind.
-        printf '%s' "${frames[$((i % n))]}" | while IFS= read -r line; do
+        written=0
+        # Process substitution, not a here-string: `<<<` appends a newline to a
+        # frame that already ends with one, so every frame wrote one line more
+        # than `height` and the block crept down the screen a line per frame.
+        while IFS= read -r line; do
             printf '\033[2K%s\n' "$line"
-        done
+            written=$((written + 1))
+            # TEST-ONLY seam (unset in every real run): slows the frame so a
+            # stop lands mid-write on purpose. Without it the mid-write window
+            # is a couple of milliseconds wide and the assertion that the screen
+            # is left clean only catches a regression two times in twelve.
+            [[ -n "${NEMR_TEST_CAT_LINE_DELAY:-}" ]] && sleep "$NEMR_TEST_CAT_LINE_DELAY"
+        done < <(printf '%s' "${frames[$((i % n))]}")
         printf '\033[%dA' "$height"
+        written=0                      # cursor is back at the top of the block
         i=$((i + 1))
-        sleep "$NEMR_CAT_DELAY"
+        if read -r -t "$NEMR_CAT_DELAY" -u 9 _; then break; fi
     done
+    printf '\r\033[J'                  # the block was ours; leave nothing
 }
 
 # Start drawing. Returns immediately.
 nemr_cat_start() {
     nemr_cat_enabled || return 0
     [[ -n "$_NEMR_CAT_PID" ]] && return 0
+    _NEMR_CAT_STOP="$(mktemp -u "${TMPDIR:-/tmp}/nemr-cat.XXXXXX")"
+    mkfifo -m 0600 "$_NEMR_CAT_STOP" 2>/dev/null || { _NEMR_CAT_STOP=""; return 0; }
     printf '\033[?25l'          # hide the cursor
     _NEMR_CAT_HID=1
     _nemr_cat_loop &
     _NEMR_CAT_PID=$!
+    exec 8<>"$_NEMR_CAT_STOP"   # <> so opening never waits for the other end
 }
 
-# Stop drawing and leave the terminal as it was found: the cat's lines erased,
-# the cursor visible. Safe to call when nothing is running, and safe to call
-# twice — it is the EXIT/INT/TERM handler as well as the end of a step.
+# Stop drawing and leave the terminal as it was found. Safe to call when
+# nothing is running, and safe to call twice — it is the EXIT/INT/TERM handler
+# as well as the end of a step.
 nemr_cat_stop() {
     if [[ -n "$_NEMR_CAT_PID" ]]; then
-        kill "$_NEMR_CAT_PID" 2>/dev/null || true
+        # Ask, do not kill: the drawer finishes the frame it is on, erases its
+        # own lines and exits. The read it is blocked on returns the instant
+        # this byte lands, so the ask costs no measurable time.
+        # A LINE, not a byte: `read` returns on a newline, so a bare byte would
+        # sit in the pipe while the drawer timed out around it forever.
+        printf 's\n' >&8 2>/dev/null || true
         wait "$_NEMR_CAT_PID" 2>/dev/null || true
+        # Only if it somehow outlived the ask. Its trap still cleans up.
+        kill -0 "$_NEMR_CAT_PID" 2>/dev/null && {
+            kill "$_NEMR_CAT_PID" 2>/dev/null
+            wait "$_NEMR_CAT_PID" 2>/dev/null
+        }
+        exec 8>&- 2>/dev/null || true
+        rm -f "$_NEMR_CAT_STOP"
         _NEMR_CAT_PID=""
-        # The cursor is at the top of the block; erase from here to the end of
-        # the screen. Nothing is drawn below the cat, so this takes exactly its
-        # lines and no others.
-        printf '\r\033[J'
+        _NEMR_CAT_STOP=""
     fi
-    # Only if we hid it. The flag outlives the drawer, so a drawer killed hard
-    # still leaves the terminal restored here; a run that never drew anything
-    # emits nothing at all, which is what keeps a captured log clean.
     if [[ -n "$_NEMR_CAT_HID" ]]; then
         printf '\033[?25h'
         _NEMR_CAT_HID=""

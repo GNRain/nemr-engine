@@ -28,7 +28,7 @@ PASS=0; FAIL=0
 # Asserted, not merely printed: a run that skipped a case would otherwise say
 # PASS with fewer assertions — the green-over-nothing shape this project keeps
 # guarding against. Raise this when a case is added.
-EXPECTED_ASSERTIONS=39
+EXPECTED_ASSERTIONS=41
 
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS + 1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
@@ -200,6 +200,48 @@ script -qec 'stty rows 10 2>/dev/null; ./scripts/lib/cat.sh --demo 1' /dev/null 
 n="$(grep -c '\*-\*' "$WORK/short.raw" || true)"
 check "$([[ "$n" == "0" ]] && echo 0 || echo 1)" \
     "a terminal too short for the drawing gets no animation at all" "$n frames"
+
+# 4c. THE SCREEN, not the escape sequences. Counting clears proves a clear was
+#     issued, not that nothing was left behind: the drawer used to be killed
+#     wherever it happened to be, so half the time the erase started part-way
+#     down the block and every line above it stayed on the screen for good.
+#     Measured before the fix: 9 of 20 stops left a cat. Nothing was miscounted
+#     — no assertion was about the screen. This one renders the transcript
+#     through a terminal and looks.
+screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$raw")"
+cat_on_screen=0
+grep -qE '\(\"\)|o\.o|o\.O|\*-\*' <<<"$screen" && cat_on_screen=1
+check "$cat_on_screen" "when the install finishes, no part of the cat is left on the screen" \
+    "$(grep -nE '\(\"\)|o\.o|\*-\*' <<<"$screen" | head -3)"
+
+# And under the stop that used to leak: many start/stop cycles, each ended at a
+# different moment within a frame, must each leave the screen as they found it.
+# The delays are a fixed ladder rather than $RANDOM so a failure reproduces.
+cat >"$WORK/cycle.sh" <<'CYCLE'
+#!/usr/bin/env bash
+. "$1/scripts/lib/cat.sh"
+printf 'before\n'
+# The seam widens the mid-frame window on purpose: without it a regression
+# here shows up two times in twelve, which is not an assertion.
+NEMR_TEST_CAT_LINE_DELAY=0.02 NEMR_CAT_DELAY=0.01 nemr_cat_start
+sleep "$2"
+nemr_cat_stop
+printf 'after\n'
+CYCLE
+chmod +x "$WORK/cycle.sh"
+leaked=0
+for delay in 0.10 0.13 0.17 0.21 0.26 0.31 0.37 0.44 0.52 0.61 0.71 0.83; do
+    timeout 30 script -qec "$WORK/cycle.sh $REPO $delay" /dev/null >"$WORK/stress.raw" 2>&1
+    after="$(python3 "$REPO/scripts/lib/render_pty.py" "$WORK/stress.raw")"
+    if [[ "$(grep -c . <<<"$after")" -ne 2 ]]; then
+        leaked=$((leaked + 1))
+        [[ "$leaked" == 1 ]] && { printf '   | after a stop at %ss the screen was:\n' "$delay"
+                                  printf '%s\n' "$after" | grep -n . | head -5 | sed 's/^/   | /'; }
+    fi
+done
+check "$([[ "$leaked" == "0" ]] && echo 0 || echo 1)" \
+    "stopped mid-frame twelve times over, the screen is left exactly as found" \
+    "$leaked of 12 left something behind"
 
 # 5. Interrupted, it leaves no hidden cursor and no half a cat.
 script -qec './scripts/lib/cat.sh --demo 20' /dev/null >"$WORK/int.raw" 2>&1 &
