@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use sqlx::postgres::PgPool;
@@ -113,9 +114,21 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/login", post(identity::login))
         .route("/v1/logout", post(auth::logout))
         .route("/v1/sessions", get(index::list).post(index::upsert))
+        // F-16: a bundle is the product's payload and can be gigabytes (the
+        // quota presets go to 10GB). axum's 2MB default body limit silently
+        // capped every push — a 6MB session answered 413, and anything larger
+        // had the connection closed mid-stream, which reaches the client as a
+        // broken pipe. The limit is lifted HERE and replaced by the upload
+        // handler's own ceiling, which it enforces while streaming to disk
+        // rather than by buffering the body in memory.
         .route(
             "/v1/sessions/{name}/bundle",
-            put(bundles::upload).get(bundles::download),
+            // The disable applies to THIS method only: chaining `.layer` on the
+            // method router scopes it to the routes added before it, so the
+            // download and every other endpoint keep axum's default.
+            put(bundles::upload)
+                .layer(DefaultBodyLimit::disable())
+                .get(bundles::download),
         )
         // E-22: delete the cloud copy — the object AND the index row. Refused
         // while another machine holds the lease (take over first).

@@ -352,7 +352,7 @@ async def type_keys(b, text):
     await b.cmd("input.performActions", {"context": b.ctx, "actions": [{"type": "key", "id": "kb", "actions": actions}]})
 
 
-async def page_flow(launch_url, email, password, server, remote_name, local_name):
+async def page_flow(launch_url, email, password, server, remote_name, local_name, add_dir="/tmp"):
     """F-1, F-3, F-2 against the real DOM. Returns a list of (name, ok, detail).
 
     Preconditions the shell arranges: `remote_name` exists only on the server
@@ -364,7 +364,7 @@ async def page_flow(launch_url, email, password, server, remote_name, local_name
         out.append({"name": name, "ok": bool(ok), "detail": detail})
         return ok
     try:
-        await _page_flow(launch_url, email, password, server, remote_name, local_name, check)
+        await _page_flow(launch_url, email, password, server, remote_name, local_name, check, add_dir)
     except SystemExit as e:
         # A wait that never came true is a failed claim, not a crash: record
         # it so the run reads as red with the reason, and stop there.
@@ -372,7 +372,7 @@ async def page_flow(launch_url, email, password, server, remote_name, local_name
     return out
 
 
-async def _page_flow(launch_url, email, password, server, remote_name, local_name, check):
+async def _page_flow(launch_url, email, password, server, remote_name, local_name, check, add_dir="/tmp"):
     async with Browser() as b:
         await b.goto(launch_url)
         await b.wait_for("document.getElementById('status').textContent !== 'connecting…'", 30, "the page's own handshake")
@@ -512,6 +512,25 @@ async def _page_flow(launch_url, email, password, server, remote_name, local_nam
         await b.eval("document.getElementById('removeform').requestSubmit()")
         await b.wait_for(f"(() => {{ const r = (window.nemrRows || []).find(x => x.name === {json.dumps(third)}); return !!r && r.where === 'remote'; }})()", 120, "the third row to read remote after the remove")
         check("F-12 removed here: the row stays and reads remote", not await b.eval(f"!!document.querySelector('button[data-remove={json.dumps(third)}]')"))
+
+        # ---- F-21: add an existing folder from the page. The panel IS the
+        # confirmation (adding is not destructive), and it must show the plan —
+        # what travels, what is excluded, how many transcripts — with the
+        # confirm disabled until a folder has actually been measured.
+        await b.eval("document.getElementById('addfolder').click()")
+        await b.wait_for(VISIBLE + "('addform')", 10, "the add-folder panel")
+        check("F-21 the add panel opens with its confirm disabled until a folder is measured",
+              await b.eval("document.getElementById('addconfirm').disabled"))
+        await b.eval("document.querySelector('#addform input[name=folder]').focus()")
+        await type_keys(b, add_dir)
+        await b.wait_for("!document.getElementById('addconfirm').disabled", 60, "the plan to come back and enable the confirm")
+        plan = await b.eval("document.getElementById('addplan').textContent")
+        check("F-21 the panel shows the plan before the confirm: what travels, what is excluded, how many transcripts",
+              ("would travel" in plan and "Excluded" in plan and "transcript" in plan and "copied, not moved" in plan), plan[:200])
+        check("F-21 there is no typed-name gate — adding is not destructive",
+              not await b.eval("!!document.getElementById('addtypeit')"))
+        await b.eval("document.getElementById('addcancel').click()")
+        check("F-21 cancel closes the add panel", not await b.eval(VISIBLE + "('addform')"))
 
         # ---- E-22, the only-copy case on the real page: the cloud copy of a
         # remote-only session is the only copy, so the typed name is required
@@ -654,6 +673,8 @@ async def credential_step_flow(launch_url, local_name):
             check("E-21 the page says this machine has no Claude login yet", await b.eval(VISIBLE + "('loginline')"), _rows)
             text = await b.eval("document.getElementById('loginline').textContent")
             check("E-21 the line says what to do: attach and run /login", "/login" in (text or ""), text)
+            check("F-25 the line says what the login costs elsewhere (E-13)",
+                  "logged out" in (text or ""), text)
             await b.eval(f"document.querySelector('button[data-attach={json.dumps(local_name)}]').click()")
             await b.wait_for("document.getElementById('attachnote').textContent.startsWith('attached')", 30, "the terminal to attach")
             await b.eval("document.querySelector('#term textarea').focus()")
@@ -698,7 +719,8 @@ def main():
     if op == "page":
         # The page itself exchanges the launch token; this process must not.
         email, password, server, remote_name, local_name = sys.argv[3:8]
-        results = asyncio.run(page_flow(sys.argv[2], email, password, server, remote_name, local_name))
+        add_dir = sys.argv[8] if len(sys.argv) > 8 else "/tmp"
+        results = asyncio.run(page_flow(sys.argv[2], email, password, server, remote_name, local_name, add_dir))
         print(json.dumps(results))
         raise SystemExit(0 if all(r["ok"] for r in results) else 4)
     surface = Surface(sys.argv[2], os.environ.get("NEMR_UI_COOKIE") or None)

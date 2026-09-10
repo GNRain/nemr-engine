@@ -1984,6 +1984,45 @@ fn import_refuses_to_clobber_an_existing_project() {
 /// "authenticate on the host") is called from nowhere in the engine's
 /// project code — so the amendment cannot silently regress into a create
 /// that refuses again.
+/// F-24: no message sends the user to log in on the host.
+///
+/// Since F-14 nemr's credential lives at `~/.local/share/nemr/host-credential/`
+/// and a host `claude` login writes `~/.claude` — a file the engine neither
+/// reads nor travels. "Run `claude` on this host and log in" was therefore
+/// advice that could not work, and it was the only thing the Product Owner was
+/// told when a credential went blank (F-24). The remedy is `/login` inside a
+/// session; this guards the text of every file that speaks to the user.
+#[test]
+fn f24_nothing_tells_the_user_to_log_in_on_the_host() {
+    let files = [
+        "src/auth.rs",
+        "src/bin/nemr.rs",
+        "src/engine/project.rs",
+        "crates/nemr-cloud/src/serve.rs",
+        // Where a new user actually reads it (D-14: install.sh is what they run,
+        // and README.md step 2 is where the login is explained).
+        "README.md",
+        "scripts/install.sh",
+    ];
+    let forbidden = [
+        "Authenticate on the host",
+        "authenticate on the host",
+        "Authenticate on this host",
+        "Run `claude` on this host",
+        "run `claude` on the host",
+        "log in on the host",
+    ];
+    for f in files {
+        let text = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("read {f}: {e}"));
+        for phrase in forbidden {
+            assert!(
+                !text.contains(phrase),
+                "{f} still sends the user to a host login ({phrase:?});                  the login that counts is /login inside a session (F-24)"
+            );
+        }
+    }
+}
+
 #[test]
 fn create_and_restore_take_one_credential_path() {
     let source = std::fs::read_to_string("src/engine/project.rs").expect("read project.rs");
@@ -2013,6 +2052,14 @@ fn create_and_restore_take_one_credential_path() {
     assert!(
         !source.contains("auth::resolve_credentials("),
         "the pre-amendment refusal must not be called from the engine's project code"
+    );
+    // F-24: and the refusal it named is gone from the engine altogether — with
+    // the credential at nemr's own path (F-14), a host `claude` login writes a
+    // file the engine never reads, so sending the user there is a dead end.
+    let auth = std::fs::read_to_string("src/auth.rs").expect("read auth.rs");
+    assert!(
+        !auth.contains("pub fn resolve_credentials"),
+        "resolve_credentials, whose remedy was a host login, must not come back (F-24)"
     );
     // Both public entry points route through it: `create` directly, a restore
     // through import_creating.
@@ -3393,13 +3440,13 @@ fn f14_a_fresh_project_binds_the_credential_directory() {
 /// the directory bind turns green.
 #[test]
 fn f14_a_login_write_by_rename_lands_on_the_host_through_the_directory_bind() {
+    use std::os::unix::fs::MetadataExt;
     if unit_only() {
         return;
     }
     if !require_host(HostRequirements::FULL) {
         return;
     }
-    use std::os::unix::fs::MetadataExt;
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
 
     // The measured login write pattern, as a shell the session runs: write #1
@@ -3524,13 +3571,13 @@ fn f14_a_login_write_by_rename_lands_on_the_host_through_the_directory_bind() {
 /// is touched.
 #[test]
 fn f14_a_host_rename_reaches_a_running_session_without_a_rebind() {
+    use std::os::unix::fs::MetadataExt;
     if unit_only() {
         return;
     }
     if !require_host(HostRequirements::FULL) {
         return;
     }
-    use std::os::unix::fs::MetadataExt;
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let temp = std::env::temp_dir().join(format!("nemr-f14-live-{}", std::process::id()));
@@ -3786,51 +3833,78 @@ fn f9_nemrd_refuses_to_start_inside_a_user_namespace() {
     );
 }
 
-/// AUTH-03 extended: `create` refuses a host credential that cannot
-/// authenticate — blanked, or refresh token spent — before provisioning
-/// anything. HOME is pointed at a temp directory holding the dead file; the
-/// refusal must come before any volume exists there. Serial by the harness
-/// (F-71), and HOME is restored on every path.
+/// F-24: a credential that cannot authenticate is a machine with NO LOGIN, not
+/// a dead end. `create` used to refuse a blanked credential and tell the user to
+/// run `claude` on the host — but since F-14 the engine reads its own file, not
+/// `~/.claude`, so that advice pointed at a file it does not read and the only
+/// way out was deleting the blank one by hand (found on the VMs). Now the
+/// engine resets it to the placeholder, `create` succeeds, and `status` says
+/// "no login yet", so the proven in-session `/login` applies.
 #[test]
-fn create_refuses_a_dead_host_credential_before_provisioning() {
+fn f24_a_blank_credential_becomes_no_login_yet_and_create_succeeds() {
     if unit_only() {
         return;
     }
     if !require_host(HostRequirements::FULL) {
         return;
     }
-    let temp = std::env::temp_dir().join(format!("nemr-dead-cred-{}", std::process::id()));
-    std::fs::create_dir_all(temp.join(".claude")).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    let temp = std::env::temp_dir().join(format!("nemr-f24-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp);
+    let cred = temp.join("host-credential/.credentials.json");
+    std::fs::create_dir_all(cred.parent().unwrap()).unwrap();
+    // Exactly what Claude Code leaves behind after a refresh is refused.
     std::fs::write(
-        temp.join(".claude/.credentials.json"),
+        &cred,
         r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"refreshTokenExpiresAt":1900000000000}}"#,
     )
     .unwrap();
-    let previous = std::env::var_os("HOME");
-    std::env::set_var("HOME", &temp);
+    let before_ino = std::fs::metadata(&cred).unwrap().ino();
+    std::env::set_var("NEMR_HOST_CREDENTIALS", &cred);
+
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let result = runtime.block_on(async {
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let _ = project::stop(&client, "f24blank").await;
+        let _ = project::delete(&client, "f24blank").await;
+    });
+    let detail = runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
         project::create(
             &client,
-            "deadcred",
+            "f24blank",
             VolumeSize::Small,
             nemr_engine::engine::agent::Agent::ClaudeCode,
         )
         .await
-        .map(|_| ())
+        .expect("create must SUCCEED on a blanked credential — it is no login, not a fault");
+        project::status(&client, "f24blank").await.expect("status")
     });
-    match previous {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
-    }
-    let err = result.expect_err("create must refuse a blanked credential");
-    let text = format!("{err:#}");
-    assert!(text.contains("BLANK") && text.contains("log in"), "{text}");
+
+    // The file itself: the placeholder, in place, so a running session's bind
+    // keeps seeing it.
+    let after = std::fs::read_to_string(&cred).unwrap();
     assert!(
-        !temp.join(".local/share/nemr/volumes/deadcred.img").exists(),
-        "the refusal must come before any volume is provisioned"
+        nemr_engine::auth::is_placeholder(&after),
+        "the blanked credential must be reset to the placeholder: {after}"
     );
+    assert_eq!(
+        std::fs::metadata(&cred).unwrap().ino(),
+        before_ino,
+        "reset in place: a session bound to this inode must keep seeing it"
+    );
+    // And what the user is told: no login yet, so `/login` inside applies.
+    assert!(
+        !detail.credential_present,
+        "status must say there is no login on this machine yet"
+    );
+
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let _ = project::stop(&client, "f24blank").await;
+        let _ = project::delete(&client, "f24blank").await;
+    });
+    std::env::remove_var("NEMR_HOST_CREDENTIALS");
     let _ = std::fs::remove_dir_all(&temp);
 }
 
@@ -4834,4 +4908,577 @@ fn f125_git_guard_acceptance_suite_passes() {
         stdout,
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// E-23: `adopt` copies a host directory's tree and Claude Code history into a
+/// fresh session — respecting .gitignore, always excluding target/ and
+/// node_modules/, carrying .git, rewriting the history to the session's
+/// `-workspace` key, and copying (never moving) the source. Fabricated inputs,
+/// no API: this proves the MECHANICS (what lands where, valid JSONL to the last
+/// line, the source untouched); `docs/ui-acceptance.sh` proves `--continue`
+/// recalls it across machines.
+#[test]
+fn e23_adopt_copies_the_tree_and_history_excludes_the_derived_and_leaves_the_source() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("nemr-e23-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let source = tmp.join("proj");
+    std::fs::create_dir_all(source.join(".git")).unwrap();
+    std::fs::create_dir_all(source.join("target/debug")).unwrap();
+    std::fs::create_dir_all(source.join("node_modules/x")).unwrap();
+    std::fs::create_dir_all(source.join("src")).unwrap();
+    std::fs::write(
+        source.join(".gitignore"),
+        "target/\nnode_modules/\nsecret.txt\n",
+    )
+    .unwrap();
+    std::fs::write(source.join("README.md"), "hello adopt").unwrap();
+    std::fs::write(source.join("src/main.rs"), "fn main() {}").unwrap();
+    std::fs::write(source.join("secret.txt"), "should be gitignored out").unwrap();
+    std::fs::write(source.join("target/debug/blob"), vec![0u8; 4096]).unwrap();
+    std::fs::write(source.join("node_modules/x/pkg"), vec![0u8; 4096]).unwrap();
+    std::fs::write(source.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    // Make it a real git repo so `git ls-files` drives the copy set.
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap()
+    };
+    // Re-init cleanly (the hand-made .git above is just to prove .git travels;
+    // a real init gives ls-files something to enumerate).
+    std::fs::remove_dir_all(source.join(".git")).unwrap();
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "initial"]);
+
+    // A fabricated host history for this directory, with a TORN final line.
+    let key: String = source
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect();
+    let home = std::env::var("HOME").unwrap();
+    let host_hist = std::path::PathBuf::from(&home)
+        .join(".claude/projects")
+        .join(&key);
+    std::fs::create_dir_all(&host_hist).unwrap();
+    let jsonl = host_hist.join("sess-e23.jsonl");
+    let mut body = String::new();
+    body.push_str(&format!(
+        "{}\n",
+        serde_json::json!({"type":"user","cwd": source.to_string_lossy(),"content":"MARKER-E23"})
+    ));
+    body.push_str(&format!(
+        "{}\n",
+        serde_json::json!({"type":"assistant","content":"ok"})
+    ));
+    body.push_str("{\"type\":\"user\",\"content\":\"half-writ"); // torn: no newline, invalid JSON
+    std::fs::write(&jsonl, &body).unwrap();
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    // A prior failed run (e.g. a neuter) can leave the projects behind; a
+    // create then fails with ProjectExists. Clear them first so the test is
+    // self-contained.
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        for n in ["e23adopt", "e23toobig"] {
+            let _ = project::stop(&client, n).await;
+            let _ = project::delete(&client, n).await;
+        }
+    });
+    let summary = runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        project::adopt(
+            &client,
+            "e23adopt",
+            nemr_engine::engine::volume::VolumeSize::Small,
+            nemr_engine::engine::agent::Agent::ClaudeCode,
+            &source,
+        )
+        .await
+        .expect("adopt")
+    });
+
+    let mount = nemr_engine::engine::volume::VolumePaths::from_env()
+        .unwrap()
+        .mount_point("e23adopt");
+    // The tree: tracked files present, .git present, derived dirs absent.
+    assert!(
+        mount.join("README.md").exists(),
+        "README.md must be adopted"
+    );
+    assert!(
+        mount.join("src/main.rs").exists(),
+        "src/main.rs must be adopted"
+    );
+    assert!(mount.join(".git/HEAD").exists(), ".git must travel");
+    assert!(
+        !mount.join("target").exists(),
+        "target/ must never be adopted"
+    );
+    assert!(
+        !mount.join("node_modules").exists(),
+        "node_modules/ must never be adopted"
+    );
+    assert!(
+        !mount.join("secret.txt").exists(),
+        "a gitignored file must not be adopted"
+    );
+
+    // The history: at the -workspace key, valid JSONL to the last line (the
+    // torn tail dropped), the marker present.
+    let adopted = mount.join(".nemr-state/projects/-workspace/sess-e23.jsonl");
+    assert!(
+        adopted.exists(),
+        "the history must land at the -workspace key"
+    );
+    let text = std::fs::read_to_string(&adopted).unwrap();
+    for line in text.lines() {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|_| panic!("every adopted history line must be valid JSON: {line:?}"));
+    }
+    assert!(text.contains("MARKER-E23"), "the marker line survives");
+    assert!(
+        !text.contains("half-writ"),
+        "the torn final line is dropped"
+    );
+    assert_eq!(
+        summary.history_lines_dropped, 1,
+        "exactly the torn line was dropped"
+    );
+    assert!(summary.history_sessions >= 1);
+
+    // Copy, not move: the source is untouched (its target/ and secret still there).
+    assert!(
+        source.join("target/debug/blob").exists(),
+        "the source target/ is untouched"
+    );
+    assert!(
+        source.join("secret.txt").exists(),
+        "the source is not modified"
+    );
+
+    // Size guard: a source larger than the quota is refused BEFORE provisioning.
+    std::fs::write(source.join("big.bin"), vec![7u8; 600 * 1024 * 1024]).unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "big"]);
+    let refused = runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        project::adopt(
+            &client,
+            "e23toobig",
+            nemr_engine::engine::volume::VolumeSize::Small, // 500MB
+            nemr_engine::engine::agent::Agent::ClaudeCode,
+            &source,
+        )
+        .await
+    });
+    let err = refused.expect_err("a tree over the quota must be refused");
+    assert!(
+        err.to_string().contains("quota"),
+        "the refusal names the quota: {err:#}"
+    );
+    // And it refused BEFORE provisioning: no e23toobig project exists.
+    let toobig_img = nemr_engine::engine::volume::VolumePaths::from_env()
+        .unwrap()
+        .image_file("e23toobig");
+    assert!(!toobig_img.exists(), "a refused adopt provisions nothing");
+
+    // Cleanup.
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let _ = project::stop(&client, "e23adopt").await;
+        let _ = project::delete(&client, "e23adopt").await;
+    });
+    let _ = std::fs::remove_dir_all(&host_hist);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// E-23: a copy that fails AFTER the session was provisioned must take the
+/// session with it.
+///
+/// The size check refuses an over-quota tree before anything is created, and
+/// that was the whole of the "a refusal must not leave a half-created project"
+/// invariant. But the copy can still fail for something no pre-check sees — a
+/// file that cannot be read, a filesystem that fills, a `.git` that changes
+/// under it — and until this, that left a provisioned, half-populated session
+/// behind whose obvious retry (`nemr add` again) was then refused for a name
+/// that already exists.
+#[test]
+fn e23_a_copy_failure_after_provisioning_leaves_no_half_created_session() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("nemr-e23rb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let source = tmp.join("proj");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("README.md"), "readable").unwrap();
+    std::fs::write(source.join("locked.txt"), "unreadable in a moment").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "-A"],
+        vec!["commit", "-qm", "initial"],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(&args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    // The injected failure: one tracked file the copy cannot read. It is listed
+    // by ls-files and measured by symlink_metadata, so the adoption gets all the
+    // way past provisioning before it fails.
+    use std::os::unix::fs::PermissionsExt as _;
+    let locked = source.join("locked.txt");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&locked).is_ok() {
+        // Running as a user that ignores the mode (root): there is no failure to
+        // inject, and asserting one would fail for the wrong reason.
+        eprintln!("SKIP: this user can read a 0o000 file, so no copy failure can be injected");
+        let _ = std::fs::remove_dir_all(&tmp);
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let _ = project::stop(&client, "e23rollback").await;
+        let _ = project::delete(&client, "e23rollback").await;
+    });
+
+    let failed = runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        project::adopt(
+            &client,
+            "e23rollback",
+            nemr_engine::engine::volume::VolumeSize::Small,
+            nemr_engine::engine::agent::Agent::ClaudeCode,
+            &source,
+        )
+        .await
+    });
+    let err = failed.expect_err("a file that cannot be copied must fail the adoption");
+    assert!(
+        format!("{err:#}").contains("was removed"),
+        "the failure says the half-created session was taken back down: {err:#}"
+    );
+
+    // The session is gone: no volume image, and the name is free to retry.
+    let image = nemr_engine::engine::volume::VolumePaths::from_env()
+        .unwrap()
+        .image_file("e23rollback");
+    assert!(
+        !image.exists(),
+        "a failed adoption must not leave {} behind",
+        image.display()
+    );
+    let exists = runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        client
+            .container_exists(&nemr_engine::config::container_id("e23rollback"))
+            .await
+            .expect("container_exists")
+    });
+    assert!(
+        !exists,
+        "a failed adoption must not leave the container record behind — the retry is \
+         refused with ProjectExists for a session that was never usable"
+    );
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// F-15: `add` copies a whole tree, so it says what and how big and asks —
+/// on a terminal. Where a confirmation cannot be drawn or answered (the
+/// acceptance drives the CLI with stderr redirected), it must REFUSE and name
+/// the flag, never prompt into a pipe and never proceed silently. With the flag
+/// it adopts without asking.
+#[test]
+fn f15_add_refuses_without_a_terminal_and_names_the_flag_and_yes_adds() {
+    if unit_only() {
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("nemr-f15-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let source = tmp.join("proj");
+    std::fs::create_dir_all(source.join("src")).unwrap();
+    std::fs::write(source.join("README.md"), "adopt me").unwrap();
+    std::fs::write(source.join("src/main.rs"), "fn main() {}").unwrap();
+
+    // No terminal (piped stdio) and no flag: refused, naming --yes.
+    let refused = std::process::Command::new(env!("CARGO_BIN_EXE_nemr"))
+        .args([
+            "adopt",
+            &source.to_string_lossy(),
+            "--name",
+            "f15adopt",
+            "--size",
+            "500MB",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run nemr adopt");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "add must refuse without a terminal and without --yes.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("--yes"),
+        "the refusal must name the flag that makes it non-interactive.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("not a terminal"),
+        "the refusal must say why.\nstderr: {stderr}"
+    );
+
+    if !require_host(HostRequirements::FULL) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return;
+    }
+    // Clear any project a previous failed run left behind.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let _ = project::stop(&client, "f15adopt").await;
+        let _ = project::delete(&client, "f15adopt").await;
+    });
+
+    // With the flag: adopts, without prompting, on the same piped stdio.
+    let adopted = std::process::Command::new(env!("CARGO_BIN_EXE_nemr"))
+        .args([
+            "adopt",
+            &source.to_string_lossy(),
+            "--name",
+            "f15adopt",
+            "--size",
+            "500MB",
+            "--yes",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run nemr adopt --yes");
+    let out = String::from_utf8_lossy(&adopted.stdout);
+    let err = String::from_utf8_lossy(&adopted.stderr);
+    assert!(
+        adopted.status.success(),
+        "add --yes must proceed without a terminal.\nstdout: {out}\nstderr: {err}"
+    );
+    assert!(
+        !err.contains("Add it?") && !out.contains("Add it?"),
+        "--yes must not print the confirmation at all.\nstdout: {out}\nstderr: {err}"
+    );
+    assert!(out.contains("added"), "it reports what it did: {out}");
+
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        let _ = project::stop(&client, "f15adopt").await;
+        let _ = project::delete(&client, "f15adopt").await;
+    });
+
+    // F-21: `adopt` stays as a hidden alias for one release, so a script that
+    // used it still works — same refusal, naming the same flag.
+    let aliased = std::process::Command::new(env!("CARGO_BIN_EXE_nemr"))
+        .args([
+            "adopt",
+            &source.to_string_lossy(),
+            "--name",
+            "f15alias",
+            "--size",
+            "500MB",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run nemr adopt (alias)");
+    let alias_err = String::from_utf8_lossy(&aliased.stderr);
+    assert!(
+        !aliased.status.success() && alias_err.contains("--yes"),
+        "the adopt alias must still resolve and refuse the same way.\nstderr: {alias_err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// F-20: Claude Code's resume list sorts transcripts by mtime, so adoption that
+/// stamps every file with the moment of import lands all of them on the same
+/// age and the list loses its order — with a real history the user cannot tell
+/// which session they were last in. The order must survive the whole journey:
+/// adopt, export (push), import (pull).
+#[test]
+fn f20_the_resume_lists_order_survives_adopt_push_and_pull() {
+    if unit_only() {
+        return;
+    }
+    if !require_host(HostRequirements::FULL) {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let tmp = std::env::temp_dir().join(format!("nemr-f20-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let source = tmp.join("proj");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("README.md"), "f20").unwrap();
+
+    // A host history of five sessions, each last written a day apart, in a
+    // deliberately jumbled filename order so only the mtimes carry the order.
+    let key: String = source
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect();
+    let home = std::env::var("HOME").unwrap();
+    let host_hist = std::path::PathBuf::from(&home)
+        .join(".claude/projects")
+        .join(&key);
+    let _ = std::fs::remove_dir_all(&host_hist);
+    std::fs::create_dir_all(&host_hist).unwrap();
+    const DAY: u64 = 86_400;
+    let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    // name -> age in days (0 = most recent)
+    let sessions = [
+        ("zulu", 0u64),
+        ("alpha", 1),
+        ("mike", 2),
+        ("bravo", 3),
+        ("kilo", 4),
+    ];
+    for (name, age) in sessions {
+        let path = host_hist.join(format!("{name}.jsonl"));
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::json!({"type":"user","content":name})),
+        )
+        .unwrap();
+        let when = base - std::time::Duration::from_secs(age * DAY);
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+    // The order the resume list would show on the host: newest first.
+    let order_of = |dir: &std::path::Path| -> Vec<String> {
+        let mut v: Vec<(i64, String)> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+            .map(|e| {
+                let m = e.metadata().unwrap();
+                (m.mtime(), e.file_name().to_string_lossy().into_owned())
+            })
+            .collect();
+        v.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+        v.into_iter().map(|(_, n)| n).collect()
+    };
+    let host_order = order_of(&host_hist);
+    assert_eq!(
+        host_order,
+        vec![
+            "zulu.jsonl",
+            "alpha.jsonl",
+            "mike.jsonl",
+            "bravo.jsonl",
+            "kilo.jsonl"
+        ],
+        "control: the host's own order is the one we planted"
+    );
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        for n in ["f20adopt", "f20pulled"] {
+            let _ = project::stop(&client, n).await;
+            let _ = project::delete(&client, n).await;
+        }
+    });
+
+    // Adopt.
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        project::adopt(
+            &client,
+            "f20adopt",
+            nemr_engine::engine::volume::VolumeSize::Small,
+            nemr_engine::engine::agent::Agent::ClaudeCode,
+            &source,
+        )
+        .await
+        .expect("adopt");
+    });
+    let mount = nemr_engine::engine::volume::VolumePaths::from_env()
+        .unwrap()
+        .mount_point("f20adopt");
+    let adopted_hist = mount.join(".nemr-state/projects/-workspace");
+    assert_eq!(
+        order_of(&adopted_hist),
+        host_order,
+        "F-20: the order must survive the adoption — every transcript keeps the time it was last written"
+    );
+
+    // Push and pull: export the session and import it as another.
+    let bundle = tmp.join("f20.nemr");
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        project::export(
+            &client,
+            "f20adopt",
+            &bundle,
+            nemr_engine::bundle::policy::Policy::default(),
+        )
+        .await
+        .expect("export");
+        project::import_creating(
+            &client,
+            &bundle,
+            Some("f20pulled"),
+            Some(nemr_engine::engine::volume::VolumeSize::Small),
+        )
+        .await
+        .expect("import");
+    });
+    let pulled_hist = nemr_engine::engine::volume::VolumePaths::from_env()
+        .unwrap()
+        .mount_point("f20pulled")
+        .join(".nemr-state/projects/-workspace");
+    assert_eq!(
+        order_of(&pulled_hist),
+        host_order,
+        "F-20: the order must survive the push and the pull too — the bundle carries each member's mtime"
+    );
+
+    runtime.block_on(async {
+        let client = ContainerdClient::connect().await.expect("connect");
+        for n in ["f20adopt", "f20pulled"] {
+            let _ = project::stop(&client, n).await;
+            let _ = project::delete(&client, n).await;
+        }
+    });
+    let _ = std::fs::remove_dir_all(&host_hist);
+    let _ = std::fs::remove_dir_all(&tmp);
 }

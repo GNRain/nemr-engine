@@ -126,7 +126,33 @@ pub async fn round_trip(
     );
     println!("ok ({} bytes, byte-identical)", fetched.len());
 
-    // 6. It must be listed under its prefix.
+    // 6. The streamed read must produce the same bytes and the same size as
+    //    `get`. This is the path a bundle download actually takes (F-16): a
+    //    backend that streams a truncated body, or reports a size that does not
+    //    match what it sends, breaks a pull without failing anything else here.
+    print!("get_stream (chunked) … ");
+    {
+        use futures::StreamExt as _;
+        let (size, mut stream) = store.get_stream(key).await?;
+        anyhow::ensure!(
+            size == bundle.len() as u64,
+            "get_stream reported {size} bytes, expected {}",
+            bundle.len()
+        );
+        let mut streamed = Vec::with_capacity(bundle.len());
+        while let Some(chunk) = stream.next().await {
+            streamed.extend_from_slice(&chunk?);
+        }
+        anyhow::ensure!(
+            streamed == bundle,
+            "the streamed bundle did NOT match: {} bytes out, {} back",
+            bundle.len(),
+            streamed.len()
+        );
+        println!("ok ({size} bytes, byte-identical)");
+    }
+
+    // 7. It must be listed under its prefix.
     print!("list … ");
     let listed = store.list("nemr-roundtrip/").await?;
     anyhow::ensure!(
@@ -136,7 +162,7 @@ pub async fn round_trip(
     );
     println!("ok (found among {} key(s))", listed.len());
 
-    // 7. Delete must be idempotent, so a retried cleanup does not fail — unless
+    // 8. Delete must be idempotent, so a retried cleanup does not fail — unless
     //    the caller asked to keep the artifact for inspection.
     match cleanup {
         Cleanup::Remove => {

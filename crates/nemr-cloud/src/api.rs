@@ -5,12 +5,17 @@
 //! verbatim leaks nothing), and lease conflicts are a distinct error variant so
 //! callers can react to "you lost the lease" differently from "network down".
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 
 pub struct Api {
     http: reqwest::blocking::Client,
+    /// The client bundle uploads and downloads use: no overall deadline, TCP
+    /// keepalive to catch a connection that has stopped (F-16). A
+    /// multi-gigabyte transfer is not a stuck request, and a total timeout
+    /// cannot tell them apart.
+    transfer: reqwest::blocking::Client,
     server: String,
     token: Option<String>,
 }
@@ -84,8 +89,25 @@ impl Api {
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .expect("constructing an HTTP client cannot fail with static config");
+        // F-16: bundle transfers get their own client, because reqwest's
+        // `timeout` is a deadline on the WHOLE request — body included. The
+        // server now accepts bundles up to 8GB; at an ordinary upstream, 120
+        // seconds runs out somewhere around a gigabyte, so a perfectly healthy
+        // push would fail for its duration rather than for anything wrong with
+        // it — and, worse, report it as the server refusing the size. A
+        // transfer is therefore given as long as its bytes take. What still has
+        // to be bounded is a connection that has STOPPED, and TCP keepalive is
+        // what bounds that here: the blocking client has no inactivity timeout,
+        // and a total one cannot tell a large transfer from a stuck one.
+        let transfer = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .timeout(None)
+            .build()
+            .expect("constructing an HTTP client cannot fail with static config");
         Api {
             http,
+            transfer,
             server: server.trim_end_matches('/').to_string(),
             token,
         }
@@ -260,16 +282,58 @@ impl Api {
         fence: i64,
         ciphertext: Vec<u8>,
     ) -> Result<serde_json::Value> {
+        let bytes = ciphertext.len();
         let resp = self
             .auth(
-                self.http
+                self.transfer
                     .put(self.url(&format!("/v1/sessions/{name}/bundle"))),
             )
             .header("x-nemr-lease-holder", holder)
             .header("x-nemr-lease-fence", fence.to_string())
             .body(ciphertext)
             .send()
-            .context("reaching the server")?;
+            // F-16: a server that refuses the size mid-stream closes the
+            // connection, and reqwest reports that as a body-write error
+            // ("Broken pipe") that names nothing. Say what it almost always
+            // means, with the size, so the user is not left guessing.
+            .map_err(|e| {
+                if e.is_timeout() {
+                    anyhow!(
+                        "this {} bundle timed out while it was being uploaded ({e}).\n\
+                         The upload has no overall deadline, so this is a connection that \
+                         stopped responding rather than a transfer that took too long. Check \
+                         the network and push again.",
+                        crate::core::human_bytes(bytes as i64)
+                    )
+                } else if e.is_body() || e.is_request() {
+                    anyhow!(
+                        "the server closed the connection while this {} bundle was being \
+                         uploaded ({e}).\n\
+                         That is what a server refusing the size looks like from here: it stops \
+                         reading before it can answer. Check the server's bundle ceiling \
+                         (NEMR_MAX_BUNDLE_BYTES) and its log.",
+                        crate::core::human_bytes(bytes as i64)
+                    )
+                } else {
+                    anyhow::Error::from(e).context("reaching the server")
+                }
+            })?;
+        if resp.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            let said = resp
+                .json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v["error"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            bail!(
+                "the server refused this bundle as too large ({}){}",
+                crate::core::human_bytes(bytes as i64),
+                if said.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {said}")
+                }
+            );
+        }
         Self::decode(resp, "uploading the bundle", true)
     }
 
@@ -289,7 +353,7 @@ impl Api {
     pub fn download_bundle(&self, name: &str) -> Result<Vec<u8>> {
         let resp = self
             .auth(
-                self.http
+                self.transfer
                     .get(self.url(&format!("/v1/sessions/{name}/bundle"))),
             )
             .send()

@@ -22,7 +22,14 @@ pub fn is_interactive() -> bool {
     if std::env::var_os("NEMR_NON_INTERACTIVE").is_some() {
         return false;
     }
-    std::io::stdin().is_terminal()
+    // BOTH ends, not just stdin (F-15). A prompt has to be read from AND drawn
+    // on: every prompt here renders to stderr. A caller that leaves stdin on a
+    // terminal but redirects stderr to a file — which is exactly how a script
+    // runs a command it wants to log — used to be judged "interactive", and the
+    // prompt then failed inside the terminal library with "IO error: not a
+    // terminal" instead of taking the non-interactive path. Requiring both is
+    // what makes the flag path the real path for every driver.
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
 /// What to do about one field, decided without doing any I/O.

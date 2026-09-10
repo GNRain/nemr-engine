@@ -284,6 +284,89 @@ impl ObjectStore for S3Store {
         Ok(())
     }
 
+    /// Stream the staged file to the object store as a multipart upload, so a
+    /// multi-gigabyte bundle never sits in memory (F-16). Parts are 16 MiB.
+    ///
+    /// **Every** failure after `put_multipart` aborts the upload. An in-progress
+    /// multipart upload is not cleaned up by dropping the handle: its parts stay
+    /// in the bucket, and stay billable, until a lifecycle rule or an operator
+    /// reaps them. Aborting only the `put_part` failure would leave one behind
+    /// for a read error on the staged file or a failed `complete` — the two
+    /// failures most likely to happen on a large upload's last leg.
+    async fn put_file(&self, key: &ObjectKey, source: &std::path::Path) -> Result<()> {
+        use object_store::ObjectStoreExt as _;
+        use tokio::io::AsyncReadExt as _;
+
+        const PART: usize = 16 * 1024 * 1024;
+        let mut file = tokio::fs::File::open(source).await.map_err(|e| {
+            StorageError::Other(anyhow::Error::from(e).context("opening the staged object"))
+        })?;
+        let mut upload = self
+            .inner
+            .put_multipart(&Self::path(key))
+            .await
+            .map_err(|e| Self::map("put", key, e))?;
+
+        let transfer = async {
+            let mut buf = vec![0u8; PART];
+            loop {
+                let mut filled = 0;
+                while filled < PART {
+                    let n = file.read(&mut buf[filled..]).await.map_err(|e| {
+                        StorageError::Other(
+                            anyhow::Error::from(e).context("reading the staged object"),
+                        )
+                    })?;
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                }
+                if filled == 0 {
+                    break;
+                }
+                upload
+                    .put_part(buf[..filled].to_vec().into())
+                    .await
+                    .map_err(|e| Self::map("put", key, e))?;
+                if filled < PART {
+                    break;
+                }
+            }
+            upload
+                .complete()
+                .await
+                .map_err(|e| Self::map("put", key, e))?;
+            Ok::<(), StorageError>(())
+        }
+        .await;
+
+        if let Err(e) = transfer {
+            let _ = upload.abort().await;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Hand the object's body out as the backend streams it, so a download of
+    /// a multi-gigabyte bundle never lands in the server's memory (F-16).
+    async fn get_stream(&self, key: &ObjectKey) -> Result<(u64, crate::ByteStream)> {
+        use futures::TryStreamExt as _;
+        use object_store::ObjectStoreExt as _;
+
+        let result = self
+            .inner
+            .get(&Self::path(key))
+            .await
+            .map_err(|e| Self::map("get", key, e))?;
+        let size = result.meta.size;
+        let key = key.clone();
+        let stream = result
+            .into_stream()
+            .map_err(move |e| Self::map("get", &key, e));
+        Ok((size, Box::pin(stream)))
+    }
+
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
         use object_store::ObjectStoreExt as _;
         match self.inner.delete(&Self::path(key)).await {

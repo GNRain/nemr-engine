@@ -39,6 +39,10 @@ tracing = "0.1"
 sha2 = "0.11.0"
 object_store = { version = "0.14.1", features = ["aws"] }
 futures = "0.3.34"
+# F-16: the streaming read side hands chunks out as `Bytes`, the same type the
+# backends and the server's body already speak, so no chunk is copied to cross
+# the seam.
+bytes = "1"
 
 [dev-dependencies]
 tempfile = "3"

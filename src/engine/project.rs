@@ -14,6 +14,8 @@ use crate::config;
 use crate::containerd::client::ContainerdClient;
 use crate::containerd::containers::{BindMount, ContainerSpec, StopOutcome};
 use crate::engine::volume::{HelperOps, PrivilegedOps, Volume, VolumePaths, VolumeSize};
+use std::os::unix::ffi::OsStringExt;
+use std::path::Path;
 
 /// Runs in the container's shell before every prompt, so a prompt never lands
 /// on top of the previous command's output.
@@ -170,33 +172,32 @@ async fn create_with_auth(
         .into());
     }
 
-    // AUTH-01/02/03: credentials come from the host, read-only, and their
-    // absence is a clear failure before anything is provisioned.
+    // AUTH-03, as amended by E-21 (2026-09-08) and F-24 (2026-09-09).
     //
-    // E-14: exempt for a restore. AUTH-03 makes a missing credential fatal "at
-    // creation time"; E-11 requires `nemr import` to work with no credential
-    // and no network at all. Those did not collide while import needed a
-    // pre-existing project — the create had already happened, with a
-    // credential. Now that a restore creates its own project, they do.
+    // The requirement was written as "a missing credential is fatal at
+    // creation time", which collided with E-11 (a restore must work on a
+    // machine with no credential and no network) and, more fundamentally,
+    // with what "missing" means: a machine that has never logged in is the
+    // *normal* first state, not a fault. So `create` and a restore behave
+    // identically — the placeholder is written where the credential will be
+    // and bound read-write like a real one, and `/login` inside the session
+    // writes the real credential through the bind onto this host (F-14 binds
+    // the directory, so Claude Code's write-by-rename lands).
     //
-    // E-11's guarantee is the one that holds: a bundle restored on a fresh
-    // machine before the user has logged in is the *normal* case, and import's
-    // own output already ends with "Authenticate on this host, then: nemr
-    // start". A credential is still required to run anything — `create` is
-    // unchanged and `attach` still resolves one — so this narrows *where*
-    // AUTH-03 fires, not whether it does. Raised as E-14 because AUTH-03 is a
-    // Section 3 requirement and narrowing it is not mine to decide.
-    // AUTH-03 as amended by E-21 (2026-09-08): a host with no credential is
-    // a machine that has never logged in, not a fault. `create` and a restore
-    // behave identically — the placeholder is written where the credential
-    // will be, bound read-write like a real one, and `/login` inside the
-    // session writes the real credential through it onto this host. A
-    // credential that IS present is still held to what it says: readable,
-    // and not dead (a spent refresh token or a blanked file — F-129).
+    // F-24 finishes it: a credential that is present but cannot authenticate
+    // — blanked by Claude Code after a refused refresh, or its refresh token
+    // spent by a login on another machine (E-13) — is the same state as never
+    // having logged in, and `ensure_host_credential_file` resets it to the
+    // placeholder in place. Refusing there was a dead end: since F-14 this
+    // file is nemr's own, and the refusal's remedy pointed at a host `claude`
+    // login, which writes `~/.claude` — a file the engine does not read.
+    //
+    // A credential that IS present and usable is still held to what it says:
+    // readable, and this machine's alone (D-02 — it is never copied into a
+    // bundle and never inherited).
     let credentials = auth::ensure_host_credential_file()?;
     let credential_dir = auth::host_credential_dir()?;
     auth::check_permissions(&credentials)?;
-    auth::refuse_dead_credential(&credentials, unix_now())?;
 
     let volume = Volume::create(name, size, paths, HelperOps::new())
         .with_context(|| format!("failed to provision volume for project {name:?}"))?;
@@ -321,6 +322,606 @@ async fn create_with_auth(
     })
 }
 
+/// What `adopt` produced, for the CLI to report.
+#[derive(Debug, Clone)]
+pub struct AdoptSummary {
+    pub name: String,
+    pub container_id: String,
+    pub size: VolumeSize,
+    pub agent: Agent,
+    pub files_copied: u64,
+    pub bytes_copied: u64,
+    pub history_sessions: u64,
+    pub history_lines_dropped: u64,
+    /// Lines that did not parse but were NOT a torn tail, so they were carried
+    /// over verbatim rather than dropped. See [`copy_history_jsonl`].
+    pub history_lines_corrupt: u64,
+    pub source: std::path::PathBuf,
+}
+
+/// Claude Code's history key for a directory: the absolute path with every
+/// `/` and `.` mapped to `-` (measured 2026-09-08). A session's project is
+/// `/workspace`, so its key is `-workspace`.
+pub fn history_key(abs: &Path) -> String {
+    abs.to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+/// A path component that is always excluded from an adopted tree: derived and
+/// huge (`target/` on nemr-engine is 11G; `node_modules/` likewise), rebuilt
+/// from source, and never belonging in a bundle (E-23).
+fn is_always_excluded_component(name: &str) -> bool {
+    name == "target" || name == "node_modules"
+}
+
+/// How a source directory's `.git` travels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitCarry {
+    /// No `.git`: not a repository.
+    None,
+    /// An ordinary repository — the directory is copied whole.
+    Dir,
+    /// `.git` is a FILE, not a directory: the marker a `git worktree` checkout
+    /// and a submodule working directory carry, holding `gitdir: <path>` that
+    /// points OUTSIDE this folder.
+    ///
+    /// The marker is copied, because it is part of the tree and dropping it
+    /// silently is how an adopted worktree ends up looking like a plain
+    /// directory; what it points at is not, because it is not in the folder
+    /// being adopted. The adopted session is therefore not a working repo, and
+    /// the plan says so rather than letting the user find out from `git status`.
+    Marker,
+}
+
+fn git_carry(source: &Path) -> GitCarry {
+    // `metadata`, not `symlink_metadata`: a `.git` symlinked to a real
+    // directory is still an ordinary repository to git and to `copy_tree`.
+    match std::fs::metadata(source.join(".git")) {
+        Ok(m) if m.is_dir() => GitCarry::Dir,
+        Ok(_) => GitCarry::Marker,
+        Err(_) => GitCarry::None,
+    }
+}
+
+/// What `.git` costs and contributes to the copy, measured the same way in the
+/// plan and in the copy itself so the two can never disagree (F-15).
+fn git_measure(source: &Path, carry: GitCarry) -> Result<(u64, u64)> {
+    let git = source.join(".git");
+    Ok(match carry {
+        GitCarry::None => (0, 0),
+        GitCarry::Dir => {
+            let mut files = 0u64;
+            let mut bytes = 0u64;
+            for f in walkdir_files(&git)? {
+                files += 1;
+                if let Ok(m) = std::fs::symlink_metadata(&f) {
+                    bytes += m.len();
+                }
+            }
+            (files, bytes)
+        }
+        GitCarry::Marker => (
+            1,
+            std::fs::symlink_metadata(&git)
+                .map(|m| m.len())
+                .unwrap_or(0),
+        ),
+    })
+}
+
+/// The files to copy from a source tree, `.gitignore`-respecting when it is a
+/// git repo, with `target/` and `node_modules/` excluded unconditionally.
+/// Returns the copy set as paths relative to `source`, plus whether `.git`
+/// should travel whole. `.git` itself is not enumerated here (git does not list
+/// its own internals); the caller copies it wholesale.
+fn adopt_copy_set(source: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let is_git = source.join(".git").exists();
+    let mut rels: Vec<std::path::PathBuf> = Vec::new();
+    if is_git {
+        // Tracked + untracked-but-not-ignored, NUL-separated. This is exactly
+        // what `.gitignore` lets through (so `target/` — ignored — never
+        // appears), and it is the measured case (a git repo).
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(source)
+            .args([
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ])
+            .output()
+            .context("running git ls-files to enumerate the adoptable tree")?;
+        if !out.status.success() {
+            bail!(
+                "git ls-files failed in {}: {}",
+                source.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        for rel in out.stdout.split(|b| *b == 0) {
+            if rel.is_empty() {
+                continue;
+            }
+            let rel = std::path::PathBuf::from(std::ffi::OsString::from_vec(rel.to_vec()));
+            if rel
+                .components()
+                .any(|c| is_always_excluded_component(&c.as_os_str().to_string_lossy()))
+            {
+                continue;
+            }
+            rels.push(rel);
+        }
+    } else {
+        // Not a repo: copy everything except the always-excluded directories.
+        for entry in walkdir_files(source)? {
+            let rel = entry.strip_prefix(source).unwrap().to_path_buf();
+            if rel
+                .components()
+                .any(|c| is_always_excluded_component(&c.as_os_str().to_string_lossy()))
+            {
+                continue;
+            }
+            rels.push(rel);
+        }
+    }
+    Ok(rels)
+}
+
+/// Every regular file **and symlink** under `dir`, recursively (symlinks are
+/// listed, never followed into). Used for the non-git copy set and for
+/// measuring `.git`.
+///
+/// Symlinks are entries in their own right: leaving them out drops them from a
+/// non-git tree's copy set entirely, and makes the measured size of `.git`
+/// disagree with what the copy actually carries.
+fn walkdir_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d)
+            .with_context(|| format!("reading {}", d.display()))?
+            .flatten()
+        {
+            let path = entry.path();
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                stack.push(path);
+            } else {
+                // A file or a symlink. `file_type` does not follow, so a symlink
+                // to a directory is listed, not descended into — no loops.
+                out.push(path);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Copy `from`'s modification time onto `to` (F-20).
+///
+/// Claude Code's resume list sorts transcripts by mtime, so a copy that stamps
+/// everything with "now" lands every session on the same age and the list loses
+/// its order. Best effort: a filesystem that will not say, or will not set, is
+/// not worth failing an adoption over.
+fn preserve_mtime(from: &Path, to: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(from) else {
+        return;
+    };
+    let Ok(modified) = meta.modified() else {
+        return;
+    };
+    if let Ok(file) = std::fs::File::options().write(true).open(to) {
+        let _ = file.set_times(std::fs::FileTimes::new().set_modified(modified));
+    }
+}
+
+/// Recursively copy `src` to `dst` (files and directories), preserving the
+/// bytes and each file's mtime (F-20). Used for `.git`.
+fn copy_tree(src: &Path, dst: &Path) -> Result<(u64, u64)> {
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut stack = vec![src.to_path_buf()];
+    std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d)
+            .with_context(|| format!("reading {}", d.display()))?
+            .flatten()
+        {
+            let path = entry.path();
+            let rel = path.strip_prefix(src).unwrap();
+            let target = dst.join(rel);
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                std::fs::create_dir_all(&target)
+                    .with_context(|| format!("creating {}", target.display()))?;
+                stack.push(path);
+            } else if ft.is_symlink() {
+                // git puts symlinks inside `.git` — an `objects/info/alternates`
+                // target, a symlinked HEAD or refs layout. Copying only regular
+                // files drops them silently, and a repo missing HEAD or its
+                // alternates is unusable in a way nothing here would report.
+                let to = std::fs::read_link(&path)
+                    .with_context(|| format!("reading the link {}", path.display()))?;
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                std::os::unix::fs::symlink(&to, &target)
+                    .with_context(|| format!("linking {}", target.display()))?;
+                files += 1;
+            } else if ft.is_file() {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                let n = std::fs::copy(&path, &target)
+                    .with_context(|| format!("copying {}", path.display()))?;
+                preserve_mtime(&path, &target);
+                files += 1;
+                bytes += n;
+            }
+        }
+    }
+    Ok((files, bytes))
+}
+
+/// What copying one history file observed.
+#[derive(Debug, Default, Clone, Copy)]
+struct HistoryCopy {
+    /// Valid JSONL lines carried over.
+    lines: u64,
+    /// A torn final write, dropped.
+    dropped: u64,
+    /// Lines that did not parse and were **not** the torn tail, carried over
+    /// verbatim.
+    corrupt: u64,
+}
+
+/// Copy one Claude Code history entry into the session's `-workspace` key,
+/// validating `.jsonl` line by line. Returns `HistoryCopy::default()` for a file
+/// that is not `.jsonl`.
+///
+/// Only the **last** line may be dropped, and only when the file does not end
+/// in a newline: that is the shape of a torn final write, which is the one
+/// damage E-23's quiescence rule expects. A line that does not parse anywhere
+/// else is not a torn write — it is a message the host wrote wrong, or damage
+/// since — and dropping it would silently remove a message from the middle of a
+/// transcript with nothing but a counter to hint at it. Those are copied through
+/// as they are, and counted separately so the summary can say so: `adopt` copies
+/// a history, it does not repair one.
+fn copy_history_jsonl(src: &Path, dst: &Path) -> Result<HistoryCopy> {
+    let raw = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
+    let mut kept: Vec<u8> = Vec::with_capacity(raw.len());
+    let mut seen = HistoryCopy::default();
+    let complete_last_line = raw.last() == Some(&b'\n');
+    let parts: Vec<&[u8]> = raw.split(|b| *b == b'\n').collect();
+    let last = parts.len().saturating_sub(1);
+    for (i, line) in parts.iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<serde_json::Value>(line) {
+            Ok(_) => {
+                kept.extend_from_slice(line);
+                kept.push(b'\n');
+                seen.lines += 1;
+            }
+            Err(_) if i == last && !complete_last_line => {
+                // The torn final write: an appended line the host had not
+                // finished flushing. There is nothing after it to lose.
+                seen.dropped += 1;
+            }
+            Err(_) => {
+                kept.extend_from_slice(line);
+                kept.push(b'\n');
+                seen.corrupt += 1;
+            }
+        }
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(dst, &kept).with_context(|| format!("writing {}", dst.display()))?;
+    Ok(seen)
+}
+
+/// What an adoption would copy, computed without provisioning anything (F-15:
+/// the confirmation has to say what and how big before the copy runs).
+#[derive(Debug, Clone)]
+pub struct AdoptPlan {
+    pub source: std::path::PathBuf,
+    pub files: u64,
+    pub bytes: u64,
+    pub git_bytes: u64,
+    pub history_sessions: u64,
+    pub is_git_repo: bool,
+    /// The repository's git directory lives outside the folder (a `git
+    /// worktree` checkout or a submodule): only the `.git` marker travels, so
+    /// the adopted session will not be a working repository.
+    pub git_dir_external: bool,
+}
+
+/// Measure what `adopt` would copy from `source`: the `.gitignore`-respecting
+/// file set (with `target/` and `node_modules/` always excluded), `.git`, and
+/// the Claude Code history for that directory. A read; it provisions nothing.
+pub fn adopt_plan(source: &Path) -> Result<AdoptPlan> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("the source directory {} does not exist", source.display()))?;
+    if !source.is_dir() {
+        bail!("{} is not a directory", source.display());
+    }
+    let rels = adopt_copy_set(&source)?;
+    let mut bytes = 0u64;
+    for rel in &rels {
+        if let Ok(m) = std::fs::symlink_metadata(source.join(rel)) {
+            if m.is_file() {
+                bytes += m.len();
+            }
+        }
+    }
+    let carry = git_carry(&source);
+    let (git_files, git_bytes) = git_measure(&source, carry)?;
+    let mut history_sessions = 0u64;
+    if let Some(home) = std::env::var_os("HOME") {
+        let hist = std::path::PathBuf::from(&home)
+            .join(".claude/projects")
+            .join(history_key(&source));
+        if hist.is_dir() {
+            for f in walkdir_files(&hist).unwrap_or_default() {
+                if f.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                    history_sessions += 1;
+                }
+            }
+        }
+    }
+    Ok(AdoptPlan {
+        // `.git` is not in `rels` — git does not list its own internals — so its
+        // files are added here. Counting only `rels` while adding `.git`'s bytes
+        // is how the confirmation came to promise a file count the summary then
+        // contradicted by the whole of `.git` (F-15: the plan says what will
+        // actually be copied).
+        files: rels.len() as u64 + git_files,
+        bytes: bytes + git_bytes,
+        git_bytes,
+        history_sessions,
+        is_git_repo: carry != GitCarry::None,
+        git_dir_external: carry == GitCarry::Marker,
+        source,
+    })
+}
+
+/// What the copy half of an adoption carried.
+#[derive(Debug, Default, Clone, Copy)]
+struct AdoptCopy {
+    files: u64,
+    bytes: u64,
+    history_sessions: u64,
+    history: HistoryCopy,
+}
+
+/// Copy the tree, `.git` and the Claude Code history onto a provisioned
+/// session's volume.
+///
+/// Split out of [`adopt`] so every failure in it has one place to be caught:
+/// the caller removes the session it just provisioned rather than leaving a
+/// half-populated one behind.
+fn copy_into_session(
+    source: &Path,
+    mount_point: &Path,
+    rels: &[std::path::PathBuf],
+    carry: GitCarry,
+) -> Result<AdoptCopy> {
+    let mut copied = AdoptCopy::default();
+
+    // The tree, into /workspace (the volume root).
+    for rel in rels {
+        let from = source.join(rel);
+        let to = mount_point.join(rel);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        // ls-files can name a path that vanished between listing and copy; skip it.
+        match std::fs::symlink_metadata(&from) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let target = std::fs::read_link(&from)
+                    .with_context(|| format!("reading the link {}", from.display()))?;
+                let _ = std::os::unix::fs::symlink(&target, &to);
+                copied.files += 1;
+            }
+            Ok(m) if m.is_file() => {
+                let n = std::fs::copy(&from, &to)
+                    .with_context(|| format!("copying {}", from.display()))?;
+                preserve_mtime(&from, &to);
+                copied.files += 1;
+                copied.bytes += n;
+            }
+            _ => {}
+        }
+    }
+
+    match carry {
+        GitCarry::None => {}
+        GitCarry::Dir => {
+            let (files, bytes) = copy_tree(&source.join(".git"), &mount_point.join(".git"))?;
+            copied.files += files;
+            copied.bytes += bytes;
+        }
+        GitCarry::Marker => {
+            // A worktree's or submodule's `.git` file. What it points at is
+            // outside the folder and does not travel; the marker does, so the
+            // tree arrives as it was rather than quietly losing a file.
+            let from = source.join(".git");
+            let to = mount_point.join(".git");
+            let n =
+                std::fs::copy(&from, &to).with_context(|| format!("copying {}", from.display()))?;
+            preserve_mtime(&from, &to);
+            copied.files += 1;
+            copied.bytes += n;
+        }
+    }
+
+    // The Claude Code history for this directory, rewritten to the session's
+    // `-workspace` key, valid JSONL to the last line.
+    let home = std::env::var_os("HOME").context("HOME is not set; cannot find the host history")?;
+    let src_hist = std::path::PathBuf::from(&home)
+        .join(".claude")
+        .join("projects")
+        .join(history_key(source));
+    if src_hist.is_dir() {
+        let dst_hist = mount_point
+            .join(config::VOLUME_STATE_PROJECTS)
+            .join("-workspace");
+        std::fs::create_dir_all(&dst_hist)
+            .with_context(|| format!("creating {}", dst_hist.display()))?;
+        let mut stack = vec![src_hist.clone()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d)
+                .with_context(|| format!("reading {}", d.display()))?
+                .flatten()
+            {
+                let path = entry.path();
+                let rel = path.strip_prefix(&src_hist).unwrap();
+                let target = dst_hist.join(rel);
+                let ft = entry.file_type()?;
+                if ft.is_dir() {
+                    std::fs::create_dir_all(&target).ok();
+                    stack.push(path);
+                } else if ft.is_file() {
+                    if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                        let seen = copy_history_jsonl(&path, &target)?;
+                        if seen.lines > 0 {
+                            copied.history_sessions += 1;
+                        }
+                        copied.history.lines += seen.lines;
+                        copied.history.dropped += seen.dropped;
+                        copied.history.corrupt += seen.corrupt;
+                    } else {
+                        if let Some(parent) = target.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        std::fs::copy(&path, &target).ok();
+                    }
+                    // F-20: every transcript keeps the time it was last written
+                    // on the host, so `claude --resume`'s list — which sorts by
+                    // mtime — comes back in the order the user left it. A
+                    // rewritten .jsonl gets it too: dropping a torn last line
+                    // is not the session being touched.
+                    preserve_mtime(&path, &target);
+                }
+            }
+        }
+    }
+
+    Ok(copied)
+}
+
+/// E-23: adopt an existing host directory into a fresh session — copy its tree
+/// (`.gitignore`-respecting, `target/`/`node_modules/` always excluded, `.git`
+/// carried whole) and its Claude Code history (rewritten to the `-workspace`
+/// key, valid JSONL to the last line) onto the session's volume, so a push and
+/// a pull on another machine can `--continue` the conversation. The host
+/// directory is read, never written (copy, not move).
+pub async fn adopt(
+    client: &ContainerdClient,
+    name: &str,
+    size: VolumeSize,
+    agent: Agent,
+    source: &Path,
+) -> Result<AdoptSummary> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("the source directory {} does not exist", source.display()))?;
+    if !source.is_dir() {
+        bail!("{} is not a directory", source.display());
+    }
+
+    // The copy set and its size, BEFORE provisioning anything — a refusal must
+    // not leave a half-created project.
+    let rels = adopt_copy_set(&source)?;
+    let carry = git_carry(&source);
+    let (_git_files, git_bytes) = git_measure(&source, carry)?;
+    let mut planned_bytes = git_bytes;
+    for rel in &rels {
+        if let Ok(m) = std::fs::symlink_metadata(source.join(rel)) {
+            if m.is_file() {
+                planned_bytes += m.len();
+            }
+        }
+    }
+    let quota = size.bytes();
+    if planned_bytes > quota {
+        bail!(
+            "the tree to adopt is {} but the session quota is {} ({}). \
+             Exclude more (target/ and node_modules/ are already excluded), or choose a larger --size. \
+             Adopting {}",
+            human_size(planned_bytes),
+            human_size(quota),
+            size,
+            source.display()
+        );
+    }
+
+    // Provision the session (volume mounted, container created, persisted).
+    let summary = create_with_auth(client, name, size, agent).await?;
+    let mount_point = VolumePaths::from_env()?.mount_point(name);
+
+    // From here on there IS a session: a volume, a container, a network
+    // allocation. The invariant above — a refusal must not leave a half-created
+    // project — has to be paid for on this side too, because the copy can still
+    // fail for something the size check cannot see: a full filesystem, one
+    // unreadable file, a `.git` that vanished mid-copy. Without this, that
+    // failure left a half-populated session behind and the obvious retry
+    // (`nemr add` again) was refused for a name that already exists.
+    let copied = match copy_into_session(&source, &mount_point, &rels, carry) {
+        Ok(copied) => copied,
+        Err(e) => {
+            let context = match delete(client, name).await {
+                Ok(()) => format!(
+                    "adding {} failed; the half-created session {name:?} was removed",
+                    source.display()
+                ),
+                Err(cleanup) => format!(
+                    "adding {} failed, and the half-created session {name:?} could NOT be \
+                     removed: {cleanup}\nRemove it with `nemr delete {name}` before retrying",
+                    source.display()
+                ),
+            };
+            return Err(e.context(context));
+        }
+    };
+
+    Ok(AdoptSummary {
+        name: summary.name,
+        container_id: summary.container_id,
+        size,
+        agent,
+        files_copied: copied.files,
+        bytes_copied: copied.bytes,
+        history_sessions: copied.history_sessions,
+        history_lines_dropped: copied.history.dropped,
+        history_lines_corrupt: copied.history.corrupt,
+        source,
+    })
+}
+
+fn human_size(bytes: u64) -> String {
+    const G: u64 = 1024 * 1024 * 1024;
+    const M: u64 = 1024 * 1024;
+    const K: u64 = 1024;
+    if bytes >= G {
+        format!("{:.1}GiB", bytes as f64 / G as f64)
+    } else if bytes >= M {
+        format!("{:.1}MiB", bytes as f64 / M as f64)
+    } else if bytes >= K {
+        format!("{:.1}KiB", bytes as f64 / K as f64)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 /// Bind mounts that relocate Claude Code's session-critical state onto the
 /// portable volume (M8).
 ///
@@ -391,6 +992,110 @@ mod tests {
     #[test]
     fn container_id_is_prefixed() {
         assert_eq!(config::container_id("demo"), "nemr-demo");
+    }
+
+    /// A scratch directory of this test binary's own, removed by the caller.
+    /// Same shape as the regression suite's: no dev-dependency for three tests.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nemr-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A torn final write is dropped; a line that does not parse ANYWHERE else
+    /// is carried over, not silently removed from the middle of a transcript.
+    #[test]
+    fn history_drops_only_a_torn_last_line_and_keeps_interior_damage() {
+        let dir = scratch("history-jsonl");
+        let src = dir.join("sess.jsonl");
+        let dst = dir.join("out/sess.jsonl");
+
+        // Two good lines, damage in the middle, a good line, then a half-written
+        // last line with no newline after it.
+        std::fs::write(
+            &src,
+            b"{\"a\":1}\n{\"b\":2}\n{\"broken\": \n{\"c\":3}\n{\"d\":",
+        )
+        .unwrap();
+
+        let seen = copy_history_jsonl(&src, &dst).unwrap();
+        assert_eq!(seen.lines, 3, "every parsing line is carried");
+        assert_eq!(seen.dropped, 1, "only the torn last line is dropped");
+        assert_eq!(
+            seen.corrupt, 1,
+            "the interior damage is counted, not hidden"
+        );
+
+        let out = std::fs::read_to_string(&dst).unwrap();
+        assert!(
+            out.contains("{\"broken\": "),
+            "an interior line that does not parse must be copied through — dropping it \
+             loses a message from the middle of the transcript with only a counter to \
+             show for it: {out:?}"
+        );
+        assert!(
+            !out.contains("{\"d\":"),
+            "the torn final write must not be carried: {out:?}"
+        );
+        assert!(
+            out.ends_with('\n'),
+            "every carried line is newline-terminated: {out:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `.git` holds symlinks — an `objects/info/alternates` target, a symlinked
+    /// HEAD. A copy that only handles regular files drops them and the adopted
+    /// repository is unusable, with nothing reporting it.
+    #[test]
+    fn copy_tree_carries_symlinks() {
+        let dir = scratch("copy-tree-symlink");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(src.join("objects/info")).unwrap();
+        std::fs::write(src.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::os::unix::fs::symlink("../../HEAD", src.join("objects/info/alternates")).unwrap();
+
+        let (files, _bytes) = copy_tree(&src, &dst).unwrap();
+        let link = dst.join("objects/info/alternates");
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "the symlink must be recreated as a symlink"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("../../HEAD"));
+        assert_eq!(files, 2, "the symlink counts as a copied entry");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A `git worktree` checkout and a submodule working directory carry a
+    /// `.git` FILE. Reading it as "not a repository" (or as a directory to copy)
+    /// is how the marker got dropped and the session arrived with no git at all.
+    #[test]
+    fn a_git_file_is_a_marker_not_a_directory_and_not_nothing() {
+        let dir = scratch("git-marker");
+        let plain = dir.join("plain");
+        let repo = dir.join("repo");
+        let worktree = dir.join("worktree");
+        std::fs::create_dir_all(plain.join("sub")).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            b"gitdir: /elsewhere/.git/worktrees/w\n",
+        )
+        .unwrap();
+
+        assert_eq!(git_carry(&plain), GitCarry::None);
+        assert_eq!(git_carry(&repo), GitCarry::Dir);
+        assert_eq!(git_carry(&worktree), GitCarry::Marker);
+
+        // The marker is one file, and it is measured, so the plan's count and
+        // the copy's count agree.
+        let (files, bytes) = git_measure(&worktree, GitCarry::Marker).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(bytes, b"gitdir: /elsewhere/.git/worktrees/w\n".len() as u64);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
@@ -1890,13 +2595,6 @@ pub async fn seed_session_config(client: &ContainerdClient, name: &str) -> Resul
         );
     }
     Ok(true)
-}
-
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// Gather everything `nemr status` reports.

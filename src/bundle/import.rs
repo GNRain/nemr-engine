@@ -312,6 +312,17 @@ impl Bundle {
                     anyhow::Error::from(e).context(format!("writing {}", target.display())),
                 )
             })?;
+            // F-20: restore the member's mtime, so Claude Code's resume list —
+            // which sorts transcripts by mtime — comes back in the order the
+            // session had before it travelled. A bundle written before F-20
+            // carries none; then the extraction time stands, as it always did.
+            if let Some(secs) = member.mtime {
+                if let Ok(file) = std::fs::File::options().write(true).open(&target) {
+                    let when =
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs.max(0) as u64);
+                    let _ = file.set_times(std::fs::FileTimes::new().set_modified(when));
+                }
+            }
             written += 1;
             bytes += member.span.length;
         }
@@ -712,6 +723,7 @@ mod tests {
                 .as_str()
                 .into(),
             mode: 0o100644,
+            mtime: None,
             size: plain.len() as u64,
             sha256: hex(&Sha256::digest(&plain)),
             span: crate::bundle::manifest::Span {
@@ -882,6 +894,7 @@ mod tests {
                     .as_str()
                     .into(),
                 mode: 0o100644,
+                mtime: None,
                 size: plain.len() as u64,
                 sha256: "0".repeat(64), // wrong on purpose
                 span: crate::bundle::manifest::Span {
@@ -932,6 +945,7 @@ mod tests {
                     .as_str()
                     .into(),
                 mode: 0o100644,
+                mtime: None,
                 size: 9_999,
                 sha256: "0".repeat(64),
                 span: crate::bundle::manifest::Span {
@@ -1013,6 +1027,7 @@ mod tests {
                     .as_str()
                     .into(),
                 mode: 0o100644,
+                mtime: None,
                 size: 15,
                 sha256: "0".repeat(64),
                 span: crate::bundle::manifest::Span {
@@ -1026,6 +1041,7 @@ mod tests {
                     .as_str()
                     .into(),
                 mode: 0o100644,
+                mtime: None,
                 size: 14,
                 sha256: hex(&Sha256::digest(b"CRITICAL-BYTES")),
                 span: crate::bundle::manifest::Span {

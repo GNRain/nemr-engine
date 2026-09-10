@@ -117,16 +117,27 @@ async fn a_bundle_uploads_encrypted_and_downloads_byte_identically() {
     assert_eq!(r.status(), 200, "upload: {}", r.text().await.unwrap());
 
     // The stored blob comes back byte-identical...
-    let got = app
+    let response = app
         .http
         .get(app.url("/v1/sessions/proj/bundle"))
         .bearer_auth(&token)
         .send()
         .await
-        .unwrap()
-        .bytes()
-        .await
         .unwrap();
+    // ...and it is streamed with its length declared. F-16 sends the body as a
+    // stream rather than a buffered Vec, and a stream with no Content-Length
+    // reaches the client as a chunked body of unknown size — no progress, and
+    // no way to tell a truncated download from a complete one.
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok()),
+        Some(ciphertext.len()),
+        "the streamed download must declare the object's length"
+    );
+    let got = response.bytes().await.unwrap();
     assert_eq!(got.as_ref(), ciphertext.as_slice(), "ciphertext round-trip");
     // ...and it is ciphertext, not the plaintext.
     assert_ne!(got.as_ref(), plaintext.as_slice());

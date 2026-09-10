@@ -53,6 +53,36 @@ enum Command {
         agent: Option<Agent>,
     },
 
+    /// Add an existing host directory as a session: copy its tree (respecting
+    /// .gitignore, always excluding target/ and node_modules/, .git carried
+    /// whole) and its Claude Code history, so it can be pushed and continued on
+    /// another machine (E-23). The directory is copied, not moved.
+    ///
+    /// `adopt` is a hidden alias for one release (F-21).
+    #[command(alias = "adopt")]
+    Add {
+        /// The host directory to add (its tree and Claude Code history).
+        dir: String,
+
+        /// Project name. Omitted, derived from the directory's basename.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Storage quota, fixed at creation time. Omitted, defaults to 2GB.
+        #[arg(long, value_parser = parse_size)]
+        size: Option<VolumeSize>,
+
+        /// Coding agent to run. Omitted, Claude Code.
+        #[arg(long, value_parser = parse_agent)]
+        agent: Option<Agent>,
+
+        /// Skip the confirmation. Required when stdin or stderr is not a
+        /// terminal, because the confirmation cannot be shown or answered there
+        /// (F-15) — add never proceeds silently.
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// Start a project's container.
     Start { name: String },
 
@@ -215,24 +245,36 @@ fn parse_size(input: &str) -> Result<VolumeSize, String> {
 
 use nemr_engine::interactive::{decide, Resolution};
 
+/// A directory basename as a session name: lowercased, every run of anything
+/// else collapsed to one `-`, and the leading and trailing `-` trimmed.
+///
+/// One function because there are two callers — the `create` prompt's
+/// suggestion and `add`'s derived name — and they were not the same: without
+/// the trim, a folder whose name starts with a dot (`.claude`, `.config`)
+/// derived `-claude`, which the engine's `[a-z0-9][a-z0-9-]*` rule rejects, so
+/// `nemr add .claude` failed deep in the daemon with a validation error instead
+/// of defaulting to something usable. It also matches what the page's panel
+/// fills in for the same folder.
+fn name_from_basename(base: &str) -> String {
+    let mut out = String::with_capacity(base.len());
+    for c in base.to_ascii_lowercase().chars() {
+        if c.is_ascii_alphanumeric() || c == '-' {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
 /// A name suggested from the current directory — the common case is that the
 /// project you want is named after where you are.
 fn name_from_cwd() -> Option<String> {
     let raw = std::env::current_dir().ok()?;
-    let base = raw.file_name()?.to_string_lossy().to_ascii_lowercase();
+    let base = raw.file_name()?.to_string_lossy().into_owned();
     // Only offer it if it is already a valid project name; never silently
     // mangle a directory name into something that only half resembles it.
-    let cleaned: String = base
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let cleaned = cleaned.trim_matches('-').to_string();
+    let cleaned = name_from_basename(&base);
     (nemr_engine::engine::volume::validate_name(&cleaned).is_ok()).then_some(cleaned)
 }
 
@@ -358,12 +400,17 @@ fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<S
             format!(
                 "  credential:   NO LOGIN YET on this machine — attach and run /login inside the session;\n\
                  \x20               the login is written to this host and stays here (D-02).\n\
+                 \x20               Logging in spends the account's refresh token, so this account's\n\
+                 \x20               OTHER machines are logged out by it (E-13 — upstream, unavoidable).\n\
                  \x20               path: {}",
                 if d.credential_path.is_empty() { "(will be created at start)".to_string() } else { d.credential_path.clone() }
             ),
             Some(format!(
                 "[nemr] no Claude login on this machine yet. Run /login inside this session; it opens a URL\n\
                  \x20      to sign in with and asks for the code. The login stays on this machine (D-02, E-21).\n\
+                 \x20      Note: logging in spends the account's refresh token, so any OTHER machine using\n\
+                 \x20      this account is logged out by it. That is Anthropic's OAuth model, not nemr's\n\
+                 \x20      doing (E-13); one account cannot be live on two machines at once.\n\
                  \x20      (nemr status {name} shows the credential's state)"
             )),
         );
@@ -382,9 +429,15 @@ fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<S
         placeholder: !d.credential_present,
     };
     let path = &d.credential_path;
+    // F-24: never "log in on this host". Since F-14 the credential nemr uses is
+    // its own, and a host `claude` login writes `~/.claude`, which the engine
+    // does not read — that advice sent the user somewhere that could not help.
+    // The remedy is the proven one: the next create or start resets a login
+    // that cannot authenticate to "no login yet", and `/login` inside the
+    // session writes a new one onto this machine.
     let host_fix = format!(
-        "log in on this host (run `claude`), then restart the session so it mounts the new \
-         file: nemr stop {name} && nemr start {name}"
+        "run `nemr start {name}` (it resets a login that cannot authenticate to \"no login yet\"), \
+         then `nemr attach {name}` and `/login` inside the session"
     );
     let (mut line, mut warning) = match facts.verdict(unix_now()) {
         CredentialVerdict::NoLoginYet => unreachable!("handled above"),
@@ -416,8 +469,9 @@ fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<S
                 human_duration(since)
             ),
             Some(format!(
-                "[nemr] Claude Code's login on this host has EXPIRED (its refresh token ran out {} ago).\n\
-                 \x20      A `/login` inside the session cannot fix that. {host_fix}",
+                "[nemr] this machine's Claude login is spent (its refresh token ran out {} ago) —\n\
+                 \x20      often because the same account logged in on another machine (E-13).\n\
+                 \x20      {host_fix}",
                 human_duration(since)
             )),
         ),
@@ -427,9 +481,9 @@ fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<S
                  \x20               Fix: {host_fix}"
             ),
             Some(format!(
-                "[nemr] Claude Code's login on this host is BLANK: it was cleared after a dead refresh\n\
-                 \x20      (revoked elsewhere, or its refresh token spent). A `/login` inside the session\n\
-                 \x20      cannot fix that. {host_fix}"
+                "[nemr] this machine's Claude login was cleared after a refresh was refused —\n\
+                 \x20      revoked, or spent because the same account logged in elsewhere (E-13).\n\
+                 \x20      {host_fix}"
             )),
         ),
     };
@@ -454,7 +508,7 @@ fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<S
             if d.credential_last_write_valid {
                 ""
             } else {
-                "  ← NOT a usable credential: log in on this host"
+                "  ← NOT a usable credential: the next start resets it to \"no login yet\"; /login inside the session"
             }
         ));
     }
@@ -683,6 +737,176 @@ async fn main() -> Result<()> {
             println!("  next:      nemr start {}", project.name);
         }
 
+        Command::Add {
+            dir,
+            name,
+            size,
+            agent,
+            yes,
+        } => {
+            let source = std::path::Path::new(&dir)
+                .canonicalize()
+                .map_err(|e| anyhow::anyhow!("the directory {dir:?} cannot be read: {e}"))?;
+            let interactive = nemr_engine::interactive::is_interactive();
+            // Derive the name from the directory basename when not given.
+            let name = match name {
+                Some(n) => n,
+                None => {
+                    let base = source
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let derived = name_from_basename(&base);
+                    // Offer it only if it is actually a name the engine accepts;
+                    // otherwise ask (or say --name is required), rather than
+                    // sending a name that fails validation in the daemon.
+                    let usable = Some(derived)
+                        .filter(|s| nemr_engine::engine::volume::validate_name(s).is_ok());
+                    resolve_name(usable, interactive)?
+                }
+            };
+            let size = resolve_size(size, interactive)?;
+            let agent = resolve_agent(agent, interactive)?;
+
+            // F-15: add copies a whole tree, so it says what and how big and
+            // asks — on a terminal. Without one it REFUSES and names the flag;
+            // it never proceeds silently, and it never tries to prompt where a
+            // prompt cannot be drawn.
+            let mut session = daemon::connect().await?;
+            if !yes {
+                // The plan comes from the daemon: the CLI has no path into the
+                // engine (E-09), and the daemon is the one that would do the
+                // copying.
+                let plan = {
+                    let __req = session.req(proto::AdoptRequest {
+                        name: name.clone(),
+                        size: size.to_string(),
+                        agent: agent.id().to_string(),
+                        source_dir: source.to_string_lossy().into_owned(),
+                        plan_only: true,
+                    });
+                    session
+                        .client()
+                        .adopt(__req)
+                        .await
+                        .map_err(status_err)?
+                        .into_inner()
+                };
+                if !interactive {
+                    anyhow::bail!(
+                        "adding {} would copy {} in {} file(s) into a new session, and asks \
+                         before it does.\n\
+                         stdin or stderr is not a terminal, so the confirmation cannot be shown \
+                         or answered here.\n\
+                         Re-run with --yes to add it without confirming.",
+                        plan.source,
+                        volume::human_bytes(plan.bytes_copied),
+                        plan.files_copied
+                    );
+                }
+                eprintln!("About to add {} as a new session:", plan.source);
+                eprintln!("  name:      {name}");
+                eprintln!("  quota:     {size}");
+                eprintln!(
+                    "  copies:    {} in {} file(s){}",
+                    volume::human_bytes(plan.bytes_copied),
+                    plan.files_copied,
+                    if plan.git_bytes > 0 {
+                        format!(
+                            ", including {} of .git",
+                            volume::human_bytes(plan.git_bytes)
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
+                if plan.is_git_repo {
+                    eprintln!(
+                        "  excluded:  anything .gitignore ignores, and target/ and node_modules/"
+                    );
+                    if plan.git_dir_external {
+                        eprintln!(
+                            "  note:      this is a git worktree or submodule — its git directory \
+                             lives outside"
+                        );
+                        eprintln!(
+                            "             the folder, so only the .git marker travels and the \
+                             session will not"
+                        );
+                        eprintln!(
+                            "             be a working git repository (no history, no commits)."
+                        );
+                    }
+                } else {
+                    eprintln!("  excluded:  target/ and node_modules/ (not a git repo — nothing else is ignored)");
+                }
+                eprintln!(
+                    "  history:   {} Claude Code session transcript(s) for this directory",
+                    plan.history_sessions
+                );
+                eprintln!("  the host directory is COPIED, not moved — it stays as it is.");
+                eprint!("Add it? [y/N]: ");
+                std::io::Write::flush(&mut std::io::stderr())?;
+                let mut answer = String::new();
+                std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut answer)?;
+                if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+                    eprintln!("Cancelled. Nothing was added.");
+                    std::process::exit(1);
+                }
+            }
+
+            let summary = {
+                let __req = session.req(proto::AdoptRequest {
+                    name,
+                    size: size.to_string(),
+                    agent: agent.id().to_string(),
+                    source_dir: source.to_string_lossy().into_owned(),
+                    plan_only: false,
+                });
+                session
+                    .client()
+                    .adopt(__req)
+                    .await
+                    .map_err(status_err)?
+                    .into_inner()
+            };
+            println!("added {} as session {:?}", summary.source, summary.name);
+            println!("  agent:     {}", agent_label(&summary.agent));
+            println!("  container: {}", summary.container_id);
+            println!(
+                "  copied:    {} files, {} (target/ and node_modules/ excluded; .git carried)",
+                summary.files_copied,
+                volume::human_bytes(summary.bytes_copied)
+            );
+            if summary.history_sessions > 0 {
+                println!(
+                    "  history:   {} session transcript(s) carried over{}",
+                    summary.history_sessions,
+                    if summary.history_lines_dropped > 0 {
+                        format!(" ({} torn line(s) dropped)", summary.history_lines_dropped)
+                    } else {
+                        String::new()
+                    }
+                );
+                if summary.history_lines_corrupt > 0 {
+                    println!(
+                        "  note:      {} line(s) in those transcripts do not parse as JSON and \
+                         were copied as they are",
+                        summary.history_lines_corrupt
+                    );
+                    println!(
+                        "             (they are not a torn last write, so they were not dropped \
+                         — the host's copy has them too)"
+                    );
+                }
+            } else {
+                println!("  history:   none found for this directory (a fresh session)");
+            }
+            println!("  quota:     {}", summary.size);
+            println!("  the host directory was copied, not moved — it is untouched");
+            println!("  next:      nemr start {}", summary.name);
+        }
+
         Command::Start { name } => {
             let mut session = daemon::connect().await?;
             let pid = {
@@ -867,6 +1091,18 @@ async fn main() -> Result<()> {
             // AC-6.2: deletion is destructive and irreversible — the volume and
             // everything written to it goes. Confirm unless explicitly waived.
             if !yes {
+                // F-15's audit: a confirmation that cannot be shown or answered
+                // must refuse and name the flag, not read EOF and call it a
+                // mismatch.
+                if !nemr_engine::interactive::is_interactive() {
+                    anyhow::bail!(
+                        "deleting {name:?} destroys its volume and everything in it, and asks \
+                         before it does.\n\
+                         stdin or stderr is not a terminal, so the confirmation cannot be shown \
+                         or answered here.\n\
+                         Re-run with --yes to delete without confirming."
+                    );
+                }
                 let projects = {
                     let __req = session.req(proto::ListRequest {});
                     session
@@ -1174,7 +1410,7 @@ async fn main() -> Result<()> {
                 volume::human_bytes(resp.bytes)
             );
             println!("\nThe bundle carried no credential, and never does (D-02).");
-            println!("Authenticate on this host, then: nemr start {name} && nemr attach {name}");
+            println!("Then: nemr start {name} && nemr attach {name} — and `/login` inside the session if it says no login yet.");
             // Suggested, never run (F-118): import works offline and
             // provisioning needs the network — the same seam as authentication
             // above. The same shape as every other next-step line this CLI
@@ -1378,4 +1614,37 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `nemr add <dir>` derives a session name from the folder, and the derived
+    /// name has to be one the engine accepts: `[a-z0-9][a-z0-9-]*`. Mapping
+    /// every other character to `-` without trimming produced `-claude` for
+    /// `.claude`, which the daemon then rejected — a default that cannot work.
+    /// The page's panel derives the same way, so both offer the same name.
+    #[test]
+    fn a_folder_name_becomes_a_name_the_engine_accepts() {
+        for (folder, expected) in [
+            ("nemr-engine", "nemr-engine"),
+            ("My Project", "my-project"),
+            (".claude", "claude"),
+            ("_scratch_", "scratch"),
+            ("a..b", "a-b"),
+            ("Ünicode", "nicode"),
+        ] {
+            let derived = name_from_basename(folder);
+            assert_eq!(derived, expected, "deriving from {folder:?}");
+            assert!(
+                nemr_engine::engine::volume::validate_name(&derived).is_ok(),
+                "{folder:?} derived {derived:?}, which the engine refuses"
+            );
+        }
+        // Nothing usable is left: the caller must ask or require --name rather
+        // than send an invalid one.
+        assert_eq!(name_from_basename("..."), "");
+        assert_eq!(name_from_basename("—"), "");
+    }
 }
