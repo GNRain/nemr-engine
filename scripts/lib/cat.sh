@@ -131,6 +131,25 @@ _nemr_cat_height() {
 
 NEMR_CAT_DELAY="${NEMR_CAT_DELAY:-0.16}"
 
+# The terminal's size: "<rows> <cols>", or nothing at all.
+#
+# The ioctl FIRST, because `tput` answers from the LINES and COLUMNS
+# environment variables when they are set — that is how a 22-row terminal
+# reported 24 and a block drew two rows more than it had. But a pty can exist
+# with no size set at all (`stty size` says "0 0"), and terminfo is the better
+# answer there, so an unset ioctl falls through to tput rather than to nothing.
+nemr_term_size() {
+    local size rows cols
+    size="$(stty size 2>/dev/null </dev/tty)" || size="$(stty size 2>/dev/null)" || size=""
+    rows="${size%% *}"; cols="${size##* }"
+    if ! [[ "$rows" =~ ^[1-9][0-9]*$ && "$cols" =~ ^[1-9][0-9]*$ ]]; then
+        rows="$(tput lines 2>/dev/null || echo 0)"
+        cols="$(tput cols 2>/dev/null || echo 0)"
+    fi
+    [[ "$rows" =~ ^[1-9][0-9]*$ && "$cols" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s %s' "$rows" "$cols"
+}
+
 # May we draw? Every "no" is a deliberate one (rule 2). NEMR_CAT=0 is the
 # caller's own off switch (--quiet passes it); NEMR_CAT=1 forces it on for the
 # test that needs a pty to prove the drawing half.
@@ -143,9 +162,9 @@ nemr_cat_enabled() {
     # Too short a terminal and the block scrolls: the cursor-up would then walk
     # over the step lines instead of its own, leaving a trail. Rather than draw
     # something broken, draw nothing.
-    local rows
-    rows="$(tput lines 2>/dev/null || echo 0)"
-    [[ "$rows" =~ ^[0-9]+$ ]] || rows=0
+    local rows size
+    size="$(nemr_term_size)" || return 1
+    rows="${size%% *}"
     (( rows >= $(_nemr_cat_height) + 2 )) || return 1
     return 0
 }
@@ -186,22 +205,50 @@ _nemr_cat_loop() {
     # nothing — the animation must never make the install wait for it.
     exec 9<>"$_NEMR_CAT_STOP"
 
-    local i=0 n=${#frames[@]}
+    # NEVER a newline on the last row of the block. At the foot of the screen
+    # that newline scrolls the terminal, and the cursor-up that follows is
+    # RELATIVE — so the block's idea of its own top drifts a row per frame and
+    # the final erase leaves stranded rows above it. Print height-1 lines with
+    # newlines, the last without, then come back up height-1.
+    # RESERVE THE BLOCK FIRST. A 15-row block started within 15 rows of the
+    # bottom scrolls while its first frame is being written, and the rows
+    # written before the scroll end up ABOVE the block — outside what the
+    # drawer thinks it owns, so its erase never reaches them. Measured at the
+    # foot of a 40-row screen (2026-09-10): four stranded rows, every run.
+    # Emitting the blank lines up front scrolls once, harmlessly, and from then
+    # on every frame lands inside a block that is fully on screen.
+    local k
+    for (( k = 1; k < height; k++ )); do printf '\r\n'; done
+    (( height > 1 )) && printf '\033[%dA' "$((height - 1))"
+    printf '\r'
+
+    local i=0 n=${#frames[@]} idx
     while :; do
         written=0
+        idx=0
         # Process substitution, not a here-string: `<<<` appends a newline to a
         # frame that already ends with one, so every frame wrote one line more
         # than `height` and the block crept down the screen a line per frame.
         while IFS= read -r line; do
-            printf '\033[2K%s\n' "$line"
-            written=$((written + 1))
+            printf '\033[2K%s' "$line"
+            idx=$((idx + 1))
+            if (( idx < height )); then
+                # \r\n, never a bare \n: a step can leave the terminal in raw
+                # mode — the smoke test's `nemr attach` does — and there a bare
+                # newline does not return the carriage, so every row of the
+                # block draws one column further right and the erase misses it.
+                # Drawing must not depend on the line discipline.
+                printf '\r\n'
+                written=$((written + 1))
+            fi
             # TEST-ONLY seam (unset in every real run): slows the frame so a
             # stop lands mid-write on purpose. Without it the mid-write window
             # is a couple of milliseconds wide and the assertion that the screen
             # is left clean only catches a regression two times in twelve.
             [[ -n "${NEMR_TEST_CAT_LINE_DELAY:-}" ]] && sleep "$NEMR_TEST_CAT_LINE_DELAY"
         done < <(printf '%s' "${frames[$((i % n))]}")
-        printf '\033[%dA' "$height"
+        (( height > 1 )) && printf '\033[%dA' "$((height - 1))"
+        printf '\r'
         written=0                      # cursor is back at the top of the block
         i=$((i + 1))
         if read -r -t "$NEMR_CAT_DELAY" -u 9 _; then break; fi

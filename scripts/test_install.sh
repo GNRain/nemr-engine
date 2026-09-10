@@ -28,7 +28,7 @@ PASS=0; FAIL=0
 # Asserted, not merely printed: a run that skipped a case would otherwise say
 # PASS with fewer assertions — the green-over-nothing shape this project keeps
 # guarding against. Raise this when a case is added.
-EXPECTED_ASSERTIONS=41
+EXPECTED_ASSERTIONS=49
 
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS + 1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
@@ -243,6 +243,107 @@ check "$([[ "$leaked" == "0" ]] && echo 0 || echo 1)" \
     "stopped mid-frame twelve times over, the screen is left exactly as found" \
     "$leaked of 12 left something behind"
 
+# 4d. THE LIVE REGION (F-27): two columns in one managed block, and the
+#     thresholds below which there are no columns at all.
+wide="$WORK/wide.raw"
+script -qec "bash -c 'stty cols 140 rows 40; $REPO/scripts/install.sh --yes'" /dev/null >"$wide" 2>&1
+wide_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$wide" --cols 140 --rows 40)"
+# A row carrying a step line AND cat art is the layout: both columns, one row.
+two_col="$(python3 - "$wide" <<'PYEOF'
+import subprocess, sys
+raw = sys.argv[1]
+d = open(raw, 'rb').read()
+i, j = d.find(b'Installing'), d.find(b'Verifying')
+mid = i + int((j - i) * 0.55)
+out = subprocess.run(['python3', 'scripts/lib/render_pty.py', raw, '--cols', '140',
+                      '--rows', '40', '--at', str(mid)], capture_output=True, text=True).stdout
+print(sum(1 for line in out.split('\n')
+          if ('already done' in line or 'already current' in line) and len(line) > 95))
+PYEOF
+)"
+check "$([[ "${two_col:-0}" -ge 3 ]] && echo 0 || echo 1)" \
+    "on a wide terminal the block is two columns: step lines and the cat share rows ($two_col of them)" \
+    "the region did not engage"
+grep -qE '✓ the smoke test passed' <<<"$wide_screen"
+check $? "the run completes with the region open"
+cat_left=0
+grep -qE '\("\)|o\.o|o\.O|\*-\*' <<<"$wide_screen" && cat_left=1
+check "$cat_left" "when it finishes the block resolves to the step list and the cat is gone"
+
+# Below the width threshold: no columns, and no truncation — today's output.
+narrow="$WORK/narrow.raw"
+script -qec "bash -c 'stty cols 100 rows 40; $REPO/scripts/install.sh --yes'" /dev/null >"$narrow" 2>&1
+narrow_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$narrow" --cols 100 --rows 40)"
+narrow_two_col="$(grep -cE '(already done|already current).{20,}[|/\\]' <<<"$narrow_screen" || true)"
+check "$([[ "${narrow_two_col:-0}" == "0" ]] && echo 0 || echo 1)" \
+    "at 100 columns — under the 129 it needs — there are no columns at all, and nothing is truncated" \
+    "$narrow_two_col rows carried both"
+grep -qE '✓ the smoke test passed' <<<"$narrow_screen"
+check $? "and the install still completes, append-only, as before"
+
+# 4e. A STEP'S OWN OUTPUT CANNOT ENTER THE REGION. Its stdout and stderr go to
+#     the log, as they always did; the region is the only writer. (A step that
+#     wrote to /dev/tty directly would bypass every redirect there is — the one
+#     that does, `nemr attach` in the smoke test, runs after the region closes.)
+cat >"$WORK/noisy.sh" <<'NOISY'
+#!/usr/bin/env bash
+. "$1/scripts/lib/cat.sh"
+. "$1/scripts/lib/region.sh"
+printf 'header
+'
+nemr_region_start "$2/state" || { printf 'NO-REGION
+'; exit 0; }
+nemr_region_publish "  · step one" "  · step two"
+( echo "STDOUT-NOISE-FROM-A-STEP"; echo "STDERR-NOISE-FROM-A-STEP" >&2 ) >>"$2/log" 2>&1
+sleep 0.4
+nemr_region_publish "  ✓ step one" "  ✓ step two"
+sleep 0.3
+nemr_region_stop
+printf 'footer
+'
+NOISY
+chmod +x "$WORK/noisy.sh"
+script -qec "bash -c 'stty cols 140 rows 40; $WORK/noisy.sh $REPO $WORK'" /dev/null >"$WORK/noisy.raw" 2>&1
+noisy_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$WORK/noisy.raw" --cols 140 --rows 40)"
+noise=0
+grep -q 'NOISE-FROM-A-STEP' <<<"$noisy_screen" && noise=1
+check "$noise" "a step's stdout and stderr reach the log, never the region" \
+    "$(grep -n 'NOISE' <<<"$noisy_screen" | head -2)"
+grep -q 'STDOUT-NOISE-FROM-A-STEP' "$WORK/log"
+check $? "and the log has them"
+
+# 4f. MORE STEPS THAN ROWS. The region never scrolls the terminal: the left
+#     column becomes a window anchored on the step running now, and says how
+#     many are above it rather than hiding them silently.
+cat >"$WORK/many.sh" <<'MANY'
+#!/usr/bin/env bash
+. "$1/scripts/lib/cat.sh"
+. "$1/scripts/lib/region.sh"
+printf 'header
+'
+nemr_region_start "$2/manystate" || { printf 'NO-REGION
+'; exit 0; }
+lines=(); for i in $(seq 1 30); do lines+=("  · step $i of thirty"); done
+nemr_region_publish "${lines[@]}"
+sleep 0.4
+for i in $(seq 1 26); do lines[$((i-1))]="  ✓ step $i of thirty"; done
+nemr_region_publish "${lines[@]}"
+sleep 0.5
+nemr_region_stop
+printf 'footer
+'
+MANY
+chmod +x "$WORK/many.sh"
+script -qec "bash -c 'stty cols 140 rows 22; $WORK/many.sh $REPO $WORK'" /dev/null >"$WORK/many.raw" 2>&1
+many_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$WORK/many.raw" --cols 140 --rows 22)"
+windowed=0
+grep -qE 'earlier step\(s\) above' <<<"$many_screen" \
+    && grep -q 'step 30 of thirty' <<<"$many_screen" \
+    && grep -q 'footer' <<<"$many_screen" || windowed=1
+check "$windowed" \
+    "30 steps in a 22-row terminal: a window anchored on the last, and a count of what is above" \
+    "$(head -3 <<<"$many_screen")"
+
 # 5. Interrupted, it leaves no hidden cursor and no half a cat.
 script -qec './scripts/lib/cat.sh --demo 20' /dev/null >"$WORK/int.raw" 2>&1 &
 sp=$!
@@ -285,11 +386,14 @@ check $r "plain ASCII only — no wide characters, nothing that renders differen
 heights="$(awk '/^frame /{if (n) print n; n=0; next} {n++} END{print n}' <<<"$frames_out" | sort -u | tr '\n' ' ')"
 check "$([[ "$(wc -w <<<"$heights")" == "1" ]] && echo 0 || echo 1)" \
     "every frame is the same height ($heights lines)"
-# And the drawer moves back by exactly that many lines — the erase is pinned to
-# the art, not to a constant that can drift from it.
+# And the drawer moves back over exactly the rows it wrote a newline for: one
+# fewer than the frame's height, because the last row deliberately carries no
+# newline (a newline there scrolls a block at the foot of the screen, and every
+# move here is relative). Pinned to the art, not to a constant beside it.
 up="$(grep -o $'\033\[[0-9]*A' "$raw" | sort -u | tr -d '\033[A' | tr '\n' ' ')"
-check "$([[ "$(echo $up)" == "$(echo $heights)" ]] && echo 0 || echo 1)" \
-    "the cursor is moved back exactly one frame-height each time (${up}vs ${heights})"
+expect_up=$(( $(echo $heights) - 1 ))
+check "$([[ "$(echo $up)" == "$expect_up" ]] && echo 0 || echo 1)" \
+    "the cursor comes back over exactly the rows it newlined: ${up}for a ${heights}row frame"
 
 # ---------------------------------------------------------------------------
 printf '\n'

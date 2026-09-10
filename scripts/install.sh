@@ -31,7 +31,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 REPO="$PWD"
 
 . scripts/lib/cat.sh
+. scripts/lib/region.sh
 . scripts/lib/steps.sh
+# shellcheck source=lib/proc.sh
+. scripts/lib/proc.sh
 . scripts/lib/base_image.sh
 
 # ---------------------------------------------------------------------------
@@ -398,11 +401,11 @@ do_step() {
     daemons)
         logged_long systemctl --user enable --now containerd-rootless.service || rc=$?
         if (( rc == 0 )); then
-            local i
-            for i in $(seq 1 30); do
-                [[ -S "$XDG_RUNTIME_DIR/containerd/containerd.sock" ]] && break
-                sleep 1
-            done
+            # The shared helper, not a hand-rolled poll (F-95): it explains its
+            # own failure. Caught by the wait-discipline gate on 2026-09-10,
+            # once this file started backgrounding anything at all.
+            wait_for_ready "rootless containerd" 30 \
+                test -S "$XDG_RUNTIME_DIR/containerd/containerd.sock" >>"$LOG" 2>&1 || true
             if [[ -S "$XDG_RUNTIME_DIR/containerd/containerd.sock" ]]; then
                 tick "$label — answering at \$XDG_RUNTIME_DIR/containerd/containerd.sock"
             else
@@ -495,10 +498,58 @@ nemr_consent "$YES" "./scripts/install.sh"
 
 open_log
 head2 "Installing"
+
+# The live region (F-27): the step lines on the left, redrawn in place, and the
+# cat looping beside them — one writer, nothing scrolling. Below its thresholds
+# (129 columns, 17 rows) this returns non-zero and the block prints as it always
+# did, line by line.
+REGION_STATE="$LOG_DIR/region.$$"
+_NEMR_REGION_STATE_PATH="$REGION_STATE"   # so sudo_refresh can reopen it
+# Nothing may prompt while the region owns the screen, so the password is taken
+# BEFORE it opens and the timestamp is kept warm underneath it. Only when a
+# privileged step is actually pending — a run where everything is already done
+# asks for nothing, as before.
+PRIVILEGED_PENDING=0
+for id in "${STEP_IDS[@]}"; do
+    case "$id" in
+        packages|containerd_off|subids|delegation|linger|propagation|helper)
+            # Only a step that WILL do privileged work. A "check and update"
+            # step (the helper) needs sudo just when its hash turns out to
+            # differ, and asking for a password that may not be needed is a
+            # regression on today's behaviour. That rare case is handled by
+            # sudo_refresh closing the region around the prompt.
+            [[ "${STEP_STATE[$id]}" == todo ]] && PRIVILEGED_PENDING=1 ;;
+    esac
+done
+if nemr_region_enabled && (( PRIVILEGED_PENDING )); then
+    sudo_refresh
+fi
+if nemr_region_start "$REGION_STATE"; then
+    _S_REGION=1
+    # Seeded with every step, so the whole list is visible from the first frame
+    # and the user never scrolls to watch it.
+    for id in "${STEP_IDS[@]}"; do _S_LINES+=("  · ${STEP_LABEL[$id]}"); done
+    nemr_region_publish "${_S_LINES[@]}"
+    if (( PRIVILEGED_PENDING )); then
+        ( while kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null || exit 0; sleep 45; done ) &
+        SUDO_KEEPALIVE=$!
+    fi
+fi
+
+_S_IDX=0
 for id in "${STEP_IDS[@]}"; do
     do_step "$id"
+    _S_IDX=$((_S_IDX + 1))
     [[ "$id" == "linger" ]] && reboot_gate
 done
+
+if (( _S_REGION )); then
+    nemr_region_stop            # resolves to the final list; the cat is gone
+    _S_REGION=0
+    [[ -n "${SUDO_KEEPALIVE:-}" ]] && { kill "$SUDO_KEEPALIVE" 2>/dev/null; wait "$SUDO_KEEPALIVE" 2>/dev/null; }
+    rm -f "$REGION_STATE"
+    flush_notes
+fi
 
 # Claude Code: detected, never installed (D-13).
 if have claude; then

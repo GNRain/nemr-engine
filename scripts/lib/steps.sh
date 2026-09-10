@@ -18,9 +18,50 @@ else
     _S_GREEN=""; _S_RED=""; _S_DIM=""; _S_RESET=""
 fi
 
-tick()  { printf '  %s✓%s %s\n' "$_S_GREEN" "$_S_RESET" "$1"; }
-cross() { printf '  %s✗%s %s\n' "$_S_RED" "$_S_RESET" "$1"; }
-note()  { printf '    %s%s%s\n' "$_S_DIM" "$1" "$_S_RESET"; }
+# When a live region owns the screen (scripts/lib/region.sh), these do not
+# print — they update the line this step owns and hand the whole list to the
+# renderer, which is the only thing writing to the terminal. Nothing else may
+# write while it is open, or the layout tears.
+_S_REGION=0
+_S_IDX=0
+_S_LINES=()
+_S_NOTES=()
+
+tick()  {
+    if (( _S_REGION )); then
+        _S_LINES[$_S_IDX]="  ✓ $1"
+        nemr_region_publish "${_S_LINES[@]}"
+    else
+        printf '  %s✓%s %s\n' "$_S_GREEN" "$_S_RESET" "$1"
+    fi
+}
+cross() {
+    if (( _S_REGION )); then
+        _S_LINES[$_S_IDX]="  ✗ $1"
+        nemr_region_publish "${_S_LINES[@]}"
+    else
+        printf '  %s✗%s %s\n' "$_S_RED" "$_S_RESET" "$1"
+    fi
+}
+note()  {
+    if (( _S_REGION )); then
+        # Kept, not dropped: printed under the region once it resolves. A note
+        # is ours, but the region is a fixed list of steps and a note would
+        # push it around.
+        _S_NOTES+=("$1")
+    else
+        printf '    %s%s%s\n' "$_S_DIM" "$1" "$_S_RESET"
+    fi
+}
+
+# Print anything the region held back, once it has resolved.
+flush_notes() {
+    local n
+    for n in ${_S_NOTES+"${_S_NOTES[@]}"}; do
+        printf '    %s%s%s\n' "$_S_DIM" "$n" "$_S_RESET"
+    done
+    _S_NOTES=()
+}
 head2() { printf '\n%s\n' "$1"; }
 
 LOG_DIR="$HOME/.local/state/nemr"
@@ -42,7 +83,19 @@ logged() {
 logged_long() {
     local rc=0
     printf '\n$ %s\n' "$*" >>"$LOG"
-    if nemr_cat_enabled; then
+    # A step can change the terminal's mode even with its output redirected:
+    # the smoke test attaches to a session, and `nemr attach` puts the tty in
+    # raw mode through /dev/tty. Save the settings and put them back, so what
+    # runs next — the drawing, and the user's shell afterwards — gets the
+    # terminal it expects.
+    local tty_state=""
+    [[ -t 1 ]] && tty_state="$(stty -g 2>/dev/null || true)"
+    if (( _S_REGION )); then
+        # The region draws the cat already, and it is the only writer.
+        "$@" >>"$LOG" 2>&1 &
+        local work=$!
+        wait "$work" || rc=$?
+    elif nemr_cat_enabled; then
         "$@" >>"$LOG" 2>&1 &
         local work=$!
         nemr_cat_start
@@ -51,6 +104,7 @@ logged_long() {
     else
         "$@" >>"$LOG" 2>&1 || rc=$?
     fi
+    [[ -n "$tty_state" ]] && stty "$tty_state" 2>/dev/null || true
     return "$rc"
 }
 
@@ -62,6 +116,7 @@ steps_trap() {
 }
 _steps_cleanup() {
     local rc=$?
+    nemr_region_stop 2>/dev/null || true
     nemr_cat_stop
     if [[ -n "$FAILED_STEP" ]]; then
         printf '\n%sStopped at: %s%s\n' "$_S_RED" "$FAILED_STEP" "$_S_RESET" >&2
@@ -101,5 +156,18 @@ nemr_consent() {
 # Ask for the password outside a running animation, so the prompt is never
 # drawn over. A fresh timestamp makes the next sudo silent.
 sudo_refresh() {
-    sudo -v || { FAILED_STEP="sudo"; cross "sudo refused"; exit 1; }
+    # Nothing may write to the terminal while a live region owns it, and a
+    # password prompt is a write. So the region is resolved first, the prompt
+    # happens on a clean screen, and a fresh region opens under it.
+    local reopen=0
+    if (( _S_REGION )); then
+        nemr_region_stop
+        reopen=1
+    fi
+    local ok=0
+    sudo -v && ok=1
+    if (( reopen )); then
+        nemr_region_start "$_NEMR_REGION_STATE_PATH" && nemr_region_publish "${_S_LINES[@]}"
+    fi
+    (( ok )) || { FAILED_STEP="sudo"; cross "sudo refused"; exit 1; }
 }
