@@ -28,7 +28,7 @@ PASS=0; FAIL=0
 # Asserted, not merely printed: a run that skipped a case would otherwise say
 # PASS with fewer assertions — the green-over-nothing shape this project keeps
 # guarding against. Raise this when a case is added.
-EXPECTED_ASSERTIONS=63
+EXPECTED_ASSERTIONS=74
 
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS + 1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
@@ -259,8 +259,17 @@ PYEOF
 )"
 grep -q 'Installing nemr' <<<"$first_live"
 check $? "the live screen names what it is doing" "$(head -4 <<<"$first_live")"
-grep -qE '(█|#)+(░|-)*  [0-9]+ of [0-9]+' <<<"$first_live"
-check $? "with a bar and a count beneath it"
+grep -qE '\[#*-*\]  [0-9]+ of [0-9]+' <<<"$first_live"
+check $? "with a bar and a count beneath it" "$(grep -n 'of ' <<<"$first_live" | head -2)"
+# The bar draws in characters every font has. It was two block characters, and
+# on Windows Terminal both rendered as the same solid grey — the bytes were
+# right and the font was not, and no terminal can be asked whether a glyph will
+# render (the Product Owner, 2026-09-10).
+blocks="$(LC_ALL=C grep -c $'\xe2\x96' "$first" || true)"
+check "$([[ "${blocks:-0}" == "0" ]] && echo 0 || echo 1)" \
+    "and it needs no font: no block characters anywhere in the run" "$blocks"
+grep -qE '\[#+-+\]' <<<"$first_live"
+check $? "the bar has a filled part and an empty part" "$(grep -o '\[[#-]*\]' <<<"$first_live" | head -1)"
 grep -qE '(installing|building|pulling|starting|adding|enabling|updating|delegating|disabling|checking|running|making) ' <<<"$first_live"
 check $? "and the step in plain words, not the plan's sentence"
 live_steps="$(grep -cE '^  (installing|building|pulling|starting|adding|enabling|updating|delegating|disabling|checking|running|making) ' <<<"$first_live")"
@@ -298,6 +307,70 @@ check $? "on failure: the step, the reason, the fix as a command, and the log" \
 fail_cat="$(grep -cE '\("\)|o\.o|\*-\*' <<<"$fail_screen" || true)"
 check "$([[ "${fail_cat:-0}" == "0" ]] && echo 0 || echo 1)" \
     "and the live screen is gone from it" "$fail_cat cat rows"
+
+# 4d-bis. THE OUTPUT PANE: the real tail of what the step printed, bounded.
+cat >"$WORK/pane.sh" <<'PANE'
+#!/usr/bin/env bash
+cd "$1"; . scripts/lib/cat.sh; . scripts/lib/region.sh; . scripts/lib/steps.sh
+LOG="$2/plog"; STEP_OUT="$2/pout"; : >"$STEP_OUT"
+printf 'a command line\n'
+nemr_region_start "$2/pstate" "$STEP_OUT" || { echo NO-REGION; exit 0; }
+_S_REGION=1
+steps_seed "building the engine" "pulling the base image"
+_S_IDX=0; step_begin
+for i in 1 2 3 4 5 6 7 8; do printf '   Compiling crate-number-%d v0.%d.0\n' "$i" "$i" >>"$STEP_OUT"; sleep 0.3; done
+# A step that prints what would tear the region if it escaped: colour, cursor
+# moves, a carriage return, a tab, and a line far wider than the pane.
+printf '\033[31mRED\033[0m\033[2K\033[5Amoved\ttabbed\rreturned %s\n' "$(head -c 300 /dev/zero | tr '\0' 'W')" >>"$STEP_OUT"
+sleep 0.5
+_S_IDX=0; step_result done new "built"   # folds the output into the log
+_S_IDX=1; step_begin                    # and the pane empties with the step
+sleep 0.5
+nemr_region_stop
+printf 'done\n'
+PANE
+chmod +x "$WORK/pane.sh"
+script -qec "bash -c 'stty cols 100 rows 30; $WORK/pane.sh $REPO $WORK'" /dev/null >"$WORK/pane.raw" 2>&1
+pane_mid="$(python3 - "$WORK/pane.raw" <<'PYEOF'
+import subprocess, sys
+raw = sys.argv[1]
+d = open(raw, 'rb').read()
+cut = d.rfind(b'\x1b[J')
+print(subprocess.run(['python3', 'scripts/lib/render_pty.py', raw, '--cols', '100',
+                      '--rows', '30', '--at', str(int((cut if cut > 0 else len(d)) * 0.62))],
+                     capture_output=True, text=True).stdout)
+PYEOF
+)"
+grep -qE '^  \+-+\+' <<<"$pane_mid"
+check $? "the pane has a border" "$(head -8 <<<"$pane_mid")"
+pane_lines="$(grep -cE '^  \| ' <<<"$pane_mid" || true)"
+check "$([[ "${pane_lines:-0}" -ge 4 ]] && echo 0 || echo 1)" \
+    "and shows several of the step's own lines, not one ($pane_lines)" "$(grep -E '^  \|' <<<"$pane_mid" | head -3)"
+grep -qE '^  \|    Compiling crate-number-[0-9]' <<<"$pane_mid"
+check $? "and they are what the step actually printed"
+# The TAIL, not the head: what is on screen is the END of what was printed, so
+# the numbers on it are consecutive and the highest is not among the first few.
+pane_max="$(grep -oE 'crate-number-([0-9]+)' <<<"$pane_mid" | grep -oE '[0-9]+$' | sort -n | tail -1)"
+pane_min="$(grep -oE 'crate-number-([0-9]+)' <<<"$pane_mid" | grep -oE '[0-9]+$' | sort -n | head -1)"
+check "$([[ -n "$pane_max" && "$pane_max" -ge 4 && $(( pane_max - pane_min )) -le 4 ]] && echo 0 || echo 1)" \
+    "it is the TAIL — the newest lines, scrolling as they arrive (showing $pane_min..$pane_max)"
+
+# The noisy line — colour, a cursor move, a tab, a carriage return and 300
+# characters — reaches the pane stripped and cut, and the border below it is
+# still whole. Asserted on the transcript, where the pane exists.
+noisy="$(LC_ALL=C grep -aoE '\| REDmoved tabbed returned W+ \|' "$WORK/pane.raw" | head -1)"
+check "$([[ -n "$noisy" ]] && echo 0 || echo 1)" \
+    "colour, cursor moves, tabs and carriage returns are stripped before the pane draws" "$noisy"
+check "$([[ "${#noisy}" -le 44 ]] && echo 0 || echo 1)" \
+    "and a 300-character line is cut to the pane's width (${#noisy} columns)"
+after_noisy="$(LC_ALL=C grep -aA1 -E 'REDmoved' "$WORK/pane.raw" | tail -1)"
+grep -qE '\+-+\+' <<<"$after_noisy"
+check $? "the border below it is whole" "$after_noisy"
+pane_end="$(python3 "$REPO/scripts/lib/render_pty.py" "$WORK/pane.raw" --cols 100 --rows 30)"
+grep -q 'Compiling crate-number' <<<"$pane_end" && r=1 || r=0
+check $r "the pane is emptied when the step changes"
+grep -q 'Compiling crate-number-8' "$WORK/plog"
+check $? "and everything it showed is in the log" "$(ls "$WORK" | tr '\n' ' ')"
 
 # 4e. WITH NO LIVE SCREEN — what a terminal that cannot hold one gets, which is
 #     what the Product Owner keeps getting. It has to look right there too.

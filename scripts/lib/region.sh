@@ -41,11 +41,14 @@ NEMR_REGION_CAT_ROWS=15
 NEMR_REGION_GAP=2
 NEMR_REGION_LEFT_COLS=40      # "  installing the privileged helper" is 34
 NEMR_REGION_BAR_CELLS=18
+NEMR_REGION_PANE_ROWS=5       # lines of the step's own output, inside a border
+NEMR_REGION_PANE_TOP=5        # the pane's border starts here (rows 0-4 above it)
 NEMR_REGION_MIN_COLS=$((NEMR_REGION_LEFT_COLS + NEMR_REGION_GAP + NEMR_REGION_CAT_COLS))
 NEMR_REGION_MIN_ROWS=$((NEMR_REGION_CAT_ROWS + 3))
 
 _NEMR_REGION_PID=""
 _NEMR_REGION_STATE=""
+_NEMR_REGION_TAIL=""
 _NEMR_REGION_STOP=""
 _NEMR_REGION_HID=""
 
@@ -102,36 +105,90 @@ _nemr_region_take_screen() {
     printf '\033[2;1H'                         # under the command line
 }
 
-# The bar. Solid and light blocks where the terminal can show them, ASCII where
-# it cannot — both are single-width, which is the property that matters inside a
-# fixed-width column. (Emoji are not: they are double-width and inconsistent,
-# which is why the marks outside the region never come in here.)
-if [[ "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" == *[Uu][Tt][Ff]* ]]; then
-    _NEMR_BAR_FULL="█"; _NEMR_BAR_EMPTY="░"
-else
-    _NEMR_BAR_FULL="#"; _NEMR_BAR_EMPTY="-"
-fi
+# The bar, in characters every font has.
+#
+# It was drawn with U+2588 FULL BLOCK and U+2591 LIGHT SHADE, and on Windows
+# Terminal it came out as one solid grey block (the Product Owner, 2026-09-10).
+# The bytes were correct — a capture from here shows "█████░░░░░░░░░░░░░  4 of
+# 14" — so the two characters were rendering as the same thing in that font, or
+# in whatever font was substituted for them. There is no way to ask a terminal
+# whether a glyph will render, so the only honest fix is not to need one: a bar
+# made of ASCII draws the same everywhere, which is worth more than a bar that
+# is prettier where the font happens to cooperate.
+_NEMR_BAR_FULL="#"
+_NEMR_BAR_EMPTY="-"
 
 _nemr_region_bar() {   # <done> <total>
     local done="$1" total="$2" filled i out=""
     (( total < 1 )) && total=1
     filled=$(( done * NEMR_REGION_BAR_CELLS / total ))
     (( filled > NEMR_REGION_BAR_CELLS )) && filled=$NEMR_REGION_BAR_CELLS
+    (( filled < 0 )) && filled=0
     for (( i = 0; i < NEMR_REGION_BAR_CELLS; i++ )); do
         if (( i < filled )); then out+="$_NEMR_BAR_FULL"; else out+="$_NEMR_BAR_EMPTY"; fi
     done
-    printf '%s  %d of %d' "$out" "$done" "$total"
+    # Bracketed, so the empty half is unmistakably part of the bar rather than
+    # trailing punctuation.
+    printf '[%s]  %d of %d' "$out" "$done" "$total"
 }
 
-# The four rows of the left column. ONE of them is the step running now, and it
-# is REPLACED, not appended to: at any moment the screen carries the current
-# step and nothing else. No list, no file names, no digests.
-_nemr_region_left() {   # <row> <phrase> <done> <total>
-    local row="$1" phrase="$2" done="$3" total="$4" text=""
+# THE OUTPUT PANE: the last few lines the CURRENT step actually printed — the
+# crate names while cargo builds, the packages while apt runs, the layers while
+# the image pulls. Bordered, fixed height, emptied when the step changes.
+#
+# Every line is contained before it is drawn: escape sequences stripped (a step
+# that prints colour or moves the cursor would otherwise write outside its own
+# pane and tear the region), carriage returns and tabs flattened, and the result
+# cut to the pane's inner width by CHARACTERS, not bytes, so a multi-byte glyph
+# is never sliced in half. If the step printed nothing the pane is empty; it
+# invents nothing to fill itself.
+_nemr_pane_inner=$((NEMR_REGION_LEFT_COLS - 6))
+
+_nemr_region_pane_line() {   # <row within the pane>
+    local n="$1" line=""
+    if (( n == 0 || n == NEMR_REGION_PANE_ROWS + 1 )); then
+        printf '  +%s+' "$(printf '%*s' "$((_nemr_pane_inner + 2))" "" | tr ' ' '-')"
+        return
+    fi
+    if [[ -n "$_NEMR_REGION_TAIL" && -s "$_NEMR_REGION_TAIL" ]]; then
+        # The last few lines that CARRY something. Blank lines are printed lines,
+        # but a pane of five that shows two of them is not the tail of anything.
+        #
+        # Then containment, in this order and for these reasons:
+        #   sed    removes escape sequences — a step that colours its output or
+        #          moves the cursor would otherwise write outside its own pane;
+        #   tr     removes every remaining control byte EXCEPT the newline —
+        #          deleting \012 as well collapses the whole tail into one line,
+        #          which is what it did the first time. Including a lone ESC:
+        #          The file is being written while this reads it, so the tail can
+        #          catch half an escape sequence; truncation then leaves a
+        #          dangling "\033[" that eats the pane's own border. Seen doing
+        #          exactly that (2026-09-10) — the border lost its right edge and
+        #          a stray "[2" appeared a row down.
+        line="$(grep -v '^[[:space:]]*$' "$_NEMR_REGION_TAIL" 2>/dev/null \
+                | tail -n "$NEMR_REGION_PANE_ROWS" \
+                | sed -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/\r/ /g' -e 's/\t/ /g' \
+                | LC_ALL=C tr -d '\000-\011\013-\037\177' \
+                | sed -n "${n}p")"
+    fi
+    line="${line:0:$_nemr_pane_inner}"
+    printf '  | %-*s |' "$_nemr_pane_inner" "$line"
+}
+
+# The left column. ONE line is the step running now, and it is REPLACED, not
+# appended to: at any moment the screen carries the current step and nothing
+# else. No list, no file names, no digests.
+_nemr_region_left() {   # <row> <phrase> <done> <total> <pane?>
+    local row="$1" phrase="$2" done="$3" total="$4" pane="$5" text=""
     case "$row" in
         0) text="$_NEMR_REGION_BRIGHT  Installing nemr...$_NEMR_REGION_RESET" ;;
         1) text="  $phrase" ;;
         3) text="  $(_nemr_region_bar "$done" "$total")" ;;
+        *)
+            if (( pane )) && (( row >= NEMR_REGION_PANE_TOP )) \
+               && (( row <= NEMR_REGION_PANE_TOP + NEMR_REGION_PANE_ROWS + 1 )); then
+                text="$_NEMR_REGION_DIM$(_nemr_region_pane_line "$((row - NEMR_REGION_PANE_TOP))")$_NEMR_REGION_RESET"
+            fi ;;
     esac
     # Padded to the column width, ignoring the escape sequences' own length.
     local visible="${text//$'\033'\[[0-9]m/}"
@@ -174,6 +231,11 @@ _nemr_region_loop() {
         height=${#cat_lines[@]}
         (( height > rows - 2 )) && height=$((rows - 2))
         (( height < 1 )) && height=1
+        # The pane only when the rows are there for it. It sits inside the cat's
+        # own height, so on any terminal tall enough for the region it costs
+        # nothing; this is what happens when the region is squeezed anyway.
+        local pane=0
+        (( height >= NEMR_REGION_PANE_TOP + NEMR_REGION_PANE_ROWS + 2 )) && pane=1
 
         if (( height > reserved )); then
             local k
@@ -185,7 +247,7 @@ _nemr_region_loop() {
 
         local r left right
         for (( r = 0; r < height; r++ )); do
-            left="$(_nemr_region_left "$r" "$phrase" "$done" "$total")"
+            left="$(_nemr_region_left "$r" "$phrase" "$done" "$total" "$pane")"
             right=""
             (( r < ${#cat_lines[@]} )) && right="${cat_lines[$r]}"
             printf '\033[2K%s%*s%s' "$left" "$NEMR_REGION_GAP" "" "$right"
@@ -209,10 +271,11 @@ _nemr_region_loop() {
     done
 }
 
-nemr_region_start() {
+nemr_region_start() {   # <state file> [<the current step's output file>]
     nemr_region_enabled || return 1
     [[ -n "$_NEMR_REGION_PID" ]] && return 0
     _NEMR_REGION_STATE="$1"
+    _NEMR_REGION_TAIL="${2:-}"
     : >"$_NEMR_REGION_STATE" 2>/dev/null \
         || { _NEMR_SCREEN_WHY="cannot write $_NEMR_REGION_STATE"; return 1; }
     _NEMR_REGION_STOP="$(mktemp -u "${TMPDIR:-/tmp}/nemr-region.XXXXXX")"

@@ -55,10 +55,12 @@ steps_seed() {   # <label>...
     _s_republish
 }
 
-# The step at $_S_IDX is the one running now.
+# The step at $_S_IDX is the one running now. Its output pane starts empty:
+# what the last step printed belongs to the last step.
 step_begin() {
     _S_STATES[$_S_IDX]="run"
     _S_TOKENS[$_S_IDX]="…"
+    [[ -n "${STEP_OUT:-}" ]] && : >"$STEP_OUT"
     _s_republish
 }
 
@@ -73,6 +75,12 @@ step_result() {   # <state> <token> <detail>
     # and the log path only when FAILED_STEP is set, and a step that failed
     # before something else set it left a resolved list with no reason on it.
     [[ "$state" == fail ]] && FAILED_STEP="$label"
+    # Everything the step printed joins the log, in order, then the pane's file
+    # is emptied for the next step.
+    if [[ -n "${STEP_OUT:-}" && -s "$STEP_OUT" ]]; then
+        cat "$STEP_OUT" >>"$LOG" 2>/dev/null || true
+        : >"$STEP_OUT"
+    fi
     printf '[%s] %s — %s\n' "$state" "$label" "$detail" >>"$LOG" 2>/dev/null || true
     if (( _S_REGION )); then
         _s_republish
@@ -177,17 +185,25 @@ open_log() { mkdir -p "$LOG_DIR"; : >>"$LOG"; }
 
 FAILED_STEP=""
 
+# WHERE A STEP'S OUTPUT GOES. To a file, always — never to the terminal, which
+# is the containment rule the region depends on. When STEP_OUT is set it goes
+# there first, so the live pane can show the tail of what THIS step printed, and
+# the whole of it is appended to the log when the step ends. The log therefore
+# reads exactly as it did before.
+_step_sink() { printf '%s' "${STEP_OUT:-$LOG}"; }
+
 # Run a command with its output in the log, never on the terminal.
 logged() {
-    printf '\n$ %s\n' "$*" >>"$LOG"
-    "$@" >>"$LOG" 2>&1
+    local sink; sink="$(_step_sink)"
+    printf '\n$ %s\n' "$*" >>"$sink"
+    "$@" >>"$sink" 2>&1
 }
 
 # A long step: the work runs in its own process and the cat plays beside it.
 # The install takes the same time whether or not a frame is ever drawn.
 logged_long() {
-    local rc=0
-    printf '\n$ %s\n' "$*" >>"$LOG"
+    local rc=0 sink; sink="$(_step_sink)"
+    printf '\n$ %s\n' "$*" >>"$sink"
     # A step can change the terminal's mode even with its output redirected:
     # the smoke test attaches to a session, and `nemr attach` puts the tty in
     # raw mode through /dev/tty. Save the settings and put them back, so what
@@ -197,17 +213,17 @@ logged_long() {
     [[ -t 1 ]] && tty_state="$(stty -g 2>/dev/null || true)"
     if (( _S_REGION )); then
         # The region draws the cat already, and it is the only writer.
-        "$@" >>"$LOG" 2>&1 &
+        "$@" >>"$sink" 2>&1 &
         local work=$!
         wait "$work" || rc=$?
     elif nemr_cat_enabled; then
-        "$@" >>"$LOG" 2>&1 &
+        "$@" >>"$sink" 2>&1 &
         local work=$!
         nemr_cat_start
         wait "$work" || rc=$?
         nemr_cat_stop
     else
-        "$@" >>"$LOG" 2>&1 || rc=$?
+        "$@" >>"$sink" 2>&1 || rc=$?
     fi
     [[ -n "$tty_state" ]] && stty "$tty_state" 2>/dev/null || true
     return "$rc"
@@ -276,7 +292,7 @@ sudo_refresh() {
     local ok=0
     sudo -v && ok=1
     if (( reopen )); then
-        nemr_region_start "$_NEMR_REGION_STATE_PATH" && nemr_region_publish "${_S_LINES[@]}"
+        nemr_region_start "$_NEMR_REGION_STATE_PATH" "${STEP_OUT:-}" && _s_republish
     fi
     (( ok )) || { FAILED_STEP="sudo"; cross "sudo refused"; exit 1; }
 }

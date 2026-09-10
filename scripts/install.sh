@@ -624,6 +624,10 @@ open_log
 # (129 columns, 17 rows) this returns non-zero and the block prints as it always
 # did, line by line.
 REGION_STATE="$LOG_DIR/region.$$"
+# The current step's own output: the pane tails it, and step_result folds it
+# into the log when the step ends.
+STEP_OUT="$LOG_DIR/step.$$"
+: >"$STEP_OUT" 2>/dev/null || STEP_OUT=""
 _NEMR_REGION_STATE_PATH="$REGION_STATE"   # so sudo_refresh can reopen it
 # Nothing may prompt while the region owns the screen, so the password is taken
 # BEFORE it opens and the timestamp is kept warm underneath it. Only when a
@@ -673,7 +677,7 @@ if (( VERBOSE )); then _NEMR_SCREEN_WHY="--verbose"; fi
     printf '               decides how far to scroll the screen into place\n\n'
 } >>"$LOG" 2>/dev/null || true
 
-if (( ! VERBOSE )) && nemr_region_start "$REGION_STATE"; then
+if (( ! VERBOSE )) && nemr_region_start "$REGION_STATE" "$STEP_OUT"; then
     _S_REGION=1
     # Seeded with every step, so the whole list is on screen from the first
     # frame: what is finished, what is running, what is still to come.
@@ -718,7 +722,7 @@ if (( _S_REGION )); then
     nemr_region_stop            # resolves to the final list; the cat is gone
     _S_REGION=0
     [[ -n "${SUDO_KEEPALIVE:-}" ]] && { kill "$SUDO_KEEPALIVE" 2>/dev/null; wait "$SUDO_KEEPALIVE" 2>/dev/null; }
-    rm -f "$REGION_STATE"
+    rm -f "$REGION_STATE" "$STEP_OUT"
     flush_notes
 fi
 
