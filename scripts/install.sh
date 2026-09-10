@@ -201,6 +201,8 @@ step_def engine     "the engine, built and installed (nemr, nemrd)"
 step_def helper     "the privileged volume helper and its sudoers grant"
 step_def client     "the client CLI (nemr ui, push, pull)"
 step_def image      "the base image $BASE_IMAGE"
+step_def claude     "Claude Code, a prerequisite (detected, never installed)"
+step_def verify     "the host passes the smoke test"
 
 missing_packages() {
     local p out=()
@@ -277,6 +279,12 @@ probe() {
         if ctr -n default images ls 2>/dev/null | grep -qF "$BASE_IMAGE"; then
             state=rebuild; detail="present; will check it is the recorded digest"
         else state=todo; detail="will pull: $BASE_IMAGE (digest ${BASE_DIGEST:0:19}…, ~332 MiB)"; fi ;;
+    claude)
+        if have claude; then detail="present at $(command -v claude)"
+        else state=todo; detail="NOT INSTALLED — nemr detects it and never installs it (D-13)"; fi ;;
+    verify)
+        state=rebuild
+        detail="runs scripts/e2e_smoke_test.sh: create, start, attach, stop, delete, host clean" ;;
     esac
     STEP_STATE["$id"]="$state"
     STEP_DETAIL["$id"]="$detail"
@@ -457,6 +465,25 @@ do_step() {
     image)
         logged_long ./scripts/fetch_base_image.sh || rc=$?
         (( rc == 0 )) && tick "$label — at the recorded digest ${BASE_DIGEST:7:12}" ;;
+    claude)
+        # Detected, never installed (D-13). Not a failure: everything else is
+        # finished, and this is the last piece the user provides.
+        if have claude; then
+            tick "$label — found at $(command -v claude)"
+        else
+            cross "$label — NOT INSTALLED"
+            note "Install Node from nodejs.org or your platform's packaging, then Claude"
+            note "Code from its own instructions. nemr does not install it for you (D-13)."
+        fi ;;
+    verify)
+        # An install is done when the host passes, not when commands exit zero.
+        # The API round-trip needs a login and this machine may have none yet by
+        # design — the login happens with /login inside a session (E-21, F-24).
+        if logged_long env NEMR_SKIP_API=1 ./scripts/e2e_smoke_test.sh; then
+            tick "$label — passed: create, start, attach, stop, delete, host left clean"
+        else
+            rc=1
+        fi ;;
     esac
 
     if (( rc != 0 )); then cross "$label"; exit "$rc"; fi
@@ -543,6 +570,10 @@ for id in "${STEP_IDS[@]}"; do
     [[ "$id" == "linger" ]] && reboot_gate
 done
 
+# ONE region for the WHOLE run. It used to stop here, and verification then drew
+# its own full-width cat below the resolved list, which scrolled the block away:
+# the layout was abandoned half way through the very run it exists for. The
+# smoke test and the Claude Code check are steps like any other now.
 if (( _S_REGION )); then
     nemr_region_stop            # resolves to the final list; the cat is gone
     _S_REGION=0
@@ -550,30 +581,6 @@ if (( _S_REGION )); then
     rm -f "$REGION_STATE"
     flush_notes
 fi
-
-# Claude Code: detected, never installed (D-13).
-if have claude; then
-    tick "Claude Code found at $(command -v claude)"
-else
-    cross "Claude Code is not installed — nemr needs it inside each session"
-    note "It is a prerequisite, not something nemr installs for you (D-13): install Node"
-    note "from nodejs.org or your platform's packaging, then Claude Code from its own"
-    note "instructions. Everything else here is finished; this is the last piece."
-fi
-
-head2 "Verifying"
-note "an install is done when the host passes, not when commands exit zero"
-FAILED_STEP="the smoke test"
-# The API round-trip needs a login, and this machine has none yet by design —
-# the login happens with /login inside a session (E-21, F-24). Everything else
-# the smoke test asserts runs: create, start, attach, stop, delete, host state.
-if logged_long env NEMR_SKIP_API=1 ./scripts/e2e_smoke_test.sh; then
-    tick "the smoke test passed: create, start, attach, stop, delete, and the host left clean"
-else
-    cross "the smoke test failed"
-    exit 1
-fi
-FAILED_STEP=""
 
 cat <<EOF
 
