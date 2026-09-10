@@ -39,10 +39,9 @@ _NEMR_REGION_SH_LOADED=1
 NEMR_REGION_CAT_COLS=37
 NEMR_REGION_CAT_ROWS=15
 NEMR_REGION_GAP=2
-NEMR_REGION_LABEL_COLS=29
-NEMR_REGION_STATUS_COLS=7
-NEMR_REGION_STEP_COLS=$((4 + NEMR_REGION_LABEL_COLS + 1 + NEMR_REGION_STATUS_COLS))
-NEMR_REGION_MIN_COLS=$((NEMR_REGION_STEP_COLS + NEMR_REGION_GAP + NEMR_REGION_CAT_COLS))
+NEMR_REGION_LEFT_COLS=40      # "  installing the privileged helper" is 34
+NEMR_REGION_BAR_CELLS=18
+NEMR_REGION_MIN_COLS=$((NEMR_REGION_LEFT_COLS + NEMR_REGION_GAP + NEMR_REGION_CAT_COLS))
 NEMR_REGION_MIN_ROWS=$((NEMR_REGION_CAT_ROWS + 3))
 
 _NEMR_REGION_PID=""
@@ -53,10 +52,14 @@ _NEMR_REGION_HID=""
 nemr_region_enabled() {
     nemr_cat_enabled || return 1
     local size rows cols
-    size="$(nemr_term_size)" || return 1
+    size="$(nemr_term_size)" || { _NEMR_SCREEN_WHY="the terminal would not report its size"; return 1; }
     rows="${size% *}"; cols="${size#* }"
-    (( cols >= NEMR_REGION_MIN_COLS )) || return 1
-    (( rows >= NEMR_REGION_MIN_ROWS )) || return 1
+    NEMR_SCREEN_MEASURED="$cols cols x $rows rows"
+    (( cols >= NEMR_REGION_MIN_COLS )) \
+        || { _NEMR_SCREEN_WHY="$cols columns, the screen needs $NEMR_REGION_MIN_COLS"; return 1; }
+    (( rows >= NEMR_REGION_MIN_ROWS )) \
+        || { _NEMR_SCREEN_WHY="$rows rows, the screen needs $NEMR_REGION_MIN_ROWS"; return 1; }
+    _NEMR_SCREEN_WHY=""
     return 0
 }
 
@@ -99,22 +102,41 @@ _nemr_region_take_screen() {
     printf '\033[2;1H'                         # under the command line
 }
 
-# One step line: "  <glyph> <label padded> <status right-aligned>", coloured by
-# state. Colour only when the caller says the terminal takes it.
-_nemr_region_line() {   # <state> <label> <status>
-    local state="$1" label="$2" status="$3" glyph=" " colour="" reset=""
-    case "$state" in
-        done) glyph="+"; colour="$_NEMR_REGION_GREEN" ;;
-        run)  glyph=">"; colour="$_NEMR_REGION_BRIGHT" ;;
-        wait) glyph="."; colour="$_NEMR_REGION_DIM" ;;
-        fail) glyph="x"; colour="$_NEMR_REGION_RED"; status="FAILED" ;;
-        warn) glyph="!"; colour="$_NEMR_REGION_AMBER" ;;
+# The bar. Solid and light blocks where the terminal can show them, ASCII where
+# it cannot — both are single-width, which is the property that matters inside a
+# fixed-width column. (Emoji are not: they are double-width and inconsistent,
+# which is why the marks outside the region never come in here.)
+if [[ "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" == *[Uu][Tt][Ff]* ]]; then
+    _NEMR_BAR_FULL="█"; _NEMR_BAR_EMPTY="░"
+else
+    _NEMR_BAR_FULL="#"; _NEMR_BAR_EMPTY="-"
+fi
+
+_nemr_region_bar() {   # <done> <total>
+    local done="$1" total="$2" filled i out=""
+    (( total < 1 )) && total=1
+    filled=$(( done * NEMR_REGION_BAR_CELLS / total ))
+    (( filled > NEMR_REGION_BAR_CELLS )) && filled=$NEMR_REGION_BAR_CELLS
+    for (( i = 0; i < NEMR_REGION_BAR_CELLS; i++ )); do
+        if (( i < filled )); then out+="$_NEMR_BAR_FULL"; else out+="$_NEMR_BAR_EMPTY"; fi
+    done
+    printf '%s  %d of %d' "$out" "$done" "$total"
+}
+
+# The four rows of the left column. ONE of them is the step running now, and it
+# is REPLACED, not appended to: at any moment the screen carries the current
+# step and nothing else. No list, no file names, no digests.
+_nemr_region_left() {   # <row> <phrase> <done> <total>
+    local row="$1" phrase="$2" done="$3" total="$4" text=""
+    case "$row" in
+        0) text="$_NEMR_REGION_BRIGHT  Installing nemr...$_NEMR_REGION_RESET" ;;
+        1) text="  $phrase" ;;
+        3) text="  $(_nemr_region_bar "$done" "$total")" ;;
     esac
-    [[ -n "$colour" ]] && reset="$_NEMR_REGION_RESET"
-    label="${label:0:$NEMR_REGION_LABEL_COLS}"
-    status="${status:0:$NEMR_REGION_STATUS_COLS}"
-    printf '%s  %s %-*s %*s%s' "$colour" "$glyph" \
-        "$NEMR_REGION_LABEL_COLS" "$label" "$NEMR_REGION_STATUS_COLS" "$status" "$reset"
+    # Padded to the column width, ignoring the escape sequences' own length.
+    local visible="${text//$'\033'\[[0-9]m/}"
+    visible="$(printf '%s' "$text" | sed 's/\x1b\[[0-9;]*m//g')"
+    printf '%s%*s' "$text" "$(( NEMR_REGION_LEFT_COLS - ${#visible} ))" ""
 }
 
 # The renderer.
@@ -138,25 +160,20 @@ _nemr_region_loop() {
 
     local reserved=0
     while :; do
-        local steps=() s
-        # Guarded, not silenced with 2>/dev/null on the read: a redirect that
-        # fails reports on stderr before the read ever runs, and that message
-        # lands in the middle of the region. It did (2026-09-10, first frame,
-        # before the first publish).
+        local phrase="" done=0 total=1 line2
         if [[ -r "$_NEMR_REGION_STATE" ]]; then
-            while IFS= read -r s; do steps+=("$s"); done <"$_NEMR_REGION_STATE"
+            IFS=$'\t' read -r phrase done total < "$_NEMR_REGION_STATE"
         fi
+        [[ "$done" =~ ^[0-9]+$ ]] || done=0
+        [[ "$total" =~ ^[0-9]+$ ]] || total=1
 
         local cat_lines=()
         while IFS= read -r line; do cat_lines+=("$line"); done \
             < <(printf '%s' "${frames[$((i % n))]}")
 
-        local want=${#steps[@]}
-        (( ${#cat_lines[@]} > want )) && want=${#cat_lines[@]}
-        (( want > rows - 2 )) && want=$((rows - 2))
-        (( want < 1 )) && want=1
-        height=$want
-        last_height=$height
+        height=${#cat_lines[@]}
+        (( height > rows - 2 )) && height=$((rows - 2))
+        (( height < 1 )) && height=1
 
         if (( height > reserved )); then
             local k
@@ -166,35 +183,12 @@ _nemr_region_loop() {
             reserved=$((height - 1))
         fi
 
-        # A window over the steps when the list is taller than the region,
-        # anchored on the end, so the step running now is always visible.
-        local first=0 hidden=0
-        if (( ${#steps[@]} > height )); then
-            first=$(( ${#steps[@]} - height ))
-            hidden=$first
-        fi
-
-        local r left right state label status
+        local r left right
         for (( r = 0; r < height; r++ )); do
-            left=""
-            if (( r == 0 && hidden > 0 )); then
-                # Says how many are above, in the label's budget. The steps
-                # above are not hidden — they are in scrollback once the region
-                # resolves, and this line is what points at them.
-                left="$(_nemr_region_line wait "… $hidden more above" "")"
-            elif (( first + r < ${#steps[@]} )); then
-                IFS=$'\t' read -r state label status <<<"${steps[$((first + r))]}"
-                left="$(_nemr_region_line "$state" "$label" "$status")"
-            else
-                left="$(printf '%*s' "$NEMR_REGION_STEP_COLS" "")"
-            fi
+            left="$(_nemr_region_left "$r" "$phrase" "$done" "$total")"
             right=""
             (( r < ${#cat_lines[@]} )) && right="${cat_lines[$r]}"
-            if [[ -n "$right" ]]; then
-                printf '\033[2K%s%*s%s' "$left" "$NEMR_REGION_GAP" "" "$right"
-            else
-                printf '\033[2K%s' "$left"
-            fi
+            printf '\033[2K%s%*s%s' "$left" "$NEMR_REGION_GAP" "" "$right"
             if (( r < height - 1 )); then
                 printf '\r\n'      # never a bare \n: a step can leave the tty raw
                 written=$((written + 1))
@@ -206,11 +200,9 @@ _nemr_region_loop() {
         written=0
         i=$((i + 1))
         if read -r -t "$NEMR_CAT_DELAY" -u 9 _; then
-            # Erase the block and go. The RESOLVE — printing the list as
-            # ordinary text — belongs to the main shell, because Ctrl-C reaches
-            # the whole process group and this renderer dies with it. A resolve
-            # that only the renderer could perform is a resolve that does not
-            # happen on the one exit that most needs it.
+            # Erase the block and go. What replaces it — the result, in four
+            # lines — is the main shell's to print, because Ctrl-C reaches the
+            # whole process group and kills this renderer outright.
             printf '\r\033[J'
             break
         fi
@@ -221,9 +213,13 @@ nemr_region_start() {
     nemr_region_enabled || return 1
     [[ -n "$_NEMR_REGION_PID" ]] && return 0
     _NEMR_REGION_STATE="$1"
-    : >"$_NEMR_REGION_STATE" 2>/dev/null || return 1   # exists before a frame reads it
+    : >"$_NEMR_REGION_STATE" 2>/dev/null \
+        || { _NEMR_SCREEN_WHY="cannot write $_NEMR_REGION_STATE"; return 1; }
     _NEMR_REGION_STOP="$(mktemp -u "${TMPDIR:-/tmp}/nemr-region.XXXXXX")"
-    mkfifo -m 0600 "$_NEMR_REGION_STOP" 2>/dev/null || { _NEMR_REGION_STOP=""; return 1; }
+    # A fifo cannot live on a Windows drive under WSL2, and TMPDIR sometimes
+    # points at one — a silent fallback on exactly the platform that reported one.
+    mkfifo -m 0600 "$_NEMR_REGION_STOP" 2>/dev/null \
+        || { _NEMR_SCREEN_WHY="no fifo in ${TMPDIR:-/tmp}"; _NEMR_REGION_STOP=""; return 1; }
     # Colour is decided once, here, by the same rules the animation follows.
     if [[ -t 1 && -z "${NO_COLOR:-}" ]] && [[ "${TERM:-dumb}" != "dumb" ]]; then
         _NEMR_REGION_GREEN=$'\033[32m'; _NEMR_REGION_BRIGHT=$'\033[1m'
@@ -241,28 +237,17 @@ nemr_region_start() {
     return 0
 }
 
-# Publish the step list: one "<state>\t<label>\t<status>" per line, written to a
-# temp and renamed so a frame never reads half an update.
-nemr_region_publish() {
+# Publish what is happening now: the phrase, and how many steps are done out of
+# how many. Written to a temp and renamed, so a frame never reads half of it.
+nemr_region_publish() {   # <phrase> <done> <total>
     [[ -n "$_NEMR_REGION_STATE" ]] || return 0
     local tmp="${_NEMR_REGION_STATE}.new"
-    printf '%s\n' "$@" >"$tmp" && mv -f "$tmp" "$_NEMR_REGION_STATE"
+    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >"$tmp" && mv -f "$tmp" "$_NEMR_REGION_STATE"
 }
 
-# Print the step list as ordinary scrollback text. This is the resolve, and the
-# main shell does it — after the renderer has gone — so it happens identically
-# whether the run finished, a step failed, or Ctrl-C killed the renderer
-# outright. What is on the screen afterwards is text: scrollable, copyable, and
-# still there when the script has exited.
-_nemr_region_resolve() {
-    [[ -r "$_NEMR_REGION_STATE" ]] || return 0
-    local s state label status
-    while IFS= read -r s; do
-        IFS=$'\t' read -r state label status <<<"$s"
-        printf '%s\r\n' "$(_nemr_region_line "$state" "$label" "$status")"
-    done <"$_NEMR_REGION_STATE"
-}
-
+# Nothing to resolve into: the live block is erased and the RESULT is printed
+# after it by the caller, in four lines. The step list it used to resolve into
+# is gone with the narration (SPEC 1.145).
 nemr_region_stop() {
     if [[ -n "$_NEMR_REGION_PID" ]]; then
         printf 's\n' >&7 2>/dev/null || true
@@ -272,7 +257,6 @@ nemr_region_stop() {
             wait "$_NEMR_REGION_PID" 2>/dev/null
         }
         exec 7>&- 2>/dev/null || true
-        _nemr_region_resolve
         rm -f "$_NEMR_REGION_STOP" "${_NEMR_REGION_STATE}.new"
         _NEMR_REGION_PID=""
         _NEMR_REGION_STOP=""

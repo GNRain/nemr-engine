@@ -62,7 +62,7 @@ while (($#)); do
     case "$1" in
         -y|--yes)   YES=1 ;;
         -q|--quiet) NEMR_CAT=0 ;;
-        -v|--verbose) VERBOSE=1; NEMR_CAT=0 ;;
+        -v|--verbose) VERBOSE=1; _S_VERBOSE=1; NEMR_CAT=0 ;;
         -h|--help)  usage; exit 0 ;;
         *) printf 'install.sh: unknown option %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -79,6 +79,7 @@ export PATH="$HOME/.local/bin:$PATH"
 is_wsl2() { grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+DEST_BIN="${NEMR_INSTALLED_BIN:-$HOME/.local/bin/nemr}"
 BASE_IMAGE="$(nemr_base_image)"
 BASE_VERSION="${BASE_IMAGE##*:}"
 BASE_DIGEST="$(cat "image/digests/${BASE_VERSION}" 2>/dev/null || true)"
@@ -191,29 +192,30 @@ preflight() {
 STEP_IDS=()
 declare -A STEP_LABEL=() STEP_PLAN=() STEP_STATE=() STEP_DETAIL=()
 
-# <id> <short label for the region, <=29> <the full name, for the plan>
+# <id> <what it is doing, in plain words> <the full name, for the plan>
 #
-# Two names on purpose. The region is a progress display with a 29-column
-# budget; the plan above it is where a step is explained, and it is printed in
-# full before the question that consents to the run (D-14). Trading the long
-# names for a layout at 80 columns was the Product Owner's call, 2026-09-10.
+# Two names on purpose. The screen says what is happening right now — "building
+# the engine" — and nothing else; the plan, printed in full before the question
+# that consents to the run, is where a step is explained (D-14). The default
+# REPORTS THE RESULT; it does not narrate the work (the Product Owner,
+# 2026-09-10, comparing this to Claude Code's own installer: four lines).
 step_def() { STEP_IDS+=("$1"); STEP_LABEL["$1"]="$2"; STEP_PLAN["$1"]="${3:-$2}"; }
 
-step_def packages        "packages" "packages from the Ubuntu archive"
-step_def containerd_off  "system containerd off" "the system-wide root containerd, disabled"
-is_wsl2 && step_def propagation     "mount propagation (WSL2)" "shared mount propagation (WSL2)"
-step_def subids          "subuid/subgid ranges" "subuid/subgid ranges for $USER_NAME"
-step_def delegation      "cgroup v2 delegation" "cgroup v2 controller delegation"
-step_def linger          "lingering" "lingering, so the user manager runs without a login"
-step_def units           "user units" "the rootless containerd and nemrd user units"
-step_def daemons         "rootless containerd" "rootless containerd, running"
-step_def shellenv        "shell environment" "PATH and CONTAINERD_ADDRESS in ~/.bashrc"
-step_def engine          "the engine (nemr, nemrd)" "the engine, built and installed (nemr, nemrd)"
-step_def helper          "helper + sudoers grant" "the privileged volume helper and its sudoers grant"
-step_def client          "client CLI (ui, push, pull)" "the client CLI (nemr ui, push, pull)"
-step_def image           "base image" "the base image $BASE_IMAGE"
-step_def claude          "Claude Code (prerequisite)" "Claude Code, a prerequisite (detected, never installed)"
-step_def verify          "smoke test" "the host passes the smoke test"
+step_def packages        "installing packages" "packages from the Ubuntu archive"
+step_def containerd_off  "disabling the system containerd" "the system-wide root containerd, disabled"
+is_wsl2 && step_def propagation     "making the mount shared" "shared mount propagation (WSL2)"
+step_def subids          "adding subuid/subgid ranges" "subuid/subgid ranges for $USER_NAME"
+step_def delegation      "delegating cgroup controllers" "cgroup v2 controller delegation"
+step_def linger          "enabling lingering" "lingering, so the user manager runs without a login"
+step_def units           "installing the user units" "the rootless containerd and nemrd user units"
+step_def daemons         "starting rootless containerd" "rootless containerd, running"
+step_def shellenv        "updating the shell environment" "PATH and CONTAINERD_ADDRESS in ~/.bashrc"
+step_def engine          "building the engine" "the engine, built and installed (nemr, nemrd)"
+step_def helper          "installing the privileged helper" "the privileged volume helper and its sudoers grant"
+step_def client          "building the client" "the client CLI (nemr ui, push, pull)"
+step_def image           "pulling the base image" "the base image $BASE_IMAGE"
+step_def claude          "checking for Claude Code" "Claude Code, a prerequisite (detected, never installed)"
+step_def verify          "running the smoke test" "the host passes the smoke test"
 
 missing_packages() {
     local p out=()
@@ -385,6 +387,7 @@ do_step() {
     #   NEMR_TEST_FAIL_STEP   fail this step, to exercise the failure path.
     if [[ "${NEMR_TEST_FAIL_STEP:-}" == "$id" ]]; then
         step_result fail "FAILED" "forced by NEMR_TEST_FAIL_STEP — see $LOG"
+        step_diagnosis "$id"
         exit 1
     fi
     if [[ -n "${NEMR_TEST_STEP_STUB:-}" ]]; then
@@ -528,9 +531,47 @@ do_step() {
         fi ;;
     esac
 
-    if (( rc != 0 )); then step_result fail "FAILED" "see $LOG"; exit "$rc"; fi
+    if (( rc != 0 )); then
+        step_result fail "FAILED" "see $LOG"
+        step_diagnosis "$id"
+        exit "$rc"
+    fi
     FAILED_STEP=""
     return 0
+}
+
+# WHY IT STOPPED, in plain words, and the command that fixes it.
+#
+# Two sources: what the step itself knows, and a handful of causes that can be
+# read out of the log. Anything unrecognised says so and points at the log —
+# a guess dressed as a diagnosis is worse than "read this".
+step_diagnosis() {
+    local id="$1" because fix tail
+    tail="$(tail -60 "$LOG" 2>/dev/null || true)"
+    case "$tail" in
+        *"iptables"*"not found"*|*"iptables: command not found"*)
+            because="iptables is missing"; fix="sudo apt install iptables, then run this again" ;;
+        *"No space left on device"*)
+            because="the disk is full"; fix="free some space, then run this again" ;;
+        *"Could not resolve host"*|*"Temporary failure in name resolution"*)
+            because="this machine cannot reach the network"; fix="restore network access, then run this again" ;;
+        *"Permission denied"*"sudoers"*|*"is not in the sudoers file"*)
+            because="this account may not use sudo"; fix="ask an administrator for sudo, then run this again" ;;
+        *"denied"*"ghcr.io"*|*"unauthorized"*)
+            because="ghcr.io refused the base image"; fix="check network access to ghcr.io, then run this again" ;;
+        *)
+            case "$id" in
+                packages)  because="apt could not install the packages"; fix="read the log below, fix the cause, then run this again" ;;
+                engine|client) because="the build failed"; fix="cargo build --release, read the error, then run this again" ;;
+                helper)    because="the privileged helper would not install"; fix="sudo ./scripts/setup_test_host.sh, then run this again" ;;
+                image)     because="the base image could not be obtained"; fix="./scripts/fetch_base_image.sh, then run this again" ;;
+                verify)    because="the host did not pass its own smoke test"; fix="read the log below — it names the assertion that failed" ;;
+                *)         because="the step did not succeed"; fix="read the log below, then run this again" ;;
+            esac ;;
+    esac
+    RESULT_FAILED_STEP="${STEP_LABEL[$id]}"
+    RESULT_BECAUSE="$because"
+    RESULT_FIX="$fix"
 }
 
 # The reboot gate, surfaced rather than hidden: delegation applies when
@@ -562,11 +603,21 @@ EOF
 # ---------------------------------------------------------------------------
 steps_trap
 preflight
-show_plan
+
+# THE PLAN IS THE CONSENT, and only that. An interactive run prints it in full
+# and asks; --verbose prints it because --verbose prints everything; a run that
+# already said --yes has consented, so it gets the screen and not the recital.
+# That recital was most of the hundred lines this used to print (the Product
+# Owner, 2026-09-10: "ours narrates the work where theirs reports the result").
+if (( ! YES )) || (( VERBOSE )); then
+    show_plan
+else
+    for id in "${STEP_IDS[@]}"; do probe "$id"; done
+fi
 nemr_consent "$YES" "./scripts/install.sh"
 
 open_log
-head2 "Installing"
+(( VERBOSE )) && head2 "Installing"
 
 # The live region (F-27): the step lines on the left, redrawn in place, and the
 # cat looping beside them — one writer, nothing scrolling. Below its thresholds
@@ -595,6 +646,33 @@ done
 if nemr_region_enabled && (( PRIVILEGED_PENDING )); then
     sudo_refresh
 fi
+# WHY THE SCREEN IS OR IS NOT LIVE — written to the log on EVERY run, because a
+# report that "the two-column region did not render" could not be answered from
+# here: the log was identical either way, and every one of the refusals was
+# silent (measured, 2026-09-10). This block is what makes the next such report
+# answerable by reading the log the reporter already has.
+if (( VERBOSE )); then _NEMR_SCREEN_WHY="--verbose"; fi
+{
+    printf '\n--- install screen\n'
+    if (( ! VERBOSE )) && nemr_region_enabled; then
+        printf '    live:      yes\n'
+    else
+        printf '    live:      NO — %s\n' "${_NEMR_SCREEN_WHY:-unknown}"
+    fi
+    _screen_size="$(nemr_term_size 2>/dev/null || true)"
+    printf '    measured:  %s   by: %s\n' \
+        "${NEMR_SCREEN_MEASURED:-${_screen_size:+${_screen_size#* } cols x ${_screen_size%% *} rows}}" \
+        "$(stty size </dev/tty >/dev/null 2>&1 && echo 'stty /dev/tty' || echo 'tput/terminfo')"
+    printf '    needs:     %s cols x %s rows\n' "$NEMR_REGION_MIN_COLS" "$NEMR_REGION_MIN_ROWS"
+    printf '    terminal:  TERM=%s  tty=%s  NO_COLOR=%s  NEMR_CAT=%s\n' \
+        "${TERM:-unset}" "$([[ -t 1 ]] && echo yes || echo no)" \
+        "${NO_COLOR:-unset}" "${NEMR_CAT:-unset}"
+    printf '    host:      %s  TMPDIR=%s\n' \
+        "$(is_wsl2 && echo WSL2 || echo linux)" "${TMPDIR:-/tmp}"
+    printf '    note:      the cursor query (DSR) does not gate this — it only\n'
+    printf '               decides how far to scroll the screen into place\n\n'
+} >>"$LOG" 2>/dev/null || true
+
 if (( ! VERBOSE )) && nemr_region_start "$REGION_STATE"; then
     _S_REGION=1
     # Seeded with every step, so the whole list is on screen from the first
@@ -602,10 +680,23 @@ if (( ! VERBOSE )) && nemr_region_start "$REGION_STATE"; then
     region_labels=()
     for id in "${STEP_IDS[@]}"; do region_labels+=("${STEP_LABEL[$id]}"); done
     steps_seed "${region_labels[@]}"
+    _s_republish
     if (( PRIVILEGED_PENDING )); then
         ( while kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null || exit 0; sleep 45; done ) &
         SUDO_KEEPALIVE=$!
     fi
+else
+    # One line, and only when the reason is the terminal rather than the user's
+    # own instruction: --quiet, --verbose and a pipe are choices, and a pipe is
+    # where noise costs most. A successful default run gains nothing.
+    case "${_NEMR_SCREEN_WHY:-}" in
+        ""|"--verbose"|quiet*|not-a-tty*) ;;
+        # Short enough to fit the terminal that just refused the screen: at 70
+        # columns a line naming the log path wraps, which is a poor first
+        # impression from the very message explaining a layout problem.
+        *) printf '  %sno live screen — %s (see the log)%s\n\n' \
+               "$_S_DIM" "$_NEMR_SCREEN_WHY" "$_S_RESET" ;;
+    esac
 fi
 
 # In append-only mode the list still exists — step_result prints from it.
@@ -631,13 +722,8 @@ if (( _S_REGION )); then
     flush_notes
 fi
 
-cat <<EOF
-
-nemr is installed.
-
-  nemr create myproject     make a session and attach to it
-  nemr ui                   the same thing in a browser
-
-Inside a session, run /login the first time — that logs this machine in, and
-the login stays here (it is never copied into a bundle or to another machine).
-EOF
+# The result, and only the result. Everything the run did is in the log, and
+# --verbose prints it as it happens.
+NEMR_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+have claude || CLAUDE_MISSING=1
+result_ok "${NEMR_VERSION:-unknown}" "${DEST_BIN/#$HOME/\~}" "${CLAUDE_MISSING:-}"

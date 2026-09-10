@@ -14,9 +14,9 @@
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     _S_GREEN=$'\033[32m'; _S_RED=$'\033[31m'; _S_DIM=$'\033[2m'; _S_RESET=$'\033[0m'
-    _S_AMBER=$'\033[33m'
+    _S_AMBER=$'\033[33m'; _S_BRIGHT=$'\033[1m'
 else
-    _S_GREEN=""; _S_RED=""; _S_DIM=""; _S_RESET=""; _S_AMBER=""
+    _S_GREEN=""; _S_RED=""; _S_DIM=""; _S_RESET=""; _S_AMBER=""; _S_BRIGHT=""
 fi
 
 # When a live region owns the screen (scripts/lib/region.sh), these do not
@@ -36,13 +36,15 @@ _S_LABELS=()
 _S_STATES=()
 _S_TOKENS=()
 
+# What the live line says right now, and how far along the run is. ONE line,
+# replaced — never a list that grows (the Product Owner, 2026-09-10).
 _s_republish() {
     (( _S_REGION )) || return 0
-    local out=() i
-    for i in "${!_S_LABELS[@]}"; do
-        out+=("$(printf '%s\t%s\t%s' "${_S_STATES[$i]}" "${_S_LABELS[$i]}" "${_S_TOKENS[$i]}")")
+    local done=0 i
+    for i in "${!_S_STATES[@]}"; do
+        case "${_S_STATES[$i]}" in done|warn|fail) done=$((done + 1)) ;; esac
     done
-    nemr_region_publish "${out[@]}"
+    nemr_region_publish "${_S_LABELS[$_S_IDX]:-}" "$done" "${#_S_LABELS[@]}"
 }
 
 # Seed the list, all pending.
@@ -74,11 +76,21 @@ step_result() {   # <state> <token> <detail>
     printf '[%s] %s — %s\n' "$state" "$label" "$detail" >>"$LOG" 2>/dev/null || true
     if (( _S_REGION )); then
         _s_republish
-    else
+    elif (( ${_S_VERBOSE:-0} )); then
+        # --verbose: every line the old run showed, detail and all.
         case "$state" in
-            done) printf '  %s✓%s %s — %s\n' "$_S_GREEN" "$_S_RESET" "$label" "$detail" ;;
+            done) printf '  %s+%s %s — %s\n' "$_S_GREEN" "$_S_RESET" "$label" "$detail" ;;
             warn) printf '  %s!%s %s — %s\n' "$_S_AMBER" "$_S_RESET" "$label" "$detail" ;;
-            *)    printf '  %s✗%s %s — %s\n' "$_S_RED" "$_S_RESET" "$label" "$detail" ;;
+            *)    printf '  %s%sx%s %s — %s\n' "$_S_RED" "$_S_BRIGHT" "$_S_RESET" "$label" "$detail" ;;
+        esac
+    else
+        # The default with no live region — which is what a terminal that cannot
+        # hold one gets, and it has to look right there too: the step in plain
+        # words and a short token, never the detail. The detail is in the log.
+        case "$state" in
+            done) printf '  %s%-34s %s%s\n' "$_S_GREEN" "$label" "$token" "$_S_RESET" ;;
+            warn) printf '  %s%-34s %s%s\n' "$_S_AMBER" "$label" "$token" "$_S_RESET" ;;
+            *)    printf '  %s%-34s %s%s\n' "$_S_RED" "$label" "FAILED" "$_S_RESET" ;;
         esac
     fi
 }
@@ -108,6 +120,43 @@ note()  {
     else
         printf '    %s%s%s\n' "$_S_DIM" "$1" "$_S_RESET"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# The result. Four lines on success, four on failure — the shape of Claude
+# Code's own installer, which reports the result where this used to narrate the
+# work (the Product Owner, 2026-09-10). Everything else is behind --verbose.
+#
+# The marks live OUT HERE, never in the live region: ✓ ✗ ⚠ are double-width in
+# some terminals and render inconsistently in others, which is exactly what
+# tears a fixed-width two-column layout. When colour is off they go too,
+# replaced by plain ASCII.
+# ---------------------------------------------------------------------------
+_S_MARK_OK="✓"; _S_MARK_BAD="✗"; _S_MARK_WARN="⚠"
+if [[ -z "$_S_GREEN" ]]; then _S_MARK_OK="OK"; _S_MARK_BAD="XX"; _S_MARK_WARN="!!"; fi
+
+result_ok() {   # <version> <installed path> [claude-missing]
+    printf '\n%s%s%s %snemr is installed.%s\n\n' \
+        "$_S_GREEN" "$_S_MARK_OK" "$_S_RESET" "$_S_BRIGHT" "$_S_RESET"
+    printf '      Version:   %s\n' "$1"
+    printf '      Installed: %s\n\n' "$2"
+    printf '    Try:  nemr create myproject\n'
+    printf '          nemr ui\n'
+    if [[ -n "${3:-}" ]]; then
+        printf '\n  %s%s%s Claude Code isn'"'"'t installed yet — nemr needs it inside each\n' \
+            "$_S_AMBER" "$_S_MARK_WARN" "$_S_RESET"
+        printf '    session. See claude.ai/code\n'
+    fi
+    printf '\n'
+}
+
+result_failed() {   # <step> <because> <fix>
+    printf '\n%s%s%s %sInstall stopped.%s\n\n' \
+        "$_S_RED" "$_S_MARK_BAD" "$_S_RESET" "$_S_BRIGHT" "$_S_RESET"
+    printf '      Failed at:  %s\n' "$1"
+    printf '      Because:    %s\n' "$2"
+    printf '      Fix:        %s\n\n' "$3"
+    printf '    Full log: %s\n\n' "${LOG/#$HOME/\~}"
 }
 
 # Print anything the region held back, once it has resolved.
@@ -179,12 +228,12 @@ _steps_cleanup() {
     nemr_region_stop 2>/dev/null || true
     nemr_cat_stop
     if [[ -n "$FAILED_STEP" ]]; then
-        printf '\n%sStopped at: %s%s\n' "$_S_RED" "$FAILED_STEP" "$_S_RESET" >&2
-        if [[ -s "$LOG" ]]; then
-            printf 'What every command printed is in:\n  %s\n' "$LOG" >&2
-        fi
-        printf 'Nothing after that step ran. Fix the cause and run this again;\n' >&2
-        printf 'it skips what is already done.\n' >&2
+        # The result, in the same four-line shape as a success: what failed, why
+        # in plain words, the command that fixes it, and where the whole log is.
+        # Nothing else — the narration is in the log and behind --verbose.
+        result_failed "${RESULT_FAILED_STEP:-$FAILED_STEP}" \
+                      "${RESULT_BECAUSE:-it did not finish}" \
+                      "${RESULT_FIX:-read the full log, then run this again}" >&2
     fi
     return $rc
 }

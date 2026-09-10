@@ -153,19 +153,27 @@ nemr_term_size() {
 # May we draw? Every "no" is a deliberate one (rule 2). NEMR_CAT=0 is the
 # caller's own off switch (--quiet passes it); NEMR_CAT=1 forces it on for the
 # test that needs a pty to prove the drawing half.
+# Every "no" names itself in _NEMR_SCREEN_WHY. The refusals used to be silent —
+# eleven of them, in two files — so a report that the live screen did not appear
+# could not be answered from here at all: the log was byte-for-byte identical
+# whether the region drew or not (measured, 2026-09-10). The reason is computed
+# either way; throwing it away was the whole defect.
+_NEMR_SCREEN_WHY=""
+
 nemr_cat_enabled() {
-    [[ "${NEMR_CAT:-}" == "0" ]] && return 1
+    [[ "${NEMR_CAT:-}" == "0" ]] && { _NEMR_SCREEN_WHY="quiet (NEMR_CAT=0)"; return 1; }
     [[ "${NEMR_CAT:-}" == "1" ]] && return 0
-    [[ -t 1 ]] || return 1
-    [[ -n "${NO_COLOR:-}" ]] && return 1
-    case "${TERM:-dumb}" in dumb|"") return 1 ;; esac
+    [[ -t 1 ]] || { _NEMR_SCREEN_WHY="not-a-tty (output is redirected or piped)"; return 1; }
+    [[ -n "${NO_COLOR:-}" ]] && { _NEMR_SCREEN_WHY="NO_COLOR is set"; return 1; }
+    case "${TERM:-dumb}" in dumb|"") _NEMR_SCREEN_WHY="TERM=${TERM:-unset}"; return 1 ;; esac
     # Too short a terminal and the block scrolls: the cursor-up would then walk
     # over the step lines instead of its own, leaving a trail. Rather than draw
     # something broken, draw nothing.
     local rows size
-    size="$(nemr_term_size)" || return 1
+    size="$(nemr_term_size)" || { _NEMR_SCREEN_WHY="the terminal would not report its size"; return 1; }
     rows="${size%% *}"
-    (( rows >= $(_nemr_cat_height) + 2 )) || return 1
+    (( rows >= $(_nemr_cat_height) + 2 )) \
+        || { _NEMR_SCREEN_WHY="$rows rows, the animation needs $(( $(_nemr_cat_height) + 2 ))"; return 1; }
     return 0
 }
 
