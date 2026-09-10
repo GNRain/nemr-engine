@@ -1835,6 +1835,46 @@ as the case every test passes.
 
 **Not done (named).** Rewriting the `cwd`/paths inside the history bodies (tidy only — `--continue` ignores them); discovery of adoptable directories by scan (out of scope); adopting the `~/.claude.json` per-project settings (not needed, and identity must not travel); bumping the base image's Claude Code.
 
+### D-14 — One command to install: what it covers, and what it asks before it acts
+
+**Status:** Ruled · 2026-09-09 (the Product Owner stated the split and the consent bar in the request) — built the same day
+**Raised by:** Rain ("Setup is too long for a new user. Installing on my second VM took a dozen commands across three sessions, and I already knew the answers. Make it one script.") · **Relates to:** D-13 (Claude Code is a prerequisite — detected, never installed), NFR-01 (nothing outside the distribution archive), PRIV-01/02/03 (rootless, one narrow sudoers grant), F-15 (the tty predicate: refuse and name the flag, never silently proceed), F-126 (pull the published base image; build only as a fallback), E-09 (the daemon), E-11 (the open/commercial seam)
+
+**Measured first (this host, 2026-09-09), before the split was drawn.** `scripts/setup_host.sh` says of itself that it is "the executable spec for the product installer that has to replace it", so it is the source. What it does, sorted by who needs it:
+
+- *A user needs:* the apt set from the Ubuntu archive (`containerd runc uidmap rootlesskit slirp4netns e2fsprogs`, plus `build-essential protobuf-compiler curl` to build from source); the system containerd disabled; subuid/subgid ranges; the cgroup-v2 delegation drop-in and the **reboot** it implies; lingering; the rootless containerd user unit; `~/.local/bin` and `CONTAINERD_ADDRESS` in the shell profile; the engine binaries; the privileged helper and its sudoers grant; the base image.
+- *Only a developer needs:* BuildKit and its unit, the test Postgres, the git hooks, and the acceptance suite. **BuildKit is dev-only** because `fetch_base_image.sh` pulls the published digest with `ctr` and refuses rather than building when the pull fails (F-126) — a locally built image at a different digest would export bundles no other machine can restore. So a user's machine needs no image builder at all.
+- *Only a self-hoster needs:* Postgres, the pepper, a storage backend, `nemr-sync`.
+
+**1. Scope — three halves, two paths.**
+
+- **`scripts/install.sh`** — everything that belongs on the machine a person works on: the engine half exactly as the Product Owner listed it, **and the client CLI** (`nemr-cloud` with its `nemr login / push / pull / sessions / ui` names). The client was in neither half of the request, and it is not the server: it runs on the user's machine and `nemr ui` is one of the two things a finished install tells them to run. Putting it here is the one place this row refines the split, stated rather than assumed.
+- **`scripts/install_server.sh`** — the self-hoster's path: Postgres, the pepper, the storage backend, `nemr-sync`. Never called by `install.sh`, and honest about being a single-host deployment: no TLS, no reverse proxy, no backups.
+- **`scripts/setup_host.sh`** keeps the developer role it already has, and is where the dev-only steps stay.
+
+**2. Consent — the plan first, then one question.**
+
+- The plan is **computed from this host**, not a fixed list: every step is marked *will do* or *already done*, and it names every file that will be written with its path, every command that will run under `sudo`, and everything fetched from off-host (the Ubuntu archive, crates.io, ghcr.io).
+- **One question, once.** `--yes` skips it. F-15's predicate holds: with no tty and no `--yes` it **refuses and names the flag** rather than proceeding silently. Anything but yes exits 0 having changed nothing — so declining is the dry run.
+- **Safe to run twice**, and a second run says what it skipped: the plan itself becomes the idempotence report, every line reading *already done*.
+- **Preflight refuses before the plan**, listing every missing prerequisite with what was found and how to get it, so a host that cannot support the stack is never half-installed.
+- **What it will never do:** install Node or Claude Code (D-13), add a third-party apt repository (NFR-01), write or copy a credential (D-02, F-24 — the login happens with `/login` inside a session), or touch a running session.
+- It finishes by **running the smoke test** — an install is done when the host passes, not when commands exit zero — and prints the two next steps: `nemr create myproject` and `nemr ui`.
+
+**3. The progress animation** (the Product Owner's request: a cat playing with cables, for Nemr, who did exactly that). Held to the browser UI's rule — **decoration never gates state**: the work runs in its own process and the frames are drawn beside it, so the install takes the same time whether or not a frame is ever drawn. No tty, `TERM=dumb`, `NO_COLOR` or `--quiet` and it draws nothing at all, so a piped or CI log is only step lines. It restores the cursor and erases its own lines on exit, on failure and on Ctrl-C. Guarded by tests, not by care.
+
+**Amended the same day (2026-09-09), on the Product Owner's reference image.** The first cat was an emoticon cat — four frames, three lines. The Product Owner then sent a reference: an ASCII-art cat, sitting in profile, drawn as a sparse dotted outline, signed "Samamine". The animation was redrawn to that likeness (four frames, 15 lines, 37 columns), and the size question was **measured rather than argued**: eight candidates were drawn from the reference and scored by independent judges on fidelity, motion and craft; every compact variant (5–8 lines) scored 4–5 on fidelity against the full-size winner's 10. Shrinking it loses the likeness, so the drawing is 15 lines, which is the size the request implies. Two judge-found defects were fixed before it shipped: the cable's pendulum stretched (the two extremes disagreed about the tip's height) and the cat never moved (a cable swaying past a still cat, not a cat playing) — the near front paw now comes off the floor once per cycle to meet the cable. One rule was added with it: a terminal too short to hold the drawing gets **no animation at all**, because the cursor arithmetic would scroll and walk over the step lines.
+
+**Open, for the Product Owner (raised, not decided).** The reference is signed. The shipped drawing is a redrawing in that cat's pose and idiom rather than a copied file, but the likeness is deliberate and close. Before this goes beyond the private preview: credit "Samamine" in the README, or redraw the cat from scratch. Recorded in `scripts/lib/cat.sh` next to the art.
+
+**Ruled the same day (2026-09-09, Product Owner), on both open points.** *Attribution:* credit Samamine in the README — the cat stays as drawn, and `README.md` gains a Credits section naming them, with the same statement beside the art. *Size:* keep the full 15 lines; the measured alternative (a compact cat at 4–5 fidelity against 10) trades away the likeness that was the point of the request, and the short-terminal rule already covers the case where 15 lines will not fit.
+
+**Consequences.**
+- `PREREQUISITES.md` and `README.md` point a user at `install.sh`; `setup_host.sh` is named as the developer path.
+- The reboot gate survives into the product: delegation needs `user@.service` to restart, so the installer exits **3** with the reason and resumes on the next run.
+- The acceptance has three runs (clean host, second run, missing prerequisite) and the clean-host arm **cannot run in CI here** — it needs sudo, a reboot, a GHCR pull and a machine with none of it present. It is a VM-snapshot arm, scripted and reported (`docs/install-acceptance.md`).
+
+
 ## Log
 
 | Date | Entry | Change |
@@ -1899,3 +1939,6 @@ as the case every test passes.
 | 2026-09-08 | E-22 | **Ruled and built** — delete the cloud copy: removes the object AND the index row (row reads local, no bundle); one click when a local copy survives, the typed name when it is the only copy (F-12's rule); refused while another machine holds the lease, take-over offered; the object removed synchronously, not tombstoned (bill what exists); proven in both storage modes and the object confirmed gone from the R2 bucket (Rain; built by Claude Code) |
 | 2026-09-08 | E-23 | **Ruled and built** — `nemr add <dir>`: copy the tree (gitignore-respecting, target/node_modules always excluded, refuse over quota) plus .git plus the Claude Code history rewritten to the `-workspace` key (only the key needs rewriting — measured); copy not move; valid JSONL to the last line; then push/pull/`--continue` recalls across machines (Rain; built by Claude Code) |
 | 2026-09-09 | E-13 | **Observed again (F-25)** — a second-machine login spent this machine's refresh token and blanked its credential, with no warning either side (Rain, 2026-09-09); and a copied credential blanked the same way on the reference host (2026-09-08/09). Ruled: inherent upstream; nemr warns before handing the user to `/login` and names the cause when a credential is found spent (Rain; built by Claude Code) |
+| 2026-09-09 | D-14 | **Ruled and built** — one install command: `scripts/install.sh` for the machine a person works on (engine **and** client — the client belongs with neither half as stated, so it is named here), `scripts/install_server.sh` for a self-hoster, `setup_host.sh` left as the developer path; BuildKit leaves the user's machine because the base image is pulled by digest, never built (F-126); the plan is computed from the host and shown in full before one question, `--yes` skips it, no tty and no flag refuses (F-15); idempotent, and a second run says what it skipped; verified by the smoke test. The progress animation never gates state and draws nothing without a tty (Rain; built by Claude Code) |
+| 2026-09-09 | D-14 | **Amended** — the animation redrawn to the Product Owner's reference cat (sitting profile, dotted outline, signed "Samamine"): 15 lines, 37 columns, the cat byte-identical across frames with the near paw batting the cable once per cycle. Measured, not argued: compact variants score 4–5 on fidelity against the full-size 10, so shrinking loses the likeness. Attribution left open for the Product Owner (Claude Code) |
+| 2026-09-09 | D-14 | **Ruled** on the two points the amendment left open: Samamine credited in README.md (the drawing stays as it is), and the cat keeps its full 15 lines — the compact alternative measured 4–5 on fidelity against 10, which is the likeness the request was about (Rain) |

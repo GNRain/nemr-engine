@@ -17,12 +17,19 @@ reference host; the outputs shown are real, not illustrative.
 ## Do this first
 
 ```bash
-./scripts/setup_host.sh
+./scripts/install.sh
 ```
 
-That script performs every step in this document, in order, idempotently, and
-refuses early with a named check, the value it found and the fix when the host
-cannot support the stack.
+That script performs every step in this document that a **user** needs, in
+order, idempotently, and refuses early with a named check, the value it found
+and the fix when the host cannot support the stack. It shows the whole plan —
+every file, every `sudo`, every download — and asks once before doing any of it
+(D-14).
+
+Developers want `./scripts/setup_host.sh` instead: the same ground plus the
+things only development needs (BuildKit, the test Postgres, the git hooks, the
+full acceptance suite). Running your own sync server is a third path,
+`./scripts/install_server.sh`.
 
 **Read the rest of this file when a preflight check refuses**, or when you want
 to know why a step exists. It is the reference; the script is the procedure.
