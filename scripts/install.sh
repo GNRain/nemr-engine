@@ -41,6 +41,7 @@ REPO="$PWD"
 # Flags
 # ---------------------------------------------------------------------------
 YES=0
+VERBOSE=0
 usage() {
     cat <<'USAGE'
 nemr install — the engine, the helper, the base image and the CLI, on this machine.
@@ -48,6 +49,9 @@ nemr install — the engine, the helper, the base image and the CLI, on this mac
   ./scripts/install.sh          show the plan, ask once, install
   ./scripts/install.sh --yes    accept the plan without the question
   ./scripts/install.sh --quiet  no animation; step lines only
+  ./scripts/install.sh --verbose  every line of today's output: the full plan,
+                                every step's detail, appended as it happens —
+                                no live screen
   ./scripts/install.sh --help   this
 
 It is safe to run twice: a step already done says so instead of being redone.
@@ -58,6 +62,7 @@ while (($#)); do
     case "$1" in
         -y|--yes)   YES=1 ;;
         -q|--quiet) NEMR_CAT=0 ;;
+        -v|--verbose) VERBOSE=1; NEMR_CAT=0 ;;
         -h|--help)  usage; exit 0 ;;
         *) printf 'install.sh: unknown option %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -184,25 +189,31 @@ preflight() {
 # The steps. Each has a probe (is it already done?) and an action.
 # ---------------------------------------------------------------------------
 STEP_IDS=()
-declare -A STEP_LABEL=() STEP_STATE=() STEP_DETAIL=()
+declare -A STEP_LABEL=() STEP_PLAN=() STEP_STATE=() STEP_DETAIL=()
 
-step_def() { STEP_IDS+=("$1"); STEP_LABEL["$1"]="$2"; }
+# <id> <short label for the region, <=29> <the full name, for the plan>
+#
+# Two names on purpose. The region is a progress display with a 29-column
+# budget; the plan above it is where a step is explained, and it is printed in
+# full before the question that consents to the run (D-14). Trading the long
+# names for a layout at 80 columns was the Product Owner's call, 2026-09-10.
+step_def() { STEP_IDS+=("$1"); STEP_LABEL["$1"]="$2"; STEP_PLAN["$1"]="${3:-$2}"; }
 
-step_def packages   "packages from the Ubuntu archive"
-step_def containerd_off "the system-wide root containerd, disabled"
-is_wsl2 && step_def propagation "shared mount propagation (WSL2)"
-step_def subids     "subuid/subgid ranges for $USER_NAME"
-step_def delegation "cgroup v2 controller delegation"
-step_def linger     "lingering, so the user manager runs without a login"
-step_def units      "the rootless containerd and nemrd user units"
-step_def daemons    "rootless containerd, running"
-step_def shellenv   "PATH and CONTAINERD_ADDRESS in ~/.bashrc"
-step_def engine     "the engine, built and installed (nemr, nemrd)"
-step_def helper     "the privileged volume helper and its sudoers grant"
-step_def client     "the client CLI (nemr ui, push, pull)"
-step_def image      "the base image $BASE_IMAGE"
-step_def claude     "Claude Code, a prerequisite (detected, never installed)"
-step_def verify     "the host passes the smoke test"
+step_def packages        "packages" "packages from the Ubuntu archive"
+step_def containerd_off  "system containerd off" "the system-wide root containerd, disabled"
+is_wsl2 && step_def propagation     "mount propagation (WSL2)" "shared mount propagation (WSL2)"
+step_def subids          "subuid/subgid ranges" "subuid/subgid ranges for $USER_NAME"
+step_def delegation      "cgroup v2 delegation" "cgroup v2 controller delegation"
+step_def linger          "lingering" "lingering, so the user manager runs without a login"
+step_def units           "user units" "the rootless containerd and nemrd user units"
+step_def daemons         "rootless containerd" "rootless containerd, running"
+step_def shellenv        "shell environment" "PATH and CONTAINERD_ADDRESS in ~/.bashrc"
+step_def engine          "the engine (nemr, nemrd)" "the engine, built and installed (nemr, nemrd)"
+step_def helper          "helper + sudoers grant" "the privileged volume helper and its sudoers grant"
+step_def client          "client CLI (ui, push, pull)" "the client CLI (nemr ui, push, pull)"
+step_def image           "base image" "the base image $BASE_IMAGE"
+step_def claude          "Claude Code (prerequisite)" "Claude Code, a prerequisite (detected, never installed)"
+step_def verify          "smoke test" "the host passes the smoke test"
 
 missing_packages() {
     local p out=()
@@ -214,6 +225,11 @@ missing_packages() {
 
 probe() {
     local id="$1" state=done detail=""
+    if [[ -n "${NEMR_TEST_STEP_STUB:-}" ]]; then
+        STEP_STATE["$id"]=todo
+        STEP_DETAIL["$id"]="will do this on a machine that has none of it"
+        return 0
+    fi
     case "$id" in
     packages)
         local miss; miss="$(missing_packages)"
@@ -307,9 +323,9 @@ show_plan() {
     for id in "${STEP_IDS[@]}"; do
         n=$((n + 1))
         case "${STEP_STATE[$id]}" in
-            done)    printf '  %2d. %-52s already done\n' "$n" "${STEP_LABEL[$id]}" ;;
-            rebuild) printf '  %2d. %-52s check and update\n' "$n" "${STEP_LABEL[$id]}" ;;
-            *)       printf '  %2d. %-52s WILL DO\n' "$n" "${STEP_LABEL[$id]}" ;;
+            done)    printf '  %2d. %-52s already done\n' "$n" "${STEP_PLAN[$id]}" ;;
+            rebuild) printf '  %2d. %-52s check and update\n' "$n" "${STEP_PLAN[$id]}" ;;
+            *)       printf '  %2d. %-52s WILL DO\n' "$n" "${STEP_PLAN[$id]}" ;;
         esac
         note "${STEP_DETAIL[$id]}"
     done
@@ -359,8 +375,34 @@ show_plan() {
 # ---------------------------------------------------------------------------
 do_step() {
     local id="$1" label="${STEP_LABEL[$1]}" rc=0
+
+    # TEST-ONLY seams, both unset in every real run.
+    #
+    #   NEMR_TEST_STEP_STUB   report what a FIRST install reports, without doing
+    #                         any of it. The layout has only ever been captured
+    #                         on idempotent runs, which is why the first-run
+    #                         line that tears it was never seen (F-29).
+    #   NEMR_TEST_FAIL_STEP   fail this step, to exercise the failure path.
+    if [[ "${NEMR_TEST_FAIL_STEP:-}" == "$id" ]]; then
+        step_result fail "FAILED" "forced by NEMR_TEST_FAIL_STEP — see $LOG"
+        exit 1
+    fi
+    if [[ -n "${NEMR_TEST_STEP_STUB:-}" ]]; then
+        # A number sets the per-step delay, so an interrupt can be aimed.
+        if [[ "$NEMR_TEST_STEP_STUB" =~ ^[0-9.]+$ ]]; then sleep "$NEMR_TEST_STEP_STUB"
+        else sleep 0.35; fi
+        case "$id" in
+            packages) step_result done "new" "installed: ${APT_PACKAGES[*]}" ;;
+            claude)   step_result warn "absent" "NOT INSTALLED — install Node, then Claude Code (D-13)" ;;
+            image)    step_result done "new" "pulled $BASE_IMAGE at ${BASE_DIGEST:7:12}" ;;
+            verify)   step_result done "ok" "passed: create, start, attach, stop, delete, host left clean" ;;
+            *)        step_result done "new" "${STEP_DETAIL[$id]#will }" ;;
+        esac
+        return 0
+    fi
+
     if [[ "${STEP_STATE[$id]}" == done ]]; then
-        tick "$label — already done"
+        step_result done "done" "already done"
         return 0
     fi
     FAILED_STEP="$label"
@@ -369,26 +411,26 @@ do_step() {
         sudo_refresh
         logged_long sudo apt-get update || rc=$?
         (( rc == 0 )) && { logged_long sudo apt-get install -y "${APT_PACKAGES[@]}" || rc=$?; }
-        (( rc == 0 )) && tick "$label — installed: ${STEP_DETAIL[$id]#will install: }" ;;
+        (( rc == 0 )) && step_result done "new" "installed: ${STEP_DETAIL[$id]#will install: }" ;;
     containerd_off)
         sudo_refresh
         logged sudo systemctl disable --now containerd.service || rc=$?
-        (( rc == 0 )) && tick "$label — disabled" ;;
+        (( rc == 0 )) && step_result done "new" "disabled" ;;
     subids)
         sudo_refresh
         grep -q "^${USER_NAME}:" /etc/subuid || logged sudo usermod --add-subuids 100000-165535 "$USER_NAME" || rc=$?
         grep -q "^${USER_NAME}:" /etc/subgid || logged sudo usermod --add-subgids 100000-165535 "$USER_NAME" || rc=$?
-        (( rc == 0 )) && tick "$label — added" ;;
+        (( rc == 0 )) && step_result done "new" "added" ;;
     delegation)
         sudo_refresh
         logged sudo install -D -m 0644 deploy/systemd/delegate.conf \
             /etc/systemd/system/user@.service.d/delegate.conf || rc=$?
         (( rc == 0 )) && { logged sudo systemctl daemon-reload || rc=$?; }
-        (( rc == 0 )) && tick "$label — installed" ;;
+        (( rc == 0 )) && step_result done "new" "installed" ;;
     linger)
         sudo_refresh
         logged sudo loginctl enable-linger "$USER_NAME" || rc=$?
-        (( rc == 0 )) && tick "$label — enabled" ;;
+        (( rc == 0 )) && step_result done "new" "enabled" ;;
     propagation)
         sudo_refresh
         logged sudo install -D -m 0644 deploy/systemd/nemr-mount-propagation.service \
@@ -396,7 +438,7 @@ do_step() {
         (( rc == 0 )) && { logged sudo systemctl daemon-reload || rc=$?; }
         (( rc == 0 )) && { logged sudo systemctl enable nemr-mount-propagation.service || rc=$?; }
         (( rc == 0 )) && { logged sudo mount --make-rshared / || rc=$?; }
-        (( rc == 0 )) && tick "$label — installed and live" ;;
+        (( rc == 0 )) && step_result done "new" "installed and live" ;;
     units)
         mkdir -p "$HOME/.config/systemd/user"
         local u
@@ -405,7 +447,7 @@ do_step() {
                 "$HOME/.config/systemd/user/$u.service" || rc=$?
         done
         (( rc == 0 )) && { logged systemctl --user daemon-reload || rc=$?; }
-        (( rc == 0 )) && tick "$label — installed" ;;
+        (( rc == 0 )) && step_result done "new" "installed" ;;
     daemons)
         logged_long systemctl --user enable --now containerd-rootless.service || rc=$?
         if (( rc == 0 )); then
@@ -415,7 +457,7 @@ do_step() {
             wait_for_ready "rootless containerd" 30 \
                 test -S "$XDG_RUNTIME_DIR/containerd/containerd.sock" >>"$LOG" 2>&1 || true
             if [[ -S "$XDG_RUNTIME_DIR/containerd/containerd.sock" ]]; then
-                tick "$label — answering at \$XDG_RUNTIME_DIR/containerd/containerd.sock"
+                step_result done "new" "answering at \$XDG_RUNTIME_DIR/containerd/containerd.sock"
             else
                 journalctl --user -u containerd-rootless.service -n 50 --no-pager >>"$LOG" 2>&1 || true
                 rc=1
@@ -429,15 +471,15 @@ do_step() {
             echo 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
             echo '# <<< nemr environment <<<'
         } >>"$HOME/.bashrc"
-        tick "$label — added (open a new shell, or source ~/.bashrc)" ;;
+        step_result done "new" "added — open a new shell, or source ~/.bashrc" ;;
     engine)
         local before="" after=""
         [[ -x "$HOME/.local/bin/nemr" ]] && before="$(sha256sum "$HOME/.local/bin/nemr" | cut -d' ' -f1)"
         logged_long ./scripts/install_engine.sh || rc=$?
         if (( rc == 0 )); then
             after="$(sha256sum "$HOME/.local/bin/nemr" | cut -d' ' -f1)"
-            if [[ "$before" == "$after" ]]; then tick "$label — already current"
-            else tick "$label — installed (${after:0:12})"; fi
+            if [[ "$before" == "$after" ]]; then step_result done "done" "already current"
+            else step_result done "new" "installed (${after:0:12})"; fi
         fi ;;
     helper)
         logged_long env -C deploy/nemr-volume cargo build --release || rc=$?
@@ -446,11 +488,11 @@ do_step() {
             built="$(sha256sum deploy/nemr-volume/target/release/nemr-volume | cut -d' ' -f1)"
             [[ -x /usr/local/libexec/nemr-volume ]] && installed="$(sha256sum /usr/local/libexec/nemr-volume | cut -d' ' -f1)"
             if [[ "$built" == "$installed" && -e /etc/sudoers.d/nemr-volume ]]; then
-                tick "$label — already current"
+                step_result done "done" "already current"
             else
                 sudo_refresh
                 logged sudo ./scripts/setup_test_host.sh || rc=$?
-                (( rc == 0 )) && tick "$label — installed, grant validated with visudo"
+                (( rc == 0 )) && step_result done "new" "installed, grant validated with visudo"
             fi
         fi ;;
     client)
@@ -459,34 +501,34 @@ do_step() {
         logged_long ./scripts/install_sync_client.sh || rc=$?
         if (( rc == 0 )); then
             after="$(sha256sum "$HOME/.local/bin/nemr-cloud" | cut -d' ' -f1)"
-            if [[ "$before" == "$after" ]]; then tick "$label — already current"
-            else tick "$label — installed (${after:0:12})"; fi
+            if [[ "$before" == "$after" ]]; then step_result done "done" "already current"
+            else step_result done "new" "installed (${after:0:12})"; fi
         fi ;;
     image)
         logged_long ./scripts/fetch_base_image.sh || rc=$?
-        (( rc == 0 )) && tick "$label — at the recorded digest ${BASE_DIGEST:7:12}" ;;
+        (( rc == 0 )) && step_result done "ok" "at the recorded digest ${BASE_DIGEST:7:12}" ;;
     claude)
         # Detected, never installed (D-13). Not a failure: everything else is
         # finished, and this is the last piece the user provides.
         if have claude; then
-            tick "$label — found at $(command -v claude)"
+            step_result done "ok" "found at $(command -v claude)"
         else
-            cross "$label — NOT INSTALLED"
-            note "Install Node from nodejs.org or your platform's packaging, then Claude"
-            note "Code from its own instructions. nemr does not install it for you (D-13)."
+            # A warning, not a failure: everything else is finished, and this
+            # is the piece the user provides (D-13).
+            step_result warn "absent" "NOT INSTALLED — install Node, then Claude Code from its own instructions (D-13)"
         fi ;;
     verify)
         # An install is done when the host passes, not when commands exit zero.
         # The API round-trip needs a login and this machine may have none yet by
         # design — the login happens with /login inside a session (E-21, F-24).
         if logged_long env NEMR_SKIP_API=1 ./scripts/e2e_smoke_test.sh; then
-            tick "$label — passed: create, start, attach, stop, delete, host left clean"
+            step_result done "ok" "passed: create, start, attach, stop, delete, host left clean"
         else
             rc=1
         fi ;;
     esac
 
-    if (( rc != 0 )); then cross "$label"; exit "$rc"; fi
+    if (( rc != 0 )); then step_result fail "FAILED" "see $LOG"; exit "$rc"; fi
     FAILED_STEP=""
     return 0
 }
@@ -548,23 +590,30 @@ for id in "${STEP_IDS[@]}"; do
             [[ "${STEP_STATE[$id]}" == todo ]] && PRIVILEGED_PENDING=1 ;;
     esac
 done
+# The stub does no privileged work, so it must not ask for a password.
+[[ -n "${NEMR_TEST_STEP_STUB:-}" ]] && PRIVILEGED_PENDING=0
 if nemr_region_enabled && (( PRIVILEGED_PENDING )); then
     sudo_refresh
 fi
-if nemr_region_start "$REGION_STATE"; then
+if (( ! VERBOSE )) && nemr_region_start "$REGION_STATE"; then
     _S_REGION=1
-    # Seeded with every step, so the whole list is visible from the first frame
-    # and the user never scrolls to watch it.
-    for id in "${STEP_IDS[@]}"; do _S_LINES+=("  · ${STEP_LABEL[$id]}"); done
-    nemr_region_publish "${_S_LINES[@]}"
+    # Seeded with every step, so the whole list is on screen from the first
+    # frame: what is finished, what is running, what is still to come.
+    region_labels=()
+    for id in "${STEP_IDS[@]}"; do region_labels+=("${STEP_LABEL[$id]}"); done
+    steps_seed "${region_labels[@]}"
     if (( PRIVILEGED_PENDING )); then
         ( while kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null || exit 0; sleep 45; done ) &
         SUDO_KEEPALIVE=$!
     fi
 fi
 
+# In append-only mode the list still exists — step_result prints from it.
+(( _S_REGION )) || { region_labels=(); for id in "${STEP_IDS[@]}"; do region_labels+=("${STEP_LABEL[$id]}"); done; steps_seed "${region_labels[@]}"; }
+
 _S_IDX=0
 for id in "${STEP_IDS[@]}"; do
+    step_begin
     do_step "$id"
     _S_IDX=$((_S_IDX + 1))
     [[ "$id" == "linger" ]] && reboot_gate

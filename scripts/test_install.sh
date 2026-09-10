@@ -28,7 +28,7 @@ PASS=0; FAIL=0
 # Asserted, not merely printed: a run that skipped a case would otherwise say
 # PASS with fewer assertions — the green-over-nothing shape this project keeps
 # guarding against. Raise this when a case is added.
-EXPECTED_ASSERTIONS=49
+EXPECTED_ASSERTIONS=56
 
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS + 1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
@@ -141,10 +141,10 @@ step "A second run does nothing, and says what it skipped"
 # ---------------------------------------------------------------------------
 out="$(./scripts/install.sh --yes 2>&1)"; rc=$?
 check "$([[ $rc -eq 0 ]] && echo 0 || echo 1)" "the run succeeds" "exit $rc; see $STATE_DIR"
-did_work="$(sed -n '/^Installing/,/^Verifying/p' <<<"$out" | grep -E '✓' | grep -vE 'already done|already current|at the recorded digest|Claude Code found' || true)"
+did_work="$(sed -n '/^Installing/,$p' <<<"$out" | grep -E '✓' | grep -vE 'already done|already current|at the recorded digest|found at|passed:' || true)"
 check "$([[ -z "$did_work" ]] && echo 0 || echo 1)" \
     "every step reports already done — nothing was redone" "${did_work:-}"
-grep -q "the smoke test passed" <<<"$out"
+grep -qE 'smoke test — passed: create, start, attach' <<<"$out"
 check $? "it verifies with the smoke test rather than trusting exit codes"
 grep -q "nemr create myproject" <<<"$out" && grep -q "nemr ui" <<<"$out"
 check $? "it ends by saying what to do next"
@@ -243,43 +243,113 @@ check "$([[ "$leaked" == "0" ]] && echo 0 || echo 1)" \
     "stopped mid-frame twelve times over, the screen is left exactly as found" \
     "$leaked of 12 left something behind"
 
-# 4d. THE LIVE REGION (F-27): two columns in one managed block, and the
-#     thresholds below which there are no columns at all.
-wide="$WORK/wide.raw"
-script -qec "bash -c 'stty cols 140 rows 40; $REPO/scripts/install.sh --yes'" /dev/null >"$wide" 2>&1
-wide_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$wide" --cols 140 --rows 40)"
-# A row carrying a step line AND cat art is the layout: both columns, one row.
-two_col="$(python3 - "$wide" <<'PYEOF'
+# 4d. THE LIVE REGION at its real threshold: 80 columns, the default terminal,
+#     on a FIRST install — the run every capture so far has skipped, and the
+#     one whose long statuses used to tear the layout (F-29).
+first="$WORK/first80.raw"
+script -qec "bash -c 'stty cols 80 rows 30; NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=1 $REPO/scripts/install.sh --yes'" /dev/null >"$first" 2>&1
+first_mid="$(python3 - "$first" <<'PYEOF'
 import subprocess, sys
 raw = sys.argv[1]
 d = open(raw, 'rb').read()
-i, j = d.find(b'Installing'), d.find(b'Verifying')
-mid = i + int((j - i) * 0.55)
-out = subprocess.run(['python3', 'scripts/lib/render_pty.py', raw, '--cols', '140',
-                      '--rows', '40', '--at', str(mid)], capture_output=True, text=True).stdout
-print(sum(1 for line in out.split('\n')
-          if ('already done' in line or 'already current' in line) and len(line) > 95))
+i, j = d.find(b'Installing'), d.rfind(b'nemr is installed')
+out = subprocess.run(['python3', 'scripts/lib/render_pty.py', raw, '--cols', '80',
+                      '--rows', '30', '--at', str(i + int((j - i) * 0.6))],
+                     capture_output=True, text=True).stdout
+print(out)
 PYEOF
 )"
+two_col="$(grep -cE '^  [+>.!x] .{28,} +[a-zA-Z…]* +[^ ]' <<<"$first_mid" || true)"
 check "$([[ "${two_col:-0}" -ge 3 ]] && echo 0 || echo 1)" \
-    "on a wide terminal the block is two columns: step lines and the cat share rows ($two_col of them)" \
-    "the region did not engage"
-grep -qE '✓ the smoke test passed' <<<"$wide_screen"
-check $? "the run completes with the region open"
-cat_left=0
-grep -qE '\("\)|o\.o|o\.O|\*-\*' <<<"$wide_screen" && cat_left=1
-check "$cat_left" "when it finishes the block resolves to the step list and the cat is gone"
+    "at exactly 80 columns, a FIRST install draws both columns ($two_col rows carry step and cat)" \
+    "$(head -6 <<<"$first_mid")"
+# The region's own rows only: the plan above it is ordinary prose that the
+# terminal wraps, and always did.
+over="$(grep -E '^  [+>.!x] ' <<<"$first_mid" | awk 'length($0) > 80' | wc -l)"
+check "$([[ "$over" == "0" ]] && echo 0 || echo 1)" \
+    "and no row exceeds 80 columns — the status has a budget and is truncated to it" \
+    "$over rows over"
+grep -q 'packages' <<<"$first_mid" && grep -qE '(new|done|ok)' <<<"$first_mid"
+check $? "the step list carries a short status token, not the sentence"
+grep -q 'installed: containerd runc uidmap' "$WORK/../"*/install-*.log 2>/dev/null \
+    || grep -rq 'installed: containerd runc uidmap' "$HOME/.local/state/nemr/" 2>/dev/null
+check $? "and the sentence itself is in the log"
 
-# Below the width threshold: no columns, and no truncation — today's output.
-narrow="$WORK/narrow.raw"
-script -qec "bash -c 'stty cols 100 rows 40; $REPO/scripts/install.sh --yes'" /dev/null >"$narrow" 2>&1
-narrow_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$narrow" --cols 100 --rows 40)"
-narrow_two_col="$(grep -cE '(already done|already current).{20,}[|/\\]' <<<"$narrow_screen" || true)"
-check "$([[ "${narrow_two_col:-0}" == "0" ]] && echo 0 || echo 1)" \
-    "at 100 columns — under the 129 it needs — there are no columns at all, and nothing is truncated" \
-    "$narrow_two_col rows carried both"
-grep -qE '✓ the smoke test passed' <<<"$narrow_screen"
-check $? "and the install still completes, append-only, as before"
+# Below the threshold there are no columns at all, and nothing is truncated:
+# today's append-only output, and the region is never started.
+narrow="$WORK/narrow79.raw"
+script -qec "bash -c 'stty cols 79 rows 30; NEMR_TEST_STEP_STUB=1 $REPO/scripts/install.sh --yes'" /dev/null >"$narrow" 2>&1
+narrow_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$narrow" --cols 79 --rows 30)"
+narrow_cat="$(grep -cE '\("\)|o\.o|\*-\*' <<<"$narrow_screen" || true)"
+check "$([[ "${narrow_cat:-0}" == "0" ]] && echo 0 || echo 1)" \
+    "at 79 columns — one under the threshold — the region is never started" "$narrow_cat cat rows"
+grep -q 'nemr is installed' <<<"$narrow_screen"
+check $? "and the run still finishes, append-only, as before"
+
+# A terminal too short: same rule, no region at all.
+short="$WORK/short.raw"
+script -qec "bash -c 'stty cols 100 rows 17; NEMR_TEST_STEP_STUB=1 $REPO/scripts/install.sh --yes'" /dev/null >"$short" 2>&1
+short_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$short" --cols 100 --rows 17)"
+short_cat="$(grep -cE '\("\)|o\.o|\*-\*' <<<"$short_screen" || true)"
+check "$([[ "${short_cat:-0}" == "0" ]] && echo 0 || echo 1)" \
+    "a terminal too short to hold the region never starts one" "$short_cat cat rows"
+
+# THE REGION RESOLVES INTO SCROLLBACK when a step fails: the list, the failure,
+# and the log path, as ordinary text that outlives the script.
+failraw="$WORK/fail.raw"
+script -qec "bash -c 'stty cols 80 rows 30; NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=1 NEMR_TEST_FAIL_STEP=image $REPO/scripts/install.sh --yes'" /dev/null >"$failraw" 2>&1
+fail_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$failraw" --cols 80 --rows 30)"
+grep -qE '^  x base image +FAILED' <<<"$fail_screen" \
+    && grep -q 'Stopped at: base image' <<<"$fail_screen" \
+    && grep -qE 'install-[0-9]+-[0-9]+\.log' <<<"$fail_screen"
+check $? "a failed step resolves to text: the list, the FAILED line, and the log path" \
+    "$(tail -6 <<<"$fail_screen")"
+fail_cat="$(grep -cE '\("\)|o\.o|\*-\*' <<<"$fail_screen" || true)"
+check "$([[ "${fail_cat:-0}" == "0" ]] && echo 0 || echo 1)" \
+    "and the cat is gone from the failure screen" "$fail_cat cat rows"
+
+# The same on Ctrl-C, which kills the renderer outright: the resolve belongs to
+# the main shell, or it does not happen on the exit that most needs it.
+cat >"$WORK/intr.sh" <<'INTR'
+#!/usr/bin/env bash
+. "$1/scripts/lib/cat.sh"
+. "$1/scripts/lib/region.sh"
+. "$1/scripts/lib/steps.sh"
+LOG="$2/ilog"; : >"$LOG"
+trap 'FAILED_STEP="${FAILED_STEP:-interrupted}"; nemr_region_stop 2>/dev/null; nemr_cat_stop; printf "\r\nStopped at: %s\r\n" "$FAILED_STEP"; exit 130' INT TERM
+printf 'a command line\n'
+nemr_region_start "$2/istate" || { printf 'NO-REGION\n'; exit 0; }
+_S_REGION=1
+steps_seed "packages" "user units" "the engine (nemr, nemrd)" "smoke test"
+_S_IDX=0; step_begin; step_result done new "installed"
+_S_IDX=1; step_begin; step_result done new "installed"
+_S_IDX=2; step_begin
+echo $$ >"$2/ipid"
+sleep 30
+INTR
+chmod +x "$WORK/intr.sh"
+rm -f "$WORK/ipid"
+( timeout 60 script -qec "bash -c 'stty cols 80 rows 24; $WORK/intr.sh $REPO $WORK'" /dev/null >"$WORK/intr.raw" 2>&1 ) &
+intr_job=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$WORK/ipid" ]] && break; sleep 0.4; done
+[[ -s "$WORK/ipid" ]] && kill -INT "$(cat "$WORK/ipid")" 2>/dev/null
+wait "$intr_job" 2>/dev/null
+intr_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$WORK/intr.raw" --cols 80 --rows 24)"
+grep -q 'a command line' <<<"$intr_screen" \
+    && grep -qE '^  \+ packages' <<<"$intr_screen" \
+    && grep -qE '^  > the engine' <<<"$intr_screen" \
+    && grep -q 'Stopped at: interrupted' <<<"$intr_screen"
+check $? "Ctrl-C resolves the region into text: the list as it stood, and why it stopped" \
+    "$(head -8 <<<"$intr_screen")"
+
+# COLOUR: on for a terminal, off for everything else.
+colour="$(grep -c $'\033\[3[123]m' "$first" || true)"
+check "$([[ "${colour:-0}" -gt 0 ]] && echo 0 || echo 1)" "the step list is coloured on a terminal"
+nocolour="$WORK/nocolour.raw"
+script -qec "bash -c 'stty cols 80 rows 30; NO_COLOR=1 NEMR_TEST_STEP_STUB=1 $REPO/scripts/install.sh --yes'" /dev/null >"$nocolour" 2>&1
+n_esc="$(grep -c $'\033\[3[123]m' "$nocolour" || true)"
+check "$([[ "${n_esc:-0}" == "0" ]] && echo 0 || echo 1)" "NO_COLOR turns every colour off" "$n_esc"
+
 
 # 4e. A STEP'S OWN OUTPUT CANNOT ENTER THE REGION. Its stdout and stderr go to
 #     the log, as they always did; the region is the only writer. (A step that
@@ -293,18 +363,18 @@ printf 'header
 '
 nemr_region_start "$2/state" || { printf 'NO-REGION
 '; exit 0; }
-nemr_region_publish "  · step one" "  · step two"
+steps_seed "step one" "step two"
 ( echo "STDOUT-NOISE-FROM-A-STEP"; echo "STDERR-NOISE-FROM-A-STEP" >&2 ) >>"$2/log" 2>&1
 sleep 0.4
-nemr_region_publish "  ✓ step one" "  ✓ step two"
+_S_IDX=0; step_result done new "did it"; _S_IDX=1; step_result done new "did it"
 sleep 0.3
 nemr_region_stop
 printf 'footer
 '
 NOISY
 chmod +x "$WORK/noisy.sh"
-script -qec "bash -c 'stty cols 140 rows 40; $WORK/noisy.sh $REPO $WORK'" /dev/null >"$WORK/noisy.raw" 2>&1
-noisy_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$WORK/noisy.raw" --cols 140 --rows 40)"
+script -qec "bash -c 'stty cols 80 rows 30; $WORK/noisy.sh $REPO $WORK'" /dev/null >"$WORK/noisy.raw" 2>&1
+noisy_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$WORK/noisy.raw" --cols 80 --rows 30)"
 noise=0
 grep -q 'NOISE-FROM-A-STEP' <<<"$noisy_screen" && noise=1
 check "$noise" "a step's stdout and stderr reach the log, never the region" \
@@ -319,30 +389,43 @@ cat >"$WORK/many.sh" <<'MANY'
 #!/usr/bin/env bash
 . "$1/scripts/lib/cat.sh"
 . "$1/scripts/lib/region.sh"
-printf 'header
-'
-nemr_region_start "$2/manystate" || { printf 'NO-REGION
-'; exit 0; }
-lines=(); for i in $(seq 1 30); do lines+=("  · step $i of thirty"); done
-nemr_region_publish "${lines[@]}"
-sleep 0.4
-for i in $(seq 1 26); do lines[$((i-1))]="  ✓ step $i of thirty"; done
-nemr_region_publish "${lines[@]}"
-sleep 0.5
+. "$1/scripts/lib/steps.sh"
+LOG="$2/mlog"
+printf 'header\n'
+nemr_region_start "$2/manystate" || { printf 'NO-REGION\n'; exit 0; }
+_S_REGION=1
+lines=(); for i in $(seq 1 30); do lines+=("step $i of thirty"); done
+steps_seed "${lines[@]}"
+sleep 1
+for i in $(seq 1 26); do _S_IDX=$((i - 1)); step_result done new "did it"; done
+sleep 1
 nemr_region_stop
-printf 'footer
-'
+printf 'footer\n'
 MANY
 chmod +x "$WORK/many.sh"
-script -qec "bash -c 'stty cols 140 rows 22; $WORK/many.sh $REPO $WORK'" /dev/null >"$WORK/many.raw" 2>&1
-many_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$WORK/many.raw" --cols 140 --rows 22)"
+script -qec "bash -c 'stty cols 80 rows 22; $WORK/many.sh $REPO $WORK'" /dev/null >"$WORK/many.raw" 2>&1
+# Asserted on the transcript, not on a screen rendered at a guessed offset: the
+# window is what the LIVE region does, and the resolve afterwards deliberately
+# prints the WHOLE list as text so the earlier steps land in scrollback.
+# Only the LIVE part: everything up to the renderer's final erase. After that
+# the main shell resolves by printing all thirty steps as text, which is the
+# point — the ones the window did not show are in scrollback.
+many_live="$(python3 - "$WORK/many.raw" <<'PYEOF'
+import sys
+d = open(sys.argv[1], 'rb').read()
+cut = d.rfind(b'\x1b[J')
+sys.stdout.write(d[:cut if cut > 0 else len(d)].decode('utf-8', 'replace'))
+PYEOF
+)"
 windowed=0
-grep -qE 'earlier step\(s\) above' <<<"$many_screen" \
-    && grep -q 'step 30 of thirty' <<<"$many_screen" \
-    && grep -q 'footer' <<<"$many_screen" || windowed=1
+grep -qE '… [0-9]+ more above' <<<"$many_live" || windowed=1        # says how many are above
+grep -q 'step 30 of thirty' <<<"$many_live" || windowed=1           # the last step is visible
+grep -q 'step 11 of thirty' <<<"$many_live" && windowed=1           # an early one is NOT, while live
+grep -q 'footer' "$WORK/many.raw" || windowed=1                     # and the run finished
+grep -q 'step 11 of thirty' "$WORK/many.raw" || windowed=1          # the ones it did not show resolve into scrollback
 check "$windowed" \
     "30 steps in a 22-row terminal: a window anchored on the last, and a count of what is above" \
-    "$(head -3 <<<"$many_screen")"
+    "$(grep -aoE '… [0-9]+ more above|step (11|30) of thirty' <<<"$many_live" | sort -u | tr '\n' ' ')"
 
 # 5. Interrupted, it leaves no hidden cursor and no half a cat.
 script -qec './scripts/lib/cat.sh --demo 20' /dev/null >"$WORK/int.raw" 2>&1 &

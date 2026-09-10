@@ -14,8 +14,9 @@
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     _S_GREEN=$'\033[32m'; _S_RED=$'\033[31m'; _S_DIM=$'\033[2m'; _S_RESET=$'\033[0m'
+    _S_AMBER=$'\033[33m'
 else
-    _S_GREEN=""; _S_RED=""; _S_DIM=""; _S_RESET=""
+    _S_GREEN=""; _S_RED=""; _S_DIM=""; _S_RESET=""; _S_AMBER=""
 fi
 
 # When a live region owns the screen (scripts/lib/region.sh), these do not
@@ -26,6 +27,61 @@ _S_REGION=0
 _S_IDX=0
 _S_LINES=()
 _S_NOTES=()
+
+# THE STEP LIST'S STATE. One entry per step: what it is called (short, for the
+# region), what state it is in, and a status token with a fixed budget. The
+# detail — the digest, the package list, the socket path — goes to the log,
+# because a column sized to whatever a step prints is not a design (F-29).
+_S_LABELS=()
+_S_STATES=()
+_S_TOKENS=()
+
+_s_republish() {
+    (( _S_REGION )) || return 0
+    local out=() i
+    for i in "${!_S_LABELS[@]}"; do
+        out+=("$(printf '%s\t%s\t%s' "${_S_STATES[$i]}" "${_S_LABELS[$i]}" "${_S_TOKENS[$i]}")")
+    done
+    nemr_region_publish "${out[@]}"
+}
+
+# Seed the list, all pending.
+steps_seed() {   # <label>...
+    local l
+    _S_LABELS=(); _S_STATES=(); _S_TOKENS=()
+    for l in "$@"; do _S_LABELS+=("$l"); _S_STATES+=("wait"); _S_TOKENS+=(""); done
+    _s_republish
+}
+
+# The step at $_S_IDX is the one running now.
+step_begin() {
+    _S_STATES[$_S_IDX]="run"
+    _S_TOKENS[$_S_IDX]="…"
+    _s_republish
+}
+
+# How it went. <state> is done|warn|fail; <token> fills the status column;
+# <detail> is the full sentence, which the log always gets and an append-only
+# run also prints.
+step_result() {   # <state> <token> <detail>
+    local state="$1" token="$2" detail="$3" label="${_S_LABELS[$_S_IDX]:-}"
+    _S_STATES[$_S_IDX]="$state"
+    _S_TOKENS[$_S_IDX]="$token"
+    # A failure carries its own explanation. The cleanup prints "Stopped at …"
+    # and the log path only when FAILED_STEP is set, and a step that failed
+    # before something else set it left a resolved list with no reason on it.
+    [[ "$state" == fail ]] && FAILED_STEP="$label"
+    printf '[%s] %s — %s\n' "$state" "$label" "$detail" >>"$LOG" 2>/dev/null || true
+    if (( _S_REGION )); then
+        _s_republish
+    else
+        case "$state" in
+            done) printf '  %s✓%s %s — %s\n' "$_S_GREEN" "$_S_RESET" "$label" "$detail" ;;
+            warn) printf '  %s!%s %s — %s\n' "$_S_AMBER" "$_S_RESET" "$label" "$detail" ;;
+            *)    printf '  %s✗%s %s — %s\n' "$_S_RED" "$_S_RESET" "$label" "$detail" ;;
+        esac
+    fi
+}
 
 tick()  {
     if (( _S_REGION )); then
@@ -112,7 +168,11 @@ logged_long() {
 # or interrupted — and a failure names the log rather than dumping it.
 steps_trap() {
     trap '_steps_cleanup' EXIT
-    trap 'FAILED_STEP="${FAILED_STEP:-interrupted}"; nemr_cat_stop; exit 130' INT TERM
+    # Ctrl-C resolves the region into ordinary text FIRST, then exits: the step
+    # list, the failure and the log path have to survive the script and be
+    # scrollable and copyable afterwards. A region that vanished with the
+    # process would take the reason with it.
+    trap 'FAILED_STEP="${FAILED_STEP:-interrupted}"; nemr_region_stop 2>/dev/null; nemr_cat_stop; exit 130' INT TERM
 }
 _steps_cleanup() {
     local rc=$?
