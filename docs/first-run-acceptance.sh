@@ -18,12 +18,18 @@ if [ -z "$project" ]; then project="firstrun-$$"; own=1; fi
 raw="/tmp/nemr-firstrun-$project.raw"; txt="/tmp/nemr-firstrun-$project.txt"
 
 echo "=== first-run acceptance for $project at $(date -u +%FT%TZ) ==="
+# The engine's own login, not the host's ~/.claude — F-14 moved it, and this
+# check went on reading the old path, so on a machine where nemr was logged in
+# it reported "no credential" and refused (the gate audit, 2026-09-09).
 python3 - <<'PY' || exit 1
 import json,os,time
-p=os.path.expanduser('~/.claude/.credentials.json')
-if not os.path.exists(p): print("no host credential; log in on the host first"); raise SystemExit(1)
-o=json.load(open(p))['claudeAiOauth']
-print("host credential: access %s (%+.1f h), refresh to %s" % ("present" if o.get('accessToken') else "BLANK", (o['expiresAt']/1000-time.time())/3600, time.strftime('%F', time.gmtime(o.get('refreshTokenExpiresAt',0)/1000))))
+p=os.path.expanduser('~/.local/share/nemr/host-credential/.credentials.json')
+if not os.path.exists(p):
+    print("this machine has no nemr login yet — attach a session and run /login (E-21, F-24)"); raise SystemExit(1)
+o=json.load(open(p)).get('claudeAiOauth', {})
+if '_nemr_placeholder' in o or not o.get('accessToken'):
+    print("this machine has no nemr login yet (the file is the placeholder) — run /login inside a session"); raise SystemExit(1)
+print("this machine's login: access %s (%+.1f h), refresh to %s" % ("present" if o.get('accessToken') else "BLANK", (o['expiresAt']/1000-time.time())/3600, time.strftime('%F', time.gmtime(o.get('refreshTokenExpiresAt',0)/1000))))
 PY
 if [ "$own" = 1 ]; then
     NEMR_NON_INTERACTIVE=1 nemr create "$project" --size 500MB >/dev/null || exit 1

@@ -205,8 +205,77 @@ fn require_serial_execution() {
 }
 
 /// Whether the developer explicitly opted out of host-backed tests.
+///
+/// ASKING IS ANNOUNCING. Every caller in this suite asks in order to skip, and
+/// 28 of them returned early without ever reaching `require_host`'s message —
+/// so they skipped in complete silence and cargo reported them as passed. The
+/// announcement therefore lives here, at the question, not at one of the two
+/// places that happened to answer it (the gate audit, 2026-09-09).
+#[track_caller]
 pub fn unit_only() -> bool {
+    if std::env::var_os("NEMR_TEST_UNIT_ONLY").is_some() {
+        announce_unit_only_skip();
+        return true;
+    }
+    false
+}
+
+/// The same question without the announcement, for code that is deciding
+/// something other than whether to skip.
+pub fn unit_only_quiet() -> bool {
     std::env::var_os("NEMR_TEST_UNIT_ONLY").is_some()
+}
+
+/// Where a unit-only run records what it did not run.
+///
+/// A harness reads this instead of grepping the suite's output, which only
+/// carries the skip lines under `--nocapture`.
+pub fn unit_only_ledger() -> PathBuf {
+    std::env::var_os("NEMR_TEST_SKIP_LEDGER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("unit-only-skips.txt"))
+}
+
+/// Announce a skipped test so it cannot be mistaken for a passed one.
+///
+/// TWO channels, deliberately.
+///
+/// 1. **Straight to the stderr file descriptor**, not `eprintln!`. libtest
+///    captures the `print!`/`eprintln!` macros for a test that passes, and a
+///    test that returns early *does* pass — so the old message was invisible in
+///    every run that did not pass `--nocapture`, which is how 33 of 76
+///    regression tests could quietly not run (the gate audit, 2026-09-09). A
+///    direct `writeln!` on the handle bypasses the capture and always prints.
+/// 2. **A ledger file**, appended once per skip, so a harness can count and
+///    report them without parsing test output at all.
+#[track_caller]
+fn announce_unit_only_skip() {
+    use std::io::Write;
+    let at = std::panic::Location::caller();
+    // Formatted first, then ONE write_all: `writeln!` straight at the handle
+    // emits several write() calls, and parallel tests interleave them into
+    // unreadable half-lines. The same reason the ledger below is written once.
+    let line = format!(
+        "\nNEMR-SKIP {at}: host-backed test NOT RUN (NEMR_TEST_UNIT_ONLY). \
+         It is reported as passed by cargo; it checked nothing.\n"
+    );
+    let _ = std::io::stderr().write_all(line.as_bytes());
+    let ledger = unit_only_ledger();
+    if let Some(dir) = ledger.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Truncated once per process, then appended to: the file describes THIS run.
+    static FRESH: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    FRESH.get_or_init(|| {
+        let _ = std::fs::write(&ledger, "");
+    });
+    // ONE write_all of one buffer: tests run in parallel by default, and a
+    // `writeln!` that formats into the file handle can issue several write()
+    // calls, which interleave into corrupted lines. Measured: they did.
+    let entry = format!("{at}\n");
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&ledger) {
+        let _ = f.write_all(entry.as_bytes());
+    }
 }
 
 /// Assert the host can run this test, or fail with instructions.
@@ -214,13 +283,10 @@ pub fn unit_only() -> bool {
 /// Returns `false` when the caller should return early because the developer
 /// opted out via `NEMR_TEST_UNIT_ONLY`. Otherwise it either returns `true` or
 /// panics with a message that says exactly what is missing and how to fix it.
+#[track_caller]
 pub fn require_host(requirements: HostRequirements) -> bool {
-    if unit_only() {
-        eprintln!(
-            "NEMR_TEST_UNIT_ONLY is set: skipping a host-backed regression test. \
-             CI does not set this, and a green run with it set proves nothing about \
-             the defects these tests guard."
-        );
+    if unit_only_quiet() {
+        announce_unit_only_skip();
         return false;
     }
 
@@ -1105,11 +1171,47 @@ pub fn run_offline(args: &[&str]) -> std::process::Output {
     Command::new("unshare")
         .args(["-rmn", "bash", "-c"])
         .arg(format!(
-            "mount -t tmpfs none '{home}/.claude' && \
-             CONTAINERD_ADDRESS='{socket}' '{}' {}",
+            "{} && CONTAINERD_ADDRESS='{socket}' '{}' {}",
+            offline_masking(&home),
             binary.display(),
             quoted.join(" ")
         ))
         .output()
         .expect("run nemr offline")
+}
+
+/// The shell that hides this machine's Claude login inside the namespace.
+///
+/// ONE definition, used by `run_offline` and by the control that proves the
+/// hiding works — otherwise the control tests something the real call does not
+/// do. It masks the path the ENGINE reads (F-14:
+/// `~/.local/share/nemr/host-credential`) and, for good measure, the host's own
+/// `~/.claude`, which is a different file the engine never reads.
+///
+/// Masking `~/.claude` alone was the whole of this for two days after F-14
+/// moved the credential, so `e11_export_and_import_work_with_no_network_and_no_credentials`
+/// silently stopped establishing the "no credential" half of its own name. It
+/// passed either way, which is why nothing caught it (the gate audit, 2026-09-09).
+fn offline_masking(home: &str) -> String {
+    let engine_credential_dir = format!("{home}/.local/share/nemr/host-credential");
+    // mkdir first: mount fails on a missing directory, and a host that has
+    // never run the engine has neither of these.
+    format!(
+        "mkdir -p '{engine_credential_dir}' '{home}/.claude' && \
+         mount -t tmpfs none '{engine_credential_dir}' && \
+         mount -t tmpfs none '{home}/.claude'"
+    )
+}
+
+/// Run an arbitrary shell command under exactly the masking `run_offline` uses.
+///
+/// This exists so a control can ask "is the credential actually hidden in
+/// there?" of the same namespace the real call runs in.
+pub fn run_offline_probe(shell: &str) -> std::process::Output {
+    let home = std::env::var("HOME").expect("HOME");
+    Command::new("unshare")
+        .args(["-rmn", "bash", "-c"])
+        .arg(format!("{} && {shell}", offline_masking(&home)))
+        .output()
+        .expect("run a probe offline")
 }

@@ -17,6 +17,13 @@ NEMR_WAIT_INTERVAL=0.05
 
 GREEN=$'\033[32m'; RED=$'\033[31m'; RESET=$'\033[0m'
 PASS=0; FAIL=0
+# F-6: the count is ASSERTED, not printed. The gate audit (2026-09-09) found
+# six of this project's eight acceptance scripts exiting 0 over a tally nobody
+# checked — a run that skipped a step read exactly like a run that made every
+# assertion. Raise this number when a step is added; a run that counts anything
+# else fails.
+# Measured: three consecutive clean runs, 34 each.
+EXPECTED_ASSERTIONS=34
 ok()   { PASS=$((PASS+1)); printf '%sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '%sFAIL%s %s\n' "$RED" "$RESET" "$1" >&2; }
 check() { # <desc> <haystack> <needle>
@@ -183,6 +190,13 @@ out=$(refuse_protected "keep-me" 2>&1); rc=$?
 
 printf '\n'
 if [[ $FAIL -eq 0 ]]; then
-    printf '%sPASS%s — %d assertions.\n' "$GREEN" "$RESET" "$PASS"; exit 0
+    if [[ "$PASS" -ne "$EXPECTED_ASSERTIONS" ]]; then
+        printf '%sFAIL%s — %d assertions, %d expected: a case was skipped, or one was\n' \
+            "$RED" "$RESET" "$PASS" "$EXPECTED_ASSERTIONS"
+        printf '       added without raising EXPECTED_ASSERTIONS (F-6).\n'
+        exit 1
+    fi
+    printf '%sPASS%s — %d assertions, all %d expected.\n' \
+        "$GREEN" "$RESET" "$PASS" "$EXPECTED_ASSERTIONS"; exit 0
 fi
 printf '%sFAIL%s — %d passed, %d failed.\n' "$RED" "$RESET" "$PASS" "$FAIL"; exit 1

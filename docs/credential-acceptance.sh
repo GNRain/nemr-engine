@@ -11,13 +11,17 @@
 # F-65 class: a check that erases the evidence of its own failure).
 set -u
 project="${1:?usage: $0 <project>}"
-cred="$HOME/.claude/.credentials.json"
+# The engine's own login (F-14), not the host's ~/.claude — which is a
+# different file that nemr neither writes nor reads.
+cred="$HOME/.local/share/nemr/host-credential/.credentials.json"
 log="${XDG_STATE_HOME:-$HOME/.local/state}/nemr/nemrd.log"
 
 echo "=== credential acceptance for $project at $(date -u +%FT%TZ) ==="
 python3 - "$cred" <<'PY'
 import json,sys,time
-o=json.load(open(sys.argv[1]))['claudeAiOauth']
+o=json.load(open(sys.argv[1])).get('claudeAiOauth', {})
+if '_nemr_placeholder' in o:
+    print("this machine has no nemr login yet (placeholder) — run /login inside a session"); raise SystemExit(1)
 print("host: access token %s (%+.1f h), refresh token to %s" % (
     "BLANK" if not o.get('accessToken') else "present",
     (o['expiresAt']/1000-time.time())/3600,

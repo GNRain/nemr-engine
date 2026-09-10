@@ -32,6 +32,15 @@ REPO="$PWD"
 
 BLUE=$'\033[34m'; RED=$'\033[31m'; GREEN=$'\033[32m'; RESET=$'\033[0m'
 STEP=0; ASSERTS=0
+# F-6: the count is ASSERTED, not printed. The gate audit (2026-09-09) found
+# six of this project's eight acceptance scripts exiting 0 over a tally nobody
+# checked — a run that skipped a step read exactly like a run that made every
+# assertion. Raise this number when a step is added; a run that counts anything
+# else fails.
+# Both modes make the same number: each NEMR_SKIP_API branch has exactly one
+# `pass` on either side (the planted marker vs the live conversation; the
+# file-level claim vs the recalled conversation). Measured in the skip mode.
+EXPECTED_ASSERTIONS=15
 step()   { STEP=$((STEP+1)); printf '\n%s== %d. %s%s\n' "$BLUE" "$STEP" "$1" "$RESET"; }
 pass()   { ASSERTS=$((ASSERTS+1)); printf '   %sok%s %s\n' "$GREEN" "$RESET" "$1"; }
 fail()   { printf '   %sFAIL%s %s\n' "$RED" "$RESET" "$1" >&2; exit 1; }
@@ -62,6 +71,10 @@ trap cleanup EXIT INT TERM
 step "Prerequisites (freshness gate first: prove the binaries are this source)"
 # ---------------------------------------------------------------------------
 command -v nemr >/dev/null || fail "nemr is not on PATH — ./scripts/install_engine.sh"
+# A filter that matches nothing exits 0, so check it names a real test BEFORE
+# trusting its result — otherwise a rename disarms this gate in silence.
+require_test_exists the_installed_engine_matches_its_source --test regression \
+    || fail "the freshness gate cannot run (see above)"
 if ! cargo test --test regression the_installed_engine_matches_its_source --quiet >/dev/null 2>&1; then
     fail "the installed nemr/nemrd is not this source — ./scripts/install_engine.sh"
 fi
@@ -165,14 +178,29 @@ nemr push "$PROJECT"
 grep -qi "$PROJECT" <<<"$(nemr sessions)" || fail "pushed session not in the index"
 pass "pushed; the session is in the server index"
 
-# The server holds ciphertext: the stored object must not contain the marker
-# or any plaintext bundle magic.
+# E-16: the server holds ciphertext. Asserted in BOTH modes.
+#
+# This check used to be guarded by `[[ "$SKIP_API" == "1" ]] &&`, so in the
+# full-API run — the mode that makes the strongest claim — the `pass` below
+# printed with nothing behind it at all (the gate audit, 2026-09-09). Two
+# needles now, and neither depends on the mode:
+#
+#   (a) structural: a plaintext bundle carries its manifest member's name in
+#       the clear (src/bundle/manifest.rs: MANIFEST_MEMBER = "manifest.json"),
+#       so finding that string in the stored object means the server holds
+#       plaintext, whatever this run put in the session;
+#   (b) this run's own words: the marker under NEMR_SKIP_API, and the live
+#       conversation's confirmation phrase otherwise.
 STORED=$(find "$BUNDLES" -type f | head -1)
 [[ -n "$STORED" ]] || fail "no stored object in the bundle dir"
-if [[ "$SKIP_API" == "1" ]] && grep -q "MARKER-$$-TRANSCRIPT" "$STORED"; then
-    fail "the stored object contains plaintext — E-16 violated"
+if grep -qa 'manifest.json' "$STORED"; then
+    fail "the stored object carries the plaintext bundle's manifest member — E-16 violated"
 fi
-pass "the stored object is ciphertext ($(stat -c%s "$STORED") bytes)"
+if [[ "$SKIP_API" == "1" ]]; then NEEDLE="MARKER-$$-TRANSCRIPT"; else NEEDLE="SAY-APRICOT"; fi
+if grep -qa "$NEEDLE" "$STORED"; then
+    fail "the stored object contains this run's plaintext ('$NEEDLE') — E-16 violated"
+fi
+pass "the stored object is ciphertext: no manifest member, no '$NEEDLE' ($(stat -c%s "$STORED") bytes)"
 
 # ---------------------------------------------------------------------------
 step "Delete the local project entirely"
@@ -243,7 +271,15 @@ step "Release the lease (clean stop)"
 nemr release "$PROJECT"
 pass "lease released"
 
-printf '\n%sPASS%s — %d steps, %d assertions.\n' "$GREEN" "$RESET" "$STEP" "$ASSERTS"
+if [[ "$ASSERTS" -ne "$EXPECTED_ASSERTIONS" ]]; then
+    printf '\n%sFAIL%s — %d assertions, %d expected: a step was skipped, or one was\n' \
+        "$RED" "$RESET" "$ASSERTS" "$EXPECTED_ASSERTIONS"
+    printf '       added without raising EXPECTED_ASSERTIONS. Zero failures over too\n'
+    printf '       few assertions is not a pass (F-6).\n'
+    exit 1
+fi
+printf '\n%sPASS%s — %d steps, %d assertions, all %d expected.\n' \
+    "$GREEN" "$RESET" "$STEP" "$ASSERTS" "$EXPECTED_ASSERTIONS"
 if [[ "$SKIP_API" == "1" ]]; then
     echo "mode: NEMR_SKIP_API=1 — transcript byte-fidelity only; the live-conversation"
     echo "      continuity claim was NOT exercised. Run without NEMR_SKIP_API for the full claim."

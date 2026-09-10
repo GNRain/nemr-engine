@@ -24,6 +24,8 @@ REPO="$PWD"
 
 . scripts/lib/cat.sh
 . scripts/lib/steps.sh
+# shellcheck source=lib/proc.sh
+. scripts/lib/proc.sh
 
 YES=0
 usage() {
@@ -221,13 +223,16 @@ note "a server is installed when it answers, not when the build exits zero"
 FAILED_STEP="the server did not answer"
 "$HOME/.local/bin/nemr-sync" >>"$LOG" 2>&1 &
 SERVER_PID=$!
+# The shared helper, not a hand-rolled poll: it watches the process as well as
+# the port, so a server that dies at startup is reported as dead rather than as
+# a timeout, and it prints the log when it gives up (F-95). This was a
+# hand-rolled loop until the wait-discipline gate — unrun since CI stopped —
+# caught it on 2026-09-10.
 health=""
-for _ in $(seq 1 30); do
-    health="$(curl -fsS "http://${LISTEN}/health" 2>/dev/null || true)"
-    [[ "$health" == "ok" ]] && break
-    kill -0 "$SERVER_PID" 2>/dev/null || break
-    sleep 1
-done
+if wait_for_service "nemr-sync" "$SERVER_PID" "$LOG" 30 \
+        curl -fsS "http://${LISTEN}/health"; then
+    health=ok
+fi
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 if [[ "$health" == "ok" ]]; then

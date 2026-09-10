@@ -124,14 +124,12 @@ echo "==> Placeholder Claude Code credential (CI only)"
 # Deliberately NOT done: weakening `resolve_credentials` or adding a skip-auth
 # flag. That would make CI exercise a different code path than users run, which
 # is the failure mode this project keeps hitting.
-if [[ ! -e "$HOME/.claude/.credentials.json" ]]; then
-    mkdir -p "$HOME/.claude"
-    cat > "$HOME/.claude/.credentials.json" <<'CRED'
-{"_comment": "CI PLACEHOLDER — not a credential. Exercises the AUTH-02 mount path only; the API round-trip is skipped in CI (NEMR_SKIP_API=1)."}
-CRED
-    chmod 600 "$HOME/.claude/.credentials.json"
-    echo "    created a placeholder at ~/.claude/.credentials.json (mode 600)"
-fi
+# Nothing to plant. Until E-21 this wrote a placeholder at
+# the host's own Claude directory so the AUTH-02 mount had a source; since E-21 the
+# ENGINE writes its own placeholder, at its own path, at create and start
+# (F-14 moved that path off ~/.claude, so what this used to write was a file
+# the engine no longer reads at all).
+echo "    credential: none needed here — the engine writes its own placeholder (E-21, F-24)"
 
 echo "==> Allow unprivileged user namespaces (E-11 offline test)"
 # Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1, which blocks

@@ -280,3 +280,38 @@ _proc_dump_stream() {
     fi
     printf '   --- end ---\n' >&2
 }
+
+# ---------------------------------------------------------------------------
+# A test filter that matches nothing is an ERROR, not a pass.
+# ---------------------------------------------------------------------------
+#
+# `cargo test <filter>` exits **0** when the filter matches no test at all. So
+# a guard written as
+#
+#     cargo test --test regression the_thing_i_depend_on --quiet || fail ...
+#
+# stops guarding the moment someone renames that test, and says nothing. Five
+# scripts in this repo gate their whole run on exactly that shape (the gate
+# audit, 2026-09-09): the freshness check that the installed nemr is this
+# source. A rename would have disarmed all five silently.
+#
+# Use this instead of calling `cargo test <filter>` directly:
+#
+#     require_test_exists the_installed_engine_matches_its_source --test regression \
+#         || die "..."
+#
+# It asks cargo what the filter matches BEFORE anything is run, and refuses a
+# filter that matches nothing. Returns 0 when at least one test matches.
+require_test_exists() {
+    local filter="$1"; shift
+    local matched
+    matched=$(cargo test "$@" "$filter" -- --list 2>/dev/null | grep -c ': test$' || true)
+    if [[ "${matched:-0}" -lt 1 ]]; then
+        printf '%s\n' \
+            "the test filter '$filter' matches no test in this suite." \
+            "  Whatever it was guarding is not being checked. It was renamed or deleted;" \
+            "  find its new name (cargo test $* -- --list) and update the caller." >&2
+        return 1
+    fi
+    return 0
+}

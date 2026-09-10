@@ -63,8 +63,17 @@ printf '%s\n' "$regression_output" | grep -E '^test result:' || true
 
 regression_passed=$(printf '%s\n' "$regression_output" \
     | sed -n 's/.*test result: ok\. \([0-9]*\) passed.*/\1/p' | head -1)
+# The LEDGER, not the output. The old grep looked for a message libtest
+# captures for a passing test — and every skipped test passes — so it read 0
+# unless the run happened to pass --nocapture. The suite now writes one line per
+# skip to a file, and reads back cleanly whatever the runner asked for
+# (tests/common/mod.rs: unit_only_ledger).
+skip_ledger="$(find target -name unit-only-skips.txt -newer Cargo.toml 2>/dev/null | head -1)"
 regression_skipped=$(printf '%s\n' "$regression_output" \
-    | grep -c 'skipping a host-backed regression test' || true)
+    | grep -c 'NEMR-SKIP' || true)
+if [[ -n "$skip_ledger" && -s "$skip_ledger" ]]; then
+    regression_skipped=$(sort -u "$skip_ledger" | wc -l)
+fi
 
 if [[ "${regression_passed:-0}" -ne "${regression_total:-0}" ]]; then
     echo "    only ${regression_passed:-0} of ${regression_total:-0} regression tests ran." >&2
@@ -72,8 +81,10 @@ if [[ "${regression_passed:-0}" -ne "${regression_total:-0}" ]]; then
     exit 1
 fi
 if [[ "${regression_skipped:-0}" -ne 0 ]]; then
-    echo "    ${regression_skipped} regression test(s) returned early (NEMR_TEST_UNIT_ONLY)." >&2
-    echo "    This gate verifies the HOST-backed guarantees; a skipped run is not a pass." >&2
+    echo "    ${regression_skipped} regression test(s) did NOT RUN (NEMR_TEST_UNIT_ONLY)." >&2
+    echo "    cargo reports them as passed; they checked nothing. This gate verifies the" >&2
+    echo "    HOST-backed guarantees, so a skipped run is not a pass. They were:" >&2
+    [[ -n "$skip_ledger" ]] && sed 's/^/      /' "$skip_ledger" >&2
     exit 1
 fi
 echo "    ok — all ${regression_total} regression tests ran, none skipped"

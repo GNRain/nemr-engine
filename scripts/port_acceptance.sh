@@ -19,6 +19,12 @@ REPO="$PWD"
 
 BLUE=$'\033[34m'; RED=$'\033[31m'; GREEN=$'\033[32m'; RESET=$'\033[0m'
 STEP=0; ASSERTS=0
+# F-6: the count is ASSERTED, not printed. The gate audit (2026-09-09) found
+# six of this project's eight acceptance scripts exiting 0 over a tally nobody
+# checked — a run that skipped a step read exactly like a run that made every
+# assertion. Raise this number when a step is added; a run that counts anything
+# else fails.
+EXPECTED_ASSERTIONS=11
 step() { STEP=$((STEP+1)); printf '\n%s== %d. %s%s\n' "$BLUE" "$STEP" "$1" "$RESET"; }
 pass() { ASSERTS=$((ASSERTS+1)); printf '   %sok%s %s\n' "$GREEN" "$RESET" "$1"; }
 fail() { printf '   %sFAIL%s %s\n' "$RED" "$RESET" "$1" >&2; exit 1; }
@@ -44,6 +50,10 @@ step "Prerequisites"
 # ---------------------------------------------------------------------------
 command -v nemr >/dev/null || fail "nemr is not on PATH — ./scripts/install_engine.sh"
 command -v rootlessctl >/dev/null || fail "rootlessctl is missing — see PREREQUISITES.md"
+# A filter that matches nothing exits 0, so check it names a real test BEFORE
+# trusting its result — otherwise a rename disarms this gate in silence.
+require_test_exists the_installed_engine_matches_its_source --test regression \
+    || fail "the freshness gate cannot run (see above)"
 if ! cargo test --test regression the_installed_engine_matches_its_source --quiet >/dev/null 2>&1; then
     fail "the installed nemr/nemrd is not this source — ./scripts/install_engine.sh"
 fi
@@ -117,6 +127,14 @@ if ss -tlnp 2>/dev/null | grep -q ":${HOST_PORT} "; then
 fi
 pass "delete released the host port"
 
-printf '\n%sPASS%s — %d steps, %d assertions.\n' "$GREEN" "$RESET" "$STEP" "$ASSERTS"
+if [[ "$ASSERTS" -ne "$EXPECTED_ASSERTIONS" ]]; then
+    printf '\n%sFAIL%s — %d assertions, %d expected: a step was skipped, or one was\n' \
+        "$RED" "$RESET" "$ASSERTS" "$EXPECTED_ASSERTIONS"
+    printf '       added without raising EXPECTED_ASSERTIONS. Zero failures over too\n'
+    printf '       few assertions is not a pass (F-6).\n'
+    exit 1
+fi
+printf '\n%sPASS%s — %d steps, %d assertions, all %d expected.\n' \
+    "$GREEN" "$RESET" "$STEP" "$ASSERTS" "$EXPECTED_ASSERTIONS"
 echo "A server inside a session is reachable from this host. That is the thing"
 echo "that did not work."
