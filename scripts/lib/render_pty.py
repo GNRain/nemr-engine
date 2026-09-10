@@ -7,10 +7,15 @@ it. Counting `\\033[J`s proves a clear was issued, not that nothing was left
 behind — and a managed region makes a stray frame harder to see, not easier.
 
     ./scripts/lib/render_pty.py <transcript> [--rows N] [--cols N] [--at BYTES]
+                                [--frame N]
 
 Prints the final screen, one line per row, trailing blanks stripped. With
 --at, prints the screen as it stood after the first N bytes, which is how a
-mid-run state is inspected.
+mid-run state is inspected. --at slices wherever the byte lands, which is
+usually halfway through a frame and shows half-drawn rows that were never on
+anyone's screen; --frame N slices at the end of the Nth COMPLETE frame instead
+(this project's renderer ends every frame by moving the cursor back up and to
+column 1), which is the honest way to read a mid-run layout.
 
 It interprets only what this project's own drawing uses: CR, LF, cursor
 up/down/forward/back, absolute positioning, erase-in-line and erase-in-display.
@@ -113,7 +118,7 @@ class Screen:
 def main():
     args = sys.argv[1:]
     path = args[0]
-    rows, cols, at = 24, 80, None
+    rows, cols, at, frame = 24, 80, None, None
     for i, a in enumerate(args):
         if a == "--rows":
             rows = int(args[i + 1])
@@ -121,7 +126,14 @@ def main():
             cols = int(args[i + 1])
         elif a == "--at":
             at = int(args[i + 1])
+        elif a == "--frame":
+            frame = int(args[i + 1])
     data = open(path, "rb").read()
+    if frame is not None:
+        ends = [m.end() for m in re.finditer(rb"\x1b\[[0-9]+A\r", data)]
+        if not ends:
+            sys.exit("no complete frame in %s" % path)
+        data = data[: ends[min(frame, len(ends)) - 1]]
     if at is not None:
         data = data[:at]
     s = Screen(rows, cols)

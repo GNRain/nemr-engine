@@ -64,7 +64,7 @@ while (($#)); do
         -q|--quiet) NEMR_CAT=0 ;;
         -v|--verbose) VERBOSE=1; _S_VERBOSE=1; NEMR_CAT=0 ;;
         -h|--help)  usage; exit 0 ;;
-        *) printf 'install.sh: unknown option %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+        *) printf 'install.sh: unknown option %s\n\n' "$1"; usage; exit 2 ;;
     esac
     shift
 done
@@ -110,8 +110,9 @@ refuse() { MISSING+=("$1"$'\n'"      found: $2"$'\n'"      fix:   $3"); }
 
 preflight() {
     if [[ "$USER_ID" -eq 0 ]]; then
-        printf 'Run this as your normal user, not root.\n' >&2
-        printf 'The stack is rootless (PRIV-01); the script asks for sudo where it needs it.\n' >&2
+        RESULT_STATE=handled
+        printf 'Run this as your normal user, not root.\n'
+        printf 'The stack is rootless (PRIV-01); the script asks for sudo where it needs it.\n'
         exit 2
     fi
 
@@ -177,11 +178,12 @@ preflight() {
     fi
 
     if (( ${#MISSING[@]} > 0 )); then
+        RESULT_STATE=handled
         printf '\n%snemr cannot be installed on this machine yet — nothing has been changed.%s\n\n' \
-            "$_S_RED" "$_S_RESET" >&2
+            "$_S_RED" "$_S_RESET"
         local m
-        for m in "${MISSING[@]}"; do printf '  needs: %s\n\n' "$m" >&2; done
-        printf 'Fix these and run this again. PREREQUISITES.md explains why each one matters.\n' >&2
+        for m in "${MISSING[@]}"; do printf '  needs: %s\n\n' "$m"; done
+        printf 'Fix these and run this again. PREREQUISITES.md explains why each one matters.\n'
         exit 1
     fi
 }
@@ -390,6 +392,13 @@ do_step() {
         step_diagnosis "$id"
         exit 1
     fi
+    #   NEMR_TEST_FORCE_ABRUPT  exit with NOTHING recorded — no step_result, no
+    #                           RESULT_STATE — while the region owns the screen.
+    #                           The shape of an exit nobody wired; proves the
+    #                           backstop prints rather than the run going silent.
+    if [[ "${NEMR_TEST_FORCE_ABRUPT:-}" == "$id" ]]; then
+        exit 1
+    fi
     if [[ -n "${NEMR_TEST_STEP_STUB:-}" ]]; then
         # A number sets the per-step delay, so an interrupt can be aimed.
         if [[ "$NEMR_TEST_STEP_STUB" =~ ^[0-9.]+$ ]]; then sleep "$NEMR_TEST_STEP_STUB"
@@ -577,24 +586,20 @@ step_diagnosis() {
 # The reboot gate, surfaced rather than hidden: delegation applies when
 # user@.service restarts, and restarting it kills the session that asks.
 reboot_gate() {
-    local delegated=""
-    [[ -r "$DELEGATED_CONTROLLERS_PATH" ]] && delegated="$(cat "$DELEGATED_CONTROLLERS_PATH")"
-    [[ " $delegated " == *" cpu "* ]] && return 0
-    FAILED_STEP=""
-    cat >&2 <<EOF
-
-  cgroup delegation is configured, but it is not in effect yet.
-      expected: cpu among this user's delegated controllers
-      found:    ${delegated:-<the user slice is not readable>}
-
-  It applies when user@${USER_ID}.service restarts, and restarting that kills the
-  session asking for it — so in practice this is a reboot.
-
-      sudo reboot
-
-  Then run this again. It will skip everything above and carry on from here.
-
-EOF
+    # A test seam so the paused outcome can be exercised where delegation IS
+    # live (this reference host); unset in every real run.
+    if [[ -z "${NEMR_TEST_FORCE_REBOOT_GATE:-}" ]]; then
+        local delegated=""
+        [[ -r "$DELEGATED_CONTROLLERS_PATH" ]] && delegated="$(cat "$DELEGATED_CONTROLLERS_PATH")"
+        [[ " $delegated " == *" cpu "* ]] && return 0
+    fi
+    # NOT a failure, and NOT the script's job to print here: the region may own
+    # the screen. Record the third outcome and exit; the single authority
+    # (_steps_cleanup) tears the region down and prints it. Printing a heredoc
+    # to stderr from here, while clearing FAILED_STEP, was exactly the first
+    # install that produced no output at all (F-32).
+    RESULT_STATE=paused
+    RESULT_PAUSED_WHY="cgroup delegation applies only after the user manager restarts"
     exit 3
 }
 
@@ -623,11 +628,24 @@ open_log
 # cat looping beside them — one writer, nothing scrolling. Below its thresholds
 # (129 columns, 17 rows) this returns non-zero and the block prints as it always
 # did, line by line.
+# Strays from dead runs, swept before this run makes its own (F-34). A crash or
+# a kill -9 cannot run the cleanup trap, so its region./step. files would sit in
+# the state dir forever — the Product Owner found a pair per run. A file whose
+# pid is no longer alive is nobody's, so it goes.
+for _stray in "$LOG_DIR"/region.* "$LOG_DIR"/step.*; do
+    [[ -e "$_stray" ]] || continue
+    _spid="${_stray##*.}"
+    [[ "$_spid" =~ ^[0-9]+$ ]] && ! kill -0 "$_spid" 2>/dev/null && rm -f "$_stray" 2>/dev/null || true
+done
+
 REGION_STATE="$LOG_DIR/region.$$"
 # The current step's own output: the pane tails it, and step_result folds it
 # into the log when the step ends.
 STEP_OUT="$LOG_DIR/step.$$"
 : >"$STEP_OUT" 2>/dev/null || STEP_OUT=""
+# Registered with the single authority, which removes them on EVERY exit —
+# success, failure, or Ctrl-C (F-34).
+STEPS_TEMP_FILES=("$REGION_STATE" "$STEP_OUT")
 _NEMR_REGION_STATE_PATH="$REGION_STATE"   # so sudo_refresh can reopen it
 # Nothing may prompt while the region owns the screen, so the password is taken
 # BEFORE it opens and the timestamp is kept warm underneath it. Only when a
@@ -647,6 +665,10 @@ for id in "${STEP_IDS[@]}"; do
 done
 # The stub does no privileged work, so it must not ask for a password.
 [[ -n "${NEMR_TEST_STEP_STUB:-}" ]] && PRIVILEGED_PENDING=0
+#   NEMR_TEST_FORCE_SUDO_ASK  ask sudo even under the stub (the test puts a
+#                             refusing `sudo` first on PATH to drive the
+#                             refusal path; the real one is never touched).
+[[ -n "${NEMR_TEST_FORCE_SUDO_ASK:-}" ]] && PRIVILEGED_PENDING=1
 if nemr_region_enabled && (( PRIVILEGED_PENDING )); then
     sudo_refresh
 fi
@@ -656,20 +678,37 @@ fi
 # silent (measured, 2026-09-10). This block is what makes the next such report
 # answerable by reading the log the reporter already has.
 if (( VERBOSE )); then _NEMR_SCREEN_WHY="--verbose"; fi
+# THE DECISION IS MADE HERE, on the real stdout — never inside the block below.
+# It used to be made inside it, where the redirect to the log file makes
+# `[[ -t 1 ]]` false by construction, so every run that ever wrote this block
+# answered "NO — not-a-tty", including the hundreds that plainly drew a screen:
+# 399 logs on this machine, none of them saying yes. A control that can only
+# give one answer is worse than no control, because it gets read.
+SCREEN_LIVE=0
+(( ! VERBOSE )) && nemr_region_enabled && SCREEN_LIVE=1
+_screen_size="$(nemr_term_size 2>/dev/null || true)"
+_screen_by="$(stty size </dev/tty >/dev/null 2>&1 && echo 'stty /dev/tty' || echo 'tput/terminfo')"
+# Also measured out here: inside the block, stdout is the log file.
+# NOT in a command substitution: inside `$( )` stdout is a pipe, so `-t 1` is
+# false there whatever the real stdout is — the same mistake as asking the
+# question inside the block's own redirect, one line further down.
+if [[ -t 1 ]]; then _screen_tty=yes; else _screen_tty=no; fi
 {
     printf '\n--- install screen\n'
-    if (( ! VERBOSE )) && nemr_region_enabled; then
+    if (( SCREEN_LIVE )); then
         printf '    live:      yes\n'
     else
         printf '    live:      NO — %s\n' "${_NEMR_SCREEN_WHY:-unknown}"
     fi
-    _screen_size="$(nemr_term_size 2>/dev/null || true)"
     printf '    measured:  %s   by: %s\n' \
         "${NEMR_SCREEN_MEASURED:-${_screen_size:+${_screen_size#* } cols x ${_screen_size%% *} rows}}" \
-        "$(stty size </dev/tty >/dev/null 2>&1 && echo 'stty /dev/tty' || echo 'tput/terminfo')"
+        "$_screen_by"
     printf '    needs:     %s cols x %s rows\n' "$NEMR_REGION_MIN_COLS" "$NEMR_REGION_MIN_ROWS"
+    printf '    fitted:    left %s + gap %s + cat %s (right edge)   pane inner %s\n' \
+        "$NEMR_REGION_LEFT_COLS" "$NEMR_REGION_GAP" "$NEMR_REGION_CAT_COLS" "$_nemr_pane_inner"
+    printf '    resize:    not supported mid-run — the width is read once, at the start\n'
     printf '    terminal:  TERM=%s  tty=%s  NO_COLOR=%s  NEMR_CAT=%s\n' \
-        "${TERM:-unset}" "$([[ -t 1 ]] && echo yes || echo no)" \
+        "${TERM:-unset}" "$_screen_tty" \
         "${NO_COLOR:-unset}" "${NEMR_CAT:-unset}"
     printf '    host:      %s  TMPDIR=%s\n' \
         "$(is_wsl2 && echo WSL2 || echo linux)" "${TMPDIR:-/tmp}"
@@ -677,7 +716,7 @@ if (( VERBOSE )); then _NEMR_SCREEN_WHY="--verbose"; fi
     printf '               decides how far to scroll the screen into place\n\n'
 } >>"$LOG" 2>/dev/null || true
 
-if (( ! VERBOSE )) && nemr_region_start "$REGION_STATE" "$STEP_OUT"; then
+if (( SCREEN_LIVE )) && nemr_region_start "$REGION_STATE" "$STEP_OUT"; then
     _S_REGION=1
     # Seeded with every step, so the whole list is on screen from the first
     # frame: what is finished, what is running, what is still to come.
@@ -722,12 +761,15 @@ if (( _S_REGION )); then
     nemr_region_stop            # resolves to the final list; the cat is gone
     _S_REGION=0
     [[ -n "${SUDO_KEEPALIVE:-}" ]] && { kill "$SUDO_KEEPALIVE" 2>/dev/null; wait "$SUDO_KEEPALIVE" 2>/dev/null; }
-    rm -f "$REGION_STATE" "$STEP_OUT"
     flush_notes
 fi
 
-# The result, and only the result. Everything the run did is in the log, and
-# --verbose prints it as it happens.
+# The result is RECORDED here and PRINTED by the single authority (F-32), so it
+# cannot be skipped by an early return or erased by the region. Everything the
+# run did is in the log; --verbose prints it as it happens.
 NEMR_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
 have claude || CLAUDE_MISSING=1
-result_ok "${NEMR_VERSION:-unknown}" "${DEST_BIN/#$HOME/\~}" "${CLAUDE_MISSING:-}"
+RESULT_OK_VERSION="${NEMR_VERSION:-unknown}"
+RESULT_OK_DEST="${DEST_BIN/#$HOME/\~}"
+RESULT_OK_CLAUDE="${CLAUDE_MISSING:-}"
+RESULT_STATE=ok

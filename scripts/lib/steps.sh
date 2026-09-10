@@ -71,10 +71,13 @@ step_result() {   # <state> <token> <detail>
     local state="$1" token="$2" detail="$3" label="${_S_LABELS[$_S_IDX]:-}"
     _S_STATES[$_S_IDX]="$state"
     _S_TOKENS[$_S_IDX]="$token"
-    # A failure carries its own explanation. The cleanup prints "Stopped at …"
-    # and the log path only when FAILED_STEP is set, and a step that failed
-    # before something else set it left a resolved list with no reason on it.
-    [[ "$state" == fail ]] && FAILED_STEP="$label"
+    # A failure carries its own explanation, and it records the run's OUTCOME
+    # so the single authority (the EXIT trap) prints the failure block from the
+    # one place every exit passes through.
+    if [[ "$state" == fail ]]; then
+        FAILED_STEP="$label"
+        RESULT_STATE=failed
+    fi
     # Everything the step printed joins the log, in order, then the pane's file
     # is emptied for the next step.
     if [[ -n "${STEP_OUT:-}" && -s "$STEP_OUT" ]]; then
@@ -167,6 +170,45 @@ result_failed() {   # <step> <because> <fix>
     printf '    Full log: %s\n\n' "${LOG/#$HOME/\~}"
 }
 
+# A third terminal outcome, as real as success and failure: the run did its
+# part and now needs a reboot to continue (cgroup delegation applies when the
+# user manager restarts). It used to print a heredoc to stderr from inside
+# reboot_gate WHILE THE REGION OWNED THE SCREEN, then clear FAILED_STEP and
+# exit — so the EXIT trap said nothing and the region erased the message on its
+# way out: a first install that produced no output at all (F-32). Now it is a
+# state the one authority prints, after the region is down.
+result_paused() {   # <why>
+    printf '\n%s%s%s %sAlmost there — reboot, then run this again.%s\n\n' \
+        "$_S_AMBER" "$_S_MARK_WARN" "$_S_RESET" "$_S_BRIGHT" "$_S_RESET"
+    printf '      Why:   %s\n' "$1"
+    printf '      Do:    sudo reboot\n'
+    printf '             then ./scripts/install.sh again\n\n'
+    printf '    It skips everything done so far and carries on from here.\n\n'
+}
+
+# The backstop. If the script reaches its end by a path nobody modelled — a
+# set -e abort mid-step, a future exit someone adds without wiring an outcome —
+# this is what prints, so the run can NEVER finish silent (F-32, the class the
+# Product Owner named). It is deliberately blunt: something went wrong that the
+# installer did not have words for, and here is the log to send.
+result_unexpected() {
+    printf '\n%s%s%s %sInstall stopped unexpectedly.%s\n\n' \
+        "$_S_RED" "$_S_MARK_BAD" "$_S_RESET" "$_S_BRIGHT" "$_S_RESET"
+    printf '    It ended on a path it has no message for. This is a bug worth\n'
+    printf '    reporting; the full log has what happened:\n\n'
+    printf '      %s\n\n' "${LOG/#$HOME/\~}"
+}
+
+# Remove this run's own temp files. Registered by the caller (install.sh sets
+# STEPS_TEMP_FILES); the ONE exit point is the one place that can promise they
+# go on success, on failure and on Ctrl-C alike (F-34).
+steps_tempclean() {
+    local f
+    for f in ${STEPS_TEMP_FILES:+"${STEPS_TEMP_FILES[@]}"}; do
+        [[ -n "$f" ]] && rm -f "$f" "${f}.new" 2>/dev/null || true
+    done
+}
+
 # Print anything the region held back, once it has resolved.
 flush_notes() {
     local n
@@ -237,20 +279,58 @@ steps_trap() {
     # list, the failure and the log path have to survive the script and be
     # scrollable and copyable afterwards. A region that vanished with the
     # process would take the reason with it.
-    trap 'FAILED_STEP="${FAILED_STEP:-interrupted}"; nemr_region_stop 2>/dev/null; nemr_cat_stop; exit 130' INT TERM
+    trap '_steps_interrupted' INT TERM
 }
+# Ctrl-C is an outcome like any other: it is recorded here and SPOKEN by the
+# single authority below, after the region is gone. Nothing prints from this
+# trap — a message written while the region still owns the screen is erased.
+_steps_interrupted() {
+    trap - INT TERM
+    if [[ -z "${RESULT_STATE:-}" ]]; then
+        RESULT_STATE=failed
+        RESULT_FAILED_STEP="${_S_LABELS[$_S_IDX]:-${FAILED_STEP:-a step}}"
+        RESULT_BECAUSE="you pressed Ctrl-C"
+        RESULT_FIX="run this again; it carries on from the step it was on"
+    fi
+    exit 130
+}
+
+# THE SINGLE AUTHORITY (F-32). Every exit — normal, failed, interrupted, or a
+# path nobody modelled — passes through here, and here is the one place that:
+#   1. tears the region down (so nothing it prints can be erased),
+#   2. removes this run's temp files (F-34), and
+#   3. prints EXACTLY ONE outcome to stdout, always.
+# The invariant the Product Owner asked for — "never finish without printing a
+# result or a failure, on every path" — is this function, and it is asserted:
+# scripts/test_install.sh drives every exit path and checks stdout is non-empty.
 _steps_cleanup() {
     local rc=$?
     nemr_region_stop 2>/dev/null || true
     nemr_cat_stop
-    if [[ -n "$FAILED_STEP" ]]; then
-        # The result, in the same four-line shape as a success: what failed, why
-        # in plain words, the command that fixes it, and where the whole log is.
-        # Nothing else — the narration is in the log and behind --verbose.
-        result_failed "${RESULT_FAILED_STEP:-$FAILED_STEP}" \
-                      "${RESULT_BECAUSE:-it did not finish}" \
-                      "${RESULT_FIX:-read the full log, then run this again}" >&2
-    fi
+    steps_tempclean
+    case "${RESULT_STATE:-}" in
+        ok)
+            result_ok "${RESULT_OK_VERSION:-unknown}" "${RESULT_OK_DEST:-~/.local/bin/nemr}" \
+                      "${RESULT_OK_CLAUDE:-}" ;;
+        failed)
+            result_failed "${RESULT_FAILED_STEP:-${FAILED_STEP:-a step}}" \
+                          "${RESULT_BECAUSE:-it did not finish}" \
+                          "${RESULT_FIX:-read the full log, then run this again}" ;;
+        paused)
+            result_paused "${RESULT_PAUSED_WHY:-a setting applies only after a reboot}" ;;
+        handled)
+            : ;;   # an early refusal (preflight, consent) already spoke, to stdout
+        *)
+            # Unmodelled. If a step recorded a failure but the state was lost,
+            # print that; otherwise the blunt backstop. Either way, not silent.
+            if [[ -n "${FAILED_STEP:-}" ]]; then
+                result_failed "${RESULT_FAILED_STEP:-$FAILED_STEP}" \
+                              "${RESULT_BECAUSE:-it did not finish}" \
+                              "${RESULT_FIX:-read the full log, then run this again}"
+            else
+                result_unexpected
+            fi ;;
+    esac
     return $rc
 }
 
@@ -264,17 +344,18 @@ nemr_consent() {
     local yes="$1" invocation="$2" reply=""
     [[ "$yes" == "1" ]] && return 0
     if [[ ! -t 0 ]]; then
-        printf '\n%sRefusing to go ahead without asking.%s\n' "$_S_RED" "$_S_RESET" >&2
-        printf 'It writes the files listed above, runs the privileged commands listed above and\n' >&2
-        printf 'downloads what is listed above, so it asks first — and there is no terminal here\n' >&2
-        printf 'to ask on. Pass --yes to accept that plan without the question:\n\n    %s --yes\n\n' "$invocation" >&2
+        RESULT_STATE=handled
+        printf '\n%sRefusing to go ahead without asking.%s\n' "$_S_RED" "$_S_RESET"
+        printf 'It writes the files listed above, runs the privileged commands listed above and\n'
+        printf 'downloads what is listed above, so it asks first — and there is no terminal here\n'
+        printf 'to ask on. Pass --yes to accept that plan without the question:\n\n    %s --yes\n\n' "$invocation"
         exit 2
     fi
     printf '\nGo ahead? [y/N] '
     read -r reply || true
     case "$reply" in
         y|Y|yes|YES) printf '\n' ;;
-        *) printf '\nNothing was changed.\n'; exit 0 ;;
+        *) RESULT_STATE=handled; printf '\nNothing was changed.\n'; exit 0 ;;
     esac
 }
 
@@ -291,8 +372,16 @@ sudo_refresh() {
     fi
     local ok=0
     sudo -v && ok=1
+    if (( ! ok )); then
+        # Refused: the region is NOT reopened (nothing is going to run under
+        # it) and the failure is recorded for the single authority to speak.
+        RESULT_STATE=failed
+        RESULT_FAILED_STEP="asking for your password"
+        RESULT_BECAUSE="sudo did not accept it, or was refused"
+        RESULT_FIX="run this again and enter your password when asked"
+        exit 1
+    fi
     if (( reopen )); then
         nemr_region_start "$_NEMR_REGION_STATE_PATH" "${STEP_OUT:-}" && _s_republish
     fi
-    (( ok )) || { FAILED_STEP="sudo"; cross "sudo refused"; exit 1; }
 }

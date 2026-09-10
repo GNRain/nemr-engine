@@ -13,6 +13,7 @@ that recommends something says so and stops there.
 
 | Report | What it measures |
 |---|---|
+| [2026-09-10-install-first-run.md](2026-09-10-install-first-run.md) | The first install on a clean distro: an installer that printed nothing at all, a layout that ignored the window, temp files nobody removed, and a log line that had never told the truth |
 | [2026-09-10-install-bar-and-pane.md](2026-09-10-install-bar-and-pane.md) | The progress bar that depended on a font, the step-output pane, and what the region costs in rows |
 | [2026-09-10-install-default.md](2026-09-10-install-default.md) | The default install screen: one live line and a result rather than a hundred lines of narration — and why the region did not render on WSL2 |
 | [2026-09-10-install-screen.md](2026-09-10-install-screen.md) | The install screen as built: 80 columns, live, coloured, and what it leaves on the screen after a failure or Ctrl-C |
