@@ -71,7 +71,7 @@ unless `sha256(installed) == sha256(built)` (finding F-11 / TEST-01).
 |---|---|---|---|---|
 | AUTH-01 | Credentials not baked into the image | `image/Dockerfile` (no creds) | smoke step 4 | ✅ |
 | AUTH-02 | Host `~/.claude/.credentials.json` bind-mounted read-only | `auth.rs`, `project.rs::create` (`BindMount::read_only`) | smoke step 4 (readable + read-only) | 🔶 (narrowed from whole `~/.claude` to the file, SPEC 1.14) — WP-C1 confirmed it is the **only** secret and stays a host bind-mount off both portable layers (D-02). **F-12** open: a file bind-mount pins an inode, so an atomic-replace credential rotation on the host is invisible in-container. |
-| AUTH-03 | Missing credentials → clear, actionable failure | `auth.rs::resolve_credentials` | `missing_credentials_error_is_actionable` | ✅ |
+| AUTH-03 | Missing credentials → clear, actionable failure | `auth.rs::ensure_host_credential_file` | `f24_a_credential_that_cannot_authenticate_becomes_no_login_yet`, `f24_a_blank_credential_becomes_no_login_yet_and_create_succeeds`, `f24_nothing_tells_the_user_to_log_in_on_the_host` | 🔶 (amended by E-21 and F-24, SPEC 1.124/1.138: a machine with no usable login is not a failure — the engine writes its placeholder, starts, and says *no Claude login on this machine yet — attach and run /login*, which is the action; since F-14 the credential is nemr's own, so the old remedy "authenticate on the host" named a file the engine does not read and `resolve_credentials` is deleted. A credential that is present and usable is still held to what it says.) |
 
 ### State locality & relocation (WP-C, new — pending Section 3 promotion)
 

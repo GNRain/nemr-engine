@@ -1104,6 +1104,8 @@ mechanism seen from two machines holding copies of one refresh token. No
 longer a daily cost: a session shares the host's live file (D-02 (f)) and a
 host-side refresh reaches it through the watcher's re-bind. Was Open —
 escalation, raised for understanding before design.
+**Ruled on the product's response** (2026-09-09, F-25): inherent upstream, and
+nemr says so where it can — the ruling is at the end of this row.
 **Raised by:** Rain (cross-machine validation) · **Contradicted:** D-02's assumption
 **Blocks:** nothing yet; **invalidates** an assumption D-02 rests on
 
@@ -1286,6 +1288,43 @@ machine can be authenticated" would be solving the wrong problem carefully.
 > experiment if (e) is ever wanted for headless paths (`--bare`, Codex).
 
 ---
+
+**Observed again in the field, twice, with dates (F-25, 2026-09-09).** It is not
+theoretical and it is not only a Phase-1 curiosity:
+
+- *2026-09-08/09, the reference host.* A dedicated credential seeded by copying
+  `~/.claude` came back blanked mid-session — `Failed to authenticate: OAuth
+  session expired and could not be refreshed` — because two holders shared one
+  refresh token and one of them rotated it. This is the concrete reason F-14
+  refuses to inherit a host login: the copy is not free, it costs the original.
+- *2026-09-09, Rain's machines.* Logging in on a second machine with the same
+  account spent the refresh token and left the first machine's credential
+  **blank, with no warning on either side**. Recovery was impossible without
+  deleting the file by hand, which is the separate defect F-24 fixes.
+
+**Ruling on what the product does (2026-09-09).** Of the three options — warn at
+login that other machines will be logged out, re-login silently, or document it
+as inherent — the answer is **inherent, and said out loud where nemr speaks**:
+
+1. *Re-login silently is not available.* nemr holds no credential of its own and
+   cannot complete an OAuth flow for the user; only the person at a browser can.
+2. *A warning at the moment of login is not nemr's to place.* The login happens
+   inside Claude Code's own `/login`, which nemr does not intercept and must not
+   wrap. What nemr CAN do is warn at the moment it hands the user to that flow:
+   the no-login-yet notice on `attach` and `status` now says that logging in
+   here spends the account's refresh token and will log this account's other
+   machines out.
+3. *And it names the cause when it bites.* A credential found spent or blank no
+   longer blames the host: it says the login was cleared or spent — often
+   because the same account logged in elsewhere — and points at the one-step
+   recovery (F-24: the next `create`/`start` resets it to "no login yet", then
+   `/login` inside the session).
+
+So the cost is upstream and unavoidable, the surprise is not: the user is told
+before they pay it and told again, correctly, when they have. One account across
+two machines will keep logging each other out; that is Anthropic's OAuth model,
+not something nemr can fix, and a user who wants both machines live needs two
+accounts. Recorded rather than papered over.
 
 ### D-11 — No user-facing path moves a bundle through storage
 
@@ -1859,3 +1898,4 @@ as the case every test passes.
 | 2026-09-08 | E-22 | **Opened** — deleting a session's cloud copy waits for a server route; F-12 removes from this machine only, the cloud copy never touched (Claude Code, on F-12) |
 | 2026-09-08 | E-22 | **Ruled and built** — delete the cloud copy: removes the object AND the index row (row reads local, no bundle); one click when a local copy survives, the typed name when it is the only copy (F-12's rule); refused while another machine holds the lease, take-over offered; the object removed synchronously, not tombstoned (bill what exists); proven in both storage modes and the object confirmed gone from the R2 bucket (Rain; built by Claude Code) |
 | 2026-09-08 | E-23 | **Ruled and built** — `nemr add <dir>`: copy the tree (gitignore-respecting, target/node_modules always excluded, refuse over quota) plus .git plus the Claude Code history rewritten to the `-workspace` key (only the key needs rewriting — measured); copy not move; valid JSONL to the last line; then push/pull/`--continue` recalls across machines (Rain; built by Claude Code) |
+| 2026-09-09 | E-13 | **Observed again (F-25)** — a second-machine login spent this machine's refresh token and blanked its credential, with no warning either side (Rain, 2026-09-09); and a copied credential blanked the same way on the reference host (2026-09-08/09). Ruled: inherent upstream; nemr warns before handing the user to `/login` and names the cause when a credential is found spent (Rain; built by Claude Code) |

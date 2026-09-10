@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 /// The dedicated host directory that holds nemr's Claude credential, relative
 /// to the user's home. It holds ONLY `.credentials.json` and the `projects`
@@ -93,6 +93,15 @@ pub fn host_credential_dir() -> Result<PathBuf> {
 pub const PLACEHOLDER: &str = r#"{"claudeAiOauth":{"_nemr_placeholder":"no Claude login on this machine yet — attach a session and run /login; the login stays on this machine (D-02, E-21, F-10)"}}"#;
 
 const MARKER: &str = "_nemr_placeholder";
+
+/// Seconds since the epoch. Local, so `auth` does not depend on a caller for
+/// the one clock read the reset check needs.
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Serializes the unit tests that mutate process-wide environment (`HOME`,
 /// `NEMR_HOST_CREDENTIALS`); without it one test's `set_var` races another's
@@ -251,6 +260,47 @@ pub fn ensure_host_credential_file() -> Result<PathBuf> {
         std::fs::create_dir_all(&m).with_context(|| format!("creating {}", m.display()))?;
     }
     if path.exists() {
+        // F-24: a credential that CANNOT AUTHENTICATE is not a fault to refuse,
+        // it is a machine with no usable login — and since F-14 the only way
+        // back is `/login` inside a session, because this file is nemr's own
+        // and a host `claude` login writes `~/.claude`, which the engine does
+        // not read. Blanked (Claude Code's dead-refresh clear) or spent (the
+        // refresh token gone, often because another machine logged in — E-13)
+        // both become the placeholder, so the proven in-session path applies
+        // and `status` says "no login yet" instead of a dead end whose only
+        // exit was deleting the file by hand.
+        //
+        // In place, so a running session's bind keeps seeing this inode, and
+        // only for a file that is already useless: a present, usable credential
+        // is never touched.
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let verdict = credential_facts(&text).verdict(now_unix_secs());
+        if matches!(
+            verdict,
+            CredentialVerdict::Blank | CredentialVerdict::RefreshExpired { .. }
+        ) {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&path)
+            {
+                f.write_all(PLACEHOLDER.as_bytes()).with_context(|| {
+                    format!("resetting the unusable credential at {}", path.display())
+                })?;
+                tracing::warn!(
+                    nemr_audit = "warning",
+                    "[nemr] the login at {} could not authenticate ({}); it has been reset to \
+                     \"no login yet\" — run /login inside a session to log this machine in again \
+                     (F-24)",
+                    path.display(),
+                    match verdict {
+                        CredentialVerdict::Blank => "blanked after a refresh was refused",
+                        _ => "its refresh token is spent",
+                    }
+                );
+            }
+        }
         return Ok(path);
     }
     // No inheritance from the host's own `~/.claude` (E-21, reaffirmed by the
@@ -275,48 +325,6 @@ pub fn ensure_host_credential_file() -> Result<PathBuf> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
     }
-    Ok(path)
-}
-
-/// Resolve the host credential file, failing per AUTH-03 if absent.
-///
-/// The error names the file and says what to do, because the actionable fix
-/// (authenticate on the host) is not something the engine can perform:
-/// interactive in-container authentication is out of scope for Phase 1.
-pub fn resolve_credentials() -> Result<PathBuf> {
-    let path = host_credentials_path()?;
-
-    if !path.exists() {
-        bail!(
-            "no Claude Code credentials found at {}.\n\
-             Authenticate on the host first by running `claude` and completing login, \
-             then retry.\n\
-             The host's credential file is mounted into every session (AUTH-02); \
-             a session refreshes it but cannot create it.",
-            path.display()
-        );
-    }
-
-    if !path.is_file() {
-        bail!(
-            "the credential path exists but is not a regular file.\n\
-             path:     {}\n\
-             expected: the Claude Code credentials file\n\
-             found:    {}\n\n\
-             It is bind-mounted into the container (AUTH-02), and only a \
-             regular file can be. Remove or rename whatever is there, then \
-             authenticate on the host by running `claude`.",
-            path.display(),
-            if path.is_dir() {
-                "a directory"
-            } else if path.is_symlink() {
-                "a symlink"
-            } else {
-                "something that is neither a regular file nor a directory"
-            }
-        );
-    }
-
     Ok(path)
 }
 
@@ -504,30 +512,6 @@ pub fn credential_facts_at(path: &Path) -> CredentialFacts {
         Ok(contents) => credential_facts(&contents),
         Err(_) => credential_facts(""),
     }
-}
-
-/// Refuse to provision against a credential that cannot authenticate
-/// (AUTH-03, extended 2026-09-06): a spent refresh token or a file Claude Code
-/// has blanked after a dead refresh. A dead credential is worse than a missing
-/// one — it looks present — and there is no point provisioning a session that
-/// will fail at its first request. Only those two states refuse: an expired
-/// access token with a live refresh token is routine (the session refreshes
-/// it), and a non-OAuth file (an API key, the CI placeholder) is not judged.
-pub fn refuse_dead_credential(path: &Path, now_unix: i64) -> Result<()> {
-    let verdict = credential_facts_at(path).verdict(now_unix);
-    let what = match verdict {
-        CredentialVerdict::Blank => "is BLANK: Claude Code cleared it after a refresh was refused (the login was revoked, or its refresh token spent)",
-        CredentialVerdict::RefreshExpired { .. } => "has an EXPIRED refresh token: nothing in it can authenticate any more",
-        _ => return Ok(()),
-    };
-    bail!(
-        "the Claude Code credential on this host {what}.\n\
-         path: {}\n\
-         A session created now would fail at its first request, and a login from inside \
-         a session cannot repair the host's login. Run `claude` on this host and log in, \
-         then create the project.",
-        path.display()
-    )
 }
 
 /// Does a running session see a *different* file than the host has now (F-12)?
@@ -832,87 +816,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The create-time refusal fires on exactly the two dead states and on
-    /// nothing else — a routine access expiry and a non-OAuth file pass.
+    /// F-24: a credential that cannot authenticate is a machine with NO LOGIN,
+    /// not a fault to refuse. The engine resets it to the placeholder — in
+    /// place, so a running session's bind keeps the inode — and the proven
+    /// in-session `/login` applies. It used to refuse and tell the user to run
+    /// `claude` on the host, which since F-14 writes a file the engine does not
+    /// read: a dead end whose only exit was deleting the file by hand.
     #[test]
-    fn create_refuses_a_dead_credential_and_nothing_else() {
-        let dir = std::env::temp_dir().join(format!("nemr-auth-dead-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let now: i64 = 1_800_000_000;
-        let write = |name: &str, body: String| {
-            let p = dir.join(name);
-            std::fs::write(&p, body).unwrap();
-            p
-        };
-        let blank = write("blank.json", r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"refreshTokenExpiresAt":1900000000000}}"#.into());
-        let err = refuse_dead_credential(&blank, now).unwrap_err().to_string();
-        assert!(err.contains("BLANK") && err.contains("log in"), "{err}");
-        let spent = write(
-            "spent.json",
-            format!(
-                r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"r","expiresAt":{},"refreshTokenExpiresAt":{}}}}}"#,
-                (now - 3600) * 1000,
-                (now - 60) * 1000
-            ),
-        );
-        let err = refuse_dead_credential(&spent, now).unwrap_err().to_string();
-        assert!(err.contains("EXPIRED refresh token"), "{err}");
-        // Controls: these must NOT refuse.
-        let routine = write(
-            "routine.json",
-            format!(
-                r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"r","expiresAt":{},"refreshTokenExpiresAt":{}}}}}"#,
-                (now - 3600) * 1000,
-                (now + 86_400) * 1000
-            ),
-        );
-        assert!(
-            refuse_dead_credential(&routine, now).is_ok(),
-            "an expired access token with a live refresh token is routine"
-        );
-        let fresh = write(
-            "fresh.json",
-            format!(
-                r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"r","expiresAt":{}}}}}"#,
-                (now + 3600) * 1000
-            ),
-        );
-        assert!(refuse_dead_credential(&fresh, now).is_ok());
-        let placeholder = write(
-            "placeholder.json",
-            r#"{"_comment":"CI PLACEHOLDER"}"#.into(),
-        );
-        assert!(
-            refuse_dead_credential(&placeholder, now).is_ok(),
-            "a non-OAuth file is not judged"
-        );
+    fn f24_a_credential_that_cannot_authenticate_becomes_no_login_yet() {
+        use std::os::unix::fs::MetadataExt;
+        let _guard = super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_seam = std::env::var_os("NEMR_HOST_CREDENTIALS");
+        let now: i64 = now_unix_secs();
+        let dir = std::env::temp_dir().join(format!("nemr-f24-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-    }
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".credentials.json");
+        std::env::set_var("NEMR_HOST_CREDENTIALS", &path);
 
-    #[test]
-    fn missing_credentials_error_is_actionable() {
-        // Point HOME at a directory with no credentials and check the message
-        // tells the user what to do, not merely that something is absent.
-        let temp = std::env::temp_dir().join("nemr-auth-test-empty");
-        std::fs::create_dir_all(&temp).unwrap();
+        let reset_from = |body: String| -> (String, u64) {
+            std::fs::write(&path, body).unwrap();
+            let before = std::fs::metadata(&path).unwrap().ino();
+            ensure_host_credential_file().unwrap();
+            let after = std::fs::metadata(&path).unwrap();
+            assert_eq!(
+                after.ino(),
+                before,
+                "reset in place: the session's bind must keep seeing it"
+            );
+            (std::fs::read_to_string(&path).unwrap(), after.ino())
+        };
 
-        let previous = std::env::var_os("HOME");
-        std::env::set_var("HOME", &temp);
-        let result = resolve_credentials();
-        match previous {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
+        // Blanked by Claude Code's dead-refresh clear.
+        let (text, _) = reset_from(
+            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"refreshTokenExpiresAt":1900000000000}}"#.into(),
+        );
+        assert!(
+            is_placeholder(&text),
+            "a blank credential becomes no-login-yet: {text}"
+        );
+        assert_eq!(
+            credential_facts(&text).verdict(now),
+            CredentialVerdict::NoLoginYet
+        );
+
+        // Spent refresh token — the E-13 shape, another machine logged in.
+        let (text, _) = reset_from(format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"r","expiresAt":{},"refreshTokenExpiresAt":{}}}}}"#,
+            (now - 3600) * 1000,
+            (now - 60) * 1000
+        ));
+        assert!(
+            is_placeholder(&text),
+            "a spent refresh token becomes no-login-yet: {text}"
+        );
+
+        // Controls: a usable credential is NEVER touched.
+        let routine = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"r","expiresAt":{},"refreshTokenExpiresAt":{}}}}}"#,
+            (now - 3600) * 1000,
+            (now + 86_400) * 1000
+        );
+        std::fs::write(&path, &routine).unwrap();
+        ensure_host_credential_file().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            routine,
+            "an expired access token with a live refresh token is routine — leave it alone"
+        );
+        let fresh = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"r","expiresAt":{}}}}}"#,
+            (now + 3600) * 1000
+        );
+        std::fs::write(&path, &fresh).unwrap();
+        ensure_host_credential_file().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            fresh,
+            "a live login is untouched"
+        );
+        let api_key = r#"{"_comment":"CI PLACEHOLDER"}"#;
+        std::fs::write(&path, api_key).unwrap();
+        ensure_host_credential_file().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            api_key,
+            "a non-OAuth file is not judged, so it is not reset"
+        );
+
+        std::env::remove_var("NEMR_HOST_CREDENTIALS");
+        if let Some(seam) = saved_seam {
+            std::env::set_var("NEMR_HOST_CREDENTIALS", seam);
         }
-
-        let error = result.unwrap_err().to_string();
-        assert!(
-            error.contains(".credentials.json"),
-            "should name the file: {error}"
-        );
-        assert!(
-            error.contains("Authenticate on the host"),
-            "should say what to do: {error}"
-        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -1059,13 +1055,6 @@ mod e21_tests {
             credential_facts(blank).verdict(1_800_000_000),
             CredentialVerdict::Blank
         );
-        // The placeholder is not "dead": create must not refuse it.
-        let dir = std::env::temp_dir().join(format!("nemr-e21-unit-a-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(".credentials.json");
-        std::fs::write(&path, PLACEHOLDER).unwrap();
-        refuse_dead_credential(&path, 1_800_000_000)
-            .expect("a placeholder is a fresh machine, not a dead login");
     }
 
     /// `ensure_host_credential_file` writes the placeholder 0600 where the

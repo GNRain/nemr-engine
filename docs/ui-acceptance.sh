@@ -46,9 +46,9 @@ PASS=0; FAIL=0
 # reads the bucket back independently (six more assertions); otherwise a
 # directory under the work dir.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=98
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=103
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=94
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=99
 fi
 # The human arm (E-21) adds its own assertions when it runs.
 [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]] && EXPECTED_ASSERTIONS=$((EXPECTED_ASSERTIONS + 4))
@@ -482,14 +482,31 @@ grep -q '_nemr_placeholder' "$NOCRED" || die "the file at the credential path is
 pass "the engine wrote its placeholder at the credential path, mode 600"
 nemr status "$NOLOGIN" 2>/dev/null | grep -q 'NO LOGIN YET' || die "nemr status does not say NO LOGIN YET"
 pass "nemr status says: no login yet on this machine"
+# F-25: before nemr hands the user to /login it says what the login costs elsewhere (E-13).
+nemr status "$NOLOGIN" 2>/dev/null | grep -q 'OTHER machines are logged out' \
+    || die "F-25: nemr status does not warn that logging in here logs this account's other machines out (E-13)"
+pass "F-25: nemr status warns that logging in spends the account's refresh token (E-13)"
+# F-24: a credential that cannot authenticate is not a dead end — blank it as a second
+# machine's login would, and the engine must reset it to the placeholder and start.
+printf '%s' '{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"scopes":[],"subscriptionType":"max"}}' > "$NOCRED"
 nemr start "$NOLOGIN" >/dev/null 2>&1 || die "start must succeed against the placeholder"
 pass "the session started against the placeholder"
+grep -q '_nemr_placeholder' "$NOCRED" \
+    || die "F-24: a blanked credential must be reset to the placeholder, not left as a dead end: $(cat "$NOCRED")"
+pass "F-24: a blanked credential is reset to no-login-yet by the engine, and start succeeds"
+nemr status "$NOLOGIN" 2>/dev/null | grep -q 'NO LOGIN YET' \
+    || die "F-24: after a blanked credential, status must say NO LOGIN YET"
+pass "F-24: status says no login yet after a blanked credential — the in-session /login path applies"
 attach_out=$(echo 'claude -p "Reply with OK" --output-format json < /dev/null 2>&1 | tail -c 300; exit' | nemr attach "$NOLOGIN" 2>&1 | tr -d '\r')
 grep -qi 'not logged in\|login\|authenticate' <<<"$attach_out" || { printf '%s\n' "$attach_out" | tail -5 | sed 's/^/   | /'; die "claude -p should say it is not logged in (the control that a placeholder is not a login)"; }
 pass "CONTROL: inside the session, claude -p says it is not logged in — the placeholder is not a login"
-grep -q 'no Claude login on this machine yet' <<<"$(echo 'true' | nemr attach "$NOLOGIN" 2>&1)" \
+nologin_notice=$(echo 'true' | nemr attach "$NOLOGIN" 2>&1)
+grep -q 'no Claude login on this machine yet' <<<"$nologin_notice" \
     || die "nemr attach did not print the no-login-yet notice"
 pass "nemr attach names the state: no Claude login on this machine yet, run /login"
+grep -q 'logged out by it' <<<"$nologin_notice" \
+    || die "F-25: the attach notice does not warn that logging in logs this account's other machines out (E-13)"
+pass "F-25: the attach notice warns what the login costs on this account's other machines (E-13)"
 "$REPO/target/release/nemr-cloud" ui --no-open >"$WORK/ui3.log" 2>&1 &
 UI3_PID=$!
 for _ in $(seq 1 60); do grep -q 'nemr ui: http' "$WORK/ui3.log" && break; sleep 0.25; done

@@ -400,12 +400,17 @@ fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<S
             format!(
                 "  credential:   NO LOGIN YET on this machine — attach and run /login inside the session;\n\
                  \x20               the login is written to this host and stays here (D-02).\n\
+                 \x20               Logging in spends the account's refresh token, so this account's\n\
+                 \x20               OTHER machines are logged out by it (E-13 — upstream, unavoidable).\n\
                  \x20               path: {}",
                 if d.credential_path.is_empty() { "(will be created at start)".to_string() } else { d.credential_path.clone() }
             ),
             Some(format!(
                 "[nemr] no Claude login on this machine yet. Run /login inside this session; it opens a URL\n\
                  \x20      to sign in with and asks for the code. The login stays on this machine (D-02, E-21).\n\
+                 \x20      Note: logging in spends the account's refresh token, so any OTHER machine using\n\
+                 \x20      this account is logged out by it. That is Anthropic's OAuth model, not nemr's\n\
+                 \x20      doing (E-13); one account cannot be live on two machines at once.\n\
                  \x20      (nemr status {name} shows the credential's state)"
             )),
         );
@@ -424,9 +429,15 @@ fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<S
         placeholder: !d.credential_present,
     };
     let path = &d.credential_path;
+    // F-24: never "log in on this host". Since F-14 the credential nemr uses is
+    // its own, and a host `claude` login writes `~/.claude`, which the engine
+    // does not read — that advice sent the user somewhere that could not help.
+    // The remedy is the proven one: the next create or start resets a login
+    // that cannot authenticate to "no login yet", and `/login` inside the
+    // session writes a new one onto this machine.
     let host_fix = format!(
-        "log in on this host (run `claude`), then restart the session so it mounts the new \
-         file: nemr stop {name} && nemr start {name}"
+        "run `nemr start {name}` (it resets a login that cannot authenticate to \"no login yet\"), \
+         then `nemr attach {name}` and `/login` inside the session"
     );
     let (mut line, mut warning) = match facts.verdict(unix_now()) {
         CredentialVerdict::NoLoginYet => unreachable!("handled above"),
@@ -458,8 +469,9 @@ fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<S
                 human_duration(since)
             ),
             Some(format!(
-                "[nemr] Claude Code's login on this host has EXPIRED (its refresh token ran out {} ago).\n\
-                 \x20      A `/login` inside the session cannot fix that. {host_fix}",
+                "[nemr] this machine's Claude login is spent (its refresh token ran out {} ago) —\n\
+                 \x20      often because the same account logged in on another machine (E-13).\n\
+                 \x20      {host_fix}",
                 human_duration(since)
             )),
         ),
@@ -469,9 +481,9 @@ fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<S
                  \x20               Fix: {host_fix}"
             ),
             Some(format!(
-                "[nemr] Claude Code's login on this host is BLANK: it was cleared after a dead refresh\n\
-                 \x20      (revoked elsewhere, or its refresh token spent). A `/login` inside the session\n\
-                 \x20      cannot fix that. {host_fix}"
+                "[nemr] this machine's Claude login was cleared after a refresh was refused —\n\
+                 \x20      revoked, or spent because the same account logged in elsewhere (E-13).\n\
+                 \x20      {host_fix}"
             )),
         ),
     };
@@ -496,7 +508,7 @@ fn credential_report(d: &proto::StatusResponse, name: &str) -> (String, Option<S
             if d.credential_last_write_valid {
                 ""
             } else {
-                "  ← NOT a usable credential: log in on this host"
+                "  ← NOT a usable credential: the next start resets it to \"no login yet\"; /login inside the session"
             }
         ));
     }
@@ -1398,7 +1410,7 @@ async fn main() -> Result<()> {
                 volume::human_bytes(resp.bytes)
             );
             println!("\nThe bundle carried no credential, and never does (D-02).");
-            println!("Authenticate on this host, then: nemr start {name} && nemr attach {name}");
+            println!("Then: nemr start {name} && nemr attach {name} — and `/login` inside the session if it says no login yet.");
             // Suggested, never run (F-118): import works offline and
             // provisioning needs the network — the same seam as authentication
             // above. The same shape as every other next-step line this CLI

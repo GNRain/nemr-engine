@@ -172,33 +172,32 @@ async fn create_with_auth(
         .into());
     }
 
-    // AUTH-01/02/03: credentials come from the host, read-only, and their
-    // absence is a clear failure before anything is provisioned.
+    // AUTH-03, as amended by E-21 (2026-09-08) and F-24 (2026-09-09).
     //
-    // E-14: exempt for a restore. AUTH-03 makes a missing credential fatal "at
-    // creation time"; E-11 requires `nemr import` to work with no credential
-    // and no network at all. Those did not collide while import needed a
-    // pre-existing project — the create had already happened, with a
-    // credential. Now that a restore creates its own project, they do.
+    // The requirement was written as "a missing credential is fatal at
+    // creation time", which collided with E-11 (a restore must work on a
+    // machine with no credential and no network) and, more fundamentally,
+    // with what "missing" means: a machine that has never logged in is the
+    // *normal* first state, not a fault. So `create` and a restore behave
+    // identically — the placeholder is written where the credential will be
+    // and bound read-write like a real one, and `/login` inside the session
+    // writes the real credential through the bind onto this host (F-14 binds
+    // the directory, so Claude Code's write-by-rename lands).
     //
-    // E-11's guarantee is the one that holds: a bundle restored on a fresh
-    // machine before the user has logged in is the *normal* case, and import's
-    // own output already ends with "Authenticate on this host, then: nemr
-    // start". A credential is still required to run anything — `create` is
-    // unchanged and `attach` still resolves one — so this narrows *where*
-    // AUTH-03 fires, not whether it does. Raised as E-14 because AUTH-03 is a
-    // Section 3 requirement and narrowing it is not mine to decide.
-    // AUTH-03 as amended by E-21 (2026-09-08): a host with no credential is
-    // a machine that has never logged in, not a fault. `create` and a restore
-    // behave identically — the placeholder is written where the credential
-    // will be, bound read-write like a real one, and `/login` inside the
-    // session writes the real credential through it onto this host. A
-    // credential that IS present is still held to what it says: readable,
-    // and not dead (a spent refresh token or a blanked file — F-129).
+    // F-24 finishes it: a credential that is present but cannot authenticate
+    // — blanked by Claude Code after a refused refresh, or its refresh token
+    // spent by a login on another machine (E-13) — is the same state as never
+    // having logged in, and `ensure_host_credential_file` resets it to the
+    // placeholder in place. Refusing there was a dead end: since F-14 this
+    // file is nemr's own, and the refusal's remedy ("log in on the host")
+    // named `~/.claude`, which the engine does not read.
+    //
+    // A credential that IS present and usable is still held to what it says:
+    // readable, and this machine's alone (D-02 — it is never copied into a
+    // bundle and never inherited).
     let credentials = auth::ensure_host_credential_file()?;
     let credential_dir = auth::host_credential_dir()?;
     auth::check_permissions(&credentials)?;
-    auth::refuse_dead_credential(&credentials, unix_now())?;
 
     let volume = Volume::create(name, size, paths, HelperOps::new())
         .with_context(|| format!("failed to provision volume for project {name:?}"))?;
@@ -2596,13 +2595,6 @@ pub async fn seed_session_config(client: &ContainerdClient, name: &str) -> Resul
         );
     }
     Ok(true)
-}
-
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// Gather everything `nemr status` reports.
