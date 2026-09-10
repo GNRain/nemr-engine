@@ -1,0 +1,17 @@
+# Reports
+
+Findings and measurements, one file per report, `YYYY-MM-DD-slug.md`.
+
+They live here rather than in a PR body or a chat message because those arrive
+truncated (the Product Owner, 2026-09-10: *"Your last three reports have come to
+me truncated mid-sentence. Write findings to a file in the repo and point me at
+the path"*). A PR that has a report links to it; it does not reproduce it.
+
+A report is a measurement and its consequences. It is not a decision —
+`docs/DECISIONS.md` is where a ruling goes — and it is not a change: a report
+that recommends something says so and stops there.
+
+| Report | What it measures |
+|---|---|
+| [2026-09-10-install-region-width.md](2026-09-10-install-region-width.md) | How narrow the installer's two-column region could be (80 columns), what that costs, and the first-run tear found while measuring |
+| [../gate-audit.md](../gate-audit.md) | What in this repo nothing executes, or whose failure no gate would notice |
