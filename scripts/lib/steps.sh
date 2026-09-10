@@ -25,7 +25,7 @@ fi
 # write while it is open, or the layout tears.
 _S_REGION=0
 _S_IDX=0
-_S_LINES=()
+# (_S_LINES is gone: tick/cross route through _S_NOTES under a region.)
 _S_NOTES=()
 
 # THE STEP LIST'S STATE. One entry per step: what it is called (short, for the
@@ -33,6 +33,7 @@ _S_NOTES=()
 # detail — the digest, the package list, the socket path — goes to the log,
 # because a column sized to whatever a step prints is not a design (F-29).
 _S_LABELS=()
+_S_ICONS=()
 _S_STATES=()
 _S_TOKENS=()
 
@@ -44,7 +45,8 @@ _s_republish() {
     for i in "${!_S_STATES[@]}"; do
         case "${_S_STATES[$i]}" in done|warn|fail) done=$((done + 1)) ;; esac
     done
-    nemr_region_publish "${_S_LABELS[$_S_IDX]:-}" "$done" "${#_S_LABELS[@]}"
+    nemr_region_publish "${_S_LABELS[$_S_IDX]:-}" "$done" "${#_S_LABELS[@]}" \
+        "${_S_ICONS[$_S_IDX]:-}"
 }
 
 # Seed the list, all pending.
@@ -52,6 +54,15 @@ steps_seed() {   # <label>...
     local l
     _S_LABELS=(); _S_STATES=(); _S_TOKENS=()
     for l in "$@"; do _S_LABELS+=("$l"); _S_STATES+=("wait"); _S_TOKENS+=(""); done
+    _s_republish
+}
+
+# One icon per step, in the same order as the labels. Kept BESIDE the labels,
+# not inside them: the region counts an icon as two columns and a label's
+# characters as one each, and a label that carried its own icon would be
+# measured with \${#...} and move the cat a column (NEMR_REGION_ICON_CELLS).
+steps_icons() {   # <icon>...
+    _S_ICONS=("$@")
     _s_republish
 }
 
@@ -106,18 +117,23 @@ step_result() {   # <state> <token> <detail>
     fi
 }
 
+# Under a region these become NOTES, printed once it resolves — the same route
+# `note` takes, and for the same reason. They used to publish the whole line
+# array into nemr_region_publish's <phrase> <done> <total> <icon> signature,
+# which would have put a line of text where the counts go and an East Asian
+# AMBIGUOUS mark inside the fixed-width column. Nothing in the installer
+# reaches it — only install_server.sh calls these, and it has no region — which
+# is exactly why it would have been found the hard way.
 tick()  {
     if (( _S_REGION )); then
-        _S_LINES[$_S_IDX]="  ✓ $1"
-        nemr_region_publish "${_S_LINES[@]}"
+        _S_NOTES+=("$_S_MARK_OK $1")
     else
         printf '  %s✓%s %s\n' "$_S_GREEN" "$_S_RESET" "$1"
     fi
 }
 cross() {
     if (( _S_REGION )); then
-        _S_LINES[$_S_IDX]="  ✗ $1"
-        nemr_region_publish "${_S_LINES[@]}"
+        _S_NOTES+=("$_S_MARK_BAD $1")
     else
         printf '  %s✗%s %s\n' "$_S_RED" "$_S_RESET" "$1"
     fi
@@ -208,6 +224,32 @@ steps_tempclean() {
         [[ -n "$f" ]] && rm -f "$f" "${f}.new" 2>/dev/null || true
     done
 }
+
+# SENDING A BLOCK TO THE LOG, without losing the outcome if it dies in there.
+#
+#   if steps_redirect_begin "$LOG"; then
+#       printf ...
+#       steps_redirect_end
+#   fi
+#
+# Fd 3 holds the real stdout for exactly as long as the block runs, and
+# _steps_cleanup speaks there — so an exit taken inside the block (a `set -u`
+# error, say) still puts its outcome on the SCREEN. Measured: before this, such
+# an exit wrote the whole failure report into the log file and left the screen
+# blank, which is the silence the single authority exists to prevent.
+#
+# Fd 3 is closed the moment the block ends, and NOTHING INSIDE A BLOCK MAY
+# SPAWN A LONG-LIVED PROCESS. A child inherits fd 3 and thereby holds the
+# CALLER'''s stdout open: with fd 3 held for the whole run, nemrd inherited it
+# during the smoke test and `out="$(./scripts/install.sh --yes)"` never
+# returned — an acceptance run sat there for twenty minutes. Printfs only.
+steps_redirect_begin() {   # <file>
+    [[ -n "${1:-}" ]] || return 1
+    { : >>"$1"; } 2>/dev/null || return 1
+    exec 3>&1
+    exec >>"$1"
+}
+steps_redirect_end() { exec 1>&3 3>&-; }
 
 # Print anything the region held back, once it has resolved.
 flush_notes() {
@@ -305,6 +347,8 @@ _steps_interrupted() {
 # scripts/test_install.sh drives every exit path and checks stdout is non-empty.
 _steps_cleanup() {
     local rc=$?
+    # Speak on the real stdout, whatever stdout has become by now.
+    { : >&3; } 2>/dev/null && exec 1>&3
     nemr_region_stop 2>/dev/null || true
     nemr_cat_stop
     steps_tempclean

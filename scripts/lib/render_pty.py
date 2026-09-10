@@ -24,6 +24,7 @@ cannot move the cursor or change a glyph.
 """
 import re
 import sys
+import unicodedata
 
 CSI = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])")
 
@@ -40,13 +41,26 @@ class Screen:
         self.r = self.rows - 1
 
     def put(self, ch):
-        if self.c >= self.cols:          # wrap, as a terminal does
+        # A wide character (East Asian Width W or F — every emoji this project
+        # allows in the region is W) advances the cursor by TWO columns and
+        # occupies two cells. Counting it as one would show the layout as
+        # correct when a real terminal tears it, which is the one thing this
+        # renderer exists to prevent.
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if self.c + w > self.cols:       # wrap, as a terminal does
             self.c = 0
             self.r += 1
         if self.r >= self.rows:
             self._scroll()
         self.buf[self.r][self.c] = ch
-        self.c += 1
+        if w == 2:
+            # The second cell is held by the same glyph. It is kept as a space
+            # so that len(line) is the number of COLUMNS the line occupies —
+            # which is what every assertion here measures. (A write that lands
+            # on this cell alone would leave half a glyph; the region redraws
+            # whole rows, so that cannot arise here.)
+            self.buf[self.r][self.c + 1] = " "
+        self.c += w
 
     def feed(self, data):
         i = 0

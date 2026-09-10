@@ -56,6 +56,46 @@ _NEMR_REGION_SH_LOADED=1
 NEMR_REGION_CAT_COLS=37
 NEMR_REGION_CAT_ROWS=15
 NEMR_REGION_GAP=2
+# THE ICON RULE (SPEC 1.148). The two top rows carry an emoji. An emoji is ONE
+# character to bash and TWO columns to the terminal, so its width is COUNTED,
+# never measured: every icon is a single codepoint with East Asian Width W and
+# default emoji presentation — no U+FE0F variation selector, which terminals
+# disagree about — and is worth exactly NEMR_REGION_ICON_CELLS columns wherever
+# a width is computed. `scripts/test_install.sh` asserts that property for every
+# icon in the table against python's unicodedata, so an icon that cannot be
+# guaranteed two columns fails the gate rather than tearing somebody's screen.
+NEMR_REGION_ICON_CELLS=2
+
+# Icons go when colour goes — no terminal, NO_COLOR, TERM=dumb — and in two more
+# cases colour does not care about but the LAYOUT does:
+#
+#   TERM=linux    the physical console has 256 glyphs and no emoji among them;
+#                 the substitute is narrow and the row tears.
+#   a non-UTF-8 locale
+#                 the shell and the terminal are then decoding differently, and
+#                 four bytes drawn as four characters is a four-column icon.
+#
+# NEMR_NO_EMOJI=1 turns them off by hand, for the machine whose font we cannot
+# reproduce. tmux and screen are deliberately NOT excluded: both have carried
+# correct wide-character tables for years, and refusing there would cost the
+# icons for a large share of real users to guard against a decade-old bug.
+_NEMR_EMOJI_WHY=""
+nemr_emoji_enabled() {
+    [[ -z "${NEMR_NO_EMOJI:-}" ]] || { _NEMR_EMOJI_WHY="NEMR_NO_EMOJI is set"; return 1; }
+    [[ -t 1 ]]                    || { _NEMR_EMOJI_WHY="not a terminal"; return 1; }
+    [[ -z "${NO_COLOR:-}" ]]      || { _NEMR_EMOJI_WHY="NO_COLOR is set"; return 1; }
+    case "${TERM:-dumb}" in
+        dumb|linux) _NEMR_EMOJI_WHY="TERM=${TERM:-dumb} has no emoji font"; return 1 ;;
+    esac
+    case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+        *UTF-8*|*utf-8*|*UTF8*|*utf8*) ;;
+        *) _NEMR_EMOJI_WHY="the locale is not UTF-8"; return 1 ;;
+    esac
+    _NEMR_EMOJI_WHY=""
+    return 0
+}
+NEMR_REGION_TITLE_ICON="🐈"    # U+1F408 cat, constant for the whole run
+
 NEMR_REGION_LEFT_MIN=40       # "  installing the privileged helper" is 34
 NEMR_REGION_LEFT_COLS=$NEMR_REGION_LEFT_MIN   # refitted to the window at start
 NEMR_REGION_BAR_CELLS=18
@@ -63,6 +103,35 @@ NEMR_REGION_PANE_ROWS=5       # lines of the step's own output, inside a border
 NEMR_REGION_PANE_TOP=5        # the pane's border starts here (rows 0-4 above it)
 NEMR_REGION_MIN_COLS=$((NEMR_REGION_LEFT_MIN + NEMR_REGION_GAP + NEMR_REGION_CAT_COLS))
 NEMR_REGION_MIN_ROWS=$((NEMR_REGION_CAT_ROWS + 3))
+
+# Compose an icon row: two spaces of indent, the icon, one space, the text —
+# and the number of COLUMNS that occupies, built from the parts rather than
+# measured with \${#...}, which counts a two-column icon as one and would walk
+# the cat a column left on every row that has one.
+#
+# The text is truncated to what is left of the left column, so a step phrase
+# longer than the column can never push the cat either.
+_nemr_region_iconed() {   # <icon> <text>   -> _icon_plain, _icon_cells
+    local icon="$1" text="$2" lead=2 icells=0 room
+    if (( _NEMR_EMOJI_ON )) && [[ -n "$icon" ]]; then
+        icells=$(( NEMR_REGION_ICON_CELLS + 1 ))     # the icon, and the space after it
+    fi
+    room=$(( NEMR_REGION_LEFT_COLS - lead - icells ))
+    (( room < 0 )) && room=0
+    # Scrubbed to ASCII first, so "characters are columns" is enforced rather
+    # than assumed: a phrase carrying a wide or a zero-width character would be
+    # counted wrong in every locale, and the icon is the only non-ASCII thing
+    # this column is allowed to hold.
+    text="${text//[^ -~]/}"
+    text="${text:0:$room}"
+    if (( icells )); then
+        _icon_plain="  $icon $text"
+    else
+        _icon_plain="  $text"
+    fi
+    _icon_cells=$(( lead + icells + ${#text} ))
+}
+_icon_plain=""; _icon_cells=0
 
 # Fit the layout to the window: the cat against the right edge, the pane taking
 # what that leaves. Called once per run — see the resize note above.
@@ -78,6 +147,8 @@ _nemr_region_fit() {   # <cols>
 _NEMR_REGION_RULE=""
 
 
+_NEMR_EMOJI_ON=0        # icons go exactly when colour goes (decided at start)
+_NEMR_REGION_CYAN=""
 _NEMR_REGION_PID=""
 _NEMR_REGION_STATE=""
 _NEMR_REGION_TAIL=""
@@ -192,13 +263,16 @@ _nemr_region_pane_refresh() {
     [[ -n "$_NEMR_REGION_TAIL" && -s "$_NEMR_REGION_TAIL" ]] || return 0
     local line
     while IFS= read -r line; do
-        # Cut to the pane's inner width by CHARACTERS, not bytes, so a
-        # multi-byte glyph is never sliced in half.
+        # Cut to the pane's inner width. The tail above has already had
+        # every byte above ASCII removed, which is what makes this safe: a
+        # step's own output is arbitrary (cargo prints arrows, apt prints
+        # accented names), and one wide glyph in here would move the pane's
+        # right-hand border and with it the cat. Removed, never sliced.
         _nemr_region_pane_rows+=("${line:0:$_nemr_pane_inner}")
     done < <(grep -v '^[[:space:]]*$' "$_NEMR_REGION_TAIL" 2>/dev/null \
              | tail -n "$NEMR_REGION_PANE_ROWS" \
              | sed -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/\r/ /g' -e 's/\t/ /g' \
-             | LC_ALL=C tr -d '\000-\011\013-\037\177')
+             | LC_ALL=C tr -d '\000-\011\013-\037\177-\377')
     return 0
 }
 
@@ -208,13 +282,18 @@ _nemr_region_pane_refresh() {
 # Sets _NEMR_LEFT_TEXT rather than printing it: read through a command
 # substitution this was a process per ROW per frame — fifteen of them — for a
 # string the shell had already built.
-_nemr_region_left() {   # <row> <phrase> <done> <total> <pane?>
-    local row="$1" phrase="$2" done="$3" total="$4" pane="$5"
-    local plain="" pre="" post="" n
+_nemr_region_left() {   # <row> <phrase> <done> <total> <pane?> <icon>
+    local row="$1" phrase="$2" done="$3" total="$4" pane="$5" icon="${6:-}"
+    local plain="" pre="" post="" n cells=0
     case "$row" in
-        0) plain="  Installing nemr..."; pre="$_NEMR_REGION_BRIGHT"; post="$_NEMR_REGION_RESET" ;;
-        1) plain="  $phrase" ;;
-        3) _nemr_region_bar "$done" "$total"; plain="  $_NEMR_BAR_TEXT" ;;
+        0)  _nemr_region_iconed "$NEMR_REGION_TITLE_ICON" "Installing nemr..."
+            plain="$_icon_plain"; cells=$_icon_cells
+            pre="$_NEMR_REGION_BRIGHT$_NEMR_REGION_CYAN"; post="$_NEMR_REGION_RESET" ;;
+        1)  _nemr_region_iconed "$icon" "$phrase"
+            plain="$_icon_plain"; cells=$_icon_cells
+            pre="$_NEMR_REGION_GREEN"; post="$_NEMR_REGION_RESET" ;;
+        3)  _nemr_region_bar "$done" "$total"
+            plain="  $_NEMR_BAR_TEXT"; cells=${#plain} ;;
         *)
             if (( pane )) && (( row >= NEMR_REGION_PANE_TOP )) \
                && (( row <= NEMR_REGION_PANE_TOP + NEMR_REGION_PANE_ROWS + 1 )); then
@@ -225,13 +304,13 @@ _nemr_region_left() {   # <row> <phrase> <done> <total> <pane?>
                     printf -v plain '  | %-*s |' "$_nemr_pane_inner" \
                         "${_nemr_region_pane_rows[$((n - 1))]:-}"
                 fi
+                cells=${#plain}
                 pre="$_NEMR_REGION_DIM"; post="$_NEMR_REGION_RESET"
             fi ;;
     esac
-    # Padded to the column width. The plain text is kept beside the styled one
-    # rather than stripped back out of it: measuring it with a `sed` was a
-    # process per row per frame, fifteen of them, for a length we already knew.
-    local pad=$(( NEMR_REGION_LEFT_COLS - ${#plain} ))
+    # Padded from the COUNT, not from the length. The two differ by exactly one
+    # column per icon, which is the whole reason this is written down.
+    local pad=$(( NEMR_REGION_LEFT_COLS - cells ))
     (( pad < 0 )) && pad=0
     printf -v _NEMR_LEFT_TEXT '%s%s%s%*s' "$pre" "$plain" "$post" "$pad" ""
 }
@@ -272,9 +351,9 @@ _nemr_region_loop() {
 
     local reserved=0
     while :; do
-        local phrase="" done=0 total=1 line2
+        local phrase="" done=0 total=1 icon="" line2
         if [[ -r "$_NEMR_REGION_STATE" ]]; then
-            IFS=$'\t' read -r phrase done total < "$_NEMR_REGION_STATE"
+            IFS=$'\t' read -r phrase done total icon < "$_NEMR_REGION_STATE"
         fi
         [[ "$done" =~ ^[0-9]+$ ]] || done=0
         [[ "$total" =~ ^[0-9]+$ ]] || total=1
@@ -301,7 +380,7 @@ _nemr_region_loop() {
 
         local r left right
         for (( r = 0; r < height; r++ )); do
-            _nemr_region_left "$r" "$phrase" "$done" "$total" "$pane"
+            _nemr_region_left "$r" "$phrase" "$done" "$total" "$pane" "$icon"
             left="$_NEMR_LEFT_TEXT"
             right=""
             (( r < fr_h )) && right="${fr_rows[$((base + r))]}"
@@ -343,10 +422,15 @@ nemr_region_start() {   # <state file> [<the current step's output file>]
         _NEMR_REGION_GREEN=$'\033[32m'; _NEMR_REGION_BRIGHT=$'\033[1m'
         _NEMR_REGION_DIM=$'\033[2m';    _NEMR_REGION_RED=$'\033[31m'
         _NEMR_REGION_AMBER=$'\033[33m'; _NEMR_REGION_RESET=$'\033[0m'
+        _NEMR_REGION_CYAN=$'\033[36m'
     else
         _NEMR_REGION_GREEN=""; _NEMR_REGION_BRIGHT=""; _NEMR_REGION_DIM=""
         _NEMR_REGION_RED="";   _NEMR_REGION_AMBER="";  _NEMR_REGION_RESET=""
+        _NEMR_REGION_CYAN=""
     fi
+    # Decided ONCE, here, before the renderer is forked, so the two processes
+    # cannot disagree about how wide a row is.
+    if nemr_emoji_enabled; then _NEMR_EMOJI_ON=1; else _NEMR_EMOJI_ON=0; fi
     printf '\033[?25l'
     _NEMR_REGION_HID=1
     _nemr_region_loop &
@@ -357,10 +441,11 @@ nemr_region_start() {   # <state file> [<the current step's output file>]
 
 # Publish what is happening now: the phrase, and how many steps are done out of
 # how many. Written to a temp and renamed, so a frame never reads half of it.
-nemr_region_publish() {   # <phrase> <done> <total>
+nemr_region_publish() {   # <phrase> <done> <total> [<icon>]
     [[ -n "$_NEMR_REGION_STATE" ]] || return 0
     local tmp="${_NEMR_REGION_STATE}.new"
-    printf '%s\t%s\t%s\n' "$1" "$2" "$3" >"$tmp" && mv -f "$tmp" "$_NEMR_REGION_STATE"
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${4:-}" >"$tmp" \
+        && mv -f "$tmp" "$_NEMR_REGION_STATE"
 }
 
 # Nothing to resolve into: the live block is erased and the RESULT is printed

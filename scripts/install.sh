@@ -203,6 +203,39 @@ declare -A STEP_LABEL=() STEP_PLAN=() STEP_STATE=() STEP_DETAIL=()
 # 2026-09-10, comparing this to Claude Code's own installer: four lines).
 step_def() { STEP_IDS+=("$1"); STEP_LABEL["$1"]="$2"; STEP_PLAN["$1"]="${3:-$2}"; }
 
+# ONE ICON PER STEP, chosen once and never animated. Every one of these is a
+# single codepoint with East Asian Width W and default emoji presentation — no
+# U+FE0F, which terminals disagree about — so each is exactly two columns
+# wherever the region computes a width. `scripts/test_install.sh` asserts that
+# property for every entry here against python's unicodedata: an icon that
+# cannot be guaranteed two columns fails the gate rather than tearing a screen.
+#
+# They are also all Unicode 6.0 or 9.0 (2010/2016), one deliberately at 8.0, so
+# a font that predates them is not a realistic worry: 🧩 and 🧰 were dropped for
+# 🔀 and 🔧 for exactly that reason — Unicode 11 (2018) is missing from Windows
+# 10 before 1809, where the terminal substitutes a NARROW box and the row tears.
+#
+# Written as literal UTF-8 bytes, never as $'\U0001F4E6': under LC_ALL=C bash
+# does not interpret \U and would emit ten ASCII characters into a column that
+# has room for two.
+declare -A STEP_ICON=(
+    [packages]="📦"        # package
+    [containerd_off]="🛑"  # stop sign
+    [propagation]="🔗"     # link
+    [subids]="🆔"          # ID button
+    [delegation]="🔀"      # twisted arrows
+    [linger]="⏳"              # hourglass flowing
+    [units]="📋"           # clipboard
+    [daemons]="🚀"         # rocket
+    [shellenv]="🐚"        # spiral shell
+    [engine]="🔨"          # hammer
+    [helper]="🔐"          # closed lock with key
+    [client]="🔧"          # wrench
+    [image]="📥"           # inbox tray
+    [claude]="🤖"          # robot
+    [verify]="✅"              # check mark button
+)
+
 step_def packages        "installing packages" "packages from the Ubuntu archive"
 step_def containerd_off  "disabling the system containerd" "the system-wide root containerd, disabled"
 is_wsl2 && step_def propagation     "making the mount shared" "shared mount propagation (WSL2)"
@@ -687,13 +720,25 @@ if (( VERBOSE )); then _NEMR_SCREEN_WHY="--verbose"; fi
 SCREEN_LIVE=0
 (( ! VERBOSE )) && nemr_region_enabled && SCREEN_LIVE=1
 _screen_size="$(nemr_term_size 2>/dev/null || true)"
-_screen_by="$(stty size </dev/tty >/dev/null 2>&1 && echo 'stty /dev/tty' || echo 'tput/terminfo')"
+# The redirections are in this order deliberately: a machine with no controlling
+# terminal fails the `</dev/tty` redirect, and bash reports that failure on the
+# stderr it has at that moment — which, written the other way round, is the real
+# stderr and leaks a line no user should see.
+_screen_by="$(stty size >/dev/null 2>&1 </dev/tty && echo 'stty /dev/tty' || echo 'tput/terminfo')"
 # Also measured out here: inside the block, stdout is the log file.
 # NOT in a command substitution: inside `$( )` stdout is a pipe, so `-t 1` is
 # false there whatever the real stdout is — the same mistake as asking the
 # question inside the block's own redirect, one line further down.
 if [[ -t 1 ]]; then _screen_tty=yes; else _screen_tty=no; fi
-{
+# One predicate, asked once, by the same function the region asks — so a run
+# that dropped its icons says WHY in the log rather than leaving the reader to
+# guess, which is the rule the screen decision itself now follows.
+if (( SCREEN_LIVE )) && nemr_emoji_enabled
+then _screen_icons="yes"; else _screen_icons="no — ${_NEMR_EMOJI_WHY:-the screen is off}"; fi
+# Sent to the log through the helper, not a bare `{ } >>"$LOG"`: an exit taken
+# with stdout redirected used to write the outcome into the log and leave the
+# screen blank.
+if steps_redirect_begin "$LOG"; then
     printf '\n--- install screen\n'
     if (( SCREEN_LIVE )); then
         printf '    live:      yes\n'
@@ -707,6 +752,8 @@ if [[ -t 1 ]]; then _screen_tty=yes; else _screen_tty=no; fi
     printf '    fitted:    left %s + gap %s + cat %s (right edge)   pane inner %s\n' \
         "$NEMR_REGION_LEFT_COLS" "$NEMR_REGION_GAP" "$NEMR_REGION_CAT_COLS" "$_nemr_pane_inner"
     printf '    resize:    not supported mid-run — the width is read once, at the start\n'
+    printf '    icons:     %s  (%s cells each, counted not measured)\n' \
+        "$_screen_icons" "$NEMR_REGION_ICON_CELLS"
     printf '    terminal:  TERM=%s  tty=%s  NO_COLOR=%s  NEMR_CAT=%s\n' \
         "${TERM:-unset}" "$_screen_tty" \
         "${NO_COLOR:-unset}" "${NEMR_CAT:-unset}"
@@ -714,15 +761,20 @@ if [[ -t 1 ]]; then _screen_tty=yes; else _screen_tty=no; fi
         "$(is_wsl2 && echo WSL2 || echo linux)" "${TMPDIR:-/tmp}"
     printf '    note:      the cursor query (DSR) does not gate this — it only\n'
     printf '               decides how far to scroll the screen into place\n\n'
-} >>"$LOG" 2>/dev/null || true
+    steps_redirect_end
+fi
 
 if (( SCREEN_LIVE )) && nemr_region_start "$REGION_STATE" "$STEP_OUT"; then
     _S_REGION=1
     # Seeded with every step, so the whole list is on screen from the first
     # frame: what is finished, what is running, what is still to come.
-    region_labels=()
-    for id in "${STEP_IDS[@]}"; do region_labels+=("${STEP_LABEL[$id]}"); done
+    region_labels=(); region_icons=()
+    for id in "${STEP_IDS[@]}"; do
+        region_labels+=("${STEP_LABEL[$id]}")
+        region_icons+=("${STEP_ICON[$id]:-}")
+    done
     steps_seed "${region_labels[@]}"
+    steps_icons "${region_icons[@]}"
     _s_republish
     if (( PRIVILEGED_PENDING )); then
         ( while kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null || exit 0; sleep 45; done ) &

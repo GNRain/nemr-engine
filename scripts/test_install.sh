@@ -28,7 +28,7 @@ PASS=0; FAIL=0
 # Asserted, not merely printed: a run that skipped a case would otherwise say
 # PASS with fewer assertions — the green-over-nothing shape this project keeps
 # guarding against. Raise this when a case is added.
-EXPECTED_ASSERTIONS=117
+EXPECTED_ASSERTIONS=141
 
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS + 1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
@@ -694,6 +694,246 @@ grep -q 'resize:    not supported mid-run' "$narrow_log"
 check $? "the log states the resize policy rather than leaving it to be discovered"
 grep -qE '^  \[[#-]{18}\]' "$WORK/narrow.raw" && r=1 || r=0
 check $r "78 columns: no live block was drawn"
+
+# ---------------------------------------------------------------------------
+step "The icons: one per step, two columns each, and they go when colour goes (F-35)"
+# ---------------------------------------------------------------------------
+# An emoji is ONE character to bash and TWO columns to the terminal. Every
+# width in the left column is therefore COUNTED from the parts, never measured
+# with ${#...}. These assertions are what stops that rule being quietly lost.
+
+# 1. Every step has an icon, and every icon is guaranteed two columns.
+icons_out="$(python3 - <<'PYEOF'
+import re, subprocess, sys, unicodedata as ud
+
+src = open("scripts/install.sh", encoding="utf-8").read()
+table = re.search(r"declare -A STEP_ICON=\((.*?)\n\)", src, re.S).group(1)
+icons = dict(re.findall(r"\[(\w+)\]=\"([^\"]+)\"", table))
+ids = re.findall(r"^\s*(?:is_wsl2 && )?step_def (\w+)", src, re.M)
+
+region = open("scripts/lib/region.sh", encoding="utf-8").read()
+title = re.search(r'NEMR_REGION_TITLE_ICON="([^"]+)"', region).group(1)
+icons["<title>"] = title
+
+missing = [i for i in ids if i not in icons]
+bad = []
+for name, ch in sorted(icons.items()):
+    if len(ch) != 1:
+        bad.append("%s: %d codepoints (%s) — only single codepoints are safe"
+                   % (name, len(ch), " ".join("U+%04X" % ord(c) for c in ch)))
+        continue
+    if ud.east_asian_width(ch) != "W":
+        bad.append("%s: U+%04X east_asian_width=%s, not W"
+                   % (name, ord(ch), ud.east_asian_width(ch)))
+    if "️" in ch:
+        bad.append("%s: carries U+FE0F, whose width terminals disagree about" % name)
+print("STEPS %d ICONS %d" % (len(ids), len(icons)))
+print("MISSING %s" % (" ".join(missing) if missing else "none"))
+print("BAD %s" % ("; ".join(bad) if bad else "none"))
+PYEOF
+)"
+grep -q '^MISSING none$' <<<"$icons_out"
+check $? "every step has an icon ($(grep '^STEPS' <<<"$icons_out"))" "$(grep '^MISSING' <<<"$icons_out")"
+grep -q '^BAD none$' <<<"$icons_out"
+check $? "every icon is a single codepoint of East Asian Width W — two columns, guaranteed" \
+    "$(grep '^BAD' <<<"$icons_out")"
+
+# 2. THE ASSERTION THE PRODUCT OWNER ASKED FOR, at the narrowest supported
+#    width, with the longest step label and an icon present: the cat must not
+#    move by a single character. Measured absolutely against the art's own
+#    per-line indent, because a relative check cannot see a shift that happens
+#    on every frame — which is exactly the shift an icon causes.
+script -qec "stty cols 79 rows 30; env NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=0.25 ./scripts/install.sh --yes" /dev/null >"$WORK/icons79.raw" 2>/dev/null
+cols79="$(python3 scripts/lib/region_columns.py "$WORK/icons79.raw" 79)"; r=$?
+check $r "79 columns: the cat is in exactly the column the art says, on every frame" \
+    "$(grep -m3 '^columns' <<<"$cols79")"
+widest79="$(python3 scripts/lib/render_pty.py "$WORK/icons79.raw" --cols 79 --rows 30 --frame 6 | awk '{ if (length($0) > m) m = length($0) } END { print m+0 }')"
+check "$([[ "$widest79" == "79" ]] && echo 0 || echo 1)" \
+    "79 columns: the block is still exactly 79 wide with icons on it ($widest79)"
+# The longest label there is, with its icon, on the narrowest screen there is.
+longest="$(grep -oE 'step_def [a-z_]+ +"[^"]+"' scripts/install.sh | sed 's/.*"\(.*\)"/\1/' | awk '{ if (length($0) > length(m)) m = $0 } END { print m }')"
+icon_of_longest="$(python3 - "$longest" <<'PYEOF'
+import re, sys
+src = open("scripts/install.sh", encoding="utf-8").read()
+sid = re.search(r'step_def (\w+) +"%s"' % re.escape(sys.argv[1]), src).group(1)
+table = re.search(r"declare -A STEP_ICON=\((.*?)\n\)", src, re.S).group(1)
+print(dict(re.findall(r"\[(\w+)\]=\"([^\"]+)\"", table))[sid])
+PYEOF
+)"
+seen_longest=0
+for f in $(seq 2 40); do
+    scr="$(python3 scripts/lib/render_pty.py "$WORK/icons79.raw" --cols 79 --rows 30 --frame "$f" 2>/dev/null || true)"
+    grep -qF "$icon_of_longest" <<<"$scr" && grep -qF "$longest" <<<"$scr" && { seen_longest=1; break; }
+done
+check "$([[ "$seen_longest" == "1" ]] && echo 0 || echo 1)" \
+    "79 columns: the longest label ('$longest') is drawn with its icon and still fits"
+
+# 3. And at a wide terminal, where the left column is much larger.
+script -qec "stty cols 132 rows 30; env NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=0.25 ./scripts/install.sh --yes" /dev/null >"$WORK/icons132.raw" 2>/dev/null
+cols132="$(python3 scripts/lib/region_columns.py "$WORK/icons132.raw" 132)"; r=$?
+check $r "132 columns: the same, on a wide terminal" "$(grep -m3 '^columns' <<<"$cols132")"
+
+# 4. The two top rows are coloured, and the icons are on them.
+top_row="$(python3 scripts/lib/render_pty.py "$WORK/icons79.raw" --cols 79 --rows 30 --frame 6 | sed -n 2p)"
+grep -qF "$(python3 -c 'import re;print(re.search(r"NEMR_REGION_TITLE_ICON=\"([^\"]+)\"", open("scripts/lib/region.sh",encoding="utf-8").read()).group(1))')" <<<"$top_row"
+check $? "the title row carries its constant icon" "$top_row"
+LC_ALL=C grep -aq $'\033\[1m\033\[36m' "$WORK/icons79.raw"
+check $? "the title row is bright and coloured"
+LC_ALL=C grep -aq $'\033\[32m  ' "$WORK/icons79.raw"
+check $? "the step row under it is coloured"
+
+# 5. THEY GO WHEN COLOUR GOES. Same rule as the ✓/✗ marks: no tty, TERM=dumb
+#    or NO_COLOR is plain text. Counted by East Asian Width, so the narrow ✓
+#    and the ambiguous ⚠ in the result block are not mistaken for icons.
+wide_chars() {   # <file> -> how many two-column characters it contains
+    python3 - "$1" <<'PYEOF'
+import sys, unicodedata as ud
+d = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+print(sum(1 for c in d if ud.east_asian_width(c) == "W"))
+PYEOF
+}
+check "$([[ "$(wide_chars "$WORK/icons79.raw")" -gt 0 ]] && echo 0 || echo 1)" \
+    "on a terminal the icons are drawn ($(wide_chars "$WORK/icons79.raw") two-column characters)"
+# Every way they can be refused, including the two that colour does not have:
+# a console font with no emoji in it, and a locale that decodes differently
+# from the terminal — both of which would draw something that is not two
+# columns wide, which is the one thing this layout cannot survive.
+for way in "NO_COLOR=1" "TERM=dumb" "TERM=linux" "NEMR_NO_EMOJI=1" "LC_ALL=C"; do
+    script -qec "stty cols 100 rows 30; env $way NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=0.02 ./scripts/install.sh --yes" /dev/null >"$WORK/noicon.raw" 2>/dev/null
+    n="$(wide_chars "$WORK/noicon.raw")"
+    check "$([[ "$n" == "0" ]] && echo 0 || echo 1)" "$way: no icons at all, plain text ($n)"
+done
+env NEMR_TEST_STEP_STUB=0.02 ./scripts/install.sh --yes >"$WORK/piped.raw" 2>/dev/null
+n="$(wide_chars "$WORK/piped.raw")"
+check "$([[ "$n" == "0" ]] && echo 0 || echo 1)" "piped: no icons at all, plain text ($n)"
+
+# 6. STATIC: nothing anywhere in these scripts may carry the pieces that make an
+#    emoji's width unknowable — a variation selector, a zero-width joiner, a
+#    skin tone, a regional indicator, a keycap — or write an icon as a $'\U…'
+#    escape, which bash does not interpret under LC_ALL=C and which would put
+#    ten ASCII characters where two columns were counted.
+dangerous="$(python3 - <<'PYEOF'
+import re
+bad = []
+for path in ("scripts/install.sh", "scripts/lib/region.sh", "scripts/lib/steps.sh"):
+    src = open(path, encoding="utf-8").read()
+    for name, pat in (("U+FE0F variation selector", "\ufe0f"),
+                      ("U+200D zero-width joiner", "\u200d"),
+                      ("U+20E3 keycap", "\u20e3")):
+        if pat in src:
+            bad.append("%s: %s" % (path, name))
+    if re.search(r"[\U0001F3FB-\U0001F3FF]", src):
+        bad.append("%s: a skin-tone modifier" % path)
+    if re.search(r"[\U0001F1E6-\U0001F1FF]", src):
+        bad.append("%s: a regional indicator" % path)
+    code = "\n".join(l.split("#", 1)[0] for l in src.split("\n"))
+    if re.search(r"\$'[^']*\\[uU]", code):
+        bad.append("%s: an icon written as a $'\\U…' escape" % path)
+print("; ".join(bad) if bad else "none")
+PYEOF
+)"
+check "$([[ "$dangerous" == "none" ]] && echo 0 || echo 1)" \
+    "no variation selectors, joiners, skin tones, flags or \$'\\U' escapes anywhere in the screen code" \
+    "$dangerous"
+
+# 7. THE PANE holds arbitrary build output, and a wide glyph in there would move
+#    its right-hand border and the cat with it. Everything above ASCII is
+#    removed before it is drawn.
+cat >"$WORK/wide_pane.sh" <<'WIDE'
+#!/usr/bin/env bash
+cd "$1"; . scripts/lib/cat.sh; . scripts/lib/region.sh; . scripts/lib/steps.sh
+LOG="$2/wlog"; STEP_OUT="$2/wout"; : >"$STEP_OUT"
+nemr_region_start "$2/wstate" "$STEP_OUT" || { echo NO-REGION; exit 0; }
+_S_REGION=1
+steps_seed "building the engine"; steps_icons "🔨"
+_S_IDX=0; step_begin
+for i in 1 2 3 4 5 6; do printf '   正在编译 café ✅ crate-%d 👩‍💻\n' "$i" >>"$STEP_OUT"; sleep 0.2; done
+sleep 0.4
+nemr_region_stop
+WIDE
+chmod +x "$WORK/wide_pane.sh"
+script -qec "bash -c 'stty cols 100 rows 30; $WORK/wide_pane.sh $REPO $WORK'" /dev/null >"$WORK/wide_pane.raw" 2>/dev/null
+pane_check="$(python3 - "$WORK/wide_pane.raw" <<'PYEOF'
+import subprocess, sys, unicodedata as ud
+raw = sys.argv[1]
+cols = 100
+left = cols - 2 - 37                      # the left column, which the pane fills
+out = subprocess.run(["python3", "scripts/lib/render_pty.py", raw,
+                      "--cols", str(cols), "--rows", "30", "--frame", "4"],
+                     capture_output=True, text=True).stdout
+rows = [r for r in out.split("\n") if r.startswith("  |") or r.startswith("  +")]
+edges = sorted({r[left - 1] if len(r) >= left else "SHORT" for r in rows})
+wide = sum(1 for r in rows for c in r[:left] if ud.east_asian_width(c) == "W")
+print("ROWS %d" % len(rows))
+print("EDGES %s" % " ".join(repr(e) for e in edges))
+print("WIDE %d" % wide)
+PYEOF
+)"
+edges="$(grep '^EDGES' <<<"$pane_check")"
+check "$([[ "$edges" == "EDGES '|' '+'" || "$edges" == "EDGES '+' '|'" ]] && echo 0 || echo 1)" \
+    "wide characters in a step's output do not move the pane's right border ($edges)" \
+    "$pane_check"
+check "$([[ "$(grep '^WIDE' <<<"$pane_check")" == "WIDE 0" ]] && echo 0 || echo 1)" \
+    "and none of them reach the pane at all — removed, not sliced" "$pane_check"
+
+# 8. The inputs the column is built from stay ASCII, and short enough that an
+#    icon still fits at the narrowest supported width.
+labels_bad="$(python3 - <<'PYEOF'
+import re
+src = open("scripts/install.sh", encoding="utf-8").read()
+bad = []
+for label in re.findall(r'^\s*(?:is_wsl2 && )?step_def \w+ +"([^"]+)"', src, re.M):
+    if not re.fullmatch(r"[ -~]*", label):
+        bad.append("%r is not ASCII" % label)
+    if 2 + 3 + len(label) > 40:
+        bad.append("%r leaves no room for an icon at 79 columns" % label)
+print("; ".join(bad) if bad else "none")
+PYEOF
+)"
+check "$([[ "$labels_bad" == "none" ]] && echo 0 || echo 1)" \
+    "every step phrase is ASCII and short enough to carry an icon at 79 columns" "$labels_bad"
+
+# 9. And the block does not creep down the screen: one wrapped row would
+#    desynchronise the walk-back from what was written, a row per frame.
+rows_seen=""
+for f in 4 8 12; do
+    rows_seen+="$(python3 scripts/lib/render_pty.py "$WORK/icons79.raw" --cols 79 --rows 30 --frame "$f" | grep -n 'Installing nemr' | cut -d: -f1) "
+done
+check "$([[ "$(tr ' ' '\n' <<<"$rows_seen" | sort -u | grep -c .)" == "1" ]] && echo 0 || echo 1)" \
+    "the block stays on the same row from frame to frame — nothing wrapped (rows: $rows_seen)"
+
+# 10. And the log says which way it went, like every other screen decision.
+icon_log="$(ls -t "$HOME/.local/state/nemr"/install-*.log 2>/dev/null | head -1)"
+grep -qE 'icons: +no —' "$icon_log"
+check $? "the log records that the icons were off for that run, and why" "$(grep 'icons:' "$icon_log" || true)"
+
+# 7. An exit taken INSIDE a redirected block still reaches the real stdout.
+#    Found while building this: a `set -u` error inside the log block sent the
+#    whole failure report into the log file and left the screen blank — the
+#    single authority speaking to whatever stdout happened to be.
+cat >"$WORK/redirected.sh" <<'REDIR'
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$1"
+. scripts/lib/cat.sh; . scripts/lib/region.sh; . scripts/lib/steps.sh
+LOG="$2/log"; : >"$LOG"
+steps_trap
+RESULT_STATE=failed
+RESULT_FAILED_STEP="a step inside a redirect"
+RESULT_BECAUSE="the block it died in owned stdout"
+RESULT_FIX="read this on the screen, not in the log"
+steps_redirect_begin "$LOG"
+printf 'this line belongs in the log\n'
+false                          # set -e, with stdout redirected
+steps_redirect_end
+REDIR
+chmod +x "$WORK/redirected.sh"
+"$WORK/redirected.sh" "$REPO" "$WORK" >"$WORK/redirected.out" 2>/dev/null || true
+grep -q 'a step inside a redirect' "$WORK/redirected.out"
+check $? "an exit inside a redirected block still prints the outcome to the real stdout" \
+    "stdout: $(head -c 120 "$WORK/redirected.out")"
+grep -q 'a step inside a redirect' "$WORK/log" && r=1 || r=0
+check $r "and it does NOT go into the file that block was writing to"
 
 # ---------------------------------------------------------------------------
 printf '\n'
