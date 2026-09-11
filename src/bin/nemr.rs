@@ -1234,6 +1234,7 @@ async fn run() -> Result<()> {
                         "name": p.name,
                         "agent": p.agent,
                         "quota": p.quota,
+                        "quota_bytes": p.quota_bytes,
                         "running": p.running,
                         "volume_path": p.volume_path,
                         "usage_known": p.usage_known,

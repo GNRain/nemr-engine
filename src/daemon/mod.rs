@@ -298,6 +298,11 @@ impl Nemr for NemrService {
                 .map(|p| ProjectStatus {
                     name: p.name,
                     container_id: p.container_id,
+                    quota_bytes: p
+                        .quota
+                        .parse::<crate::engine::volume::VolumeSize>()
+                        .map(|s| s.bytes())
+                        .unwrap_or(0),
                     quota: p.quota,
                     running: p.running,
                     volume_path: p.volume_path,

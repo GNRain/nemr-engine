@@ -412,7 +412,12 @@ async def _page_flow(launch_url, email, password, server, remote_name, local_nam
         # exactly the helper's minimum and to the end on exactly its maximum —
         # not near them, on them, because the page computes the mapping and an
         # off-by-one there is a create that the engine refuses.
-        limits = await b.eval("(async () => (await (await fetch('/api/sessions')).json()).create_options)()")
+        # The X-Nemr-Request header is what the page's own `api()` helper sends
+        # and what the server requires; a bare fetch is refused and comes back
+        # as something that is not JSON. (Introduced with the slider assertions
+        # in SPEC 1.153 and only reachable once a protocol-3 helper existed, so
+        # this is the first run that could hit it.)
+        limits = await b.eval("(async () => (await (await fetch('/api/sessions', {headers: {'X-Nemr-Request': '1'}})).json()).create_options)()")
         drag = ("(v => { const r = document.getElementById('createsizerange');"
                 " r.value = v; r.dispatchEvent(new Event('input'));"
                 " return document.getElementById('createsize').value; })")
@@ -501,7 +506,10 @@ async def _page_flow(launch_url, email, password, server, remote_name, local_nam
         except SystemExit:
             st = await b.eval("document.getElementById('status').textContent")
         check("F-2 the exit code is one line of status above the table", st == "the shell exited (0)", st)
-        row = await b.wait_for(f"(() => {{ const r = document.querySelector('tr.srow[data-name={json.dumps(local_name)}]'); return r ? r.children[3].textContent : ''; }})()", 30, "the row after the exit")
+        # CHANGED DELIBERATELY (SPEC 1.154): the list is cards, not table rows,
+        # so the state comes from the card's badge instead of a row's fourth
+        # cell. Same fact, read from the element that now carries it.
+        row = await b.wait_for(f"(() => {{ const r = document.querySelector('.card[data-name={json.dumps(local_name)}] .badge'); return r ? r.textContent : ''; }})()", 30, "the card after the exit")
         check("F-2 the row still says running: shell exit is not stop", row == "running", row)
         await b.eval(f"document.querySelector('button[data-attach={json.dumps(local_name)}]').click()")
         await b.wait_for("document.getElementById('attachnote').textContent.startsWith('attached')", 30, "a second attach")

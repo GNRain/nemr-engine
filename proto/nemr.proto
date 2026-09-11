@@ -169,6 +169,11 @@ message ProjectStatus {
   double used_percent = 8;
   // The agent id from the container label (WP-K, for `nemr list --json`).
   string agent = 9;
+  // The quota in bytes. `quota` above is the same number as a person writes it
+  // ("2GB"); this is the number a meter can be drawn from. Parsed here, by the
+  // half that owns the size type, so nothing downstream reimplements it.
+  // 0 when the label is missing or unreadable.
+  uint64 quota_bytes = 10;
 }
 
 message PortSpec {

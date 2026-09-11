@@ -42,6 +42,11 @@ pub struct LocalProject {
     pub running: bool,
     pub usage_known: bool,
     pub used_bytes: u64,
+    /// The quota in bytes, so the page can draw "used of allocated" without
+    /// parsing a size spelling of its own. `None` from a source that predates
+    /// the field.
+    #[serde(default)]
+    pub quota_bytes: Option<u64>,
     /// E-21: whether this machine has a Claude login for its sessions (the
     /// daemon's `credential_present`). `None` when the source cannot say —
     /// the CLI's `nemr list --json` does not carry it.
