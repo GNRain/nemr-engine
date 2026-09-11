@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use nemr_style::{bytes as human, Progress, Tone, Voice};
 
 use crate::api::{Api, LeaseLost};
 use crate::core::{self, human_bytes, EngineOps, HeldElsewhere};
@@ -91,14 +92,27 @@ pub fn register(server: Option<String>, email: Option<String>) -> Result<()> {
 
     // Recovery is not deferrable (E-16): show the code once, and the account
     // stays unusable until the user proves they stored it by typing it back.
+    let v = Voice::for_stdout();
     println!();
-    println!("Your recovery code — the ONLY way back in if you forget your password:");
+    println!(
+        "{}",
+        v.warned("Your recovery code — the ONLY way back in if you forget your password:")
+    );
     println!();
-    println!("    {}", pending.recovery_code.display());
+    println!(
+        "    {}",
+        v.paint(Tone::Pending, &pending.recovery_code.display())
+    );
     println!();
-    println!("Store it now (password manager, paper — not this machine).");
-    println!("A forgotten password with no recovery code means your data is");
-    println!("unrecoverable, permanently: the server cannot read it (E-16).");
+    println!(
+        "{}",
+        v.note("Store it now: a password manager, or paper. Not this machine.")
+    );
+    println!(
+        "{}",
+        v.note("A forgotten password with no recovery code is unrecoverable — the")
+    );
+    println!("{}", v.note("server cannot read your data either (E-16)."));
     println!();
     // Piped stdout is block-buffered: flush so a driver (or a human paging
     // output) sees the code before we block waiting for it to be typed back.
@@ -127,8 +141,15 @@ pub fn register(server: Option<String>, email: Option<String>) -> Result<()> {
                 break;
             }
             None if attempt < 5 => {
-                eprintln!("that code does not open the recovery envelope — try again.");
-                eprintln!("(it is the code printed above, hyphens and case do not matter)");
+                let ev = Voice::for_stderr();
+                eprintln!(
+                    "{}",
+                    ev.failed("That code does not open the recovery envelope.")
+                );
+                eprintln!(
+                    "{}",
+                    ev.note("It is the code printed above; hyphens and case do not matter.")
+                );
             }
             None => {}
         }
@@ -137,8 +158,12 @@ pub fn register(server: Option<String>, email: Option<String>) -> Result<()> {
         bail!("{}", core::unconfirmed_message());
     };
     let account = core::register_confirm(&pending, &recovered)?;
-    println!("Recovery confirmed. Account is active.");
-    println!("logged in as {} ({})", account.email, account.server);
+    println!(
+        "{}",
+        v.done("Account created, and the recovery code confirmed.")
+    );
+    println!("{}", v.field("account", &account.email, Tone::Plain));
+    println!("{}", v.field("server", &account.server, Tone::Plain));
     Ok(())
 }
 
@@ -147,20 +172,30 @@ pub fn login(server: Option<String>, email: Option<String>) -> Result<()> {
     let email = resolve_email(email)?;
     let password = keys::read_password(false)?;
     let account = core::login(&server, &email, &password)?;
-    println!("logged in as {} ({})", account.email, account.server);
+    let v = Voice::for_stdout();
+    println!("{}", v.done(&format!("Logged in as {}.", account.email)));
+    println!("{}", v.field("server", &account.server, Tone::Plain));
     Ok(())
 }
 
 pub fn logout() -> Result<()> {
     let report = core::logout()?;
     if let Some(e) = report.revoke_failed {
-        eprintln!("warning: could not revoke the token server-side: {e}");
-        eprintln!("         (it expires on its own; local state is cleared regardless)");
+        let ev = Voice::for_stderr();
+        eprintln!("{}", ev.warned("Could not revoke the token on the server."));
+        eprintln!("{}", ev.note(&e.to_string()));
+        eprintln!(
+            "{}",
+            ev.note("It expires on its own; local state is cleared regardless.")
+        );
     }
     if report.was_logged_in {
-        println!("logged out");
+        println!("{}", Voice::for_stdout().done("Logged out."));
     } else {
-        println!("not logged in");
+        println!(
+            "{}",
+            Voice::for_stdout().done("Not logged in — nothing to do.")
+        );
     }
     Ok(())
 }
@@ -173,15 +208,24 @@ pub fn sessions() -> Result<()> {
     let local = match engine_cli::list_projects() {
         Ok(list) => Some(list),
         Err(e) => {
-            eprintln!("note: local projects unavailable ({e:#});");
-            eprintln!("      showing the server index only.");
+            let ev = Voice::for_stderr();
+            eprintln!(
+                "{}",
+                ev.warned("Local projects are unavailable; showing the server's index only.")
+            );
+            eprintln!("{}", ev.note(&format!("{e:#}")));
             None
         }
     };
     let rows = core::sessions(local.as_deref())?;
 
     if rows.is_empty() {
-        println!("no sessions anywhere. Create one with: nemr create <name> --size 2GB");
+        let v = Voice::for_stdout();
+        println!("{}", v.done("No sessions, here or on the server."));
+        println!(
+            "{}",
+            v.field("Create one", "nemr create <name> --size 2GB", Tone::Good)
+        );
         return Ok(());
     }
 
@@ -224,10 +268,15 @@ fn ago(unix: i64) -> String {
 // --- push / pull / release ---------------------------------------------------
 
 pub fn push(name: &str, release_after: bool, take_over: bool) -> Result<()> {
+    let v = Voice::for_stdout();
     state::load_account()?; // "not logged in" before the password prompt
     let password = keys::read_password(false)?;
-    let mut say = |line: &str| println!("{line}");
-    core::push(
+    // The steps are shown IN PLACE while it runs and erased when it ends, the
+    // way the installer does it: what a long command leaves behind should be
+    // its result, not a transcript of itself.
+    let mut progress = Progress::new(v);
+    let mut say = |line: &str| progress.set(line);
+    let report = core::push(
         name,
         &password,
         release_after,
@@ -235,27 +284,81 @@ pub fn push(name: &str, release_after: bool, take_over: bool) -> Result<()> {
         &CliEngine,
         &mut say,
     )
-    .map(|_| ())
-    .map_err(with_cli_remedy)
+    .map_err(with_cli_remedy);
+    progress.clear();
+    let report = report?;
+    println!("{}", v.done(&format!("Pushed {name}.")));
+    println!(
+        "{}",
+        v.field(
+            "uploaded",
+            &format!(
+                "{} encrypted, from {}",
+                human(report.ciphertext_bytes.max(0) as u64),
+                human(report.plaintext_bytes as u64)
+            ),
+            Tone::Plain
+        )
+    );
+    println!(
+        "{}",
+        v.field(
+            "lease",
+            &if report.released {
+                "released — another machine can take this session".to_string()
+            } else {
+                format!("held by {}", report.holder)
+            },
+            if report.released {
+                Tone::Plain
+            } else {
+                Tone::Good
+            }
+        )
+    );
+    Ok(())
 }
 
 pub fn pull(name: &str, take_over: bool) -> Result<()> {
+    let v = Voice::for_stdout();
     state::load_account()?;
     let password = keys::read_password(false)?;
-    let mut say = |line: &str| println!("{line}");
-    core::pull(name, &password, take_over, &CliEngine, &mut say)
-        .map(|_| ())
-        .map_err(with_cli_remedy)
+    let mut progress = Progress::new(v);
+    let mut say = |line: &str| progress.set(line);
+    let report =
+        core::pull(name, &password, take_over, &CliEngine, &mut say).map_err(with_cli_remedy);
+    progress.clear();
+    let report = report?;
+    println!("{}", v.done(&format!("Pulled {name}.")));
+    println!("{}", v.field("session", &report.imported, Tone::Plain));
+    println!(
+        "{}",
+        v.field("lease", &format!("held by {}", report.holder), Tone::Good)
+    );
+    println!(
+        "{}",
+        v.field("Next", &format!("nemr start {name}"), Tone::Good)
+    );
+    Ok(())
 }
 
 pub fn release(name: &str) -> Result<()> {
+    let v = Voice::for_stdout();
     match core::release(name)? {
         core::ReleaseOutcome::NoLeaseHere => {
-            println!("no lease state for {name:?} on this machine")
+            println!("{}", v.done(&format!("Nothing to release for {name}.")));
+            println!("{}", v.note("This machine holds no lease on it."));
         }
-        core::ReleaseOutcome::Released => println!("released the lease on {name:?}"),
+        core::ReleaseOutcome::Released => {
+            println!("{}", v.done(&format!("Released the lease on {name}.")));
+            println!("{}", v.note("Another machine can take this session now."));
+        }
         core::ReleaseOutcome::AlreadyLost => {
-            println!("lease on {name:?} was already lost (taken over or expired)")
+            println!(
+                "{}",
+                v.warned(&format!("The lease on {name} was already gone."))
+            );
+            println!("{}", v.note("Taken over by another machine, or expired."));
         }
     }
     Ok(())

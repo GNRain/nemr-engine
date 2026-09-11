@@ -675,7 +675,22 @@ fn restore_default_sigpipe() {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // ONE SHAPE FOR EVERY FAILURE, the installer's: what went wrong,
+            // then the command that fixes it. The messages already carried
+            // their remedies — this is what makes them look like remedies.
+            let v = nemr_style::Voice::for_stderr();
+            let causes: Vec<String> = e.chain().skip(1).map(|c| c.to_string()).collect();
+            eprint!("{}", nemr_style::error_block(&v, &e.to_string(), &causes));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     restore_default_sigpipe();
 
     // Parse first: the subscriber's verbosity is now a flag, so it cannot be
@@ -715,26 +730,52 @@ async fn main() -> Result<()> {
             };
             let project_agent: Agent = project.agent.parse().unwrap_or(Agent::ClaudeCode);
 
-            println!("created project {:?}", project.name);
-            println!("  agent:     {}", agent_label(&project.agent));
+            let v = nemr_style::Voice::for_stdout();
+            use nemr_style::Tone;
+            println!("{}", v.done(&format!("Created {}.", project.name)));
+            println!(
+                "{}",
+                v.field("agent", &agent_label(&project.agent), Tone::Plain)
+            );
             if !project_agent.portability_verified() {
                 // At the point of selection, not only in docs someone may not
                 // read: "implemented the same way" must not quietly become
                 // "works" (E-15/F-84).
+                let ev = nemr_style::Voice::for_stderr();
                 eprintln!();
                 eprintln!(
-                    "  note: {} support is IMPLEMENTED BUT UNVERIFIED.",
-                    agent_label(&project.agent)
+                    "{}",
+                    ev.warned(&format!(
+                        "{} support is implemented but UNVERIFIED.",
+                        agent_label(&project.agent)
+                    ))
                 );
-                eprintln!("        Where it stores its conversation has not been measured, so a");
                 eprintln!(
-                    "        stop/restart or an export/import may silently lose it. See F-84."
+                    "{}",
+                    ev.note("Where it stores its conversation has not been measured, so a")
+                );
+                eprintln!(
+                    "{}",
+                    ev.note("stop/restart or an export/import may silently lose it. See F-84.")
                 );
             }
-            println!("  container: {}", project.container_id);
-            println!("  volume:    {} ({})", project.volume_path, project.size);
-            println!("  status:    stopped (ready to start)");
-            println!("  next:      nemr start {}", project.name);
+            println!("{}", v.field("container", &project.container_id, Tone::Dim));
+            println!(
+                "{}",
+                v.field(
+                    "volume",
+                    &format!("{} ({})", project.volume_path, project.size),
+                    Tone::Dim
+                )
+            );
+            println!(
+                "{}",
+                v.field("status", "stopped (ready to start)", Tone::Plain)
+            );
+            println!(
+                "{}",
+                v.field("Next", &format!("nemr start {}", project.name), Tone::Good)
+            );
         }
 
         Command::Add {
@@ -850,7 +891,10 @@ async fn main() -> Result<()> {
                 let mut answer = String::new();
                 std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut answer)?;
                 if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
-                    eprintln!("Cancelled. Nothing was added.");
+                    eprintln!(
+                        "{}",
+                        nemr_style::Voice::for_stderr().done("Cancelled. Nothing was added.")
+                    );
                     std::process::exit(1);
                 }
             }
@@ -870,41 +914,84 @@ async fn main() -> Result<()> {
                     .map_err(status_err)?
                     .into_inner()
             };
-            println!("added {} as session {:?}", summary.source, summary.name);
-            println!("  agent:     {}", agent_label(&summary.agent));
-            println!("  container: {}", summary.container_id);
+            let v = nemr_style::Voice::for_stdout();
+            use nemr_style::Tone;
             println!(
-                "  copied:    {} files, {} (target/ and node_modules/ excluded; .git carried)",
-                summary.files_copied,
-                volume::human_bytes(summary.bytes_copied)
+                "{}",
+                v.done(&format!("Added {} as {}.", summary.source, summary.name))
+            );
+            println!(
+                "{}",
+                v.field("agent", &agent_label(&summary.agent), Tone::Plain)
+            );
+            println!("{}", v.field("container", &summary.container_id, Tone::Dim));
+            println!(
+                "{}",
+                v.field(
+                    "copied",
+                    &format!(
+                        "{} files, {} (target/ and node_modules/ excluded; .git carried)",
+                        summary.files_copied,
+                        volume::human_bytes(summary.bytes_copied)
+                    ),
+                    Tone::Plain
+                )
             );
             if summary.history_sessions > 0 {
                 println!(
-                    "  history:   {} session transcript(s) carried over{}",
-                    summary.history_sessions,
-                    if summary.history_lines_dropped > 0 {
-                        format!(" ({} torn line(s) dropped)", summary.history_lines_dropped)
-                    } else {
-                        String::new()
-                    }
+                    "{}",
+                    v.field(
+                        "history",
+                        &format!(
+                            "{} session transcript(s) carried over{}",
+                            summary.history_sessions,
+                            if summary.history_lines_dropped > 0 {
+                                format!(" ({} torn line(s) dropped)", summary.history_lines_dropped)
+                            } else {
+                                String::new()
+                            }
+                        ),
+                        Tone::Plain
+                    )
                 );
                 if summary.history_lines_corrupt > 0 {
                     println!(
-                        "  note:      {} line(s) in those transcripts do not parse as JSON and \
-                         were copied as they are",
-                        summary.history_lines_corrupt
+                        "{}",
+                        v.field(
+                            "note",
+                            &format!(
+                                "{} line(s) in those transcripts do not parse as JSON and were \
+                                 copied as they are",
+                                summary.history_lines_corrupt
+                            ),
+                            Tone::Pending
+                        )
                     );
                     println!(
-                        "             (they are not a torn last write, so they were not dropped \
-                         — the host's copy has them too)"
+                        "{}",
+                        v.note("They are not a torn last write, so they were not dropped — the")
                     );
+                    println!("{}", v.note("host's copy has them too."));
                 }
             } else {
-                println!("  history:   none found for this directory (a fresh session)");
+                println!(
+                    "{}",
+                    v.field(
+                        "history",
+                        "none found for this directory (a fresh session)",
+                        Tone::Plain
+                    )
+                );
             }
-            println!("  quota:     {}", summary.size);
-            println!("  the host directory was copied, not moved — it is untouched");
-            println!("  next:      nemr start {}", summary.name);
+            println!("{}", v.field("quota", &summary.size, Tone::Plain));
+            println!(
+                "{}",
+                v.note("The host directory was copied, not moved — it is untouched.")
+            );
+            println!(
+                "{}",
+                v.field("Next", &format!("nemr start {}", summary.name), Tone::Good)
+            );
         }
 
         Command::Start { name } => {
@@ -919,8 +1006,20 @@ async fn main() -> Result<()> {
                     .into_inner()
                     .supervisor_pid
             };
-            println!("started project {name:?} (supervisor pid {pid})");
-            println!("  attach with: nemr attach {name}");
+            let v = nemr_style::Voice::for_stdout();
+            println!("{}", v.done(&format!("Started {name}.")));
+            println!(
+                "{}",
+                v.field("supervisor", &format!("pid {pid}"), nemr_style::Tone::Dim)
+            );
+            println!(
+                "{}",
+                v.field(
+                    "Attach",
+                    &format!("nemr attach {name}"),
+                    nemr_style::Tone::Good
+                )
+            );
         }
 
         Command::Stop { name } => {
@@ -936,10 +1035,22 @@ async fn main() -> Result<()> {
                     .outcome
             };
             match outcome.as_str() {
-                "graceful" => println!("stopped project {name:?} (terminated gracefully)"),
-                "no_task" => println!("project {name:?} was not running"),
+                "graceful" => {
+                    let v = nemr_style::Voice::for_stdout();
+                    println!("{}", v.done(&format!("Stopped {name}.")));
+                    println!("{}", v.note("It shut down on its own when asked."));
+                }
+                "no_task" => {
+                    let v = nemr_style::Voice::for_stdout();
+                    println!("{}", v.done(&format!("{name} was not running.")));
+                }
                 "killed" => {
-                    println!("stopped project {name:?} (ignored SIGTERM; killed)");
+                    let v = nemr_style::Voice::for_stdout();
+                    println!("{}", v.warned(&format!("Stopped {name}, by force.")));
+                    println!(
+                        "{}",
+                        v.note("It ignored the request to shut down and was killed.")
+                    );
                     eprintln!(
                         "[nemr] warning: the container ignored SIGTERM and was killed after the \n\
                          grace period. Its processes were given no opportunity to flush state."
@@ -1001,8 +1112,17 @@ async fn main() -> Result<()> {
 
             let projects = resp.projects;
 
+            let v = nemr_style::Voice::for_stdout();
             if projects.is_empty() && resp.untracked_volumes.is_empty() {
-                println!("no projects. Create one with: nemr create <name> --size 2GB");
+                println!("{}", v.done("No projects yet."));
+                println!(
+                    "{}",
+                    v.field(
+                        "Create one",
+                        "nemr create <name> --size 2GB",
+                        nemr_style::Tone::Good
+                    )
+                );
                 return Ok(());
             }
 
@@ -1022,9 +1142,29 @@ async fn main() -> Result<()> {
                     } else {
                         "unmounted".to_string()
                     };
+                    // THE WORDS AND THE COLUMNS ARE UNCHANGED — three
+                    // acceptance scripts match `^<name> ` and one matches
+                    // `^<name>  *running` on this output. Only the STATUS
+                    // value is painted, and only on a terminal, so a pipe
+                    // still sees exactly what it saw before.
                     println!(
-                        "{:<18} {:<9} {:<18} {:<8} {}",
-                        p.name, status, used, p.quota, p.volume_path
+                        "{:<18} {} {:<18} {:<8} {}",
+                        p.name,
+                        v.pad(
+                            &v.paint(
+                                if p.running {
+                                    nemr_style::Tone::Good
+                                } else {
+                                    nemr_style::Tone::Plain
+                                },
+                                status
+                            ),
+                            status.len(),
+                            9
+                        ),
+                        used,
+                        p.quota,
+                        p.volume_path
                     );
                 }
             }
@@ -1035,8 +1175,11 @@ async fn main() -> Result<()> {
             if !untracked.is_empty() {
                 println!();
                 println!(
-                    "{} volume image(s) belong to no project and are using disk:",
-                    untracked.len()
+                    "{}",
+                    v.warned(&format!(
+                        "{} volume image(s) belong to no project and are using disk:",
+                        untracked.len()
+                    ))
                 );
                 for name in untracked.iter().take(10) {
                     println!("  {name}");
@@ -1044,7 +1187,10 @@ async fn main() -> Result<()> {
                 if untracked.len() > 10 {
                     println!("  ... and {} more", untracked.len() - 10);
                 }
-                println!("Reclaim them with: nemr reconcile");
+                println!(
+                    "{}",
+                    v.field("Reclaim them", "nemr reconcile", nemr_style::Tone::Good)
+                );
             }
         }
 
@@ -1121,8 +1267,12 @@ async fn main() -> Result<()> {
                         } else {
                             "unknown".into()
                         };
-                        eprintln!("About to delete project {name:?}:");
-                        eprintln!("  container: {}", p.container_id);
+                        let ev = nemr_style::Voice::for_stderr();
+                        eprintln!("{}", ev.warned(&format!("About to delete {name}:")));
+                        eprintln!(
+                            "{}",
+                            ev.field("container", &p.container_id, nemr_style::Tone::Dim)
+                        );
                         eprintln!(
                             "  volume:    {} ({} used of {})",
                             p.volume_path, used, p.quota
@@ -1136,7 +1286,13 @@ async fn main() -> Result<()> {
                             }
                         );
                         eprintln!();
-                        eprintln!("This permanently destroys the volume and everything in it.");
+                        eprintln!(
+                            "{}",
+                            ev.paint(
+                                nemr_style::Tone::Bad,
+                                "This permanently destroys the volume and everything in it."
+                            )
+                        );
                     }
                     None => eprintln!("About to delete project {name:?} (details unavailable)."),
                 }
@@ -1146,7 +1302,12 @@ async fn main() -> Result<()> {
                 let mut answer = String::new();
                 std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut answer)?;
                 if answer.trim() != name {
-                    eprintln!("Cancelled: input did not match {name:?}. Nothing was deleted.");
+                    eprintln!(
+                        "{}",
+                        nemr_style::Voice::for_stderr().done(&format!(
+                            "Cancelled — that did not match {name}. Nothing was deleted."
+                        ))
+                    );
                     std::process::exit(1);
                 }
             }
@@ -1155,7 +1316,10 @@ async fn main() -> Result<()> {
                 let __req = session.req(proto::DeleteRequest { name: name.clone() });
                 session.client().delete(__req).await.map_err(status_err)?
             };
-            println!("deleted project {name:?}");
+            println!(
+                "{}",
+                nemr_style::Voice::for_stdout().done(&format!("Deleted {name}."))
+            );
         }
 
         Command::Reconcile => {
@@ -1176,35 +1340,88 @@ async fn main() -> Result<()> {
                 && report.stale_forwards.is_empty()
                 && report.unattributable_forwards.is_empty()
             {
+                let v = nemr_style::Voice::for_stdout();
+                println!("{}", v.done("Nothing to reconcile."));
                 println!(
-                    "nothing to reconcile: no orphaned mounts, loop devices, snapshots or \
-                     port forwards"
+                    "{}",
+                    v.note("No orphaned mounts, loop devices, snapshots or port forwards.")
                 );
             } else {
+                let v = nemr_style::Voice::for_stdout();
+                use nemr_style::Tone;
+                let reclaimed = report.released.len()
+                    + report.snapshots_removed.len()
+                    + report.stale_forwards.len();
+                let stuck = report.not_released.len()
+                    + report.orphan_backing_files.len()
+                    + report.unattributable_forwards.len();
+                if stuck == 0 {
+                    println!("{}", v.done(&format!("Reclaimed {reclaimed}.")));
+                } else {
+                    println!(
+                        "{}",
+                        v.warned(&format!("Reclaimed {reclaimed}; {stuck} need you to look."))
+                    );
+                }
+                println!();
                 for name in &report.released {
-                    println!("released orphan volume {name:?} (mount + loop device)");
+                    println!(
+                        "{}",
+                        v.field(
+                            "released",
+                            &format!("{name} (mount + loop device)"),
+                            Tone::Good
+                        )
+                    );
                 }
                 for name in &report.not_released {
+                    println!("{}", v.field("NOT released", name, Tone::Bad));
                     println!(
-                        "FAILED to fully release {name:?}: the helper reported success but the \
-                         host still shows it mounted or loop-attached. An attached loop device \
-                         holds its image open, so that disk space is NOT reclaimed.\n  \
-                         Check: losetup -a | grep {name}"
+                        "{}",
+                        v.note(
+                            "The helper reported success but the host still shows it mounted or"
+                        )
+                    );
+                    println!(
+                        "{}",
+                        v.note("loop-attached, so that disk space is NOT reclaimed.")
+                    );
+                    println!(
+                        "{}",
+                        v.field("Check", &format!("losetup -a | grep {name}"), Tone::Good)
                     );
                 }
                 for key in &report.snapshots_removed {
-                    println!("removed orphan snapshot {key:?}");
+                    println!(
+                        "{}",
+                        v.field("removed", &format!("orphan snapshot {key}"), Tone::Good)
+                    );
                 }
                 for name in &report.orphan_backing_files {
                     println!(
-                        "orphan backing file for {name:?}: mount/loop released, but the file was \
-                         KEPT — it may hold data. Remove it deliberately if you are sure."
+                        "{}",
+                        v.field(
+                            "kept",
+                            &format!("the backing file for {name}"),
+                            Tone::Pending
+                        )
                     );
+                    println!(
+                        "{}",
+                        v.note(
+                            "Its mount and loop device are released, but the file may hold data."
+                        )
+                    );
+                    println!("{}", v.note("Remove it deliberately if you are sure."));
                 }
                 for f in &report.stale_forwards {
                     println!(
-                        "reclaimed port forward {f} — the project is stopped, so this was \
-                         nemr's own leftover"
+                        "{}",
+                        v.field("reclaimed", &format!("port forward {f}"), Tone::Good)
+                    );
+                    println!(
+                        "{}",
+                        v.note("The project is stopped, so this was nemr's own leftover.")
                     );
                 }
                 for f in &report.unattributable_forwards {
@@ -1231,11 +1448,21 @@ async fn main() -> Result<()> {
                     .into_inner()
             };
 
-            println!("{}", d.name);
+            let v = nemr_style::Voice::for_stdout();
+            use nemr_style::Tone;
+            // The result first: the state of the thing, before the detail.
+            if d.running {
+                println!("{}", v.done(&format!("{} is running.", d.name)));
+            } else {
+                println!("{}", v.done(&format!("{} is stopped.", d.name)));
+            }
             println!("  agent:        {}", agent_label(&d.agent));
             println!(
                 "  state:        {}",
-                if d.running { "running" } else { "stopped" }
+                v.paint(
+                    if d.running { Tone::Good } else { Tone::Plain },
+                    if d.running { "running" } else { "stopped" }
+                )
             );
             println!("  container:    {}", d.container_id);
 
@@ -1255,9 +1482,9 @@ async fn main() -> Result<()> {
                 "  image file:   {} ({})",
                 d.image_file,
                 if d.image_present {
-                    "present"
+                    v.paint(Tone::Plain, "present")
                 } else {
-                    "MISSING"
+                    v.paint(Tone::Bad, "MISSING")
                 }
             );
             println!(
@@ -1272,10 +1499,14 @@ async fn main() -> Result<()> {
             // F-28: the question that cost the most time to answer by hand.
             match d.mount_check {
                 -1 => println!("  mount check:  n/a (not mounted)"),
-                1 => println!("  mount check:  ok (backed by this project's image)"),
+                1 => println!(
+                    "  mount check:  {} (backed by this project's image)",
+                    v.paint(Tone::Good, "ok")
+                ),
                 _ => println!(
-                    "  mount check:  WRONG VOLUME — mounted filesystem is backed by {}\n\
+                    "  mount check:  {} — mounted filesystem is backed by {}\n\
                      \x20               Run `nemr reconcile`, then start again.",
+                    v.paint(Tone::Bad, "WRONG VOLUME"),
                     if d.mounted_image.is_empty() {
                         "something that is not a loop device".to_string()
                     } else {

@@ -16,6 +16,7 @@ use clap::{Parser, Subcommand};
 
 mod api;
 mod commands;
+mod configure;
 mod core;
 mod daemon;
 mod engine_cli;
@@ -125,6 +126,11 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ServerAction {
+    /// Write sync.env, interactively: the port, the storage, the database.
+    /// It generates the pepper itself, checks the database and the storage
+    /// answer before it writes anything, and never overwrites a file that is
+    /// already there.
+    Configure,
     /// Start it in the FOREGROUND: this process becomes the server, so Ctrl-C
     /// stops it and nothing outlives the window you ran it in.
     Start,
@@ -135,7 +141,19 @@ enum ServerAction {
     Status,
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            let v = nemr_style::Voice::for_stderr();
+            let causes: Vec<String> = e.chain().skip(1).map(|c| c.to_string()).collect();
+            eprint!("{}", nemr_style::error_block(&v, &e.to_string(), &causes));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     // argv[0] dispatch: invoked as `nemr-login` etc. (via the open CLI's
     // external-subcommand exec), rewrite to the matching subcommand so one
     // binary serves every name.
@@ -167,6 +185,7 @@ fn main() -> Result<()> {
         Command::Release { name } => commands::release(&name),
         Command::Ui { port, no_open } => serve::run(port, !no_open),
         Command::Server { action } => match action {
+            ServerAction::Configure => configure::run(),
             ServerAction::Start => server::start(),
             ServerAction::Stop => server::stop(),
             ServerAction::Status => server::status(),

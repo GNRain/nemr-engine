@@ -22,10 +22,9 @@ use nemr_sync::{connect_and_migrate, router, AppState, Config, DynStore, KdfCost
 /// Start the sync server on an ephemeral port; returns its base URL and the
 /// bundle-store directory (so tests can inspect stored ciphertext directly).
 pub fn spawn_server(lease_ttl_secs: i64) -> (String, tempfile::TempDir) {
-    let db = std::env::var("DATABASE_URL").expect(
-        "DATABASE_URL must be set (see scripts/setup_sync_test_db.sh) to run \
-         the nemr-cloud integration tests",
-    );
+    // The environment first, then the server's own settings file.
+    let db = nemr_sync::settings::setting("DATABASE_URL")
+        .unwrap_or_else(|e| panic!("{e}\n  (scripts/setup_sync_test_db.sh starts one)"));
     let store_dir = tempfile::tempdir().unwrap();
     let store_path = store_dir.path().to_path_buf();
 

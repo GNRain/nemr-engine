@@ -142,10 +142,25 @@ impl S3Config {
             ))
         };
 
+        let endpoint = set("NEMR_S3_ENDPOINT").ok_or_else(|| missing("NEMR_S3_ENDPOINT"))?;
+        // THE SCHEME IS REQUIRED, and refused by name when it is absent.
+        // Without this the URL parser inside the client panics — measured:
+        // `NEMR_S3_ENDPOINT=minio.home.lan:9000` exits 101 with
+        // `panicked at object_store .. InvalidUri`, which names a crate the
+        // reader has never heard of instead of the line they typed. Somebody
+        // self-hosting is exactly the person most likely to type it that way.
+        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "NEMR_S3_ENDPOINT={endpoint:?} has no scheme — it must start with \
+                 http:// or https://  (a box on your own network is usually \
+                 http://host:9000; a cloud endpoint is https://…)"
+            )));
+        }
+
         Ok(Some(Self {
             provider,
             bucket,
-            endpoint: set("NEMR_S3_ENDPOINT").ok_or_else(|| missing("NEMR_S3_ENDPOINT"))?,
+            endpoint,
             region: set("NEMR_S3_REGION").unwrap_or_else(|| provider.default_region().to_string()),
             access_key_id: set("NEMR_S3_ACCESS_KEY_ID")
                 .ok_or_else(|| missing("NEMR_S3_ACCESS_KEY_ID"))?,

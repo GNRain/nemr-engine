@@ -20,7 +20,7 @@ fn register_login_logout_round_trip() {
     let (code, out, err) = m.run(&["sessions"]);
     assert_eq!(code, 0, "sessions after register: {err}");
     assert!(
-        out.contains("no sessions"),
+        out.to_lowercase().contains("no sessions"),
         "expected empty list, got: {out}"
     );
 
@@ -68,7 +68,10 @@ fn push_then_pull_on_a_second_machine_is_byte_identical_and_encrypted() {
 
     let (code, out, err) = a.run(&["push", "proj", "--release"]);
     assert_eq!(code, 0, "push: {err}");
-    assert!(out.contains("pushed"), "push should report: {out}");
+    assert!(
+        out.to_lowercase().contains("pushed"),
+        "push should report: {out}"
+    );
 
     // What the server stores is ciphertext: not the plaintext, not containing
     // it, and larger by the AEAD envelope overhead.

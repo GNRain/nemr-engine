@@ -9,7 +9,8 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 /// Pool size is `NEMR_DB_MAX_CONN` (default 16). The integration suite lowers it
 /// so many concurrently-spawned test servers do not exhaust a small Postgres.
 pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<PgPool> {
-    let max = std::env::var("NEMR_DB_MAX_CONN")
+    // From sync.env too — see the note in bundles.rs.
+    let max = crate::settings::setting("NEMR_DB_MAX_CONN")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(16);

@@ -6,7 +6,7 @@
 # The wrapper layer (SPEC §3.2) is its own crate so the GUI and the resolved
 # E-09 daemon can consume it without pulling in the engine. deploy/nemr-volume
 # has its own [workspace] and stays a separate privilege domain.
-members = ["crates/nemr-containerd", "crates/nemr-daemon-api", "crates/nemr-storage", "crates/nemr-crypto", "crates/nemr-sync", "crates/nemr-cloud"]
+members = ["crates/nemr-containerd", "crates/nemr-daemon-api", "crates/nemr-style", "crates/nemr-storage", "crates/nemr-crypto", "crates/nemr-sync", "crates/nemr-cloud"]
 
 [package]
 name = "nemr-engine"
@@ -31,6 +31,9 @@ name = "nemr"
 path = "src/bin/nemr.rs"
 
 [dependencies]
+# The shared voice of the command line. Open, tiny, no dependencies of its own
+# — the commercial half depends on it too, which is why it is its own crate.
+nemr-style = { path = "crates/nemr-style", version = "0.1.0" }
 # The engine depends on the wrapper crate, never on containerd-client directly
 # (SPEC §3.2). The connectivity baselines that DO use containerd-client directly
 # moved into the wrapper crate's own bins.

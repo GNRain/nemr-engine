@@ -34,6 +34,35 @@ use anyhow::{anyhow, bail, Context, Result};
 /// The name of the file, for messages.
 pub const ENV_FILE_NAME: &str = "sync.env";
 
+/// One setting, from wherever a SERVER would get it: the process environment
+/// first, then `sync.env`. A refusal names the key and the file, because those
+/// are the two things the reader needs and neither is guessable.
+///
+/// This exists so that nothing — not a test, not a script, not a command —
+/// needs a human to export something a server's own settings file already
+/// holds. The Product Owner's rule (2026-09-11): *"anything that needs me to
+/// export something first either reads the file or refuses naming the file and
+/// the key."*
+pub fn setting(key: &str) -> Result<String> {
+    let env = |k: &str| std::env::var(k).ok();
+    if let Some(v) = env(key).filter(|v| !v.is_empty()) {
+        return Ok(v);
+    }
+    let settings = Settings::load(&env)?;
+    settings
+        .get(key, &env)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "{key} is not set, and {} does not carry it either.\n  \
+                 Put it in that file (mode 0600), or export it for this command:\n      \
+                 {key}=...\n  \
+                 `nemr server configure` writes that file for you.",
+                settings.file_for_messages()
+            )
+        })
+}
+
 /// Where the file is looked for, in order, given the environment.
 pub fn env_file_path(get: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
     if let Some(explicit) = get("NEMR_SYNC_ENV_FILE") {
@@ -253,6 +282,46 @@ pub fn select_storage(get: &dyn Fn(&str) -> Option<String>) -> Result<StorageCho
 
 #[cfg(test)]
 mod tests {
+    /// The rule the Product Owner set: nothing should need a human to export
+    /// what the server's own settings file already holds. This is that rule,
+    /// as a test — and the thing a neuter removes.
+    #[test]
+    fn a_setting_comes_from_the_file_when_the_environment_does_not_have_it() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sync.env");
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&file)
+                .unwrap();
+            writeln!(f, "NEMR_TEST_ONLY_SETTING=from-the-file").unwrap();
+        }
+        std::env::set_var("NEMR_SYNC_ENV_FILE", &file);
+        std::env::remove_var("NEMR_TEST_ONLY_SETTING");
+        assert_eq!(
+            setting("NEMR_TEST_ONLY_SETTING").unwrap(),
+            "from-the-file",
+            "a setting the environment does not carry must come from the file"
+        );
+        // And the environment still wins, key by key.
+        std::env::set_var("NEMR_TEST_ONLY_SETTING", "from-the-environment");
+        assert_eq!(
+            setting("NEMR_TEST_ONLY_SETTING").unwrap(),
+            "from-the-environment"
+        );
+        // A key neither has is a refusal that names the key AND the file.
+        std::env::remove_var("NEMR_TEST_ONLY_SETTING");
+        let err = setting("NEMR_TEST_ABSENT_SETTING").unwrap_err().to_string();
+        assert!(err.contains("NEMR_TEST_ABSENT_SETTING"), "{err}");
+        assert!(err.contains(&file.display().to_string()), "{err}");
+        std::env::remove_var("NEMR_SYNC_ENV_FILE");
+    }
+
     use super::*;
 
     fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {

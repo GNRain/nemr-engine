@@ -5511,7 +5511,12 @@ fn f15_add_refuses_without_a_terminal_and_names_the_flag_and_yes_adds() {
         !err.contains("Add it?") && !out.contains("Add it?"),
         "--yes must not print the confirmation at all.\nstdout: {out}\nstderr: {err}"
     );
-    assert!(out.contains("added"), "it reports what it did: {out}");
+    // Case-insensitive since SPEC 1.151: every command now opens with a result
+    // line, and a result line is a sentence.
+    assert!(
+        out.to_lowercase().contains("added"),
+        "it reports what it did: {out}"
+    );
 
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");

@@ -46,11 +46,11 @@ pub struct TestApp {
 }
 
 pub async fn spawn() -> TestApp {
-    let db = std::env::var("DATABASE_URL").expect(
-        "DATABASE_URL must be set to run the nemr-sync integration tests \
-         (a Postgres, e.g. `podman run -d -p 127.0.0.1:5433:5432 \
-         -e POSTGRES_PASSWORD=nemr -e POSTGRES_USER=nemr -e POSTGRES_DB=nemr postgres:16`)",
-    );
+    // The environment first, then the server's own settings file — the same
+    // order the server uses, so a machine that can run a server can run its
+    // tests with nothing exported.
+    let db = nemr_sync::settings::setting("DATABASE_URL")
+        .unwrap_or_else(|e| panic!("{e}\n  (scripts/setup_sync_test_db.sh starts one)"));
     let pool = connect_and_migrate(&db).await.expect("connect + migrate");
 
     let tmp = tempfile::tempdir().unwrap();
