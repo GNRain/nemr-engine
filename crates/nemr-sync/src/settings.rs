@@ -239,10 +239,15 @@ pub fn select_storage(get: &dyn Fn(&str) -> Option<String>) -> Result<StorageCho
             "both NEMR_BUNDLE_DIR and NEMR_S3_* are set; exactly one backend is allowed — \
              unset one (a directory for tests and self-hosting, an object store for anything shared)"
         ),
+        // NAMES A COMMAND, not just a list of keys. This is the refusal the
+        // Product Owner actually met, and reading it he still had to work out
+        // where the keys were meant to go. `configure` puts them in the file.
         (None, false) => bail!(
-            "no storage backend is configured; set exactly one: NEMR_BUNDLE_DIR=<existing directory>, \
-             or NEMR_S3_PROVIDER, NEMR_S3_BUCKET, NEMR_S3_ENDPOINT, NEMR_S3_ACCESS_KEY_ID and \
-             NEMR_S3_SECRET_ACCESS_KEY for an object store"
+            "no storage backend is configured; it needs exactly one: NEMR_BUNDLE_DIR=<existing \
+             directory>, or NEMR_S3_PROVIDER, NEMR_S3_BUCKET, NEMR_S3_ENDPOINT, \
+             NEMR_S3_ACCESS_KEY_ID and NEMR_S3_SECRET_ACCESS_KEY for an object store.\n\
+             To be asked for them and have them written to the settings file: nemr server \
+             configure"
         ),
         (Some(d), false) => {
             let p = PathBuf::from(&d);
@@ -264,7 +269,8 @@ pub fn select_storage(get: &dyn Fn(&str) -> Option<String>) -> Result<StorageCho
                 .collect();
             if !missing.is_empty() {
                 bail!(
-                    "the object store is half-configured; missing: {}",
+                    "the object store is half-configured; missing: {}.\nTo be asked for them \
+                     and have them written to the settings file: nemr server configure",
                     missing.join(", ")
                 );
             }

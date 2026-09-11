@@ -157,6 +157,35 @@ impl Voice {
 
     /// A continuation under a field: the same indent, no label, no colon —
     /// for the sentence that explains the value above it.
+    /// A note that is too long for one line, wrapped and aligned under the
+    /// value it explains. WIDTH IS FIXED AT 80 rather than asked of the
+    /// terminal: this crate has no dependencies on purpose, and a wrong guess
+    /// at a wide terminal costs a short line while a dependency costs the
+    /// seam. Words longer than the column are left long rather than broken —
+    /// the long words here are URLs and variable names, and a broken one
+    /// cannot be copied.
+    pub fn notes(&self, text: &str) -> String {
+        const WIDTH: usize = 80;
+        let indent = 2 + LABEL_WIDTH + 1;
+        let room = WIDTH.saturating_sub(indent).max(24);
+        let mut out: Vec<String> = Vec::new();
+        for paragraph in text.lines() {
+            let mut line = String::new();
+            for word in paragraph.split_whitespace() {
+                if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > room {
+                    out.push(self.note(&line));
+                    line = String::new();
+                }
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            }
+            out.push(self.note(&line));
+        }
+        out.join("\n")
+    }
+
     pub fn note(&self, text: &str) -> String {
         // LABEL_WIDTH + 1: `field` spends one more space between the padding
         // and the value, and a continuation that does not line up with the
@@ -193,6 +222,17 @@ impl Voice {
 /// rewriting them: the first line is the headline, a later line carrying a
 /// `word: command` remedy becomes `Fix`, and anything else is dim detail
 /// underneath.
+/// A remedy is a line whose second half is a command — `Fix: nemr x`,
+/// `Create it first: nemr create …`, `Run: nemr login`. ONE RULE, used by
+/// every place that renders a failure, so a message written once is promoted
+/// the same way whether it arrives through `anyhow` or through a field.
+pub fn remedy(line: &str) -> Option<&str> {
+    match line.split_once(": ") {
+        Some((_, cmd)) if cmd.starts_with("nemr") || cmd.starts_with("./") => Some(cmd.trim()),
+        _ => None,
+    }
+}
+
 pub fn error_block(v: &Voice, message: &str, causes: &[String]) -> String {
     let mut lines = message.lines().map(str::trim_end).filter(|l| !l.is_empty());
     let headline = lines.next().unwrap_or("it failed").to_string();
@@ -203,19 +243,16 @@ pub fn error_block(v: &Voice, message: &str, causes: &[String]) -> String {
     out.push_str(".\n");
     let mut said_fix = false;
     for line in &rest {
-        // A remedy is a line whose second half is a command — `Fix: nemr x`,
-        // `Create it first: nemr create …`, `Run: nemr login`.
-        match line.split_once(": ") {
-            Some((lead, cmd)) if cmd.starts_with("nemr") || cmd.starts_with("./") => {
+        match remedy(line) {
+            Some(cmd) => {
                 if !said_fix {
                     out.push('\n');
                     said_fix = true;
                 }
-                let _ = lead;
-                out.push_str(&v.field("Fix", cmd.trim(), Tone::Good));
+                out.push_str(&v.field("Fix", cmd, Tone::Good));
                 out.push('\n');
             }
-            _ => {
+            None => {
                 out.push_str(&v.note(line.trim()));
                 out.push('\n');
             }
@@ -302,6 +339,29 @@ pub fn bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_note_wraps_and_every_line_lines_up() {
+        let v = Voice::plain();
+        let text = "no storage backend is configured; it needs exactly one: \
+                    NEMR_BUNDLE_DIR=<existing directory>, or the five NEMR_S3_ names. \
+                    To be asked for them: nemr server configure";
+        let out = v.notes(text);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.len() > 1, "it did not wrap: {out}");
+        let indent = 2 + LABEL_WIDTH + 1;
+        for l in &lines {
+            assert!(l.len() <= 80, "{} columns: {l:?}", l.len());
+            assert!(
+                l.starts_with(&" ".repeat(indent)) && !l[indent..].starts_with(' '),
+                "not aligned under the value: {l:?}"
+            );
+        }
+        // Every word survives, in order — wrapping must not eat one.
+        let joined: Vec<&str> = out.split_whitespace().collect();
+        let original: Vec<&str> = text.split_whitespace().collect();
+        assert_eq!(joined, original);
+    }
 
     #[test]
     fn without_colour_nothing_carries_an_escape() {

@@ -38,9 +38,9 @@ PASS=0; FAIL=0
 # Asserted, not merely printed: a run that skipped a case would otherwise say
 # PASS with fewer assertions.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=68
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=81
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=63
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=71
 fi
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS+1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
@@ -313,6 +313,41 @@ out="$(server "${S3_ENV[@]}" -- stop)"
 grep -qi 'stopped' <<<"$out"
 check $? "and stop stops that one too" "$out"
 wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
+
+# configure, with a real object store: the confirmation must show the shape of
+# the file and none of its secrets — INCLUDING THE ENDPOINT, which carries the
+# account id for the provider most people use.
+S3CONF="$WORK/s3conf"; mkdir -p "$S3CONF/config/nemr"
+umask 077
+{ printf 'NEMR_SERVER_ADDR=%s\n' "127.0.0.1:18134"
+  printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
+  printf 'NEMR_AUTH_PEPPER=ephemeral\n'; } > "$S3CONF/config/nemr/sync.env"
+out="$(printf '%s\n' "3" "$NEMR_S3_PROVIDER" "$NEMR_S3_ENDPOINT" "$NEMR_S3_BUCKET" \
+        "$NEMR_S3_ACCESS_KEY_ID" "$NEMR_S3_SECRET_ACCESS_KEY" \
+    | script -qec "env -u NEMR_SYNC_ENV_FILE -u NEMR_S3_PROVIDER -u NEMR_S3_BUCKET \
+         -u NEMR_S3_ENDPOINT -u NEMR_S3_ACCESS_KEY_ID -u NEMR_S3_SECRET_ACCESS_KEY \
+         HOME=$S3CONF XDG_CONFIG_HOME=$S3CONF/config NEMR_SYNC_BIN=$SYNC \
+         $CLOUD server configure" /dev/null 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] && grep -qE '^NEMR_S3_PROVIDER=' "$S3CONF/config/nemr/sync.env"
+check $? "it completes a file with a real object store" "$(tail -3 <<<"$out" | tr -d '\r')"
+# WHAT THIS CAN AND CANNOT PROVE. The whole captured session contains the
+# answers, because a pty echoes what is typed into it — and this harness types
+# all six answers at once, faster than rpassword can turn echo off. That is the
+# harness, not the command: the subject here is WHAT CONFIGURE ITSELF PRINTS,
+# which is the block it shows before it writes. So the assertion is scoped to
+# that block, and the file is checked separately to prove the values really did
+# go in — a confirmation with no secrets in it is worth nothing if the file is
+# empty too.
+shown="$(sed -n '/Adding to /,$p' <<<"$out")"
+grep -qF "$NEMR_S3_SECRET_ACCESS_KEY" <<<"$shown" && r=1 || r=0
+check $r "the secret access key never appears in its confirmation"
+grep -qF "$NEMR_S3_ACCESS_KEY_ID" <<<"$shown" && r=1 || r=0
+check $r "nor the access key id"
+grep -qF "$NEMR_S3_ENDPOINT" <<<"$shown" && r=1 || r=0
+check $r "nor the endpoint, which carries the account id"
+grep -qF "$NEMR_S3_ENDPOINT" "$S3CONF/config/nemr/sync.env" &&
+    grep -qF "$NEMR_S3_SECRET_ACCESS_KEY" "$S3CONF/config/nemr/sync.env"
+check $? "while the file it wrote holds both, so the redaction is not an empty file"
 else
     printf '\n   %s(the object-store arm did not run: NEMR_S3_BUCKET is not in this environment)%s\n' \
         "$BOLD" "$RESET"
@@ -381,10 +416,60 @@ check $? "and it ends by saying what to run next"
 pepper="$(sed -n 's/^NEMR_AUTH_PEPPER=//p' "$written")"
 grep -qF "$pepper" <<<"$out" && r=1 || r=0
 check $r "the pepper it generated does not appear in its own output"
-# A file that exists is never overwritten, and never silently.
+# A file that has everything is never overwritten, and never silently.
+# WORDING CHANGED DELIBERATELY (SPEC 1.152): it used to say "already exists",
+# which was also what it said to a file that was missing its storage. It now
+# distinguishes the two, so the assertion names the complete case.
 out="$(configure "18132" "1" "$CONF/bundles" "$DATABASE_URL")"; rc=$?
-[[ $rc -ne 0 ]] && grep -q "already exists" <<<"$out"
+[[ $rc -ne 0 ]] && grep -q "already has everything a server needs" <<<"$out"
 check $? "a second run refuses rather than overwriting, and names the file" "$(head -3 <<<"$out")"
+
+# ---------------------------------------------------------------------------
+step "configure completes a half-written settings file instead of refusing it"
+# ---------------------------------------------------------------------------
+# THE CASE THAT MATTERS, and the one this was found by: a machine where
+# `install_server.sh` wrote the database and the pepper, and the storage
+# credentials were kept in a SECOND file sourced by hand every session. That
+# file exists, so `configure` used to refuse — leaving the one job undone.
+HALF="$WORK/half"; mkdir -p "$HALF/config/nemr" "$HALF/bundles"
+halffile="$HALF/config/nemr/sync.env"
+umask 077
+{ printf 'NEMR_SERVER_ADDR=%s\n' "127.0.0.1:18133"
+  printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
+  printf 'NEMR_AUTH_PEPPER=%s\n' "a-pepper-that-must-survive-untouched"; } > "$halffile"
+cp "$halffile" "$HALF/before.env"
+
+# WHAT THAT FILE LOOKS LIKE BEFORE IT IS COMPLETED. This is the screen the
+# Product Owner actually met, so it is asserted rather than described: a short
+# value, the reason underneath, and the remedy as one command he can copy.
+out="$(env -i PATH="$PATH" HOME="$HALF" NEMR_SYNC_BIN="$SYNC" NEMR_SYNC_ENV_FILE="$halffile" \
+    "$CLOUD" server status 2>&1)"
+grep -qE '^  storage: +not configured$' <<<"$out"
+check $? "the value stays short and the reason goes underneath" "$(grep -A2 'storage:' <<<"$out")"
+grep -qF '\n' <<<"$out" && r=1 || r=0
+check $r "no escaped newline reaches the reader"
+grep -qE '^  Fix: +nemr server configure$' <<<"$out"
+check $? "and the remedy is one whole command, on its own line" "$(grep 'Fix:' <<<"$out")"
+
+out="$(printf '%s\n' "1" "$HALF/bundles" | script -qec \
+    "env -u NEMR_SYNC_ENV_FILE HOME=$HALF XDG_CONFIG_HOME=$HALF/config NEMR_SYNC_BIN=$SYNC \
+         $CLOUD server configure" /dev/null 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] && grep -q 'missing the storage backend' <<<"$out"
+check $? "it names what is missing instead of refusing the file" "$(sed -n '2,3p' <<<"$out" | tr -d '\r')"
+# BOTH HALVES, in one assertion each: a file that was never touched also has
+# three identical lines and is still 0600, so "unchanged" alone would stay
+# green with the whole feature disabled. Each asserts the file GREW as well.
+[[ "$(wc -l <"$halffile")" -gt 3 ]] && diff -q "$HALF/before.env" <(head -3 "$halffile") >/dev/null
+check $? "lines were added and every line already there is byte-identical" \
+    "$(diff "$HALF/before.env" <(head -3 "$halffile") || true)"
+grep -qE '^NEMR_BUNDLE_DIR=' "$halffile"
+check $? "and the storage it was missing is now in the file"
+[[ "$(wc -l <"$halffile")" -gt 3 && "$(stat -c '%a' "$halffile")" == "600" ]]
+check $? "the completed file is still 0600" "$(stat -c '%a' "$halffile")"
+out="$(env -i PATH="$PATH" HOME="$HALF" NEMR_SYNC_BIN="$SYNC" NEMR_SYNC_ENV_FILE="$halffile" \
+    "$CLOUD" server status 2>&1)"
+grep -qE 'database: .*answers' <<<"$out" && grep -qE 'storage: .*answers' <<<"$out"
+check $? "and the completed file starts a server with nothing exported" "$(head -6 <<<"$out")"
 
 # And the file it wrote starts a server, with nothing exported.
 out="$(env -i PATH="$PATH" HOME="$CONF" NEMR_SYNC_BIN="$SYNC" \

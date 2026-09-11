@@ -43,6 +43,19 @@ impl Preflight {
     pub fn state(&self, key: &str) -> &str {
         self.get(key).unwrap_or("unknown")
     }
+    /// A report built by hand, for tests that need a shape rather than a
+    /// server. Not a way to fake a preflight at runtime: nothing but tests
+    /// calls it, and a real report only ever comes from `nemr-sync --check`.
+    #[cfg(test)]
+    pub fn from_pairs(pairs: &[(&str, &str)]) -> Preflight {
+        Preflight {
+            facts: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ok: true,
+        }
+    }
     /// A reported value, with its newlines put back and every line indented
     /// under the refusal it belongs to. The report is one line per fact so it
     /// can be parsed; a refusal is prose so it can be read.
@@ -666,31 +679,26 @@ pub fn status() -> Result<()> {
             )
         );
     }
+    // WORKING AND BROKEN READ DIFFERENTLY. A backend that answers is one
+    // short line; a backend that does not has prose explaining it, and prose
+    // jammed into the value column is a 300-column line nobody reads. The
+    // failure keeps the value short and puts the reason underneath, which is
+    // what `running: no` already does two lines up.
     let backend_ok = report.state("backend_state") == "ok";
-    println!(
-        "{}",
-        v.field(
-            "storage",
-            &format!(
-                "{}  ({})",
-                report.get("backend").unwrap_or("not configured"),
-                describe_state(report.state("backend_state"), report.get("backend_error"))
-            ),
-            if backend_ok { Tone::Good } else { Tone::Bad }
-        )
+    say_state(
+        &v,
+        "storage",
+        report.get("backend").unwrap_or("not configured"),
+        backend_ok,
+        &describe_state(report.state("backend_state"), report.get("backend_error")),
     );
     let db_ok = report.state("database_state") == "ok";
-    println!(
-        "{}",
-        v.field(
-            "database",
-            &format!(
-                "{}  ({})",
-                report.get("database").unwrap_or("not configured"),
-                describe_state(report.state("database_state"), report.get("database_error"))
-            ),
-            if db_ok { Tone::Good } else { Tone::Bad }
-        )
+    say_state(
+        &v,
+        "database",
+        report.get("database").unwrap_or("not configured"),
+        db_ok,
+        &describe_state(report.state("database_state"), report.get("database_error")),
     );
     let pepper = report.state("pepper");
     println!(
@@ -775,10 +783,37 @@ pub fn status() -> Result<()> {
     }
 }
 
+/// One field of the status report whose value may or may not have answered.
+fn say_state(v: &Voice, label: &str, name: &str, ok: bool, detail: &str) {
+    if ok {
+        println!(
+            "{}",
+            v.field(label, &format!("{name}  ({detail})"), Tone::Good)
+        );
+        return;
+    }
+    println!("{}", v.field(label, name, Tone::Bad));
+    // The reason, wrapped; then the command to fix it, whole. A command split
+    // across two lines cannot be copied, which is the only thing it is for.
+    for line in detail.lines() {
+        match nemr_style::remedy(line) {
+            Some(cmd) => println!("{}", v.field("Fix", cmd, Tone::Good)),
+            None => println!("{}", v.notes(line)),
+        }
+    }
+}
+
 fn describe_state(state: &str, error: Option<&str>) -> String {
     match (state, error) {
         ("ok", _) => "answers".into(),
-        (s, Some(e)) => format!("{s}: {e}"),
+        // "unconfigured" beside a value that already reads "not configured"
+        // is the same word twice; the state is only worth naming when it says
+        // something the value does not.
+        // UNESCAPED HERE. The report is one line per fact so it can be
+        // parsed, which means a multi-line message arrives with its newlines
+        // written as `\n`; a reader should never see those two characters.
+        ("unconfigured", Some(e)) => unescape(e),
+        (s, Some(e)) => format!("{s}: {}", unescape(e)),
         (s, None) => s.into(),
     }
 }

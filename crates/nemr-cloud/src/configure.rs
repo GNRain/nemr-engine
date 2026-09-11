@@ -18,6 +18,131 @@ use nemr_style::{Tone, Voice};
 
 use crate::server;
 
+/// What an existing settings file does NOT have. Taken from the server's own
+/// preflight rather than by parsing the file here: there is one reader of that
+/// file and it is the server.
+struct Missing {
+    storage: bool,
+    database: bool,
+    pepper: bool,
+}
+
+impl Missing {
+    fn of(report: &server::Preflight) -> Missing {
+        Missing {
+            storage: report.state("backend_state") == "unconfigured",
+            database: report.state("database_state") == "unconfigured",
+            pepper: report.state("pepper") == "missing",
+        }
+    }
+    fn none(&self) -> bool {
+        !self.storage && !self.database && !self.pepper
+    }
+    fn names(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.storage {
+            v.push("the storage backend");
+        }
+        if self.database {
+            v.push("the database");
+        }
+        if self.pepper {
+            v.push("the auth pepper");
+        }
+        v
+    }
+}
+
+/// Add only what is missing, by appending. Existing lines are never read back
+/// out, never rewritten and never reordered — the file may hold a pepper this
+/// command has no business touching.
+fn add_missing(v: &Voice, path: &Path, missing: &Missing) -> Result<()> {
+    println!("{}", v.paint(Tone::Dim, "nemr server configure"));
+    println!(
+        "{}",
+        v.warned(&format!(
+            "{} exists, but it is missing {}.",
+            path.display(),
+            missing.names().join(" and ")
+        ))
+    );
+    println!(
+        "{}",
+        v.note("Nothing already in it will be changed — this only adds what is absent.")
+    );
+    println!();
+
+    let mut add = String::new();
+    let mut storage = None;
+    if missing.storage {
+        storage = Some(ask_storage(v)?);
+    }
+    if missing.database {
+        println!();
+        let db = prompt(
+            v,
+            "Postgres connection",
+            "postgres://nemr:nemr@127.0.0.1:5433/nemr",
+        )?;
+        add.push_str("\n# Postgres. nemr does not install or start one.\n");
+        add.push_str(&format!("DATABASE_URL={db}\n"));
+    }
+    if let Some(s) = &storage {
+        add.push_str(&storage_lines(s));
+    }
+    if missing.pepper {
+        add.push_str(&pepper_lines());
+    }
+
+    // Checked before it is added, against a candidate that is the real file
+    // plus the new lines — so what is verified is what will be there.
+    println!();
+    println!(
+        "{}",
+        v.paint(Tone::Dim, "Checking, before writing anything:")
+    );
+    let current =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let probe = write_private_temp(path, &format!("{current}{add}"))?;
+    let report = match server::preflight_with(Some(probe.as_path())) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_file(&probe);
+            return Err(e);
+        }
+    };
+    if !report_ok(v, &report) {
+        let _ = std::fs::remove_file(&probe);
+        eprint!(
+            "{}",
+            v.refusal(
+                "Nothing was added.",
+                "one of the things the server needs did not answer, and the file is \
+                 left exactly as it was",
+                "fix the one marked above, then run `nemr server configure` again",
+            )
+        );
+        std::process::exit(1);
+    }
+
+    println!();
+    println!(
+        "{}",
+        v.paint(Tone::Dim, &format!("Adding to {}:", path.display()))
+    );
+    for line in redacted(&add) {
+        println!("  {}", v.paint(Tone::Dim, &line));
+    }
+    // Appended through the checked candidate, so the file on disk is the file
+    // that answered — and the original is only replaced once that is true.
+    std::fs::rename(&probe, path)
+        .with_context(|| format!("moving the settings into place at {}", path.display()))?;
+    println!();
+    println!("{}", v.done(&format!("{} updated.", path.display())));
+    println!("{}", v.field("Start it", "nemr server start", Tone::Good));
+    Ok(())
+}
+
 /// What the questions produced, in the order the file is written.
 struct Answers {
     addr: String,
@@ -55,22 +180,32 @@ pub fn run() -> Result<()> {
         std::process::exit(2);
     }
 
-    // A file that exists is never overwritten, and never silently either.
+    // A FILE THAT EXISTS IS NEVER OVERWRITTEN. But "it exists" and "it is
+    // complete" are different things, and the common case is the second: a
+    // file that has the database and the pepper because `install_server.sh`
+    // wrote them, and no storage because the credentials were in a second file
+    // the Product Owner sourced by hand every session. Refusing there would
+    // leave the one job undone, so this ADDS what is missing and touches no
+    // line that is already in the file.
     if path.exists() {
-        eprint!(
-            "{}",
-            v.refusal(
-                &format!("{} already exists.", path.display()),
-                "this command writes that file, and will not write over settings you \
-                 may be running a server on",
-                &format!(
-                    "edit it, or move it aside and run this again:  mv {} {}.old",
-                    path.display(),
-                    path.display()
-                ),
-            )
-        );
-        std::process::exit(1);
+        let existing = server::preflight_with(Some(path.as_path()))?;
+        let missing = Missing::of(&existing);
+        if missing.none() {
+            eprint!(
+                "{}",
+                v.refusal(
+                    &format!("{} already has everything a server needs.", path.display()),
+                    "this command will not write over settings you may be running a server on",
+                    &format!(
+                        "edit it, or move it aside and start again:  mv {} {}.old",
+                        path.display(),
+                        path.display()
+                    ),
+                )
+            );
+            std::process::exit(1);
+        }
+        return add_missing(&v, &path, &missing);
     }
 
     println!("{}", v.paint(Tone::Dim, "nemr server configure"));
@@ -109,31 +244,7 @@ pub fn run() -> Result<()> {
             return Err(e);
         }
     };
-    let db_ok = report.state("database_state") == "ok";
-    let store_ok = report.state("backend_state") == "ok";
-    println!(
-        "{}",
-        v.field(
-            "database",
-            if db_ok { "answers" } else { "no answer" },
-            if db_ok { Tone::Good } else { Tone::Bad }
-        )
-    );
-    if !db_ok {
-        println!("{}", v.field("", report.state("database_error"), Tone::Dim));
-    }
-    println!(
-        "{}",
-        v.field(
-            "storage",
-            if store_ok { "answers" } else { "no answer" },
-            if store_ok { Tone::Good } else { Tone::Bad }
-        )
-    );
-    if !store_ok {
-        println!("{}", v.field("", report.state("backend_error"), Tone::Dim));
-    }
-    if !(db_ok && store_ok) {
+    if !report_ok(&v, &report) {
         let _ = std::fs::remove_file(&probe);
         eprint!(
             "{}",
@@ -185,6 +296,25 @@ fn ask(v: &Voice) -> Result<Answers> {
         format!("127.0.0.1:{port}")
     };
 
+    let storage = ask_storage(v)?;
+
+    println!();
+    let database = prompt(
+        v,
+        "Postgres connection",
+        "postgres://nemr:nemr@127.0.0.1:5433/nemr",
+    )?;
+
+    Ok(Answers {
+        addr,
+        database,
+        storage,
+    })
+}
+
+/// The storage question, asked on its own so that a settings file missing only
+/// its storage can be completed without re-asking anything else.
+fn ask_storage(v: &Voice) -> Result<Storage> {
     println!();
     println!(
         "{}",
@@ -194,7 +324,7 @@ fn ask(v: &Voice) -> Result<Answers> {
     println!("    2  object storage on your own network (MinIO, Garage, anything S3)");
     println!("    3  cloud object storage (Cloudflare R2, Backblaze B2, Amazon S3)");
     let choice = prompt(v, "Choice", "1")?;
-    let storage = match choice.as_str() {
+    Ok(match choice.as_str() {
         "1" => {
             let default = default_bundle_dir();
             let dir = prompt(v, "Folder", &default)?;
@@ -238,19 +368,6 @@ fn ask(v: &Voice) -> Result<Answers> {
             }
         }
         other => bail!("{other:?} is not one of 1, 2 or 3"),
-    };
-
-    println!();
-    let database = prompt(
-        v,
-        "Postgres connection",
-        "postgres://nemr:nemr@127.0.0.1:5433/nemr",
-    )?;
-
-    Ok(Answers {
-        addr,
-        database,
-        storage,
     })
 }
 
@@ -273,13 +390,22 @@ fn compose(a: &Answers) -> String {
     s.push_str("# Where the server listens.\n");
     s.push_str(&format!("NEMR_SERVER_ADDR={}\n\n", a.addr));
     s.push_str("# Postgres. nemr does not install or start one.\n");
-    s.push_str(&format!("DATABASE_URL={}\n\n", a.database));
-    match &a.storage {
+    s.push_str(&format!("DATABASE_URL={}\n", a.database));
+    s.push_str(&storage_lines(&a.storage));
+    s.push_str(&pepper_lines());
+    s
+}
+
+/// The storage settings as file lines. Shared by the file this command writes
+/// and by the lines it appends to a file that was missing them.
+fn storage_lines(storage: &Storage) -> String {
+    let mut s = String::new();
+    match storage {
         Storage::Directory(dir) => {
             s.push_str(
-                "# Storage: a folder. It must exist; the server reads it, never creates it.\n",
+                "\n# Storage: a folder. It must exist; the server reads it, never creates it.\n",
             );
-            s.push_str(&format!("NEMR_BUNDLE_DIR={dir}\n\n"));
+            s.push_str(&format!("NEMR_BUNDLE_DIR={dir}\n"));
         }
         Storage::Objects {
             provider,
@@ -288,21 +414,58 @@ fn compose(a: &Answers) -> String {
             key_id,
             secret,
         } => {
-            s.push_str("# Storage: an object store. All five, or none (E-20).\n");
+            s.push_str("\n# Storage: an object store. All five, or none (E-20).\n");
             s.push_str(&format!("NEMR_S3_PROVIDER={provider}\n"));
             s.push_str(&format!("NEMR_S3_BUCKET={bucket}\n"));
             s.push_str(&format!("NEMR_S3_ENDPOINT={endpoint}\n"));
             s.push_str(&format!("NEMR_S3_ACCESS_KEY_ID={key_id}\n"));
-            s.push_str(&format!("NEMR_S3_SECRET_ACCESS_KEY={secret}\n\n"));
+            s.push_str(&format!("NEMR_S3_SECRET_ACCESS_KEY={secret}\n"));
         }
     }
-    s.push_str(
-        "# The authentication pepper, generated for this server. It makes the\n\
-         # account-lookup endpoint answer the same way for an unknown email every time\n\
-         # (F-89). Changing it is safe; losing it only costs that property.\n",
-    );
-    s.push_str(&format!("NEMR_AUTH_PEPPER={}\n", generate_pepper()));
     s
+}
+
+/// The pepper, generated HERE: E-19 says a server without one refuses to bind,
+/// and nobody should be asked to invent a random string when a machine is
+/// standing right there.
+fn pepper_lines() -> String {
+    format!(
+        "\n# The authentication pepper, generated for this server. It makes the\n\
+         # account-lookup endpoint answer the same way for an unknown email every time\n\
+         # (F-89). Changing it is safe; losing it only costs that property.\n\
+         NEMR_AUTH_PEPPER={}\n",
+        generate_pepper()
+    )
+}
+
+/// What the preflight said, in the same two lines whether this is a new file
+/// or an old one being completed. True when the server would start.
+fn report_ok(v: &Voice, report: &server::Preflight) -> bool {
+    let db_ok = report.state("database_state") == "ok";
+    let store_ok = report.state("backend_state") == "ok";
+    println!(
+        "{}",
+        v.field(
+            "database",
+            if db_ok { "answers" } else { "no answer" },
+            if db_ok { Tone::Good } else { Tone::Bad }
+        )
+    );
+    if !db_ok {
+        println!("{}", v.field("", report.state("database_error"), Tone::Dim));
+    }
+    println!(
+        "{}",
+        v.field(
+            "storage",
+            if store_ok { "answers" } else { "no answer" },
+            if store_ok { Tone::Good } else { Tone::Bad }
+        )
+    );
+    if !store_ok {
+        println!("{}", v.field("", report.state("backend_error"), Tone::Dim));
+    }
+    db_ok && store_ok
 }
 
 /// The confirmation, with every secret left out. What is shown is the shape of
@@ -312,6 +475,12 @@ fn redacted(body: &str) -> Vec<String> {
         "NEMR_AUTH_PEPPER",
         "NEMR_S3_SECRET_ACCESS_KEY",
         "NEMR_S3_ACCESS_KEY_ID",
+        // THE ENDPOINT IS A SECRET TOO, for the provider most people use: an
+        // R2 endpoint is https://<account id>.r2.cloudflarestorage.com, so
+        // printing it prints the account id. It is redacted for every
+        // provider rather than guessed at per provider — a rule you have to
+        // reason about is a rule that leaks the day the reasoning is wrong.
+        "NEMR_S3_ENDPOINT",
     ];
     let mut out = Vec::new();
     for line in body.lines() {
@@ -320,7 +489,14 @@ fn redacted(body: &str) -> Vec<String> {
         }
         let shown = match line.split_once('=') {
             Some((k, _)) if secret_keys.contains(&k) => {
-                format!("{k}=<generated, not shown>")
+                // Accurate about WHY it is hidden: the pepper is the machine's
+                // own, the rest are the operator's and were typed in.
+                let why = if k == "NEMR_AUTH_PEPPER" {
+                    "generated, not shown"
+                } else {
+                    "not shown"
+                };
+                format!("{k}=<{why}>")
             }
             // The database URL can carry a password, and does by default.
             Some((k, v)) if k == "DATABASE_URL" => format!("{k}={}", redact_url(v)),
@@ -479,6 +655,13 @@ mod tests {
         assert!(!shown.contains("s3cr3t-value"), "{shown}");
         assert!(!shown.contains("AKIAEXAMPLE"), "{shown}");
         assert!(!shown.contains("hunter2"), "{shown}");
+        // AND THE ENDPOINT. For the provider most people use it reads
+        // https://<account id>.r2.cloudflarestorage.com, so showing it shows
+        // the account id.
+        assert!(
+            !shown.contains("box:9000"),
+            "the endpoint is in the confirmation: {shown}"
+        );
         // And the pepper, which is generated, never appears either.
         let pepper = body
             .lines()
@@ -488,6 +671,39 @@ mod tests {
         // What it DOES show: the shape.
         assert!(shown.contains("NEMR_S3_BUCKET=b"));
         assert!(shown.contains("NEMR_SERVER_ADDR=127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn a_file_missing_only_its_storage_is_completed_not_refused() {
+        // The shape `install_server.sh` leaves behind: a database and a pepper
+        // and no storage, because the credentials lived in a second file.
+        let half = server::Preflight::from_pairs(&[
+            ("database_state", "ok"),
+            ("backend_state", "unconfigured"),
+            ("pepper", "configured"),
+        ]);
+        let m = Missing::of(&half);
+        assert!(m.storage && !m.database && !m.pepper);
+        assert!(!m.none(), "there is something to add");
+        assert_eq!(m.names(), vec!["the storage backend"]);
+
+        let whole = server::Preflight::from_pairs(&[
+            ("database_state", "ok"),
+            ("backend_state", "ok"),
+            ("pepper", "configured"),
+        ]);
+        assert!(Missing::of(&whole).none(), "a complete file is left alone");
+    }
+
+    #[test]
+    fn what_is_added_carries_its_own_blank_line() {
+        // Appended to a file whose last line has a newline and nothing else,
+        // so each block must open with one — otherwise the first added key
+        // lands on the end of somebody's existing line.
+        let lines = storage_lines(&Storage::Directory("/tmp/x".into()));
+        assert!(lines.starts_with('\n'), "{lines:?}");
+        assert!(pepper_lines().starts_with('\n'));
+        assert!(lines.ends_with('\n'), "{lines:?}");
     }
 
     #[test]
