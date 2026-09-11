@@ -269,6 +269,16 @@ with a stand-in report carrying a minute of skew.
 test. The UI acceptance asserts that it went through the command rather than
 around it.
 
+Both run green through the new path: the UI acceptance at **100 assertions**
+(the full browser flow, `NEMR_SKIP_API=1`), the sync acceptance at **15**.
+
+One thing to know if you run the UI acceptance yourself: an earlier attempt
+failed at the E-23 add panel, with the daemon not answering its version
+handshake inside fifteen seconds while the folder was measured. It did not
+reproduce — the machine was building, testing and running a browser at the time
+— and the daemon answered normally straight afterwards. Recorded rather than
+explained away; if it recurs it is worth a finding of its own.
+
 ## 10. Acceptance
 
 `scripts/server_acceptance.sh` — **43 assertions, all green**, the count itself
