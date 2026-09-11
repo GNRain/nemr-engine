@@ -46,9 +46,9 @@ PASS=0; FAIL=0
 # reads the bucket back independently (six more assertions); otherwise a
 # directory under the work dir.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=103
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=104
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=99
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=100
 fi
 # The human arm (E-21) adds its own assertions when it runs.
 [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]] && EXPECTED_ASSERTIONS=$((EXPECTED_ASSERTIONS + 4))
@@ -144,10 +144,18 @@ step "Start the sync server (storage: $STORAGE_MODE)"
 if ss -ltn 2>/dev/null | grep -q ":${SERVER_ADDR##*:} "; then
     die "something already listens on $SERVER_ADDR (a stale sync server from an earlier run?) — stop it; this script starts its own and will not talk to another"
 fi
+# THE SERVER IS STARTED BY `nemr server start` (SPEC 1.149), which is the one
+# command a self-hoster runs: it checks the settings, Postgres and the store,
+# refuses naming what is missing, and then EXECS the server — so the pid below
+# is the server's own and Ctrl-C reaches it, exactly as before. This script was
+# the only thing that knew how to start a server correctly; now the command
+# knows, and this runs the command.
+#
 # NEMR_AUTH_PEPPER=ephemeral is E-19's one escape hatch: a throwaway server
 # with a random pepper and a loud warning. A server with no pepper refuses
 # to bind, which is what a real deployment gets. NEMR_SYNC_ENV_FILE is
-# emptied so the developer's own ~/.config/nemr/sync.env is never read here.
+# emptied so the developer's own ~/.config/nemr/sync.env is never read here,
+# and NEMR_SYNC_BIN pins the server to THIS build rather than an installed one.
 BUNDLE_PREFIX="ui-acceptance-$$"
 if [[ "$STORAGE_MODE" == s3 ]]; then
     # F-8 (ruled): nobody creates buckets — not the server, not this script.
@@ -163,18 +171,24 @@ if [[ "$STORAGE_MODE" == s3 ]]; then
     # exactly them.
     env -u NEMR_BUNDLE_DIR NEMR_SYNC_ENV_FILE= NEMR_SERVER_ADDR="$SERVER_ADDR" \
         NEMR_AUTH_PEPPER=ephemeral NEMR_BUNDLE_PREFIX="$BUNDLE_PREFIX" \
-        "$REPO/target/release/nemr-sync" >"$WORK/server.log" 2>&1 &
+        NEMR_SYNC_BIN="$REPO/target/release/nemr-sync" \
+        "$REPO/target/release/nemr-cloud" server start >"$WORK/server.log" 2>&1 &
 else
     mkdir -p "$WORK/bundles"
     env -u NEMR_S3_BUCKET -u NEMR_S3_PROVIDER -u NEMR_S3_ENDPOINT -u NEMR_S3_ACCESS_KEY_ID -u NEMR_S3_SECRET_ACCESS_KEY \
         NEMR_SYNC_ENV_FILE= NEMR_BUNDLE_DIR="$WORK/bundles" NEMR_SERVER_ADDR="$SERVER_ADDR" \
         NEMR_AUTH_PEPPER=ephemeral NEMR_BUNDLE_PREFIX="$BUNDLE_PREFIX" \
-        "$REPO/target/release/nemr-sync" >"$WORK/server.log" 2>&1 &
+        NEMR_SYNC_BIN="$REPO/target/release/nemr-sync" \
+        "$REPO/target/release/nemr-cloud" server start >"$WORK/server.log" 2>&1 &
 fi
 SYNC_PID=$!
 wait_for_service "the sync server" "$SYNC_PID" "$WORK/server.log" 15 \
     curl -fsS "$SERVER_URL/health" || exit 1
 pass "the sync server is up on $SERVER_ADDR"
+server_summary() { sed 's/\x1b\[[0-9;]*m//g' "$WORK/server.log"; }
+server_summary | grep -q '^nemr server: starting' \
+    || { server_summary | head -3 | sed 's/^/   | /'; die "the server was not started through \`nemr server start\`"; }
+pass "it was started by \`nemr server start\`, the command a self-hoster runs"
 # The server's log, plain: no colour codes even if a subscriber emits them.
 server_log() { sed 's/\x1b\[[0-9;]*m//g' "$WORK/server.log"; }
 server_log | grep -q 'THROWAWAY SERVER' || die "the ephemeral pepper did not announce itself loudly"

@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 DEST="${NEMR_INSTALL_DIR:-$HOME/.local/bin}"
-NAMES=(login logout register sessions push pull release ui)
+NAMES=(login logout register sessions push pull release ui server)
 
 # Built TOGETHER with the server, deliberately, and every script that hashes
 # this binary builds it the same way (F-7). Measured: `-p nemr-cloud` alone

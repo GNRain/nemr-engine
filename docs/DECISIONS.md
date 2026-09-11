@@ -1835,6 +1835,39 @@ as the case every test passes.
 
 **Not done (named).** Rewriting the `cwd`/paths inside the history bodies (tidy only — `--continue` ignores them); discovery of adoptable directories by scan (out of scope); adopting the `~/.claude.json` per-project settings (not needed, and identity must not travel); bumping the base image's Claude Code.
 
+
+### E-24 — A background mode for `nemr server`, and what happens to a server nobody is watching
+
+**Status:** OPEN — proposed, awaiting the Product Owner's ruling
+**Raised by:** Claude Code, alongside `nemr server start` (SPEC 1.149) · **Relates to:** E-19 (sync.env and the pepper), E-20 (the storage backend)
+
+**The brief settled the default.** *"Foreground by default so Ctrl-C stops it, since that is what I do today. If you want a background mode, propose it as a decision row with what happens to a server nobody is watching."* Built as ruled: `start` execs the server, so the process you started IS the server, Ctrl-C reaches it, its log is on your terminal, and nothing outlives the window.
+
+**The question.** Should there be a way to start a sync server that outlives the terminal — and if so, what is responsible for it afterwards?
+
+**What is different about a server nobody is watching.** All four of these are true of the foreground form and stop being true the moment it detaches:
+
+| While you watch it | If it detaches |
+|---|---|
+| The log is on your screen; a failed push is visible as it happens | The log goes somewhere, and something must decide where, rotate it, and stop it filling the disk |
+| A crash ends with your prompt coming back | A crash is silent until somebody tries to push. Nothing restarts it |
+| It stops when you stop | It survives a logout; on a reboot it is gone unless lingering is enabled (the engine already enables lingering for `nemrd`, D-14) |
+| One is running because you started one | Two can be running: a forgotten one on the port, a new one refusing to bind. The port check refuses the second, which is the right answer only while the first is the one you wanted |
+| The pepper you passed is in your shell | A detached server outlives the shell that held its settings, so `sync.env` stops being optional and becomes the only sane source |
+
+**Three options.**
+
+**(a) No background mode. Foreground only, as built.** A self-hoster who wants a service uses a service manager, which is what service managers are for: `systemd --user`, with `nemr server start` as the `ExecStart`. Cheapest, and nothing new can be left running by accident. The cost is that "start it and close the laptop" has no answer in this CLI.
+
+**(b) `nemr server start --detach`.** The command double-forks, writes the same record file, and redirects the log to `$XDG_STATE_HOME/nemr/cloud/server.log`. `stop` and `status` already work on the record, so they need no change. **What it owes:** a log that is rotated or capped (an unwatched server writes forever); a `nemr server logs` or a printed path, because a log nobody can find is a log nobody reads; and an answer for a crash, which is nothing — a detached server that dies stays dead until someone notices. This is the option that most resembles what people expect and carries the most unowned responsibility.
+
+**(c) A systemd user unit, shipped and installed by `nemr server install`.** `deploy/systemd/user/nemr-sync.service`, `ExecStart=%h/.local/bin/nemr-cloud server start`, `Restart=on-failure`, journal for the log, lingering for the reboot. Every liability in (b) is answered by something that already exists and is already trusted with `nemrd` and rootless containerd. **The known blocker, recorded when E-19 was ruled and still true:** the development database is a `podman run -d` with no restart policy (`scripts/setup_sync_test_db.sh:59-64`), so a unit that survives a reboot would come up against a database that did not, and the server would restart-loop against a Postgres that is not there. That is a deployment question of its own, and it is why this is a decision and not a follow-up commit.
+
+**Recommendation: (a) now, (c) when a deployment ruling exists; not (b).** The foreground form plus a unit covers both real cases — a person running a server for the afternoon, and a machine running one for a team — and neither invents a supervision story this project would then own. `--detach` is the middle option that looks convenient and quietly makes the CLI responsible for logs, restarts and orphans, which is exactly the promise `nemr server start` was scoped to avoid making about Postgres.
+
+**If (b) is ruled anyway, the minimum it must carry:** the log path printed at start and named again by `status`; a capped log (size or age), decided here, not in code; `status` distinguishing "detached and healthy" from "detached and dead" rather than reporting the record; and a refusal to detach without a `sync.env`, since a detached server outlives the environment it was started from.
+
+
 ### D-14 — One command to install: what it covers, and what it asks before it acts
 
 **Status:** Ruled · 2026-09-09 (the Product Owner stated the split and the consent bar in the request) — built the same day

@@ -86,7 +86,7 @@ pass "server and client built"
 # The client under its many names, resolved via the open CLI's external
 # subcommands — the acceptance runs `nemr login`, not `nemr-cloud login`.
 BIN="$WORK/bin"; mkdir -p "$BIN"
-for name in login logout register sessions push pull release ui; do
+for name in $(sed -n 's/^NAMES=(\(.*\))$/\1/p' "$REPO/scripts/install_sync_client.sh"); do
     ln -sf "$REPO/target/release/nemr-cloud" "$BIN/nemr-$name"
 done
 export PATH="$BIN:$PATH"
@@ -95,8 +95,16 @@ export PATH="$BIN:$PATH"
 step "Start the sync server (filesystem store, local Postgres)"
 # ---------------------------------------------------------------------------
 BUNDLES="$WORK/bundles"; mkdir -p "$BUNDLES"
+# Through `nemr server start` (SPEC 1.149), for the same reason the UI
+# acceptance does: one command knows how to start a server, and a script that
+# hand-assembles the environment drifts from it. Two settings this needed and
+# did not have — since E-19 a server with no pepper REFUSES TO BIND, and
+# without NEMR_SYNC_ENV_FILE= it would read the developer's own sync.env — so
+# this start could not have worked on a clean host.
 NEMR_BUNDLE_DIR="$BUNDLES" NEMR_SERVER_ADDR="$SERVER_ADDR" \
-    "$REPO/target/release/nemr-sync" >"$WORK/server.log" 2>&1 &
+    NEMR_SYNC_ENV_FILE= NEMR_AUTH_PEPPER=ephemeral \
+    NEMR_SYNC_BIN="$REPO/target/release/nemr-sync" \
+    "$REPO/target/release/nemr-cloud" server start >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 
 # Probe the database FIRST and separately, so "the server did not come up"

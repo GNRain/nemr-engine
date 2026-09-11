@@ -13,6 +13,7 @@ that recommends something says so and stops there.
 
 | Report | What it measures |
 |---|---|
+| [2026-09-11-server-one-command.md](2026-09-11-server-one-command.md) | One command for the sync server: what it checks, what it refuses, why it will not start Postgres, and the three defects found on the way |
 | [2026-09-10-install-icons.md](2026-09-10-install-icons.md) | Colour and one emoji per step in the live region, and the column arithmetic that keeps a two-column glyph from moving the cat |
 | [2026-09-10-install-first-run.md](2026-09-10-install-first-run.md) | The first install on a clean distro: an installer that printed nothing at all, a layout that ignored the window, temp files nobody removed, and a log line that had never told the truth |
 | [2026-09-10-install-bar-and-pane.md](2026-09-10-install-bar-and-pane.md) | The progress bar that depended on a font, the step-output pane, and what the region costs in rows |

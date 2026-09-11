@@ -21,6 +21,7 @@ mod daemon;
 mod engine_cli;
 mod keys;
 mod serve;
+mod server;
 mod state;
 
 #[derive(Parser)]
@@ -94,6 +95,18 @@ enum Command {
         no_open: bool,
     },
 
+    /// Run the sync server: one command instead of a screen of environment
+    /// variables. SELF-HOSTING AND DEVELOPMENT ONLY — the hosted product does
+    /// not need this, and a normal user never starts a server.
+    ///
+    /// Settings come from sync.env and the environment (E-19). It does not
+    /// install or start Postgres: it checks that one answers and refuses,
+    /// naming the connection it tried.
+    Server {
+        #[command(subcommand)]
+        action: ServerAction,
+    },
+
     /// INTERNAL: the detached lease-heartbeat holder. Spawned by push/pull;
     /// renews until it fails, then marks the lease lost and refuses to
     /// continue. Not for direct use.
@@ -108,6 +121,18 @@ enum Command {
         #[arg(long)]
         interval_ms: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum ServerAction {
+    /// Start it in the FOREGROUND: this process becomes the server, so Ctrl-C
+    /// stops it and nothing outlives the window you ran it in.
+    Start,
+    /// Stop the server this command started (SIGTERM; never SIGKILL).
+    Stop,
+    /// Is it running, on what address, on which storage — and do Postgres and
+    /// that storage answer right now?
+    Status,
 }
 
 fn main() -> Result<()> {
@@ -141,6 +166,11 @@ fn main() -> Result<()> {
         Command::Pull { name, take_over } => commands::pull(&name, take_over),
         Command::Release { name } => commands::release(&name),
         Command::Ui { port, no_open } => serve::run(port, !no_open),
+        Command::Server { action } => match action {
+            ServerAction::Start => server::start(),
+            ServerAction::Stop => server::stop(),
+            ServerAction::Status => server::status(),
+        },
         Command::Hold {
             name,
             holder,
