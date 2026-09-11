@@ -1536,6 +1536,7 @@ dependencies = [
  "nemr-crypto",
  "nemr-daemon-api",
  "nemr-storage",
+ "nemr-style",
  "nemr-sync",
  "rand 0.8.8",
  "reqwest 0.12.28",
@@ -1608,6 +1609,7 @@ dependencies = [
  "libc",
  "nemr-containerd",
  "nemr-daemon-api",
+ "nemr-style",
  "prost",
  "serde",
  "serde_json",
@@ -1638,6 +1640,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "nemr-style"
+version = "0.1.0"
 
 [[package]]
 name = "nemr-sync"

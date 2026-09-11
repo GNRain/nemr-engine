@@ -186,7 +186,9 @@ wait_for_service "the sync server" "$SYNC_PID" "$WORK/server.log" 15 \
     curl -fsS "$SERVER_URL/health" || exit 1
 pass "the sync server is up on $SERVER_ADDR"
 server_summary() { sed 's/\x1b\[[0-9;]*m//g' "$WORK/server.log"; }
-server_summary | grep -q '^nemr server: starting' \
+# UPDATED DELIBERATELY with the one-voice change (SPEC 1.151): the banner is
+# now a result line, `OK Starting the sync server.` when piped into this log.
+server_summary | grep -qE '^(OK|✓) Starting the sync server' \
     || { server_summary | head -3 | sed 's/^/   | /'; die "the server was not started through \`nemr server start\`"; }
 pass "it was started by \`nemr server start\`, the command a self-hoster runs"
 # The server's log, plain: no colour codes even if a subscriber emits them.

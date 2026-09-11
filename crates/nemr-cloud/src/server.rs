@@ -28,19 +28,33 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Result};
+use nemr_style::{Tone, Voice};
 
 /// The report `nemr-sync --check` prints, as a map, plus whether it exited 0.
-struct Preflight {
+pub struct Preflight {
     facts: BTreeMap<String, String>,
     ok: bool,
 }
 
 impl Preflight {
-    fn get(&self, key: &str) -> Option<&str> {
+    pub fn get(&self, key: &str) -> Option<&str> {
         self.facts.get(key).map(String::as_str)
     }
-    fn state(&self, key: &str) -> &str {
+    pub fn state(&self, key: &str) -> &str {
         self.get(key).unwrap_or("unknown")
+    }
+    /// A report built by hand, for tests that need a shape rather than a
+    /// server. Not a way to fake a preflight at runtime: nothing but tests
+    /// calls it, and a real report only ever comes from `nemr-sync --check`.
+    #[cfg(test)]
+    pub fn from_pairs(pairs: &[(&str, &str)]) -> Preflight {
+        Preflight {
+            facts: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ok: true,
+        }
     }
     /// A reported value, with its newlines put back and every line indented
     /// under the refusal it belongs to. The report is one line per fact so it
@@ -136,8 +150,35 @@ const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// So: a deadline, and a kill. A read-only command must not be able to start a
 /// server, and must not be able to wait forever for one.
 fn preflight() -> Result<Preflight> {
+    preflight_with(None)
+}
+
+/// The same, against a specific settings file — which is how `configure`
+/// checks answers it has not written yet.
+pub fn preflight_with(env_file: Option<&std::path::Path>) -> Result<Preflight> {
     let bin = sync_bin()?;
-    let child = Command::new(&bin)
+    let mut cmd = Command::new(&bin);
+    if let Some(f) = env_file {
+        // The candidate file, and ONLY it: a value left over in this process's
+        // environment would make the check pass for settings the file does not
+        // carry, and the file is what the server will read.
+        cmd.env("NEMR_SYNC_ENV_FILE", f);
+        for k in [
+            "DATABASE_URL",
+            "NEMR_SERVER_ADDR",
+            "NEMR_AUTH_PEPPER",
+            "NEMR_BUNDLE_DIR",
+            "NEMR_BUNDLE_PREFIX",
+            "NEMR_S3_PROVIDER",
+            "NEMR_S3_BUCKET",
+            "NEMR_S3_ENDPOINT",
+            "NEMR_S3_ACCESS_KEY_ID",
+            "NEMR_S3_SECRET_ACCESS_KEY",
+        ] {
+            cmd.env_remove(k);
+        }
+    }
+    let child = cmd
         .arg("--check")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -266,8 +307,11 @@ fn write_pid_file(pid: i32, addr: &str, backend: &str) -> Result<()> {
 }
 
 /// The file the first run asks for, with every setting named and explained.
-/// Printed, never written: the pepper is the one value this command must not
-/// invent (E-19), and a file it wrote for you would be a file you never read.
+/// Printed, never written: `start` is not the command that writes settings,
+/// and a file it wrote for you would be a file you never read. It opens by
+/// naming the command that DOES write it — a page of instructions that does
+/// not mention the one-line alternative is a page that wastes the reader's
+/// afternoon.
 fn print_template(path: &str, file_reading_disabled: bool) {
     if file_reading_disabled {
         eprintln!(
@@ -279,19 +323,23 @@ either way, and they are listed below."
     }
     eprintln!(
         "
-The server reads one file — {path} — mode 0600. Create it with the settings
-below, then run this again. Every line is KEY=VALUE; anything already in your
-environment wins over the file, key by key.
+The server reads one file — {path} — mode 0600.
+
+To be asked for what goes in it and have it written for you: nemr server configure
+
+To write it yourself, the settings are below. Every line is KEY=VALUE; anything
+already in your environment wins over the file, key by key.
 
   # ---- required ------------------------------------------------------------
 
   # Postgres. This command does not install or start one; see below.
   DATABASE_URL=postgres://nemr:<password>@127.0.0.1:5433/nemr
 
-  # The auth pepper. THERE IS NO DEFAULT AND NOTHING GENERATES ONE FOR YOU:
-  # an unset pepper makes /v1/auth/params an account-enumeration oracle that
-  # resets on every restart (F-89), so a server without one refuses to bind.
-  # Generate it once, into the file, so it never reaches your shell history:
+  # The auth pepper. THE SERVER NEVER GENERATES ONE FOR YOU, and there is no
+  # default: an unset pepper makes /v1/auth/params an account-enumeration
+  # oracle that resets on every restart (F-89), so a server without one
+  # refuses to bind. `nemr server configure` generates it into the file;
+  # by hand, once, so it never reaches your shell history:
   #
   #   umask 077; mkdir -p \"$(dirname {path})\"
   #   printf 'NEMR_AUTH_PEPPER=%s\\n' \"$(head -c 32 /dev/urandom | base64 -w0)\" >> {path}
@@ -344,14 +392,18 @@ fn postgres_help() {
     eprintln!("  bigger promise than starting a server.");
 }
 
+/// A refusal whose "why" is several lines of somebody else's message: the
+/// headline here, the detail printed by the caller underneath.
 fn refuse(headline: &str) {
+    let v = Voice::for_stderr();
     eprintln!();
-    eprintln!("nemr server: {headline}");
+    eprintln!("{}", v.failed(headline));
 }
 
 // --- start -------------------------------------------------------------------
 
 pub fn start() -> Result<()> {
+    let v = Voice::for_stdout();
     let report = preflight()?;
 
     // 1. Settings at all. A malformed or wrong-mode sync.env is the server's
@@ -495,17 +547,29 @@ pub fn start() -> Result<()> {
     let backend = report.get("backend").unwrap_or("unknown").to_string();
     let bin = sync_bin()?;
 
-    println!("nemr server: starting");
-    println!("  address:   {addr}");
-    println!("  storage:   {backend}");
+    println!("{}", v.done("Starting the sync server."));
+    println!();
+    println!("{}", v.field("address", &addr, Tone::Plain));
+    println!("{}", v.field("storage", &backend, Tone::Good));
     println!(
-        "  database:  {}",
-        report.get("database").unwrap_or("(unset)")
+        "{}",
+        v.field(
+            "database",
+            report.get("database").unwrap_or("(unset)"),
+            Tone::Good
+        )
     );
     if report.state("pepper") == "ephemeral" {
-        println!("  pepper:    ephemeral — THROWAWAY SERVER (E-19's escape hatch)");
+        println!(
+            "{}",
+            v.field(
+                "pepper",
+                "ephemeral — THROWAWAY SERVER (E-19's escape hatch)",
+                Tone::Pending
+            )
+        );
     }
-    println!("  Ctrl-C stops it.");
+    println!("{}", v.note("Ctrl-C stops it."));
     println!();
 
     // The pid file names THIS process, because the next call replaces this
@@ -522,14 +586,25 @@ pub fn start() -> Result<()> {
 // --- stop --------------------------------------------------------------------
 
 pub fn stop() -> Result<()> {
+    let v = Voice::for_stdout();
     sweep_stale_pid_file();
     let Some((pid, fields)) = running_pid() else {
-        println!("nemr server: nothing to stop — no server started by this command is running.");
-        println!("             (`nemr server status` also looks at the address itself.)");
+        println!("{}", v.done("Nothing to stop."));
+        println!(
+            "{}",
+            v.note("No server started by this command is running.")
+        );
+        println!(
+            "{}",
+            v.note("`nemr server status` also looks at the address itself.")
+        );
         return Ok(());
     };
     let addr = fields.get("addr").map(String::as_str).unwrap_or("");
-    println!("nemr server: stopping pid {pid} {addr}");
+    println!(
+        "{}",
+        v.field("stopping", &format!("pid {pid} {addr}"), Tone::Pending)
+    );
     // SIGTERM, which the server now handles as its graceful shutdown — the
     // same path Ctrl-C takes. Before that handler existed every caller's
     // SIGTERM got the default disposition: dead where it stood, mid-request.
@@ -544,7 +619,7 @@ pub fn stop() -> Result<()> {
     for _ in 0..100 {
         if running_pid().is_none() {
             let _ = std::fs::remove_file(pid_file());
-            println!("nemr server: stopped");
+            println!("{}", v.done("Stopped."));
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -558,6 +633,7 @@ pub fn stop() -> Result<()> {
 // --- status ------------------------------------------------------------------
 
 pub fn status() -> Result<()> {
+    let v = Voice::for_stdout();
     sweep_stale_pid_file();
     let report = preflight()?;
     let addr = report.state("addr").to_string();
@@ -574,31 +650,78 @@ pub fn status() -> Result<()> {
         },
     };
 
-    println!("nemr server");
-    println!("  running:   {}", if running { "yes" } else { "no" });
-    println!("             {how}");
-    println!("  address:   {addr}");
-    if running {
+    // THE RESULT FIRST: one line that says whether the thing works, before any
+    // of the detail that says why.
+    let healthy = running && report.ok;
+    if healthy {
+        println!("{}", v.done("The sync server is up."));
+    } else if running {
         println!(
-            "  /health:   {}",
-            if answers(&addr) {
-                "answers"
-            } else {
-                "NO ANSWER"
-            }
+            "{}",
+            v.warned("The sync server is up, but something it needs is not.")
+        );
+    } else {
+        println!("{}", v.failed("No sync server is running."));
+    }
+    println!();
+
+    println!(
+        "{}",
+        v.field(
+            "running",
+            if running { "yes" } else { "no" },
+            if running { Tone::Good } else { Tone::Bad }
+        )
+    );
+    println!("{}", v.note(&how));
+    println!("{}", v.field("address", &addr, Tone::Plain));
+    if running {
+        let ok = answers(&addr);
+        println!(
+            "{}",
+            v.field(
+                "/health",
+                if ok { "answers" } else { "NO ANSWER" },
+                if ok { Tone::Good } else { Tone::Bad }
+            )
         );
     }
-    println!(
-        "  storage:   {}  ({})",
+    // WORKING AND BROKEN READ DIFFERENTLY. A backend that answers is one
+    // short line; a backend that does not has prose explaining it, and prose
+    // jammed into the value column is a 300-column line nobody reads. The
+    // failure keeps the value short and puts the reason underneath, which is
+    // what `running: no` already does two lines up.
+    let backend_ok = report.state("backend_state") == "ok";
+    say_state(
+        &v,
+        "storage",
         report.get("backend").unwrap_or("not configured"),
-        describe_state(report.state("backend_state"), report.get("backend_error"))
+        backend_ok,
+        &describe_state(report.state("backend_state"), report.get("backend_error")),
     );
-    println!(
-        "  database:  {}  ({})",
+    let db_ok = report.state("database_state") == "ok";
+    say_state(
+        &v,
+        "database",
         report.get("database").unwrap_or("not configured"),
-        describe_state(report.state("database_state"), report.get("database_error"))
+        db_ok,
+        &describe_state(report.state("database_state"), report.get("database_error")),
     );
-    println!("  pepper:    {}", report.state("pepper"));
+    let pepper = report.state("pepper");
+    println!(
+        "{}",
+        v.field(
+            "pepper",
+            pepper,
+            match pepper {
+                "configured" => Tone::Good,
+                // Ephemeral is not broken, but it IS a throwaway server, and
+                // the one thing you must not mistake for a configured one.
+                "ephemeral" => Tone::Pending,
+                _ => Tone::Bad,
+            }
+        )
+    );
     // Only when it matters. The lease is time-based, and a database whose clock
     // has drifted makes a lease that was just taken look long expired — which
     // reads as a lease bug and is not one. Measured here at 61 seconds on a
@@ -609,40 +732,95 @@ pub fn status() -> Result<()> {
     {
         if skew.abs() >= 2_000 {
             println!(
-                "  clock:     the database is {:.1}s {} this machine — the lease is time-based, \
-                 so this will look like a lease bug. Restarting the database usually fixes it.",
-                skew.abs() as f64 / 1000.0,
-                if skew > 0 { "AHEAD of" } else { "BEHIND" }
+                "{}",
+                v.field(
+                    "clock",
+                    &format!(
+                        "the database is {:.1}s {} this machine — the lease is time-based, so \
+                         this will look like a lease bug. Restarting the database usually fixes it.",
+                        skew.abs() as f64 / 1000.0,
+                        if skew > 0 { "AHEAD of" } else { "BEHIND" }
+                    ),
+                    Tone::Pending
+                )
             );
         }
     }
     match report.state("env_file_state") {
         "present" => println!(
-            "  settings:  {}  (keys: {})",
-            report.state("env_file"),
-            report.state("env_file_keys")
+            "{}",
+            v.field(
+                "settings",
+                &format!(
+                    "{}  (keys: {})",
+                    report.state("env_file"),
+                    report.state("env_file_keys")
+                ),
+                Tone::Dim
+            )
         ),
         "absent" => println!(
-            "  settings:  the environment only — {} does not exist",
-            report.state("env_file")
+            "{}",
+            v.field(
+                "settings",
+                &format!(
+                    "the environment only — {} does not exist",
+                    report.state("env_file")
+                ),
+                Tone::Dim
+            )
         ),
-        _ => println!("  settings:  the environment only (NEMR_SYNC_ENV_FILE is empty)"),
+        _ => println!(
+            "{}",
+            v.field(
+                "settings",
+                "the environment only (NEMR_SYNC_ENV_FILE is empty)",
+                Tone::Dim
+            )
+        ),
     }
     // The exit code is the summary: 0 means running AND everything it depends
     // on answered, so `nemr server status && curl ...` is a sentence that says
     // what it looks like it says. Anything else is 1, and the lines above say
     // which of the five it was.
-    if running && report.ok {
+    if healthy {
         Ok(())
     } else {
         std::process::exit(1)
     }
 }
 
+/// One field of the status report whose value may or may not have answered.
+fn say_state(v: &Voice, label: &str, name: &str, ok: bool, detail: &str) {
+    if ok {
+        println!(
+            "{}",
+            v.field(label, &format!("{name}  ({detail})"), Tone::Good)
+        );
+        return;
+    }
+    println!("{}", v.field(label, name, Tone::Bad));
+    // The reason, wrapped; then the command to fix it, whole. A command split
+    // across two lines cannot be copied, which is the only thing it is for.
+    for line in detail.lines() {
+        match nemr_style::remedy(line) {
+            Some(cmd) => println!("{}", v.field("Fix", cmd, Tone::Good)),
+            None => println!("{}", v.notes(line)),
+        }
+    }
+}
+
 fn describe_state(state: &str, error: Option<&str>) -> String {
     match (state, error) {
         ("ok", _) => "answers".into(),
-        (s, Some(e)) => format!("{s}: {e}"),
+        // "unconfigured" beside a value that already reads "not configured"
+        // is the same word twice; the state is only worth naming when it says
+        // something the value does not.
+        // UNESCAPED HERE. The report is one line per fact so it can be
+        // parsed, which means a multi-line message arrives with its newlines
+        // written as `\n`; a reader should never see those two characters.
+        ("unconfigured", Some(e)) => unescape(e),
+        (s, Some(e)) => format!("{s}: {}", unescape(e)),
         (s, None) => s.into(),
     }
 }

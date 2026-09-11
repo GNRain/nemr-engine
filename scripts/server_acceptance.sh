@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # The acceptance for `nemr server start|stop|status` (E-24 / SPEC 1.149).
 #
-#   export DATABASE_URL=postgres://nemr:nemr@127.0.0.1:5433/nemr
 #   ./scripts/server_acceptance.sh
+#
+# Nothing has to be exported: the database and the storage come from the
+# server's own settings file, `sync.env`, exactly as they do for the server.
+# Export something and it wins, key by key, which is the rule everywhere else.
 #
 # WHAT IT PROVES. The lifecycle in BOTH storage modes — start, status, stop —
 # and the four refusals the Product Owner asked for by name: no settings at
@@ -24,15 +27,20 @@ cd "$(dirname "$0")/.."
 REPO="$PWD"
 # shellcheck source=lib/proc.sh
 . "$REPO/scripts/lib/proc.sh"
+# shellcheck source=lib/settings.sh
+. "$REPO/scripts/lib/settings.sh"
+# The server's own settings, for the run that tests the server. The
+# environment still wins; this only fills what it does not carry.
+nemr_settings_load || exit 1
 
 GREEN=$'\033[32m'; RED=$'\033[31m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
 PASS=0; FAIL=0
 # Asserted, not merely printed: a run that skipped a case would otherwise say
 # PASS with fewer assertions.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=48
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=82
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=43
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=72
 fi
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS+1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
@@ -50,7 +58,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-: "${DATABASE_URL:?DATABASE_URL is required — ./scripts/setup_sync_test_db.sh}"
+nemr_settings_require DATABASE_URL || {
+    printf '  A throwaway one:  ./scripts/setup_sync_test_db.sh\n\n' >&2
+    exit 1
+}
 CLOUD="$REPO/target/release/nemr-cloud"
 SYNC="$REPO/target/release/nemr-sync"
 cargo build --release -p nemr-sync -p nemr-cloud --quiet || { fail "the release build failed"; exit 1; }
@@ -99,8 +110,13 @@ grep -q DATABASE_URL <<<"$out" && grep -q NEMR_AUTH_PEPPER <<<"$out" &&
 check $? "the template names every setting, both backends included"
 grep -q "$WORK/home/.config/nemr/sync.env" <<<"$out"
 check $? "and names the file it wants, by path"
-grep -qi 'NOTHING GENERATES ONE FOR YOU' <<<"$out"
-check $? "it says plainly that no pepper is generated for you (E-19)"
+grep -qi 'THE SERVER NEVER GENERATES ONE FOR YOU' <<<"$out"
+check $? "it says plainly that the server invents no pepper (E-19)"
+# WORDING CHANGED DELIBERATELY (SPEC 1.152): it used to read "NOTHING generates
+# one for you", which stopped being true the moment `configure` shipped — that
+# command generates one. E-19's rule is about the SERVER, and it still holds.
+grep -qi 'nemr server configure' <<<"$out"
+check $? "and the template names the command that writes the file for you"
 grep -q 'NEMR_AUTH_PEPPER=ephemeral' <<<"$out" && grep -qi 'throwaway' <<<"$out"
 check $? "and the escape hatch stays explicit: the literal value, marked throwaway"
 check "$([[ ! -e "$WORK/home/.config/nemr/sync.env" ]] && echo 0 || echo 1)" \
@@ -170,7 +186,7 @@ SERVER_PID=$!
 wait_for_service "the sync server" "$SERVER_PID" "$WORK/server.log" 20 \
     curl -fsS "http://$ADDR/health" || { fail "the server did not come up"; exit 1; }
 pass "start brings the server up in the foreground"
-grep -q "address:   $ADDR" "$WORK/server.log" && grep -q 'storage:   local:' "$WORK/server.log"
+grep -qE "address: +$ADDR" "$WORK/server.log" && grep -qE 'storage: +local:' "$WORK/server.log"
 check $? "and says the address and the storage it chose before the log begins" "$(head -5 "$WORK/server.log")"
 grep -q 'THROWAWAY SERVER' "$WORK/server.log"
 check $? "the ephemeral pepper still announces itself loudly (E-19)"
@@ -302,10 +318,199 @@ out="$(server "${S3_ENV[@]}" -- stop)"
 grep -qi 'stopped' <<<"$out"
 check $? "and stop stops that one too" "$out"
 wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
+
+# configure, with a real object store: the confirmation must show the shape of
+# the file and none of its secrets — INCLUDING THE ENDPOINT, which carries the
+# account id for the provider most people use.
+S3CONF="$WORK/s3conf"; mkdir -p "$S3CONF/config/nemr"
+umask 077
+{ printf 'NEMR_SERVER_ADDR=%s\n' "127.0.0.1:18134"
+  printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
+  printf 'NEMR_AUTH_PEPPER=ephemeral\n'; } > "$S3CONF/config/nemr/sync.env"
+out="$(printf '%s\n' "3" "$NEMR_S3_PROVIDER" "$NEMR_S3_ENDPOINT" "$NEMR_S3_BUCKET" \
+        "$NEMR_S3_ACCESS_KEY_ID" "$NEMR_S3_SECRET_ACCESS_KEY" \
+    | script -qec "env -u NEMR_SYNC_ENV_FILE -u NEMR_S3_PROVIDER -u NEMR_S3_BUCKET \
+         -u NEMR_S3_ENDPOINT -u NEMR_S3_ACCESS_KEY_ID -u NEMR_S3_SECRET_ACCESS_KEY \
+         HOME=$S3CONF XDG_CONFIG_HOME=$S3CONF/config NEMR_SYNC_BIN=$SYNC \
+         $CLOUD server configure" /dev/null 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] && grep -qE '^NEMR_S3_PROVIDER=' "$S3CONF/config/nemr/sync.env"
+check $? "it completes a file with a real object store" "$(tail -3 <<<"$out" | tr -d '\r')"
+# WHAT THIS CAN AND CANNOT PROVE. The whole captured session contains the
+# answers, because a pty echoes what is typed into it — and this harness types
+# all six answers at once, faster than rpassword can turn echo off. That is the
+# harness, not the command: the subject here is WHAT CONFIGURE ITSELF PRINTS,
+# which is the block it shows before it writes. So the assertion is scoped to
+# that block, and the file is checked separately to prove the values really did
+# go in — a confirmation with no secrets in it is worth nothing if the file is
+# empty too.
+shown="$(sed -n '/Adding to /,$p' <<<"$out")"
+grep -qF "$NEMR_S3_SECRET_ACCESS_KEY" <<<"$shown" && r=1 || r=0
+check $r "the secret access key never appears in its confirmation"
+grep -qF "$NEMR_S3_ACCESS_KEY_ID" <<<"$shown" && r=1 || r=0
+check $r "nor the access key id"
+grep -qF "$NEMR_S3_ENDPOINT" <<<"$shown" && r=1 || r=0
+check $r "nor the endpoint, which carries the account id"
+grep -qF "$NEMR_S3_ENDPOINT" "$S3CONF/config/nemr/sync.env" &&
+    grep -qF "$NEMR_S3_SECRET_ACCESS_KEY" "$S3CONF/config/nemr/sync.env"
+check $? "while the file it wrote holds both, so the redaction is not an empty file"
 else
     printf '\n   %s(the object-store arm did not run: NEMR_S3_BUCKET is not in this environment)%s\n' \
         "$BOLD" "$RESET"
 fi
+
+# ---------------------------------------------------------------------------
+step "sync.env is the only file: nothing exported, everything from it (SPEC 1.151)"
+# ---------------------------------------------------------------------------
+# THE COMPLAINT: "I still set variables by hand every session — set -a; source
+# ~/.config/nemr/r2.env; set +a — and export DATABASE_URL=...". The server has
+# always been able to read all of it from sync.env (E-20 put NEMR_S3_* there on
+# purpose); nothing proved it, and one script said the opposite. This proves it,
+# with `env -i`: not one variable is exported, and the file carries everything.
+SOLO="$WORK/solo"; mkdir -p "$SOLO"
+solo_env() {   # <file> — a complete settings file, mode 0600
+    umask 077
+    { printf 'NEMR_SERVER_ADDR=%s\n' "127.0.0.1:18131"
+      printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
+      printf 'NEMR_AUTH_PEPPER=ephemeral\n'
+      cat; } > "$1"
+    chmod 600 "$1"
+}
+mkdir -p "$SOLO/bundles"
+printf 'NEMR_BUNDLE_DIR=%s\n' "$SOLO/bundles" | solo_env "$SOLO/local.env"
+out="$(env -i PATH="$PATH" HOME="$SOLO" NEMR_SYNC_BIN="$SYNC" NEMR_SYNC_ENV_FILE="$SOLO/local.env" \
+    "$CLOUD" server status 2>&1)"
+grep -qE 'database: .*answers' <<<"$out" && grep -qE 'storage: .*answers' <<<"$out"
+check $? "with NOTHING exported, a directory-backed server reads it all from the file" \
+    "$(head -6 <<<"$out")"
+grep -q "$SOLO/local.env" <<<"$out"
+check $? "and says which file it read"
+
+# ---------------------------------------------------------------------------
+step "nemr server configure writes that file, and refuses rather than surprising you"
+# ---------------------------------------------------------------------------
+CONF="$WORK/conf"; mkdir -p "$CONF"
+configure() {   # <stdin...> — a real pty, because it asks questions
+    # NEMR_SYNC_ENV_FILE is cleared deliberately: it names a file, and this
+    # run is about the file the command CHOOSES from XDG_CONFIG_HOME. With it
+    # set, the caller's own settings file would be the subject.
+    printf '%s\n' "$@" | script -qec \
+        "env -u NEMR_SYNC_ENV_FILE HOME=$CONF XDG_CONFIG_HOME=$CONF/config NEMR_SYNC_BIN=$SYNC \
+             DATABASE_URL=$DATABASE_URL $CLOUD server configure" /dev/null 2>&1
+}
+# No terminal at all: it asks questions, so it refuses rather than guessing.
+out="$(env -u NEMR_SYNC_ENV_FILE HOME="$CONF" XDG_CONFIG_HOME="$CONF/config" NEMR_SYNC_BIN="$SYNC" \
+    "$CLOUD" server configure </dev/null 2>&1)"; rc=$?
+[[ $rc -eq 2 ]] && grep -qi 'needs a terminal' <<<"$out"
+check $? "with no terminal it refuses, saying why" "$(head -3 <<<"$out")"
+
+# The happy path: port, storage 1 (a folder), the folder, the database.
+out="$(configure "18132" "1" "$CONF/bundles" "$DATABASE_URL")"
+written="$CONF/config/nemr/sync.env"
+check "$([[ -f "$written" ]] && echo 0 || echo 1)" "it writes the file" "$(tail -4 <<<"$out")"
+check "$([[ "$(stat -c '%a' "$written" 2>/dev/null)" == "600" ]] && echo 0 || echo 1)" \
+    "0600, because it holds the pepper" "$(stat -c '%a' "$written" 2>/dev/null)"
+grep -q 'THIS IS A SECRETS FILE' "$written"
+check $? "and its header says so in as many words"
+grep -qE '^NEMR_AUTH_PEPPER=.{40,}' "$written"
+check $? "it generated the pepper itself — nobody was asked to invent one"
+grep -qE '^NEMR_BUNDLE_DIR=' "$written" && ! grep -q '^NEMR_S3_' "$written"
+check $? "exactly one storage backend is written (E-20)"
+grep -qi 'nemr server start' <<<"$out"
+check $? "and it ends by saying what to run next"
+# THE SECRET IS NEVER SHOWN. Not in the confirmation, not anywhere.
+pepper="$(sed -n 's/^NEMR_AUTH_PEPPER=//p' "$written")"
+grep -qF "$pepper" <<<"$out" && r=1 || r=0
+check $r "the pepper it generated does not appear in its own output"
+# A file that has everything is never overwritten, and never silently.
+# WORDING CHANGED DELIBERATELY (SPEC 1.152): it used to say "already exists",
+# which was also what it said to a file that was missing its storage. It now
+# distinguishes the two, so the assertion names the complete case.
+out="$(configure "18132" "1" "$CONF/bundles" "$DATABASE_URL")"; rc=$?
+[[ $rc -ne 0 ]] && grep -q "already has everything a server needs" <<<"$out"
+check $? "a second run refuses rather than overwriting, and names the file" "$(head -3 <<<"$out")"
+
+# ---------------------------------------------------------------------------
+step "configure completes a half-written settings file instead of refusing it"
+# ---------------------------------------------------------------------------
+# THE CASE THAT MATTERS, and the one this was found by: a machine where
+# `install_server.sh` wrote the database and the pepper, and the storage
+# credentials were kept in a SECOND file sourced by hand every session. That
+# file exists, so `configure` used to refuse — leaving the one job undone.
+HALF="$WORK/half"; mkdir -p "$HALF/config/nemr" "$HALF/bundles"
+halffile="$HALF/config/nemr/sync.env"
+umask 077
+{ printf 'NEMR_SERVER_ADDR=%s\n' "127.0.0.1:18133"
+  printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
+  printf 'NEMR_AUTH_PEPPER=%s\n' "a-pepper-that-must-survive-untouched"; } > "$halffile"
+cp "$halffile" "$HALF/before.env"
+
+# WHAT THAT FILE LOOKS LIKE BEFORE IT IS COMPLETED. This is the screen the
+# Product Owner actually met, so it is asserted rather than described: a short
+# value, the reason underneath, and the remedy as one command he can copy.
+out="$(env -i PATH="$PATH" HOME="$HALF" NEMR_SYNC_BIN="$SYNC" NEMR_SYNC_ENV_FILE="$halffile" \
+    "$CLOUD" server status 2>&1)"
+grep -qE '^  storage: +not configured$' <<<"$out"
+check $? "the value stays short and the reason goes underneath" "$(grep -A2 'storage:' <<<"$out")"
+grep -qF '\n' <<<"$out" && r=1 || r=0
+check $r "no escaped newline reaches the reader"
+grep -qE '^  Fix: +nemr server configure$' <<<"$out"
+check $? "and the remedy is one whole command, on its own line" "$(grep 'Fix:' <<<"$out")"
+
+out="$(printf '%s\n' "1" "$HALF/bundles" | script -qec \
+    "env -u NEMR_SYNC_ENV_FILE HOME=$HALF XDG_CONFIG_HOME=$HALF/config NEMR_SYNC_BIN=$SYNC \
+         $CLOUD server configure" /dev/null 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] && grep -q 'missing the storage backend' <<<"$out"
+check $? "it names what is missing instead of refusing the file" "$(sed -n '2,3p' <<<"$out" | tr -d '\r')"
+# BOTH HALVES, in one assertion each: a file that was never touched also has
+# three identical lines and is still 0600, so "unchanged" alone would stay
+# green with the whole feature disabled. Each asserts the file GREW as well.
+[[ "$(wc -l <"$halffile")" -gt 3 ]] && diff -q "$HALF/before.env" <(head -3 "$halffile") >/dev/null
+check $? "lines were added and every line already there is byte-identical" \
+    "$(diff "$HALF/before.env" <(head -3 "$halffile") || true)"
+grep -qE '^NEMR_BUNDLE_DIR=' "$halffile"
+check $? "and the storage it was missing is now in the file"
+[[ "$(wc -l <"$halffile")" -gt 3 && "$(stat -c '%a' "$halffile")" == "600" ]]
+check $? "the completed file is still 0600" "$(stat -c '%a' "$halffile")"
+out="$(env -i PATH="$PATH" HOME="$HALF" NEMR_SYNC_BIN="$SYNC" NEMR_SYNC_ENV_FILE="$halffile" \
+    "$CLOUD" server status 2>&1)"
+grep -qE 'database: .*answers' <<<"$out" && grep -qE 'storage: .*answers' <<<"$out"
+check $? "and the completed file starts a server with nothing exported" "$(head -6 <<<"$out")"
+
+# And the file it wrote starts a server, with nothing exported.
+out="$(env -i PATH="$PATH" HOME="$CONF" NEMR_SYNC_BIN="$SYNC" \
+    NEMR_SYNC_ENV_FILE="$written" "$CLOUD" server status 2>&1)"
+grep -qE 'database: .*answers' <<<"$out" && grep -qE 'storage: .*answers' <<<"$out"
+check $? "the file it wrote answers for both, with nothing exported" "$(head -6 <<<"$out")"
+
+# ---------------------------------------------------------------------------
+step "One voice: result first, colour with meaning, and none of it when piped"
+# ---------------------------------------------------------------------------
+# Every command opens with a line that says whether it worked. Piped, that line
+# is `OK`/`XX`/`!!` and there is not one escape byte anywhere.
+for spec in "server status:$SOLO/local.env" "server stop:$SOLO/local.env"; do
+    cmd="${spec%%:*}"; envf="${spec##*:}"
+    # shellcheck disable=SC2086
+    out="$(env -i PATH="$PATH" HOME="$SOLO" XDG_STATE_HOME="$SOLO/state" \
+        NEMR_SYNC_BIN="$SYNC" NEMR_SYNC_ENV_FILE="$envf" "$CLOUD" $cmd 2>&1 || true)"
+    head -1 <<<"$out" | grep -qE '^(OK|XX|!!) '
+    check $? "nemr $cmd piped: the first line is the result" "$(head -1 <<<"$out")"
+    LC_ALL=C grep -q $'\033' <<<"$out" && r=1 || r=0
+    check $r "nemr $cmd piped: not one escape byte"
+done
+# On a terminal the same command is coloured, and the VALUE carries it.
+out="$(script -qec "env HOME=$SOLO XDG_STATE_HOME=$SOLO/state NEMR_SYNC_BIN=$SYNC \
+    NEMR_SYNC_ENV_FILE=$SOLO/local.env $CLOUD server status" /dev/null 2>&1)"
+LC_ALL=C grep -aq $'\033\[32m' <<<"$out"
+check $? "on a terminal it is coloured"
+LC_ALL=C grep -aqE $'running\033\\[0m\033\\[2m:' <<<"$out"
+check $? "the label is dim and the value is what carries the colour"
+# NO_COLOR and TERM=dumb turn it off, like everything else here.
+for way in "NO_COLOR=1" "TERM=dumb"; do
+    out="$(script -qec "env $way HOME=$SOLO XDG_STATE_HOME=$SOLO/state NEMR_SYNC_BIN=$SYNC \
+        NEMR_SYNC_ENV_FILE=$SOLO/local.env $CLOUD server status" /dev/null 2>&1)"
+    LC_ALL=C grep -aq $'\033\[3' <<<"$out" && r=1 || r=0
+    check $r "$way: no colour, even on a terminal"
+done
 
 # ---------------------------------------------------------------------------
 printf '\n'

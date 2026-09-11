@@ -157,9 +157,9 @@ show_plan() {
     printf '  crates.io   the Rust dependencies, to build nemr-sync here from this source\n'
 
     head2 "What it will not do"
-    printf '  copy any credential out of your environment into a file — if you want S3 or R2\n'
-    printf '  instead of a local directory, set NEMR_S3_* in the environment you start the\n'
-    printf '  server in; this writes NEMR_BUNDLE_DIR and nothing else about storage (E-20)\n'
+    printf '  copy any credential out of your environment into a file — this writes\n'
+    printf '  NEMR_BUNDLE_DIR and nothing else about storage (E-20). For an object store,\n'
+    printf '  run `nemr server configure`, which asks and writes all of it into sync.env\n'
     printf '  give you TLS, a reverse proxy, backups or a unit: one host, foreground process\n'
     printf '  regenerate a pepper that already exists — changing it locks out every account\n'
 }

@@ -29,7 +29,10 @@ use crate::{index, lease, AppState};
 /// stored; the session keeps whatever bundle it already had.
 fn max_bundle_bytes() -> u64 {
     const DEFAULT: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
-    std::env::var("NEMR_MAX_BUNDLE_BYTES")
+                                                 // From sync.env too, not only the environment: everything a server needs
+                                                 // lives in one file, and a ceiling somebody raised for their own deployment
+                                                 // is exactly the kind of thing that must survive opening a new terminal.
+    crate::settings::setting("NEMR_MAX_BUNDLE_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT)

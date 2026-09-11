@@ -13,6 +13,7 @@ that recommends something says so and stops there.
 
 | Report | What it measures |
 |---|---|
+| [2026-09-11-one-voice-and-one-file.md](2026-09-11-one-voice-and-one-file.md) | sync.env as the only file a server needs, `nemr server configure`, and one voice across both binaries — with every command's before and after |
 | [2026-09-11-install-resize.md](2026-09-11-install-resize.md) | Dragging the window stacked the install screen twenty deep: SIGWINCH handled, and the pty harness that can prove it |
 | [2026-09-11-server-one-command.md](2026-09-11-server-one-command.md) | One command for the sync server: what it checks, what it refuses, why it will not start Postgres, and the three defects found on the way |
 | [2026-09-10-install-icons.md](2026-09-10-install-icons.md) | Colour and one emoji per step in the live region, and the column arithmetic that keeps a two-column glyph from moving the cat |

@@ -51,6 +51,11 @@ export NEMR_CLOUD_PASSWORD="acceptance horse battery staple $$"
 export NEMR_CLOUD_KDF_FAST=1     # test account; production uses OWASP costs
 SERVER_ADDR="127.0.0.1:18080"
 export NEMR_SERVER_URL="http://${SERVER_ADDR}"
+# The database comes from the server's own settings file when the environment
+# does not carry it — the same order the server uses — and only then from the
+# development default.
+. "$REPO/scripts/lib/settings.sh"
+nemr_settings_load || exit 1
 export DATABASE_URL="${DATABASE_URL:-postgres://nemr:nemr@127.0.0.1:5433/nemr}"
 SKIP_API="${NEMR_SKIP_API:-0}"
 
@@ -144,7 +149,9 @@ while IFS= read -r line <&"${REG[0]}"; do
         CODE="$trimmed"
         echo "$CODE" >&"${REG[1]}"
     fi
-    [[ "$line" == *"logged in as"* ]] && break
+    # UPDATED DELIBERATELY with the one-voice change (SPEC 1.151): register's
+    # last line is now a result line, not "logged in as".
+    [[ "$line" == *"recovery code confirmed"* || "$line" == *"logged in as"* ]] && break
 done
 wait "$REG_WAIT_PID" || fail "register exited non-zero"
 [[ -n "$CODE" ]] || fail "no recovery code appeared"

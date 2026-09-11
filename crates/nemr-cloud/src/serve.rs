@@ -2577,9 +2577,9 @@ mod tests {
     /// directory for this test, and the KDF runs at test cost.
     fn spawn_sync_server() -> (String, tempfile::TempDir) {
         use nemr_sync::{connect_and_migrate, router, AppState, Config, DynStore, KdfCost};
-        let db = std::env::var("DATABASE_URL").expect(
-            "DATABASE_URL must be set (scripts/setup_sync_test_db.sh) for the UI surface test",
-        );
+        // The environment first, then the server's own settings file.
+        let db = nemr_sync::settings::setting("DATABASE_URL")
+            .unwrap_or_else(|e| panic!("{e}\n  (scripts/setup_sync_test_db.sh starts one)"));
         let store_dir = tempfile::tempdir().unwrap();
         let store_path = store_dir.path().to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();

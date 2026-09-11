@@ -1,0 +1,17 @@
+# ONE VOICE for every nemr command, on both sides of the E-11 seam.
+#
+# Open, and deliberately tiny: the engine and the sync client both depend on it,
+# so it must carry no policy, no I/O and no dependencies — it turns a value and
+# a tone into a string, and decides once whether this terminal gets colour.
+#
+# It is NOT commercial (scripts/check_seam.sh): the open half may depend on it,
+# which is the whole point of it existing rather than the rules being copied
+# into each binary and drifting.
+[package]
+name = "nemr-style"
+version = "0.1.0"
+edition = "2021"
+description = "The shared voice of the nemr command line: result first, colour with meaning"
+publish = false
+
+[dependencies]

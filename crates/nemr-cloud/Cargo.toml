@@ -24,6 +24,8 @@ path = "src/main.rs"
 
 [dependencies]
 nemr-crypto = { path = "../nemr-crypto", version = "0.1.0" }
+# The shared voice of the command line (open; both halves depend on it).
+nemr-style = { path = "../nemr-style", version = "0.1.0" }
 # The daemon's API (the E-11 seam): this process is a gRPC client of nemrd, and
 # links the API rather than the engine. The allowed direction: commercial → open.
 nemr-daemon-api = { path = "../nemr-daemon-api", version = "0.1.0" }
