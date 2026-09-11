@@ -17,6 +17,14 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// The record `nemr server start` leaves about the server it started. It is a
+/// CLAIM ABOUT A PID, never a claim that a server is running: after the exec
+/// there is no wrapper left to remove it, and a killed process would not have
+/// cleaned up either. Every reader verifies before believing it.
+pub fn server_record_path() -> PathBuf {
+    state_dir().join("server")
+}
+
 pub fn state_dir() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -140,7 +148,7 @@ pub fn holder_identity() -> String {
 
 /// Write a file 0600, creating parent directories, atomically enough for our
 /// purposes (write to a sibling temp name, then rename).
-fn write_private(path: &PathBuf, bytes: &[u8]) -> Result<()> {
+pub fn write_private(path: &PathBuf, bytes: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = path
         .parent()

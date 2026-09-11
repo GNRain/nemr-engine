@@ -327,7 +327,7 @@ probe() {
     client)
         if [[ -x "$HOME/.local/bin/nemr-cloud" ]]; then
             state=rebuild; detail="installed; will rebuild and reinstall if it changed"
-        else state=todo; detail="will write: ~/.local/bin/nemr-cloud and 8 symlinks (nemr-login … nemr-ui)"; fi ;;
+        else state=todo; detail="will write: ~/.local/bin/nemr-cloud and 9 symlinks (nemr-login … nemr-server)"; fi ;;
     image)
         if ctr -n default images ls 2>/dev/null | grep -qF "$BASE_IMAGE"; then
             state=rebuild; detail="present; will check it is the recorded digest"
@@ -374,7 +374,7 @@ show_plan() {
     is_wsl2 && printf '  /etc/systemd/system/nemr-mount-propagation.service root:root 0644   (sudo)\n'
     printf '  ~/.config/systemd/user/containerd-rootless.service\n'
     printf '  ~/.config/systemd/user/nemrd.service              (installed, not enabled — the CLI starts it)\n'
-    printf '  ~/.local/bin/nemr, nemrd, nemr-cloud + 8 nemr-* symlinks\n'
+    printf '  ~/.local/bin/nemr, nemrd, nemr-cloud + 9 nemr-* symlinks\n'
     printf '  ~/.bashrc                                        one marked block: PATH, CONTAINERD_ADDRESS\n'
     printf '  ~/.local/share/nemr/                             volumes, mounts and this machine'"'"'s login live here\n'
     printf '  %s\n' "$LOG"

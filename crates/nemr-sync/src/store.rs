@@ -118,6 +118,30 @@ pub fn probe_prefix(bundle_prefix: &str) -> String {
 /// One egress-free list against the store. A failure here is the store's
 /// own message, with any query string cut off by the backend (a
 /// credential never reaches this text).
+/// Can this directory actually take a bundle?
+///
+/// `list` succeeds on a read-only directory, and `select_storage` asks only
+/// that the path is a directory — so a server could pass every gate it has and
+/// fail at the first push. This creates a probe file and removes it again: the
+/// cheapest question that has the right answer, and it leaves nothing behind.
+///
+/// Local backends only. The same probe against an object store would cost a
+/// class-A operation and leave an object, which is why E-20 chose a list for
+/// the reachability check in the first place.
+pub fn writable(dir: &std::path::Path) -> anyhow::Result<()> {
+    let probe = dir.join(format!(".nemr-write-probe-{}", std::process::id()));
+    std::fs::write(&probe, b"").map_err(|e| {
+        anyhow::anyhow!(
+            "the bundle directory is not writable: {} ({e}). The server would start and then \
+             fail at the first push — fix the mode or the owner, or point NEMR_BUNDLE_DIR \
+             somewhere this user can write",
+            dir.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
 pub async fn preflight(store: &dyn DynStore, bundle_prefix: &str) -> anyhow::Result<()> {
     store
         .list(&probe_prefix(bundle_prefix))
