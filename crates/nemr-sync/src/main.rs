@@ -272,8 +272,35 @@ async fn check() -> anyhow::Result<()> {
             )
             .await;
             match attempt {
-                Ok(Ok(conn)) => {
+                Ok(Ok(mut conn)) => {
                     println!("database_state=ok");
+                    // THE DATABASE'S CLOCK, because the lease is time-based and
+                    // the two clocks are not the same clock. Measured here
+                    // (2026-09-11): the development Postgres container had
+                    // drifted 61 seconds ahead of its host, and four of the six
+                    // lease tests failed with "the current holder must be able
+                    // to write" — a lease bug that was not a lease bug. A
+                    // restart of the container fixed it and they passed twice.
+                    // Reported, never enforced: a server whose database is a
+                    // little ahead still works, and this is a number for the
+                    // person reading the report to weigh.
+                    let sent = std::time::SystemTime::now();
+                    if let Ok(row) = sqlx::query_scalar::<_, f64>(
+                        "select extract(epoch from clock_timestamp())::float8",
+                    )
+                    .fetch_one(&mut conn)
+                    .await
+                    {
+                        let round_trip = sent.elapsed().unwrap_or_default();
+                        let here = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs_f64();
+                        // Half the round trip is the fairest correction we can
+                        // make without a protocol for it.
+                        let skew = row - (here - round_trip.as_secs_f64() / 2.0);
+                        println!("database_clock_skew_ms={}", (skew * 1000.0).round() as i64);
+                    }
                     let _ = conn.close().await;
                 }
                 Ok(Err(e)) => {

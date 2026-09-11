@@ -117,22 +117,75 @@ fn sync_bin() -> Result<PathBuf> {
 }
 
 /// Run the server's own preflight and parse its report.
+/// How long the preflight may take before it is assumed not to be a preflight
+/// at all. The database connect inside it has a five-second timeout and an
+/// object store on a slow link can take a few seconds more; twenty is
+/// generous, and what matters is that it is FINITE.
+const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Run the server's own preflight and parse its report.
+///
+/// THIS IS WHERE A BINARY THAT DOES NOT UNDERSTAND `--check` IS CAUGHT, and it
+/// has to be caught by a clock rather than by asking. A `nemr-sync` older than
+/// this client ignores the argument and does what it always does: it reads the
+/// settings and STARTS A SERVER. Measured here — `nemr server status`, which
+/// promises to change nothing, spawned yesterday's installed binary, which
+/// opened the developer's real bundle store, bound a port, and ran for three
+/// minutes while this command waited for output that was never coming.
+///
+/// So: a deadline, and a kill. A read-only command must not be able to start a
+/// server, and must not be able to wait forever for one.
 fn preflight() -> Result<Preflight> {
     let bin = sync_bin()?;
-    let out = Command::new(&bin)
+    let child = Command::new(&bin)
         .arg("--check")
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| anyhow::anyhow!("could not run {} --check: {e}", bin.display()))?;
+    let pid = child.id() as i32;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let out = match rx.recv_timeout(CHECK_TIMEOUT) {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => bail!("could not read {} --check: {e}", bin.display()),
+        Err(_) => {
+            // It is still running. Whatever it is doing, it is not reporting.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            bail!(
+                "{} did not answer `--check` within {}s, so it was stopped.\n\n  \
+                 A nemr-sync older than this client does not know that argument and starts a\n  \
+                 SERVER instead, which is the likeliest thing to have just happened. Build or\n  \
+                 install a matching one:\n\n      \
+                 cargo build --release -p nemr-sync\n      \
+                 ./scripts/install_server.sh\n\n  \
+                 or point NEMR_SYNC_BIN at the one you mean.",
+                bin.display(),
+                CHECK_TIMEOUT.as_secs()
+            )
+        }
+    };
     let mut facts = BTreeMap::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         if let Some((k, v)) = line.split_once('=') {
             facts.insert(k.to_string(), v.to_string());
         }
     }
-    if facts.is_empty() {
+    // `settings_state` is the report's signature: every run of `--check` that
+    // got as far as reading its settings prints it, and nothing else this
+    // binary prints looks like it. Without it, whatever ran was not a
+    // preflight — an old binary that exited, a wrapper, the wrong file.
+    if !facts.contains_key("settings_state") {
         let err = String::from_utf8_lossy(&out.stderr);
         bail!(
-            "{} --check reported nothing.\n{}",
+            "{} did not report a preflight.\n\n  It may be older than this client, which would\n  \
+             mean it does not know `--check`. Build or install a matching one:\n\n      \
+             cargo build --release -p nemr-sync\n\n  it said:\n{}",
             bin.display(),
             err.trim()
         );
@@ -546,6 +599,23 @@ pub fn status() -> Result<()> {
         describe_state(report.state("database_state"), report.get("database_error"))
     );
     println!("  pepper:    {}", report.state("pepper"));
+    // Only when it matters. The lease is time-based, and a database whose clock
+    // has drifted makes a lease that was just taken look long expired — which
+    // reads as a lease bug and is not one. Measured here at 61 seconds on a
+    // development container, costing four lease tests and an hour.
+    if let Some(skew) = report
+        .get("database_clock_skew_ms")
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        if skew.abs() >= 2_000 {
+            println!(
+                "  clock:     the database is {:.1}s {} this machine — the lease is time-based, \
+                 so this will look like a lease bug. Restarting the database usually fixes it.",
+                skew.abs() as f64 / 1000.0,
+                if skew > 0 { "AHEAD of" } else { "BEHIND" }
+            );
+        }
+    }
     match report.state("env_file_state") {
         "present" => println!(
             "  settings:  {}  (keys: {})",

@@ -30,9 +30,9 @@ PASS=0; FAIL=0
 # Asserted, not merely printed: a run that skipped a case would otherwise say
 # PASS with fewer assertions.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=42
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=48
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=37
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=43
 fi
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS+1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
@@ -197,6 +197,66 @@ curl -fsS --max-time 2 "http://$ADDR/health" >/dev/null 2>&1 && r=1 || r=0
 check $r "and nothing answers on the address afterwards"
 check "$([[ ! -e "$WORK/state/nemr/sync-server.pid" ]] && echo 0 || echo 1)" \
     "and the pid file is gone"
+
+# ---------------------------------------------------------------------------
+step "A server binary that does not understand --check is stopped, not waited for"
+# ---------------------------------------------------------------------------
+# MEASURED, not imagined: a nemr-sync older than this client ignores `--check`
+# and starts a SERVER. `nemr server status` — which promises to change nothing
+# — spawned the installed binary, which opened the real bundle store, bound a
+# port and ran for three minutes while status waited for output that was never
+# coming. The stand-in below has the same shape: it ignores its arguments and
+# does not exit.
+cat >"$WORK/old-nemr-sync" <<'OLD'
+#!/usr/bin/env bash
+# A nemr-sync from before --check existed: the argument means nothing to it and
+# it goes on to be a server, which here is a process that does not exit.
+exec sleep 300
+OLD
+chmod +x "$WORK/old-nemr-sync"
+before="$(date +%s)"
+out="$(server NEMR_SYNC_BIN="$WORK/old-nemr-sync" "${GOOD_LOCAL[@]}" -- status)"; rc=$?
+elapsed=$(( $(date +%s) - before ))
+[[ $rc -ne 0 ]] && grep -qi 'did not answer' <<<"$out"
+check $? "it refuses rather than waiting for a report that is not coming" "$(head -3 <<<"$out")"
+check "$([[ $elapsed -lt 40 ]] && echo 0 || echo 1)" \
+    "and it refuses on a clock, in ${elapsed}s — a read-only command cannot hang forever"
+grep -qi 'older than this client' <<<"$out"
+check $? "and says what is most likely wrong, and how to fix it"
+sleep 1
+pgrep -f "$WORK/old-nemr-sync" >/dev/null && r=1 || r=0
+check $r "and the process it started is stopped — a status command leaves no server behind"
+
+# ---------------------------------------------------------------------------
+step "A database whose clock has drifted is named, because it looks like a lease bug"
+# ---------------------------------------------------------------------------
+# Measured on this machine (2026-09-11): the development Postgres container had
+# drifted 61 SECONDS ahead of its host, and four of the six lease tests failed
+# with "the current holder must be able to write" — a lease that had just been
+# taken looked long expired. Restarting the container fixed it and they passed
+# twice. The skew is now reported, so the next hour is not spent the same way.
+cat >"$WORK/skewed-check" <<'SKEW'
+#!/usr/bin/env bash
+# A preflight report from a server whose database is a minute ahead.
+cat <<'REPORT'
+env_file_state=disabled
+settings_state=ok
+addr=127.0.0.1:18103
+pepper=configured
+backend=local:/tmp
+backend_writable=yes
+backend_state=ok
+database=postgres://nemr:***@127.0.0.1:5433/nemr
+database_state=ok
+database_clock_skew_ms=61000
+REPORT
+SKEW
+chmod +x "$WORK/skewed-check"
+out="$(server NEMR_SYNC_BIN="$WORK/skewed-check" "${GOOD_LOCAL[@]}" -- status)"
+grep -qi 'the database is 61.0s AHEAD' <<<"$out"
+check $? "status says the database clock has drifted, and by how much" "$(grep -i clock <<<"$out")"
+grep -qi 'look like a lease bug' <<<"$out"
+check $? "and says what it will look like instead, so the hour is not spent on the lease"
 
 # ---------------------------------------------------------------------------
 step "A record is a claim about a pid, and it is verified before it is believed"

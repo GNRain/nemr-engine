@@ -185,6 +185,40 @@ first push. There is now a write probe — local backends only, because the same
 probe against an object store costs a class-A operation and leaves an object
 behind, which is exactly why E-20 chose a list for reachability.
 
+**A status command started a server.** This one was found by running the
+finished command on this machine rather than through the harness, and it is the
+worst of the four. `~/.local/bin/nemr-sync` here is yesterday's build, from
+before `--check` existed. An older `nemr-sync` does not reject an argument it
+does not know — it ignores it and does what it always does: reads the settings
+and **starts a server**. So `nemr server status`, which promises to change
+nothing, spawned it; that binary opened the developer's real bundle store, bound
+a port, and ran for three minutes while `status` sat waiting for a report that
+was never coming.
+
+Two things were wrong and both are fixed. The wait is now bounded — twenty
+seconds, after which the child is stopped, SIGTERM then SIGKILL — and the report
+has to be recognisable: without a `settings_state=` line, whatever ran was not a
+preflight, and the refusal says so and names the fix.
+
+```
+/home/nemr/.local/bin/nemr-sync did not answer `--check` within 20s, so it was stopped.
+
+  A nemr-sync older than this client does not know that argument and starts a
+  SERVER instead, which is the likeliest thing to have just happened. Build or
+  install a matching one:
+
+      cargo build --release -p nemr-sync
+      ./scripts/install_server.sh
+
+  or point NEMR_SYNC_BIN at the one you mean.
+```
+
+Asserted, with a stand-in that has the same shape — a script that ignores its
+arguments and does not exit: the refusal arrives, it arrives **on a clock**
+(measured at 20s, asserted under 40), it says what is likely wrong, and the
+process it started is gone afterwards. A read-only command must not be able to
+start a server, and must not be able to wait forever for one.
+
 **And one in a script.** `scripts/sync_acceptance.sh` started the server with no
 pepper and without emptying `NEMR_SYNC_ENV_FILE`. Since E-19 a server with no
 pepper refuses to bind, so that start worked on this machine only because the
@@ -193,27 +227,63 @@ failed on a clean host, which is where that acceptance is supposed to run. It
 now starts through `nemr server start` with the ephemeral pepper, like the UI
 acceptance.
 
-## 8. Both acceptances now start servers the same way
+## 8. And one that was not a defect in this work at all
+
+While running the suites, four of the six lease tests in `crates/nemr-sync`
+started failing, each with *"the current holder must be able to write"* — a 409
+where a 200 was expected — and a different subset each run.
+
+It is not this change. The control: with `crates/nemr-sync` checked out at the
+previous commit, the same tests fail the same way. Serially, they fail too.
+
+**The cause is a clock.** The development Postgres container had drifted **61
+seconds ahead of its host**:
+
+| | |
+|---|---|
+| host | 2026-09-11T01:57:45Z |
+| the container | 2026-09-11T01:58:46Z |
+
+The lease is time-based, so a lease taken a moment ago looked long expired to
+the database that was asked about it. Restarting the container put the clocks
+back within milliseconds of each other, and the six tests passed twice.
+
+Because that cost an hour and read the whole time like a lease bug, `--check`
+now measures it — `database_clock_skew_ms`, corrected for half the round trip —
+and `status` says so when it exceeds two seconds:
+
+```
+  clock:     the database is 61.0s AHEAD of this machine — the lease is
+             time-based, so this will look like a lease bug. Restarting the
+             database usually fixes it.
+```
+
+It is **reported, never enforced**: nothing refuses to start over it. That is an
+addition beyond the brief, flagged here rather than buried, and it is asserted
+with a stand-in report carrying a minute of skew.
+
+## 9. Both acceptances now start servers the same way
 
 `docs/ui-acceptance.sh` and `scripts/sync_acceptance.sh` both call
 `nemr server start`, with `NEMR_SYNC_BIN` pinning the server to the build under
 test. The UI acceptance asserts that it went through the command rather than
 around it.
 
-## 9. Acceptance
+## 10. Acceptance
 
-`scripts/server_acceptance.sh` — **37 assertions, all green**, the count itself
+`scripts/server_acceptance.sh` — **43 assertions, all green**, the count itself
 asserted. It covers the lifecycle (status, start, status, second start refused,
 stop, nothing answering afterwards, record gone), the help's audience sentence,
 and every refusal: nothing configured, no pepper, Postgres unreachable, a store
-that does not answer, and a bundle directory that cannot be written to. Each
+that does not answer, a bundle directory that cannot be written to, and a server
+binary too old to understand `--check`. Each
 refusal is checked for what it must say **and** for what it must never say.
 
 **The object-store arm did not run here**: `NEMR_S3_BUCKET` is not in this
 session's environment, so the run announced the skip and expected five fewer
 assertions rather than counting them as passed. The arm is written and needs one
 run in your environment — `NEMR_S3_BUCKET` and the rest exported, then
-`./scripts/server_acceptance.sh`, which will expect 42. What did run against the
+`./scripts/server_acceptance.sh`, which will expect 48. What did run against the
 S3 code path is the unreachable-store refusal, with a dead endpoint and dummy
 credentials.
 
@@ -235,7 +305,7 @@ inside the server. An assertion that the refusal merely *mentions*
 What this command adds is that the refusal arrives **before anything starts**,
 and that is what the assertion now says and what the neuter turns red.
 
-## 10. The background mode, as a decision row
+## 11. The background mode, as a decision row
 
 `docs/DECISIONS.md` **E-24**, open, with what happens to a server nobody is
 watching: where the log goes and who caps it, that a crash is silent until
