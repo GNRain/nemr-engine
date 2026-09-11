@@ -28,7 +28,7 @@ PASS=0; FAIL=0
 # Asserted, not merely printed: a run that skipped a case would otherwise say
 # PASS with fewer assertions — the green-over-nothing shape this project keeps
 # guarding against. Raise this when a case is added.
-EXPECTED_ASSERTIONS=39
+EXPECTED_ASSERTIONS=141
 
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS + 1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
@@ -141,11 +141,11 @@ step "A second run does nothing, and says what it skipped"
 # ---------------------------------------------------------------------------
 out="$(./scripts/install.sh --yes 2>&1)"; rc=$?
 check "$([[ $rc -eq 0 ]] && echo 0 || echo 1)" "the run succeeds" "exit $rc; see $STATE_DIR"
-did_work="$(sed -n '/^Installing/,/^Verifying/p' <<<"$out" | grep -E '✓' | grep -vE 'already done|already current|at the recorded digest|Claude Code found' || true)"
+did_work="$(sed -n '/^Installing/,$p' <<<"$out" | grep -E '✓' | grep -vE 'already done|already current|at the recorded digest|found at|passed:' || true)"
 check "$([[ -z "$did_work" ]] && echo 0 || echo 1)" \
     "every step reports already done — nothing was redone" "${did_work:-}"
-grep -q "the smoke test passed" <<<"$out"
-check $? "it verifies with the smoke test rather than trusting exit codes"
+grep -qE 'running the smoke test +ok' <<<"$out"
+check $? "it verifies with the smoke test rather than trusting exit codes" "$(tail -6 <<<"$out")"
 grep -q "nemr create myproject" <<<"$out" && grep -q "nemr ui" <<<"$out"
 check $? "it ends by saying what to do next"
 
@@ -201,9 +201,266 @@ n="$(grep -c '\*-\*' "$WORK/short.raw" || true)"
 check "$([[ "$n" == "0" ]] && echo 0 || echo 1)" \
     "a terminal too short for the drawing gets no animation at all" "$n frames"
 
+# 4c. THE SCREEN, not the escape sequences. Counting clears proves a clear was
+#     issued, not that nothing was left behind: the drawer used to be killed
+#     wherever it happened to be, so half the time the erase started part-way
+#     down the block and every line above it stayed on the screen for good.
+#     Measured before the fix: 9 of 20 stops left a cat. Nothing was miscounted
+#     — no assertion was about the screen. This one renders the transcript
+#     through a terminal and looks.
+screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$raw")"
+cat_on_screen=0
+grep -qE '\(\"\)|o\.o|o\.O|\*-\*' <<<"$screen" && cat_on_screen=1
+check "$cat_on_screen" "when the install finishes, no part of the cat is left on the screen" \
+    "$(grep -nE '\(\"\)|o\.o|\*-\*' <<<"$screen" | head -3)"
+
+# And under the stop that used to leak: many start/stop cycles, each ended at a
+# different moment within a frame, must each leave the screen as they found it.
+# The delays are a fixed ladder rather than $RANDOM so a failure reproduces.
+cat >"$WORK/cycle.sh" <<'CYCLE'
+#!/usr/bin/env bash
+. "$1/scripts/lib/cat.sh"
+printf 'before\n'
+# The seam widens the mid-frame window on purpose: without it a regression
+# here shows up two times in twelve, which is not an assertion.
+NEMR_TEST_CAT_LINE_DELAY=0.02 NEMR_CAT_DELAY=0.01 nemr_cat_start
+sleep "$2"
+nemr_cat_stop
+printf 'after\n'
+CYCLE
+chmod +x "$WORK/cycle.sh"
+leaked=0
+for delay in 0.10 0.13 0.17 0.21 0.26 0.31 0.37 0.44 0.52 0.61 0.71 0.83; do
+    timeout 30 script -qec "$WORK/cycle.sh $REPO $delay" /dev/null >"$WORK/stress.raw" 2>&1
+    after="$(python3 "$REPO/scripts/lib/render_pty.py" "$WORK/stress.raw")"
+    if [[ "$(grep -c . <<<"$after")" -ne 2 ]]; then
+        leaked=$((leaked + 1))
+        [[ "$leaked" == 1 ]] && { printf '   | after a stop at %ss the screen was:\n' "$delay"
+                                  printf '%s\n' "$after" | grep -n . | head -5 | sed 's/^/   | /'; }
+    fi
+done
+check "$([[ "$leaked" == "0" ]] && echo 0 || echo 1)" \
+    "stopped mid-frame twelve times over, the screen is left exactly as found" \
+    "$leaked of 12 left something behind"
+
+# 4d. THE DEFAULT: one live line and the cat, nothing else — and a result that
+#     reports rather than narrates (F-30). Captured on a FIRST install.
+first="$WORK/first.raw"
+script -qec "bash -c 'stty cols 100 rows 30; NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=1 $REPO/scripts/install.sh --yes'" /dev/null >"$first" 2>&1
+first_live="$(python3 - "$first" <<'PYEOF'
+import subprocess, sys
+raw = sys.argv[1]
+d = open(raw, 'rb').read()
+cut = d.rfind(b'\x1b[J')
+print(subprocess.run(['python3', 'scripts/lib/render_pty.py', raw, '--cols', '100',
+                      '--rows', '30', '--at', str(int(cut * 0.6) if cut > 0 else len(d))],
+                     capture_output=True, text=True).stdout)
+PYEOF
+)"
+grep -q 'Installing nemr' <<<"$first_live"
+check $? "the live screen names what it is doing" "$(head -4 <<<"$first_live")"
+grep -qE '\[#*-*\]  [0-9]+ of [0-9]+' <<<"$first_live"
+check $? "with a bar and a count beneath it" "$(grep -n 'of ' <<<"$first_live" | head -2)"
+# The bar draws in characters every font has. It was two block characters, and
+# on Windows Terminal both rendered as the same solid grey — the bytes were
+# right and the font was not, and no terminal can be asked whether a glyph will
+# render (the Product Owner, 2026-09-10).
+blocks="$(LC_ALL=C grep -c $'\xe2\x96' "$first" || true)"
+check "$([[ "${blocks:-0}" == "0" ]] && echo 0 || echo 1)" \
+    "and it needs no font: no block characters anywhere in the run" "$blocks"
+grep -qE '\[#+-+\]' <<<"$first_live"
+check $? "the bar has a filled part and an empty part" "$(grep -o '\[[#-]*\]' <<<"$first_live" | head -1)"
+grep -qE '(installing|building|pulling|starting|adding|enabling|updating|delegating|disabling|checking|running|making) ' <<<"$first_live"
+check $? "and the step in plain words, not the plan's sentence"
+live_steps="$(grep -cE '^  (installing|building|pulling|starting|adding|enabling|updating|delegating|disabling|checking|running|making) ' <<<"$first_live")"
+check "$([[ "${live_steps:-0}" -le 1 ]] && echo 0 || echo 1)" \
+    "ONE step line, replaced — not a list that grows ($live_steps on screen)" \
+    "$(grep -nE '^  [a-z]' <<<"$first_live" | head -4)"
+# On the transcript, not on a screen sliced at a guessed offset: a slice can
+# land between frames.
+grep -qF "\`-.-'" "$first"
+check $? "the cat plays beside it" "$(grep -c . <<<"$first_live") rows on the sliced screen"
+
+# The result: four lines, and only the result.
+first_end="$(python3 "$REPO/scripts/lib/render_pty.py" "$first" --cols 100 --rows 30)"
+grep -qE '(✓|OK) nemr is installed' <<<"$first_end" \
+    && grep -qE 'Version: +[0-9]' <<<"$first_end" \
+    && grep -qE 'Installed: +~?/' <<<"$first_end" \
+    && grep -q 'nemr create myproject' <<<"$first_end"
+check $? "on success: the mark, the version, where it went, and what to try" \
+    "$(tail -10 <<<"$first_end")"
+narration="$(grep -cE 'digest|manifest|apt-get|containerd runc|WILL DO|Files it writes' <<<"$first_end" || true)"
+check "$([[ "${narration:-0}" == "0" ]] && echo 0 || echo 1)" \
+    "and no narration: no plan, no digests, no package names, no file list" "$narration lines"
+
+# On failure: the step, the reason, the fix, the log. Nothing else.
+failraw="$WORK/fail.raw"
+script -qec "bash -c 'stty cols 100 rows 30; NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=1 NEMR_TEST_FAIL_STEP=image $REPO/scripts/install.sh --yes'" /dev/null >"$failraw" 2>&1
+fail_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$failraw" --cols 100 --rows 30)"
+grep -qE '(✗|XX) Install stopped' <<<"$fail_screen" \
+    && grep -qE 'Failed at: +pulling the base image' <<<"$fail_screen" \
+    && grep -qE 'Because: +.' <<<"$fail_screen" \
+    && grep -qE 'Fix: +.' <<<"$fail_screen" \
+    && grep -qE 'Full log: .*install-[0-9]+-[0-9]+\.log' <<<"$fail_screen"
+check $? "on failure: the step, the reason, the fix as a command, and the log" \
+    "$(tail -10 <<<"$fail_screen")"
+fail_cat="$(grep -cE '\("\)|o\.o|\*-\*' <<<"$fail_screen" || true)"
+check "$([[ "${fail_cat:-0}" == "0" ]] && echo 0 || echo 1)" \
+    "and the live screen is gone from it" "$fail_cat cat rows"
+
+# 4d-bis. THE OUTPUT PANE: the real tail of what the step printed, bounded.
+cat >"$WORK/pane.sh" <<'PANE'
+#!/usr/bin/env bash
+cd "$1"; . scripts/lib/cat.sh; . scripts/lib/region.sh; . scripts/lib/steps.sh
+LOG="$2/plog"; STEP_OUT="$2/pout"; : >"$STEP_OUT"
+printf 'a command line\n'
+nemr_region_start "$2/pstate" "$STEP_OUT" || { echo NO-REGION; exit 0; }
+_S_REGION=1
+steps_seed "building the engine" "pulling the base image"
+_S_IDX=0; step_begin
+for i in 1 2 3 4 5 6 7 8; do printf '   Compiling crate-number-%d v0.%d.0\n' "$i" "$i" >>"$STEP_OUT"; sleep 0.3; done
+# A step that prints what would tear the region if it escaped: colour, cursor
+# moves, a carriage return, a tab, and a line far wider than the pane.
+printf '\033[31mRED\033[0m\033[2K\033[5Amoved\ttabbed\rreturned %s\n' "$(head -c 300 /dev/zero | tr '\0' 'W')" >>"$STEP_OUT"
+sleep 0.5
+_S_IDX=0; step_result done new "built"   # folds the output into the log
+_S_IDX=1; step_begin                    # and the pane empties with the step
+sleep 0.5
+nemr_region_stop
+printf 'done\n'
+PANE
+chmod +x "$WORK/pane.sh"
+script -qec "bash -c 'stty cols 100 rows 30; $WORK/pane.sh $REPO $WORK'" /dev/null >"$WORK/pane.raw" 2>&1
+# Read at a FRAME BOUNDARY, about two thirds through: an arbitrary byte offset
+# lands halfway through a redraw and shows rows from two different frames at
+# once — a composite that was never on anyone's screen, and which made this
+# assertion depend on how fast the machine happened to be.
+pane_mid="$(python3 - "$WORK/pane.raw" <<'PYEOF'
+import re, subprocess, sys
+raw = sys.argv[1]
+n = len(re.findall(rb"\x1b\[[0-9]+A\r", open(raw, 'rb').read()))
+print(subprocess.run(['python3', 'scripts/lib/render_pty.py', raw, '--cols', '100',
+                      '--rows', '30', '--frame', str(max(1, int(n * 0.62)))],
+                     capture_output=True, text=True).stdout)
+PYEOF
+)"
+grep -qE '^  \+-+\+' <<<"$pane_mid"
+check $? "the pane has a border" "$(head -8 <<<"$pane_mid")"
+pane_lines="$(grep -cE '^  \| ' <<<"$pane_mid" || true)"
+check "$([[ "${pane_lines:-0}" -ge 4 ]] && echo 0 || echo 1)" \
+    "and shows several of the step's own lines, not one ($pane_lines)" "$(grep -E '^  \|' <<<"$pane_mid" | head -3)"
+grep -qE '^  \|    Compiling crate-number-[0-9]' <<<"$pane_mid"
+check $? "and they are what the step actually printed"
+# The TAIL, not the head: what is on screen is the END of what was printed, so
+# the numbers on it are consecutive and the highest is not among the first few.
+pane_max="$(grep -oE 'crate-number-([0-9]+)' <<<"$pane_mid" | grep -oE '[0-9]+$' | sort -n | tail -1)"
+pane_min="$(grep -oE 'crate-number-([0-9]+)' <<<"$pane_mid" | grep -oE '[0-9]+$' | sort -n | head -1)"
+check "$([[ -n "$pane_max" && "$pane_max" -ge 4 && $(( pane_max - pane_min )) -le 4 ]] && echo 0 || echo 1)" \
+    "it is the TAIL — the newest lines, scrolling as they arrive (showing $pane_min..$pane_max)"
+
+# The noisy line — colour, a cursor move, a tab, a carriage return and 300
+# characters — reaches the pane stripped and cut, and the border below it is
+# still whole. Asserted on the transcript, where the pane exists.
+noisy="$(LC_ALL=C grep -aoE '\| REDmoved tabbed returned W+ +\|' "$WORK/pane.raw" | head -1)"
+check "$([[ -n "$noisy" ]] && echo 0 || echo 1)" \
+    "colour, cursor moves, tabs and carriage returns are stripped before the pane draws" "$noisy"
+# The pane is fitted to the window (F-33), so its width is derived here rather
+# than written down: 100 columns of terminal, less the gap and the cat, less
+# the border and its padding — plus the "| " and " |" the capture includes.
+pane_inner=$(( 100 - 2 - 37 - 6 ))
+check "$([[ "${#noisy}" == "$(( pane_inner + 4 ))" ]] && echo 0 || echo 1)" \
+    "and a 300-character line is cut to the pane's width, $pane_inner at 100 columns (${#noisy} - 4)"
+after_noisy="$(LC_ALL=C grep -aA1 -E 'REDmoved' "$WORK/pane.raw" | tail -1)"
+grep -qE '\+-+\+' <<<"$after_noisy"
+check $? "the border below it is whole" "$after_noisy"
+pane_end="$(python3 "$REPO/scripts/lib/render_pty.py" "$WORK/pane.raw" --cols 100 --rows 30)"
+grep -q 'Compiling crate-number' <<<"$pane_end" && r=1 || r=0
+check $r "the pane is emptied when the step changes"
+grep -q 'Compiling crate-number-8' "$WORK/plog"
+check $? "and everything it showed is in the log" "$(ls "$WORK" | tr '\n' ' ')"
+
+# 4e. WITH NO LIVE SCREEN — what a terminal that cannot hold one gets, which is
+#     what the Product Owner keeps getting. It has to look right there too.
+plain="$WORK/plain.raw"
+script -qec "bash -c 'stty cols 70 rows 30; NEMR_TEST_STEP_STUB=1 $REPO/scripts/install.sh --yes'" /dev/null >"$plain" 2>&1
+plain_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$plain" --cols 70 --rows 30)"
+plain_cat="$(grep -cE '\("\)|o\.o|\*-\*' <<<"$plain_screen" || true)"
+check "$([[ "${plain_cat:-0}" == "0" ]] && echo 0 || echo 1)" \
+    "at 70 columns there is no live screen at all" "$plain_cat"
+grep -qE '(✓|OK) nemr is installed' <<<"$plain_screen"
+check $? "and the run still ends in the same four-line result"
+plain_lines="$(grep -c . <<<"$(python3 "$REPO/scripts/lib/render_pty.py" "$plain" --cols 70 --rows 30)")"
+check "$([[ "${plain_lines:-99}" -le 26 ]] && echo 0 || echo 1)" \
+    "and it is short — $plain_lines lines on screen, where the old default printed about a hundred"
+grep -qE 'no live screen — [0-9]+ columns' <<<"$plain_screen"
+check $? "and it SAYS why there is no live screen" "$(grep -n 'live screen' <<<"$plain_screen" | head -2)"
+
+# 4f. THE DECISION IS IN THE LOG, on every run, whichever way it went — the
+#     thing whose absence made a WSL2 report unanswerable from here.
+newest_log="$(ls -t "$HOME/.local/state/nemr"/install-*.log 2>/dev/null | head -1)"
+grep -q -- '--- install screen' "$newest_log"
+check $? "the log records the screen decision"
+grep -qE 'live: +(yes|NO)' "$newest_log" \
+    && grep -qE 'measured: +[0-9]+ cols x [0-9]+ rows' "$newest_log" \
+    && grep -qE 'needs: +[0-9]+ cols x [0-9]+ rows' "$newest_log" \
+    && grep -qE 'TERM=.*tty=' "$newest_log" \
+    && grep -q 'DSR' "$newest_log"
+check $? "with the size it measured, the thresholds, the terminal, and DSR named as not gating" \
+    "$(sed -n '/--- install screen/,/^$/p' "$newest_log" | head -8)"
+
+# And it must be able to say YES. The decision used to be re-made INSIDE the
+# block's own `>>"$LOG"` redirect, where stdout is the log file and `-t 1` is
+# false by construction: every run ever written answered "NO — not-a-tty",
+# including the ones whose screens were captured for the report (399 logs on
+# this machine, none saying yes). A control with only one possible answer is
+# worse than no control, so this drives a run that DOES draw and reads it back.
+script -qec "stty cols 100 rows 30; env NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=0.02 ./scripts/install.sh --yes" /dev/null >"$WORK/live.raw" 2>/dev/null
+live_log="$(ls -t "$HOME/.local/state/nemr"/install-*.log 2>/dev/null | head -1)"
+grep -q 'live:      yes' "$live_log" && grep -q 'tty=yes' "$live_log"
+check $? "a run that DID draw is logged as live: yes — the decision is read, not re-made under the log's own redirect" \
+    "$(sed -n '/--- install screen/,/^$/p' "$live_log" | head -3)"
+grep -qE 'fitted: +left [0-9]+ \+ gap 2 \+ cat 37' "$live_log"
+check $? "and the log records the width it fitted to" \
+    "$(grep 'fitted:' "$live_log" || true)"
+
+# 4g. THE PLAN IS THE CONSENT, and only that: an interactive run shows it, a
+#     --yes run does not, --verbose shows everything.
+interactive="$(printf 'n\n' | script -qec "bash -c 'stty cols 100 rows 30; NEMR_TEST_STEP_STUB=1 $REPO/scripts/install.sh'" /dev/null 2>&1)"
+grep -q 'the plan for this machine' <<<"$interactive" && grep -q 'Go ahead?' <<<"$interactive"
+check $? "an interactive run still shows the full plan before the question"
+yes_plan="$(grep -c 'the plan for this machine' <<<"$first_end" || true)"
+check "$([[ "${yes_plan:-0}" == "0" ]] && echo 0 || echo 1)" \
+    "a --yes run does not recite it — that consent was already given" "$yes_plan"
+verbose="$(script -qec "bash -c 'stty cols 100 rows 30; NEMR_TEST_STEP_STUB=1 $REPO/scripts/install.sh --yes --verbose'" /dev/null 2>&1)"
+grep -q 'the plan for this machine' <<<"$verbose" && grep -q 'pulled ghcr.io' <<<"$verbose"
+check $? "--verbose shows everything: the full plan and every step's detail"
+
+# 4h. Colour and marks: on for a terminal, and the emoji go with the colour.
+colour="$(grep -c $'\033\[3[123]m' "$first" || true)"
+check "$([[ "${colour:-0}" -gt 0 ]] && echo 0 || echo 1)" "the result is coloured on a terminal"
+grep -q '✓' <<<"$first_end"
+check $? "and carries the tick"
+nocolour="$WORK/nocolour.raw"
+script -qec "bash -c 'stty cols 100 rows 30; NO_COLOR=1 NEMR_TEST_STEP_STUB=1 $REPO/scripts/install.sh --yes'" /dev/null >"$nocolour" 2>&1
+n_esc="$(grep -c $'\033\[3[123]m' "$nocolour" || true)"
+nc_screen="$(python3 "$REPO/scripts/lib/render_pty.py" "$nocolour" --cols 100 --rows 30)"
+check "$([[ "${n_esc:-0}" == "0" ]] && echo 0 || echo 1)" "NO_COLOR turns every colour off" "$n_esc"
+grep -q 'OK nemr is installed' <<<"$nc_screen" && ! grep -q '✓' <<<"$nc_screen"
+check $? "and the marks go with it, replaced by plain ASCII"
+
+
 # 5. Interrupted, it leaves no hidden cursor and no half a cat.
+# `set -m` matters here and is not decoration: without job control bash sets
+# SIGINT to SIG_IGN in a background child, an ignore that is INHERITED and that
+# `trap ... INT` cannot override ("signals ignored on entry cannot be
+# trapped"). This harness ran for a year sending a signal the demo could not
+# act on: it exited normally, restored the cursor, and the assertion passed for
+# the wrong reason. With monitor mode the job gets its own process group and
+# keeps the default disposition, so the interrupt is real.
+set -m
 script -qec './scripts/lib/cat.sh --demo 20' /dev/null >"$WORK/int.raw" 2>&1 &
 sp=$!
+set +m
 sleep 1.5
 # The demo's OWN process, not the `script` wrapper whose command line carries
 # the same words — and never this script's process group. Signalling by pattern
@@ -222,12 +479,17 @@ if [[ -n "$demo" ]]; then
         fail "refusing to interrupt: the demo shares this script's process group"
     fi
 fi
-wait "$sp" 2>/dev/null
+wait "$sp" 2>/dev/null; int_demo_rc=$?
 tail_bytes="$(tail -c 20 "$WORK/int.raw" | cat -v)"
 grep -q '\[?25h' <<<"$tail_bytes"
 check $? "an interrupt gives the cursor back (transcript ends with the show-cursor sequence)"
 check "$([[ -z "$(pgrep -f '_nemr_cat_loop' || true)" ]] && echo 0 || echo 1)" \
     "an interrupt leaves no drawing process behind"
+# ... and it really was interrupted: a 20-iteration demo that ran to the end
+# would prove nothing about interrupting, which is exactly what this harness
+# used to do (see the note above).
+check "$([[ "$int_demo_rc" != "0" ]] && echo 0 || echo 1)" \
+    "the demo was actually interrupted, not merely finished (exit $int_demo_rc)"
 
 # 6. Small, and the same in any 80-column terminal.
 frames_out="$(./scripts/lib/cat.sh --show)"
@@ -243,11 +505,435 @@ check $r "plain ASCII only — no wide characters, nothing that renders differen
 heights="$(awk '/^frame /{if (n) print n; n=0; next} {n++} END{print n}' <<<"$frames_out" | sort -u | tr '\n' ' ')"
 check "$([[ "$(wc -w <<<"$heights")" == "1" ]] && echo 0 || echo 1)" \
     "every frame is the same height ($heights lines)"
-# And the drawer moves back by exactly that many lines — the erase is pinned to
-# the art, not to a constant that can drift from it.
+# And the drawer moves back over exactly the rows it wrote a newline for: one
+# fewer than the frame's height, because the last row deliberately carries no
+# newline (a newline there scrolls a block at the foot of the screen, and every
+# move here is relative). Pinned to the art, not to a constant beside it.
 up="$(grep -o $'\033\[[0-9]*A' "$raw" | sort -u | tr -d '\033[A' | tr '\n' ' ')"
-check "$([[ "$(echo $up)" == "$(echo $heights)" ]] && echo 0 || echo 1)" \
-    "the cursor is moved back exactly one frame-height each time (${up}vs ${heights})"
+expect_up=$(( $(echo $heights) - 1 ))
+check "$([[ "$(echo $up)" == "$expect_up" ]] && echo 0 || echo 1)" \
+    "the cursor comes back over exactly the rows it newlined: ${up}for a ${heights}row frame"
+
+# ---------------------------------------------------------------------------
+step "Every exit prints an outcome — the run is never silent (F-32)"
+# ---------------------------------------------------------------------------
+# THE FINDING. On a fresh WSL2 distro the very first `./scripts/install.sh
+# --yes` printed NOTHING AT ALL: sudo asked for a password and the prompt came
+# straight back. The reboot gate had exited while the live region owned the
+# screen; its message went to stderr, the region erased it on the way out, and
+# nothing else spoke. A first install, the one run that matters most, with no
+# plan, no result and no error.
+#
+# The fix is structural, not another message: the EXIT trap is the SINGLE
+# AUTHORITY, it runs after the region is gone, and it prints exactly one
+# outcome for every state including one nobody modelled. These assertions drive
+# every exit the script has and read what reached STDOUT — not stderr, which
+# the region overwrites and which a caller may well have redirected.
+PTY_RUN="NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=0.25"
+
+# <name> <pipe|pty> <expected phrase> <command>. Answers two questions about
+# one exit: did ANYTHING reach stdout, and does it say the right thing.
+exit_path() {
+    local name="$1" mode="$2" want="$3" cmd="$4"
+    # Split deliberately: bash creates every name in a `local` list before it
+    # assigns any of them, so "f=$WORK/$name.out" in the same statement reads an
+    # unset $name and, under `set -u`, kills the run.
+    local f="$WORK/$name.out" rc=0
+    if [[ "$mode" == answer_n ]]; then
+        # "n" goes into the PTY, not into the installer's stdin: a pipe on
+        # stdin is "no terminal", which is a different exit path entirely.
+        echo n | script -qec "stty cols 100 rows 30; $cmd 2>$WORK/$name.err" /dev/null >"$f" 2>/dev/null
+        rc=$?
+        python3 scripts/lib/render_pty.py "$f" --cols 100 --rows 30 >"$WORK/$name.screen"
+    elif [[ "$mode" == pty ]]; then
+        # stderr to a file, so the transcript IS stdout — the finding was about
+        # a script whose only word went to a stderr nobody could see.
+        script -qec "stty cols 100 rows 30; $cmd 2>$WORK/$name.err" /dev/null >"$f" 2>/dev/null
+        rc=$?
+        python3 scripts/lib/render_pty.py "$f" --cols 100 --rows 30 >"$WORK/$name.screen"
+    else
+        eval "$cmd" >"$f" 2>"$WORK/$name.err"; rc=$?
+        cp "$f" "$WORK/$name.screen"
+    fi
+    EXIT_RC=$rc
+    # BOTH halves, because under a live region the first is not enough on its
+    # own: the renderer writes thousands of bytes to stdout and then erases
+    # them, which is exactly how the reported run managed to be silent with a
+    # busy stdout. So: bytes on stdout, AND something left on the screen.
+    local visible
+    visible="$(tr -d '[:space:]' <"$WORK/$name.screen" 2>/dev/null | head -c 1)"
+    check "$([[ -s "$f" && -n "$visible" ]] && echo 0 || echo 1)" \
+        "$name: stdout is not empty, and the screen it leaves is not blank" \
+        "exit $rc, $(wc -c <"$f") bytes on stdout, screen $([[ -n "$visible" ]] && echo 'has text' || echo 'BLANK')"
+    grep -qE "$want" "$WORK/$name.screen"
+    check $? "$name: it says what happened (/$want/)" "$(tail -3 "$WORK/$name.screen")"
+}
+
+filtered_path="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v cargo | grep -v rustup | paste -sd:)"
+# A sudo that refuses, first on PATH. The real one is never touched.
+mkdir -p "$WORK/refuse"
+printf '#!/bin/sh\necho "sudo: refused (acceptance shim)" >&2\nexit 1\n' >"$WORK/refuse/sudo"
+chmod +x "$WORK/refuse/sudo"
+
+exit_path help      pipe 'nemr install'                    './scripts/install.sh --help'
+exit_path badopt    pipe 'unknown option'                  './scripts/install.sh --bogus'
+exit_path preflight pipe 'cannot be installed'             "env PATH=$filtered_path ./scripts/install.sh --yes"
+exit_path notty     pipe 'Refusing to go ahead'            './scripts/install.sh </dev/null'
+exit_path declined  answer_n 'Nothing was changed'          './scripts/install.sh'
+exit_path paused    pty  'reboot, then run this again'     "env $PTY_RUN NEMR_TEST_FORCE_REBOOT_GATE=1 ./scripts/install.sh --yes"
+exit_path failed    pty  'Install stopped'                 "env $PTY_RUN NEMR_TEST_FAIL_STEP=image ./scripts/install.sh --yes"
+exit_path ok        pty  'nemr is installed'               "env $PTY_RUN ./scripts/install.sh --yes"
+exit_path abrupt    pty  'Install stopped unexpectedly'    "env $PTY_RUN NEMR_TEST_FORCE_ABRUPT=image ./scripts/install.sh --yes"
+exit_path sudo_no   pty  'asking for your password'        "env PATH=$WORK/refuse:\$PATH $PTY_RUN NEMR_TEST_FORCE_SUDO_ASK=1 ./scripts/install.sh --yes"
+
+# Ctrl-C is an exit path like any other and owes the same answer. The signal
+# goes to the INSTALLER's process group, found by its own command line and
+# never by pattern: signalling by pattern has twice in this project killed the
+# shell doing the signalling.
+set -m     # see the note on the cat's interrupt above: without job control the
+           # signal reaches a process that has SIGINT ignored, and proves nothing.
+script -qec "stty cols 100 rows 30; env NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=1 ./scripts/install.sh --yes 2>$WORK/int2.err" /dev/null >"$WORK/interrupted.out" 2>/dev/null &
+sp=$!
+set +m
+sleep 4
+victim="$(pgrep -P "$sp" 2>/dev/null | head -1)"     # script(1)'s own child
+vpg=""; [[ -n "$victim" ]] && vpg="$(ps -o pgid= -p "$victim" | tr -d ' ')"
+# Two guards, both learned the hard way: the group must not be this script's
+# own (signalling by pattern has twice killed the shell doing the signalling),
+# and it must actually be the installer — a background helper left over from an
+# earlier run INHERITS the same command line, so matching on that picked a
+# process group that had already finished and the run carried on untouched.
+victim_cmd="$(tr '\0' ' ' </proc/"${victim:-0}"/cmdline 2>/dev/null || true)"
+if [[ -n "$vpg" && "$vpg" != "$(ps -o pgid= -p $$ | tr -d ' ')" && "$victim_cmd" == *install.sh* ]]; then
+    kill -INT -- "-$vpg" 2>/dev/null
+else
+    fail "refusing to interrupt: no installer process group of its own (pid ${victim:-none}, pgid ${vpg:-none})"
+fi
+wait "$sp" 2>/dev/null; int_rc=$?
+python3 scripts/lib/render_pty.py "$WORK/interrupted.out" --cols 100 --rows 30 >"$WORK/interrupted.screen"
+int_visible="$(tr -d '[:space:]' <"$WORK/interrupted.screen" 2>/dev/null | head -c 1)"
+check "$([[ -s "$WORK/interrupted.out" && -n "$int_visible" ]] && echo 0 || echo 1)" \
+    "interrupted: stdout is not empty, and the screen it leaves is not blank"
+grep -q 'you pressed Ctrl-C' "$WORK/interrupted.screen"
+check $? "interrupted: it says what happened, after the region is gone" "$(tail -3 "$WORK/interrupted.screen")"
+check "$([[ "$int_rc" == "130" ]] && echo 0 || echo 1)" "interrupted: it exits 130" "exit $int_rc"
+
+# And exactly ONE outcome per run: the single authority is single. Two blocks
+# would mean a path both spoke for itself and fell through to the trap.
+doubled=""
+for name in paused failed ok abrupt sudo_no interrupted; do
+    n="$(grep -cE '^([✓✗⚠]|OK|XX|!!) ' "$WORK/$name.screen" || true)"
+    [[ "$n" == "1" ]] || doubled+="$name=$n "
+done
+check "$([[ -z "$doubled" ]] && echo 0 || echo 1)" \
+    "every result path prints exactly one outcome block, never two" "${doubled:-}"
+
+# ---------------------------------------------------------------------------
+step "The run leaves no temp files, and sweeps strays from dead runs (F-34)"
+# ---------------------------------------------------------------------------
+# Four runs on the reporter's machine left region.409, region.135604, step.409
+# and step.135604 behind — one pair per run, never cleaned. They are cleaned at
+# the same single exit point that prints the outcome, so success, failure and
+# Ctrl-C all get it; a kill -9 cannot run a trap, so its leftovers are swept by
+# the NEXT run, and only after checking the pid is really gone.
+leftovers() { ls -1 "$STATE_DIR"/region.* "$STATE_DIR"/step.* 2>/dev/null | tr '\n' ' '; }
+check "$([[ -z "$(leftovers)" ]] && echo 0 || echo 1)" \
+    "a successful run leaves no region./step. files" "$(leftovers)"
+# The runs above already exercised failure and the interrupt; both went through
+# the same trap, so what is on disk now answers for all three.
+env NEMR_TEST_STEP_STUB=0.02 NEMR_TEST_FAIL_STEP=image ./scripts/install.sh --yes >/dev/null 2>&1
+check "$([[ -z "$(leftovers)" ]] && echo 0 || echo 1)" \
+    "a failed run leaves none either" "$(leftovers)"
+
+# The sweep: a dead pid's files go, a LIVE pid's files are left alone. Cleanup
+# that cannot tell the difference would delete a concurrent run's state file
+# out from under it — this project's rule is that cleanup verifies before it
+# destroys, and never touches a live subject.
+dead=999999
+while kill -0 "$dead" 2>/dev/null; do dead=$((dead + 1)); done
+: >"$STATE_DIR/region.$dead"; : >"$STATE_DIR/step.$dead"
+: >"$STATE_DIR/region.$$";    : >"$STATE_DIR/step.$$"
+env NEMR_TEST_STEP_STUB=0.02 ./scripts/install.sh --yes >/dev/null 2>&1
+check "$([[ ! -e "$STATE_DIR/region.$dead" && ! -e "$STATE_DIR/step.$dead" ]] && echo 0 || echo 1)" \
+    "a stray pair from a dead run is swept at the start of the next"
+check "$([[ -e "$STATE_DIR/region.$$" && -e "$STATE_DIR/step.$$" ]] && echo 0 || echo 1)" \
+    "a LIVE pid's files are not touched — cleanup verifies before it destroys"
+rm -f "$STATE_DIR/region.$$" "$STATE_DIR/step.$$"
+
+# ---------------------------------------------------------------------------
+step "The layout is fitted to the window: cat on the right edge, pane takes the rest (F-33)"
+# ---------------------------------------------------------------------------
+# Fixed at 79 columns, the cat sat in the middle of a wide terminal with the
+# right half empty and the pane cut short. It is now measured once at the start
+# and fitted: cat against the right edge, pane taking what that leaves.
+for w in 79 100 132; do
+    cap="$WORK/fit$w.raw"
+    script -qec "stty cols $w rows 30; env NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=0.25 ./scripts/install.sh --yes" /dev/null >"$cap" 2>/dev/null
+    scr="$WORK/fit$w.screen"
+    python3 scripts/lib/render_pty.py "$cap" --cols "$w" --rows 30 --frame 4 >"$scr"
+    widest="$(awk '{ if (length($0) > m) m = length($0) } END { print m+0 }' "$scr")"
+    check "$([[ "$widest" == "$w" ]] && echo 0 || echo 1)" \
+        "$w columns: the cat reaches the right edge — the widest row is exactly $w ($widest)"
+    check "$([[ "$widest" -le "$w" ]] && echo 0 || echo 1)" \
+        "$w columns: nothing is drawn past the edge, so no row wraps"
+    # The pane takes the rest: border width = left column = cols - gap - cat.
+    border="$(grep -oE '\+-+\+' "$scr" | head -1)"
+    want_border=$(( w - 2 - 37 - 6 + 4 ))
+    check "$([[ "${#border}" == "$want_border" ]] && echo 0 || echo 1)" \
+        "$w columns: the pane is $want_border wide — it takes the space the cat leaves (${#border})"
+done
+
+# Below the minimum the region is never started, and the log says so by name.
+# 78 is one column under NEMR_REGION_MIN_COLS.
+script -qec "stty cols 78 rows 30; env NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=0.02 ./scripts/install.sh --yes" /dev/null >"$WORK/narrow.raw" 2>/dev/null
+narrow_log="$(ls -t "$STATE_DIR"/install-*.log | head -1)"
+grep -q 'live:      NO — 78 columns, the screen needs 79' "$narrow_log"
+check $? "78 columns: the region is refused by name and the run falls back to plain printing" \
+    "$(grep -A2 'install screen' "$narrow_log" | tail -2)"
+grep -q 'resize:    not supported mid-run' "$narrow_log"
+check $? "the log states the resize policy rather than leaving it to be discovered"
+grep -qE '^  \[[#-]{18}\]' "$WORK/narrow.raw" && r=1 || r=0
+check $r "78 columns: no live block was drawn"
+
+# ---------------------------------------------------------------------------
+step "The icons: one per step, two columns each, and they go when colour goes (F-35)"
+# ---------------------------------------------------------------------------
+# An emoji is ONE character to bash and TWO columns to the terminal. Every
+# width in the left column is therefore COUNTED from the parts, never measured
+# with ${#...}. These assertions are what stops that rule being quietly lost.
+
+# 1. Every step has an icon, and every icon is guaranteed two columns.
+icons_out="$(python3 - <<'PYEOF'
+import re, subprocess, sys, unicodedata as ud
+
+src = open("scripts/install.sh", encoding="utf-8").read()
+table = re.search(r"declare -A STEP_ICON=\((.*?)\n\)", src, re.S).group(1)
+icons = dict(re.findall(r"\[(\w+)\]=\"([^\"]+)\"", table))
+ids = re.findall(r"^\s*(?:is_wsl2 && )?step_def (\w+)", src, re.M)
+
+region = open("scripts/lib/region.sh", encoding="utf-8").read()
+title = re.search(r'NEMR_REGION_TITLE_ICON="([^"]+)"', region).group(1)
+icons["<title>"] = title
+
+missing = [i for i in ids if i not in icons]
+bad = []
+for name, ch in sorted(icons.items()):
+    if len(ch) != 1:
+        bad.append("%s: %d codepoints (%s) — only single codepoints are safe"
+                   % (name, len(ch), " ".join("U+%04X" % ord(c) for c in ch)))
+        continue
+    if ud.east_asian_width(ch) != "W":
+        bad.append("%s: U+%04X east_asian_width=%s, not W"
+                   % (name, ord(ch), ud.east_asian_width(ch)))
+    if "️" in ch:
+        bad.append("%s: carries U+FE0F, whose width terminals disagree about" % name)
+print("STEPS %d ICONS %d" % (len(ids), len(icons)))
+print("MISSING %s" % (" ".join(missing) if missing else "none"))
+print("BAD %s" % ("; ".join(bad) if bad else "none"))
+PYEOF
+)"
+grep -q '^MISSING none$' <<<"$icons_out"
+check $? "every step has an icon ($(grep '^STEPS' <<<"$icons_out"))" "$(grep '^MISSING' <<<"$icons_out")"
+grep -q '^BAD none$' <<<"$icons_out"
+check $? "every icon is a single codepoint of East Asian Width W — two columns, guaranteed" \
+    "$(grep '^BAD' <<<"$icons_out")"
+
+# 2. THE ASSERTION THE PRODUCT OWNER ASKED FOR, at the narrowest supported
+#    width, with the longest step label and an icon present: the cat must not
+#    move by a single character. Measured absolutely against the art's own
+#    per-line indent, because a relative check cannot see a shift that happens
+#    on every frame — which is exactly the shift an icon causes.
+script -qec "stty cols 79 rows 30; env NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=0.25 ./scripts/install.sh --yes" /dev/null >"$WORK/icons79.raw" 2>/dev/null
+cols79="$(python3 scripts/lib/region_columns.py "$WORK/icons79.raw" 79)"; r=$?
+check $r "79 columns: the cat is in exactly the column the art says, on every frame" \
+    "$(grep -m3 '^columns' <<<"$cols79")"
+widest79="$(python3 scripts/lib/render_pty.py "$WORK/icons79.raw" --cols 79 --rows 30 --frame 6 | awk '{ if (length($0) > m) m = length($0) } END { print m+0 }')"
+check "$([[ "$widest79" == "79" ]] && echo 0 || echo 1)" \
+    "79 columns: the block is still exactly 79 wide with icons on it ($widest79)"
+# The longest label there is, with its icon, on the narrowest screen there is.
+longest="$(grep -oE 'step_def [a-z_]+ +"[^"]+"' scripts/install.sh | sed 's/.*"\(.*\)"/\1/' | awk '{ if (length($0) > length(m)) m = $0 } END { print m }')"
+icon_of_longest="$(python3 - "$longest" <<'PYEOF'
+import re, sys
+src = open("scripts/install.sh", encoding="utf-8").read()
+sid = re.search(r'step_def (\w+) +"%s"' % re.escape(sys.argv[1]), src).group(1)
+table = re.search(r"declare -A STEP_ICON=\((.*?)\n\)", src, re.S).group(1)
+print(dict(re.findall(r"\[(\w+)\]=\"([^\"]+)\"", table))[sid])
+PYEOF
+)"
+seen_longest=0
+for f in $(seq 2 40); do
+    scr="$(python3 scripts/lib/render_pty.py "$WORK/icons79.raw" --cols 79 --rows 30 --frame "$f" 2>/dev/null || true)"
+    grep -qF "$icon_of_longest" <<<"$scr" && grep -qF "$longest" <<<"$scr" && { seen_longest=1; break; }
+done
+check "$([[ "$seen_longest" == "1" ]] && echo 0 || echo 1)" \
+    "79 columns: the longest label ('$longest') is drawn with its icon and still fits"
+
+# 3. And at a wide terminal, where the left column is much larger.
+script -qec "stty cols 132 rows 30; env NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=0.25 ./scripts/install.sh --yes" /dev/null >"$WORK/icons132.raw" 2>/dev/null
+cols132="$(python3 scripts/lib/region_columns.py "$WORK/icons132.raw" 132)"; r=$?
+check $r "132 columns: the same, on a wide terminal" "$(grep -m3 '^columns' <<<"$cols132")"
+
+# 4. The two top rows are coloured, and the icons are on them.
+top_row="$(python3 scripts/lib/render_pty.py "$WORK/icons79.raw" --cols 79 --rows 30 --frame 6 | sed -n 2p)"
+grep -qF "$(python3 -c 'import re;print(re.search(r"NEMR_REGION_TITLE_ICON=\"([^\"]+)\"", open("scripts/lib/region.sh",encoding="utf-8").read()).group(1))')" <<<"$top_row"
+check $? "the title row carries its constant icon" "$top_row"
+LC_ALL=C grep -aq $'\033\[1m\033\[36m' "$WORK/icons79.raw"
+check $? "the title row is bright and coloured"
+LC_ALL=C grep -aq $'\033\[32m  ' "$WORK/icons79.raw"
+check $? "the step row under it is coloured"
+
+# 5. THEY GO WHEN COLOUR GOES. Same rule as the ✓/✗ marks: no tty, TERM=dumb
+#    or NO_COLOR is plain text. Counted by East Asian Width, so the narrow ✓
+#    and the ambiguous ⚠ in the result block are not mistaken for icons.
+wide_chars() {   # <file> -> how many two-column characters it contains
+    python3 - "$1" <<'PYEOF'
+import sys, unicodedata as ud
+d = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+print(sum(1 for c in d if ud.east_asian_width(c) == "W"))
+PYEOF
+}
+check "$([[ "$(wide_chars "$WORK/icons79.raw")" -gt 0 ]] && echo 0 || echo 1)" \
+    "on a terminal the icons are drawn ($(wide_chars "$WORK/icons79.raw") two-column characters)"
+# Every way they can be refused, including the two that colour does not have:
+# a console font with no emoji in it, and a locale that decodes differently
+# from the terminal — both of which would draw something that is not two
+# columns wide, which is the one thing this layout cannot survive.
+for way in "NO_COLOR=1" "TERM=dumb" "TERM=linux" "NEMR_NO_EMOJI=1" "LC_ALL=C"; do
+    script -qec "stty cols 100 rows 30; env $way NEMR_TEST_CURSOR_ROW=26 NEMR_TEST_STEP_STUB=0.02 ./scripts/install.sh --yes" /dev/null >"$WORK/noicon.raw" 2>/dev/null
+    n="$(wide_chars "$WORK/noicon.raw")"
+    check "$([[ "$n" == "0" ]] && echo 0 || echo 1)" "$way: no icons at all, plain text ($n)"
+done
+env NEMR_TEST_STEP_STUB=0.02 ./scripts/install.sh --yes >"$WORK/piped.raw" 2>/dev/null
+n="$(wide_chars "$WORK/piped.raw")"
+check "$([[ "$n" == "0" ]] && echo 0 || echo 1)" "piped: no icons at all, plain text ($n)"
+
+# 6. STATIC: nothing anywhere in these scripts may carry the pieces that make an
+#    emoji's width unknowable — a variation selector, a zero-width joiner, a
+#    skin tone, a regional indicator, a keycap — or write an icon as a $'\U…'
+#    escape, which bash does not interpret under LC_ALL=C and which would put
+#    ten ASCII characters where two columns were counted.
+dangerous="$(python3 - <<'PYEOF'
+import re
+bad = []
+for path in ("scripts/install.sh", "scripts/lib/region.sh", "scripts/lib/steps.sh"):
+    src = open(path, encoding="utf-8").read()
+    for name, pat in (("U+FE0F variation selector", "\ufe0f"),
+                      ("U+200D zero-width joiner", "\u200d"),
+                      ("U+20E3 keycap", "\u20e3")):
+        if pat in src:
+            bad.append("%s: %s" % (path, name))
+    if re.search(r"[\U0001F3FB-\U0001F3FF]", src):
+        bad.append("%s: a skin-tone modifier" % path)
+    if re.search(r"[\U0001F1E6-\U0001F1FF]", src):
+        bad.append("%s: a regional indicator" % path)
+    code = "\n".join(l.split("#", 1)[0] for l in src.split("\n"))
+    if re.search(r"\$'[^']*\\[uU]", code):
+        bad.append("%s: an icon written as a $'\\U…' escape" % path)
+print("; ".join(bad) if bad else "none")
+PYEOF
+)"
+check "$([[ "$dangerous" == "none" ]] && echo 0 || echo 1)" \
+    "no variation selectors, joiners, skin tones, flags or \$'\\U' escapes anywhere in the screen code" \
+    "$dangerous"
+
+# 7. THE PANE holds arbitrary build output, and a wide glyph in there would move
+#    its right-hand border and the cat with it. Everything above ASCII is
+#    removed before it is drawn.
+cat >"$WORK/wide_pane.sh" <<'WIDE'
+#!/usr/bin/env bash
+cd "$1"; . scripts/lib/cat.sh; . scripts/lib/region.sh; . scripts/lib/steps.sh
+LOG="$2/wlog"; STEP_OUT="$2/wout"; : >"$STEP_OUT"
+nemr_region_start "$2/wstate" "$STEP_OUT" || { echo NO-REGION; exit 0; }
+_S_REGION=1
+steps_seed "building the engine"; steps_icons "🔨"
+_S_IDX=0; step_begin
+for i in 1 2 3 4 5 6; do printf '   正在编译 café ✅ crate-%d 👩‍💻\n' "$i" >>"$STEP_OUT"; sleep 0.2; done
+sleep 0.4
+nemr_region_stop
+WIDE
+chmod +x "$WORK/wide_pane.sh"
+script -qec "bash -c 'stty cols 100 rows 30; $WORK/wide_pane.sh $REPO $WORK'" /dev/null >"$WORK/wide_pane.raw" 2>/dev/null
+pane_check="$(python3 - "$WORK/wide_pane.raw" <<'PYEOF'
+import subprocess, sys, unicodedata as ud
+raw = sys.argv[1]
+cols = 100
+left = cols - 2 - 37                      # the left column, which the pane fills
+out = subprocess.run(["python3", "scripts/lib/render_pty.py", raw,
+                      "--cols", str(cols), "--rows", "30", "--frame", "4"],
+                     capture_output=True, text=True).stdout
+rows = [r for r in out.split("\n") if r.startswith("  |") or r.startswith("  +")]
+edges = sorted({r[left - 1] if len(r) >= left else "SHORT" for r in rows})
+wide = sum(1 for r in rows for c in r[:left] if ud.east_asian_width(c) == "W")
+print("ROWS %d" % len(rows))
+print("EDGES %s" % " ".join(repr(e) for e in edges))
+print("WIDE %d" % wide)
+PYEOF
+)"
+edges="$(grep '^EDGES' <<<"$pane_check")"
+check "$([[ "$edges" == "EDGES '|' '+'" || "$edges" == "EDGES '+' '|'" ]] && echo 0 || echo 1)" \
+    "wide characters in a step's output do not move the pane's right border ($edges)" \
+    "$pane_check"
+check "$([[ "$(grep '^WIDE' <<<"$pane_check")" == "WIDE 0" ]] && echo 0 || echo 1)" \
+    "and none of them reach the pane at all — removed, not sliced" "$pane_check"
+
+# 8. The inputs the column is built from stay ASCII, and short enough that an
+#    icon still fits at the narrowest supported width.
+labels_bad="$(python3 - <<'PYEOF'
+import re
+src = open("scripts/install.sh", encoding="utf-8").read()
+bad = []
+for label in re.findall(r'^\s*(?:is_wsl2 && )?step_def \w+ +"([^"]+)"', src, re.M):
+    if not re.fullmatch(r"[ -~]*", label):
+        bad.append("%r is not ASCII" % label)
+    if 2 + 3 + len(label) > 40:
+        bad.append("%r leaves no room for an icon at 79 columns" % label)
+print("; ".join(bad) if bad else "none")
+PYEOF
+)"
+check "$([[ "$labels_bad" == "none" ]] && echo 0 || echo 1)" \
+    "every step phrase is ASCII and short enough to carry an icon at 79 columns" "$labels_bad"
+
+# 9. And the block does not creep down the screen: one wrapped row would
+#    desynchronise the walk-back from what was written, a row per frame.
+rows_seen=""
+for f in 4 8 12; do
+    rows_seen+="$(python3 scripts/lib/render_pty.py "$WORK/icons79.raw" --cols 79 --rows 30 --frame "$f" | grep -n 'Installing nemr' | cut -d: -f1) "
+done
+check "$([[ "$(tr ' ' '\n' <<<"$rows_seen" | sort -u | grep -c .)" == "1" ]] && echo 0 || echo 1)" \
+    "the block stays on the same row from frame to frame — nothing wrapped (rows: $rows_seen)"
+
+# 10. And the log says which way it went, like every other screen decision.
+icon_log="$(ls -t "$HOME/.local/state/nemr"/install-*.log 2>/dev/null | head -1)"
+grep -qE 'icons: +no —' "$icon_log"
+check $? "the log records that the icons were off for that run, and why" "$(grep 'icons:' "$icon_log" || true)"
+
+# 7. An exit taken INSIDE a redirected block still reaches the real stdout.
+#    Found while building this: a `set -u` error inside the log block sent the
+#    whole failure report into the log file and left the screen blank — the
+#    single authority speaking to whatever stdout happened to be.
+cat >"$WORK/redirected.sh" <<'REDIR'
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$1"
+. scripts/lib/cat.sh; . scripts/lib/region.sh; . scripts/lib/steps.sh
+LOG="$2/log"; : >"$LOG"
+steps_trap
+RESULT_STATE=failed
+RESULT_FAILED_STEP="a step inside a redirect"
+RESULT_BECAUSE="the block it died in owned stdout"
+RESULT_FIX="read this on the screen, not in the log"
+steps_redirect_begin "$LOG"
+printf 'this line belongs in the log\n'
+false                          # set -e, with stdout redirected
+steps_redirect_end
+REDIR
+chmod +x "$WORK/redirected.sh"
+"$WORK/redirected.sh" "$REPO" "$WORK" >"$WORK/redirected.out" 2>/dev/null || true
+grep -q 'a step inside a redirect' "$WORK/redirected.out"
+check $? "an exit inside a redirected block still prints the outcome to the real stdout" \
+    "stdout: $(head -c 120 "$WORK/redirected.out")"
+grep -q 'a step inside a redirect' "$WORK/log" && r=1 || r=0
+check $r "and it does NOT go into the file that block was writing to"
 
 # ---------------------------------------------------------------------------
 printf '\n'

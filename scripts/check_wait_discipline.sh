@@ -44,11 +44,19 @@ wait_discipline_holds() {
     # Comments stripped first: "Draw until killed." is prose, not a poll.
     local code
     code="$(grep -vE '^[[:space:]]*#' "$file" 2>/dev/null)"
-    if grep -qE '(^|[^a-zA-Z0-9_])wait "?\$' <<<"$code" &&
-       ! grep -qE 'for .*(seq|\{1\.\.)|until |while .*(curl|nc |ss |test -|\[\[)' <<<"$code"; then
-        return 0
-    fi
-    return 1
+
+    # Judge each backgrounded PID, not the whole file. A script may both wait
+    # for a child to FINISH (bash's `wait`, which returns its exit status — the
+    # opposite of a wait that cannot explain itself) and poll for something
+    # else's readiness elsewhere. Asking "does this file contain a loop
+    # anywhere" conflated the two and flagged an installer that does both.
+    local var vars
+    vars="$(grep -oE '[A-Za-z_][A-Za-z0-9_]*=\$!' <<<"$code" | sed 's/=\$!//' | sort -u)"
+    [[ -z "$vars" ]] && return 1        # $! captured into nothing we can follow
+    for var in $vars; do
+        grep -qE "(^|[^a-zA-Z0-9_])wait \"?\\\$(\{)?$var" <<<"$code" || return 1
+    done
+    return 0
 }
 
 mapfile -t candidates < <(find scripts -maxdepth 2 -name '*.sh' -type f 2>/dev/null | sort)
