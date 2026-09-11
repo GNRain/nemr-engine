@@ -13,7 +13,9 @@ use crate::auth;
 use crate::config;
 use crate::containerd::client::ContainerdClient;
 use crate::containerd::containers::{BindMount, ContainerSpec, StopOutcome};
-use crate::engine::volume::{HelperOps, PrivilegedOps, Volume, VolumePaths, VolumeSize};
+use crate::engine::volume::{
+    human_size, HelperOps, PrivilegedOps, Volume, VolumePaths, VolumeSize,
+};
 use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 
@@ -907,21 +909,6 @@ pub async fn adopt(
     })
 }
 
-fn human_size(bytes: u64) -> String {
-    const G: u64 = 1024 * 1024 * 1024;
-    const M: u64 = 1024 * 1024;
-    const K: u64 = 1024;
-    if bytes >= G {
-        format!("{:.1}GiB", bytes as f64 / G as f64)
-    } else if bytes >= M {
-        format!("{:.1}MiB", bytes as f64 / M as f64)
-    } else if bytes >= K {
-        format!("{:.1}KiB", bytes as f64 / K as f64)
-    } else {
-        format!("{bytes}B")
-    }
-}
-
 /// Bind mounts that relocate Claude Code's session-critical state onto the
 /// portable volume (M8).
 ///
@@ -969,7 +956,7 @@ mod tests {
         let labels = project_labels(
             "demo",
             "/mnt/demo",
-            VolumeSize::Medium,
+            VolumeSize::MEDIUM,
             Agent::ClaudeCode,
             Some(netns::Allocation { index: 3 }),
         );
@@ -1533,8 +1520,12 @@ pub fn agent_from_labels(labels: &std::collections::HashMap<String, String>) -> 
 }
 
 fn read_recorded_size(paths: &VolumePaths, name: &str) -> Option<VolumeSize> {
+    // THE FILE IS THE RECORD. It used to be matched against the three presets
+    // and any other length read as "unknown"; now the length IS the size, so a
+    // volume made at any size reports itself correctly and nothing has to be
+    // recognised.
     let length = std::fs::metadata(paths.image_file(name)).ok()?.len();
-    VolumeSize::all().into_iter().find(|s| s.bytes() == length)
+    Some(VolumeSize::from_bytes(length))
 }
 
 fn audit_remount(name: &str, mount_point: &std::path::Path) {

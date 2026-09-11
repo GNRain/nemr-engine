@@ -254,6 +254,30 @@ impl Nemr for NemrService {
         Ok(Response::new(DeleteResponse {}))
     }
 
+    /// What a volume size may be here (SPEC 1.153).
+    ///
+    /// Asks the privileged helper, which is where the bounds are enforced,
+    /// rather than answering from a constant this program keeps — the CLI
+    /// prompt and the page's slider both come through here, so a copy kept in
+    /// the daemon would be a third opinion to keep in step.
+    async fn size_limits(
+        &self,
+        _request: Request<SizeLimitsRequest>,
+    ) -> Result<Response<SizeLimitsResponse>, Status> {
+        let paths = crate::engine::volume::VolumePaths::from_env().map_err(status_from_anyhow)?;
+        let ops = crate::engine::volume::HelperOps::new();
+        let limits =
+            crate::engine::volume::size_limits(&ops, &paths).map_err(status_from_anyhow)?;
+        Ok(Response::new(SizeLimitsResponse {
+            min_bytes: limits.min,
+            max_bytes: limits.max,
+            block_bytes: limits.block,
+            default_bytes: crate::engine::volume::VolumeSize::DEFAULT.bytes(),
+            free_bytes: limits.free,
+            volumes_path: paths.image_dir().display().to_string(),
+        }))
+    }
+
     async fn list(&self, _request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         let projects = crate::engine::project::list(&self.client)
             .await

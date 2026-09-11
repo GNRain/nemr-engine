@@ -14,6 +14,12 @@ service Nemr {
   rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
 
   rpc Create(CreateRequest) returns (CreateResponse);
+  // What a volume size may be on THIS host, and how much room there is for
+  // one. Answered from the privileged helper (the program that enforces the
+  // bounds) and from statvfs on the volumes directory, so the CLI prompt, the
+  // page's slider and the engine cannot hold three different opinions.
+  // Provisions nothing.
+  rpc SizeLimits(SizeLimitsRequest) returns (SizeLimitsResponse);
   rpc Adopt(AdoptRequest) returns (AdoptResponse);
   rpc Start(StartRequest) returns (StartResponse);
   rpc Stop(StopRequest) returns (StopResponse);
@@ -60,7 +66,11 @@ message HandshakeResponse {
 
 message CreateRequest {
   string name = 1;
-  string size = 2;   // volume size preset, e.g. "2GB"
+  // A volume size: a whole number with an optional unit — "2GB", "1536MB", or
+  // a byte count. Kibibyte-based, as the presets always were. Stays a string
+  // rather than becoming a uint64 so this field is unchanged on the wire and
+  // an older message still parses; what widened is what the engine accepts.
+  string size = 2;
   string agent = 3;  // agent id, e.g. "claude-code"
 }
 message CreateResponse {
@@ -102,6 +112,20 @@ message AdoptResponse {
   // are, never dropped. Reported so a summary can say the transcript arrived
   // with damage the host already had.
   uint64 history_lines_corrupt = 13;
+}
+
+message SizeLimitsRequest {}
+message SizeLimitsResponse {
+  uint64 min_bytes = 1;
+  uint64 max_bytes = 2;
+  // The allocation unit a size is rounded down to.
+  uint64 block_bytes = 3;
+  // What a create with no size asked for would use.
+  uint64 default_bytes = 4;
+  // Free space on the filesystem holding the volumes directory, from statvfs —
+  // the same call `nemr status` uses, so the two agree.
+  uint64 free_bytes = 5;
+  string volumes_path = 6;
 }
 
 message StartRequest { string name = 1; }

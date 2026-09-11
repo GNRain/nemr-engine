@@ -24,7 +24,13 @@ pub mod proto {
     // or the reverse — refuses with the reinstall advice instead of failing
     // with an unimplemented-RPC error that names nothing.
     // v3: adds Adopt (E-23).
-    pub const PROTOCOL_VERSION: u32 = 3;
+    // v4: adds SizeLimits, and `CreateRequest.size` widens from one of three
+    // preset words to any size in range. The FIELD is unchanged — still a
+    // string, still "2GB" for the same volume — so the message is wire-
+    // compatible both ways; what is not compatible is the new RPC, which an
+    // older daemon answers with UNIMPLEMENTED. The handshake turns that into a
+    // refusal that names the fix, which is the whole reason it exists.
+    pub const PROTOCOL_VERSION: u32 = 4;
 }
 
 pub mod client;
