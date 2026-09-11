@@ -10,7 +10,12 @@
 //! security property must hold inside this program:
 //!
 //! - **The caller never supplies a path, device, or UID.** They supply a
-//!   volume name and a size preset. Everything else is derived here.
+//!   volume name and a size in bytes. Everything else is derived here.
+//! - **The size is a number parsed by this program.** It stopped being a
+//!   closed set of preset words in protocol 3, so this binary now parses
+//!   attacker-controlled numeric input while running as root. Every parse,
+//!   bound and rounding happens before any syscall, any path construction and
+//!   any allocation derived from the value. See [`parse_size_bytes`].
 //! - **Names are validated before use.** The engine validates too, but that
 //!   check is advisory — this one is the boundary.
 //! - **No caller-controlled environment variable influences path
@@ -28,8 +33,10 @@
 //! # Usage
 //!
 //! ```text
-//! nemr-volume mount   <name> <500MB|2GB|10GB>
-//! nemr-volume unmount <name>
+//! nemr-volume mount     <name> <bytes>
+//! nemr-volume unmount   <name>
+//! nemr-volume normalize <bytes>
+//! nemr-volume version
 //! ```
 
 mod loopdev;
@@ -40,21 +47,64 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const MAX_NAME_LEN: usize = 32;
-const VALID_SIZES: [&str; 3] = ["500MB", "2GB", "10GB"];
+
+/// Smallest volume this helper will mount, in bytes — 64 MiB.
+///
+/// MEASURED, not guessed. Two things were measured on a host with the base
+/// image installed:
+///
+/// 1. **What a session puts in the volume: nothing.** The volume is the
+///    session's `/workspace`; the base image lives in containerd's own store,
+///    not here. Three freshly created 500 MB volumes on the development host
+///    were byte-for-byte identical to a bare `mkfs.ext4` of the same size
+///    (50388992 bytes in use, all of it ext4's own metadata). So the working
+///    set a new volume must hold is zero, and the binding constraint is
+///    entirely ext4's overhead.
+/// 2. **What ext4 costs at small sizes.** `mkfs.ext4` then `dumpe2fs`, usable
+///    = (free blocks − reserved blocks) × block size:
+///
+///    | asked | usable | overhead |
+///    |-------|--------|----------|
+///    | 16 MiB | 10653696 | 37% |
+///    | 32 MiB | 25534464 | 24% |
+///    | 64 MiB | 55296000 | 18% |
+///    | 500 MB | 447684608 | 15% |
+///
+/// 64 MiB is where the overhead stops dominating and 52.7 MiB is left for a
+/// checkout — three times what the largest observed fresh session had written.
+/// Below it a volume is mostly journal.
+const MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Largest volume this helper will mount, in bytes — 1 TiB.
+///
+/// A ceiling, not a capacity promise. The backing file is sparse, so an absurd
+/// size costs no disk until it is written to — which is exactly why an
+/// unbounded value is dangerous: `--size 1000000GB` would succeed quietly,
+/// format, mount, and then fail with ENOSPC in the middle of somebody's work.
+/// Free disk is checked by the caller against the real filesystem; this bound
+/// is the backstop that keeps a typo from ever reaching `mkfs`.
+const MAX_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 
 /// Interface version between the engine and this helper.
 ///
-/// The engine checks this before invoking a privileged operation and refuses to
-/// run against a helper whose protocol it does not understand, so a source
-/// change that was never installed (`scripts/setup_test_host.sh`) is caught
-/// rather than silently ignored. Bump it whenever the argument grammar or the
-/// helper's guarantees change.
+/// The engine checks this once per process, before its first privileged call,
+/// and refuses to run against a helper whose protocol it does not speak — so a
+/// source change that was never installed (`scripts/setup_test_host.sh`) is
+/// caught rather than silently ignored. Bump it whenever the argument grammar
+/// or the helper's guarantees change.
+///
+/// (Until protocol 3 that sentence was aspirational: nothing in the engine
+/// read this number. `HelperOps::PROTOCOL` is the other half of it.)
 ///
 /// - 1: initial mount/unmount grammar (implicit; helpers without a `version`
 ///   subcommand predate the fd-based hardening).
 /// - 2: symlink-safe fd-based mount/chown, backing-file flock, inode-identity
 ///   loop lookup.
-const PROTOCOL_VERSION: u32 = 2;
+/// - 3: `mount` takes a size in BYTES instead of one of three preset words,
+///   and `normalize` is added so a caller can ask what this helper will accept
+///   and what a value rounds to before it allocates anything. The request
+///   shape changed, so the version moves and every host needs the redeploy.
+const PROTOCOL_VERSION: u32 = 3;
 
 fn main() -> ExitCode {
     match run() {
@@ -91,16 +141,20 @@ fn run() -> Result<(), String> {
             reject_extra_args(&args, 2)?;
             cmd_unmount(&invoker, name)
         }
+        Some("normalize") => {
+            let size = require_arg(&args, 1, "size")?;
+            reject_extra_args(&args, 2)?;
+            cmd_normalize(&invoker, size)
+        }
         Some(other) => Err(format!(
-            "unknown subcommand {other:?}; expected 'mount', 'unmount' or 'version'"
+            "unknown subcommand {other:?}; expected 'mount', 'unmount', 'normalize' or 'version'"
         )),
-        None => Err(
-            "usage: nemr-volume mount <name> <500MB|2GB|10GB> | nemr-volume unmount <name> \
-             | nemr-volume version"
-                .to_string(),
-        ),
+        None => Err(USAGE.to_string()),
     }
 }
+
+const USAGE: &str = "usage: nemr-volume mount <name> <bytes> | nemr-volume unmount <name> \
+                     | nemr-volume normalize <bytes> | nemr-volume version";
 
 fn require_arg<'a>(args: &'a [String], index: usize, what: &str) -> Result<&'a str, String> {
     args.get(index)
@@ -160,10 +214,12 @@ impl Invoker {
         self.home.join(".local").join("share").join("nemr")
     }
 
+    fn volumes_dir(&self) -> PathBuf {
+        self.managed_root().join("volumes")
+    }
+
     fn image_file(&self, name: &str) -> PathBuf {
-        self.managed_root()
-            .join("volumes")
-            .join(format!("{name}.img"))
+        self.volumes_dir().join(format!("{name}.img"))
     }
 
     fn mount_point(&self, name: &str) -> PathBuf {
@@ -237,15 +293,100 @@ fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_size(size: &str) -> Result<(), String> {
-    if VALID_SIZES.contains(&size) {
-        Ok(())
-    } else {
-        Err(format!(
-            "unrecognised size {size:?}; valid sizes: {}",
-            VALID_SIZES.join(", ")
-        ))
+/// Parse a caller-supplied size into bytes (PRIV-03).
+///
+/// THIS IS THE BOUNDARY. The engine and the CLI both validate too, and both
+/// checks are conveniences; this one runs as root and must assume the caller
+/// ran neither.
+///
+/// The accepted grammar is deliberately the narrowest thing that can express a
+/// byte count: **one or more ASCII digits, nothing else**. Everything a looser
+/// parser would have to reason about is refused by construction rather than by
+/// a rule that has to be got right:
+///
+/// - `+5`, `-5` — a sign is not a digit. `u64::from_str` accepts a leading
+///   `+`, so this does not delegate to it for that check.
+/// - `0x40`, `0o100`, `0b1` — a prefix is not a digit. There is no radix here;
+///   a value is decimal or it is refused.
+/// - ` 5`, `5 `, `5\n` — whitespace is not a digit. Nothing is trimmed, so a
+///   caller cannot smuggle a value past a bound with padding.
+/// - `5MB`, `5e9`, `5.0` — a unit, an exponent and a point are not digits.
+///   Units are the CLI's vocabulary, not this program's.
+/// - `99999999999999999999999` — overflow is refused as overflow, by
+///   `checked_mul`/`checked_add` on each digit, so nothing wraps into a small
+///   in-range number.
+/// - Unicode digits (`٥`, `５`) — `is_ascii_digit`, not `is_numeric`.
+///
+/// Only then are the bounds applied, and only then does anything derived from
+/// the value exist. No syscall, no path, no allocation runs before this
+/// returns.
+fn parse_size_bytes(size: &str) -> Result<u64, String> {
+    if size.is_empty() {
+        return Err("size must not be empty; give a whole number of bytes".to_string());
     }
+    if size.len() > 20 {
+        // 2^64 - 1 is 20 digits. Anything longer cannot be a u64 and is
+        // refused before the accumulate loop rather than by it.
+        return Err(format!(
+            "size is {} characters; a byte count is at most 20 digits",
+            size.len()
+        ));
+    }
+    let mut bytes: u64 = 0;
+    for c in size.chars() {
+        if !c.is_ascii_digit() {
+            return Err(format!(
+                "size {size:?} contains {c:?}; a size is a whole number of bytes, \
+                 digits only — no sign, no unit, no whitespace, no 0x prefix"
+            ));
+        }
+        bytes = bytes
+            .checked_mul(10)
+            .and_then(|b| b.checked_add(u64::from(c as u8 - b'0')))
+            .ok_or_else(|| format!("size {size:?} does not fit in 64 bits"))?;
+    }
+    if bytes < MIN_BYTES {
+        return Err(format!(
+            "size {bytes} is below the minimum {MIN_BYTES} ({} MiB): \
+             ext4 overhead would leave almost nothing usable",
+            MIN_BYTES / (1024 * 1024)
+        ));
+    }
+    if bytes > MAX_BYTES {
+        return Err(format!(
+            "size {bytes} is above the maximum {MAX_BYTES} ({} GiB): \
+             the backing file is sparse, so an absurd size fails later and \
+             further from the cause than it does here",
+            MAX_BYTES / (1024 * 1024 * 1024)
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Round a validated size DOWN to a whole number of filesystem blocks.
+///
+/// Down, never up: rounding up would hand back more than the caller checked
+/// against free disk, and a size that grew between the check and the
+/// allocation is the same class of surprise as a TOCTOU. A tail shorter than
+/// one block is unusable anyway — ext4 allocates in whole blocks.
+///
+/// A block size that is zero or not a power of two is refused rather than
+/// worked around: it means `statvfs` answered something this program does not
+/// understand, and guessing at that point is how a rounding bug becomes a
+/// sizing bug.
+fn round_down_to_block(bytes: u64, block: u64) -> Result<u64, String> {
+    if block == 0 || !block.is_power_of_two() {
+        return Err(format!(
+            "the filesystem reported a block size of {block}, which is not a power of two"
+        ));
+    }
+    let rounded = bytes - (bytes % block);
+    if rounded < MIN_BYTES {
+        return Err(format!(
+            "size {bytes} rounds down to {rounded}, below the minimum {MIN_BYTES}"
+        ));
+    }
+    Ok(rounded)
 }
 
 /// Audit line (PRIV-04, NFR-04).
@@ -255,6 +396,42 @@ fn validate_size(size: &str) -> Result<(), String> {
 /// engine captures and re-logs these.
 fn audit(message: &str) {
     eprintln!("[elevated] {message}");
+}
+
+/// Answer what this helper will accept, and what a size rounds to — without
+/// doing anything.
+///
+/// The engine allocates the backing file itself (unprivileged), so it has to
+/// know the rounded length BEFORE it allocates; asking afterwards would mean
+/// either a second allocation or a file that differs from what was agreed.
+/// This is that question, answered by the program that enforces the answer,
+/// from the real filesystem rather than from a constant the two halves would
+/// have to keep in step.
+///
+/// Touches nothing: it opens the volumes directory read-only to ask `statvfs`
+/// for its block size, and prints. Output is `key=value` lines so a caller
+/// parses it without a format to keep in step either.
+fn cmd_normalize(invoker: &Invoker, size: &str) -> Result<(), String> {
+    let requested = parse_size_bytes(size)?;
+
+    // Through the same symlink-refusing resolver as everything else. It is
+    // read-only and unprivileged in effect, but a resolver that is only used
+    // on the dangerous paths is a resolver somebody will forget to use on the
+    // next one.
+    let dir_fd = safe::open_beneath(&invoker.volumes_dir(), libc::O_RDONLY)?;
+    let vfs = safe::fstatvfs(&dir_fd)?;
+    // f_frsize is the fragment size — the unit f_blocks/f_bavail count in, and
+    // the one that matters for how much of a file is a whole block. f_bsize is
+    // a preferred I/O size and on some filesystems is not the allocation unit.
+    let block = vfs.f_frsize as u64;
+    let rounded = round_down_to_block(requested, block)?;
+
+    println!("min={MIN_BYTES}");
+    println!("max={MAX_BYTES}");
+    println!("block={block}");
+    println!("requested={requested}");
+    println!("bytes={rounded}");
+    Ok(())
 }
 
 /// Attach the backing file to a loop device, mount it, and hand ownership to
@@ -273,7 +450,9 @@ fn audit(message: &str) {
 /// backing file. See src/safe.rs for the full rationale.
 fn cmd_mount(invoker: &Invoker, name: &str, size: &str) -> Result<(), String> {
     validate_name(name)?;
-    validate_size(size)?;
+    // PARSED AND BOUNDED FIRST, before a path is built from the name or a
+    // descriptor is opened. A refusal here has touched nothing.
+    let size_bytes = parse_size_bytes(size)?;
 
     let image_path = invoker.image_file(name);
     let mount_path = invoker.mount_point(name);
@@ -300,6 +479,20 @@ fn cmd_mount(invoker: &Invoker, name: &str, size: &str) -> Result<(), String> {
             invoker.uid
         ));
     }
+    // THE SIZE ARGUMENT MEANS SOMETHING NOW. Under protocol 2 it was a preset
+    // word used only in the audit line, so a caller could claim any of the
+    // three and nothing checked. A byte count can be checked against the file
+    // that is about to be mounted, and is: the two must agree exactly, which
+    // makes the audit line a statement about the mount rather than about the
+    // argument.
+    let actual = image_stat.st_size as u64;
+    if actual != size_bytes {
+        return Err(format!(
+            "{} is {actual} bytes but the request says {size_bytes}; \
+             the size must be the backing file's own length",
+            image_path.display()
+        ));
+    }
 
     // Resolve the mount point's parent to a pinned descriptor, again refusing
     // symlinks. The child is opened relative to it, so the mount target cannot
@@ -319,7 +512,7 @@ fn cmd_mount(invoker: &Invoker, name: &str, size: &str) -> Result<(), String> {
     }
 
     audit(&format!(
-        "provisioning volume {name:?} ({size}) for uid {} at {}",
+        "provisioning volume {name:?} ({size_bytes} bytes) for uid {} at {}",
         invoker.uid,
         mount_path.display()
     ));
@@ -513,14 +706,102 @@ mod tests {
         assert!(validate_name(&"a".repeat(MAX_NAME_LEN + 1)).is_err());
     }
 
+    /// THE BOUNDARY TEST. Every one of these goes through the helper's own
+    /// parser, not through the CLI — the CLI's validation is a convenience and
+    /// this program must be correct with no caller at all.
     #[test]
-    fn only_preset_sizes_accepted() {
-        for size in VALID_SIZES {
-            assert!(validate_size(size).is_ok());
+    fn a_malformed_size_is_refused_before_anything_is_derived_from_it() {
+        for size in [
+            "",            // nothing
+            " ",           // whitespace only
+            " 67108864",   // leading space
+            "67108864 ",   // trailing space
+            "67108864\n",  // trailing newline
+            "+67108864",   // leading plus — u64::from_str would accept this
+            "-67108864",   // negative
+            "0x4000000",   // hex prefix
+            "0o400000000", // octal prefix
+            "0b1",         // binary prefix
+            "6_7108864",   // digit separator
+            "67108864.0",  // a point
+            "6.7e7",       // an exponent
+            "64MB",        // a unit: the CLI's vocabulary, not this one
+            "64 MB",
+            "２００００００００", // full-width digits: is_ascii_digit, not is_numeric
+            "٦٧١٠٨٨٦٤",           // arabic-indic digits
+            "67108864;rm -rf /",
+            "$(echo 67108864)",
+            "99999999999999999999999999", // longer than 20 digits
+            "18446744073709551616",       // u64::MAX + 1, exactly 20 digits
+        ] {
+            let error = parse_size_bytes(size)
+                .expect_err(&format!("{size:?} must be refused"))
+                .to_string();
+            assert!(!error.is_empty(), "{size:?} was refused without saying why");
         }
-        for size in ["1TB", "2gb", "", "2GB;rm", "999999GB"] {
-            assert!(validate_size(size).is_err(), "{size:?} must be rejected");
+    }
+
+    #[test]
+    fn an_out_of_range_size_is_refused_and_the_bound_is_named() {
+        for size in ["0", "1", "1024", &(MIN_BYTES - 1).to_string()] {
+            let error = parse_size_bytes(size).expect_err(&format!("{size:?} is below MIN"));
+            assert!(
+                error.contains(&MIN_BYTES.to_string()),
+                "the refusal must name the minimum: {error}"
+            );
         }
+        for size in [
+            &(MAX_BYTES + 1).to_string(),
+            &u64::MAX.to_string(),
+            "18446744073709551615",
+        ] {
+            let error = parse_size_bytes(size).expect_err(&format!("{size:?} is above MAX"));
+            assert!(
+                error.contains(&MAX_BYTES.to_string()),
+                "the refusal must name the maximum: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_size_in_range_is_accepted_exactly() {
+        for bytes in [MIN_BYTES, MIN_BYTES + 1, 524_288_000, MAX_BYTES] {
+            assert_eq!(parse_size_bytes(&bytes.to_string()), Ok(bytes));
+        }
+        // No overflow anywhere on the way to a legitimate large value.
+        assert_eq!(parse_size_bytes("1099511627776"), Ok(MAX_BYTES));
+    }
+
+    /// The bounds themselves, asserted rather than described — MIN was
+    /// measured and MAX was chosen, and both are load-bearing.
+    #[test]
+    fn the_bounds_are_what_was_measured() {
+        assert_eq!(MIN_BYTES, 67_108_864, "64 MiB");
+        assert_eq!(MAX_BYTES, 1_099_511_627_776, "1 TiB");
+        assert!(MIN_BYTES < MAX_BYTES);
+        assert_eq!(MIN_BYTES % 4096, 0, "MIN must survive its own rounding");
+        assert_eq!(MAX_BYTES % 4096, 0);
+    }
+
+    #[test]
+    fn rounding_goes_down_and_never_below_the_minimum() {
+        assert_eq!(round_down_to_block(MIN_BYTES, 4096), Ok(MIN_BYTES));
+        assert_eq!(round_down_to_block(MIN_BYTES + 1, 4096), Ok(MIN_BYTES));
+        assert_eq!(round_down_to_block(MIN_BYTES + 4095, 4096), Ok(MIN_BYTES));
+        assert_eq!(
+            round_down_to_block(MIN_BYTES + 4096, 4096),
+            Ok(MIN_BYTES + 4096)
+        );
+        // Never up: what comes back is never more than what went in.
+        for bytes in [MIN_BYTES + 1, MIN_BYTES + 1234, 1_234_567_890] {
+            assert!(round_down_to_block(bytes, 4096).unwrap() <= bytes);
+        }
+        // A block size this program does not understand is refused, not
+        // guessed around.
+        assert!(round_down_to_block(MIN_BYTES, 0).is_err());
+        assert!(round_down_to_block(MIN_BYTES, 4095).is_err());
+        // Rounding must not be a way past the minimum.
+        assert!(round_down_to_block(MIN_BYTES, 1024 * 1024 * 1024).is_err());
     }
 
     /// Paths must derive from the passwd home, never from the environment.
@@ -583,7 +864,7 @@ mod tests {
 
     #[test]
     fn extra_arguments_are_refused() {
-        let args: Vec<String> = ["mount", "a", "2GB", "extra"]
+        let args: Vec<String> = ["mount", "a", "67108864", "extra"]
             .iter()
             .map(|s| s.to_string())
             .collect();
