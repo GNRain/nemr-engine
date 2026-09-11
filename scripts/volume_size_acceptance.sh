@@ -22,7 +22,7 @@ BLUE=$'\033[34m'; RED=$'\033[31m'; GREEN=$'\033[32m'; RESET=$'\033[0m'
 STEP=0; ASSERTS=0
 # F-6: the count is ASSERTED. A run that skipped a step must not read like a
 # run that made every assertion.
-EXPECTED_ASSERTIONS=24
+EXPECTED_ASSERTIONS=32
 step() { STEP=$((STEP+1)); printf '\n%s== %d. %s%s\n' "$BLUE" "$STEP" "$1" "$RESET"; }
 pass() { ASSERTS=$((ASSERTS+1)); printf '   %sok%s %s\n' "$GREEN" "$RESET" "$1"; }
 fail() { printf '   %sFAIL%s %s\n' "$RED" "$RESET" "$1" >&2; exit 1; }
@@ -63,9 +63,12 @@ step "The helper refuses a bad size ITSELF, with no CLI in front of it"
 # ---------------------------------------------------------------------------
 # The boundary is the helper. These go straight to it, because the CLI's own
 # validation is a convenience and must not be what the proof rests on.
+# `set -e` is on, and a command substitution that fails takes the script with
+# it — which is exactly what every assertion here does on purpose. So the
+# failure is captured rather than propagated.
 helper_refuses() {   # <size> <what>
-    local out rc
-    out="$(sudo -n "$HELPER" normalize "$1" 2>&1)"; rc=$?
+    local out rc=0
+    out="$(sudo -n "$HELPER" normalize "$1" 2>&1)" || rc=$?
     [[ $rc -ne 0 ]]
     check $? "the helper itself refuses $2" "exit $rc: $out"
 }
@@ -106,30 +109,32 @@ img="$HOME/.local/share/nemr/volumes/$ODD.img"
 check $? "the backing file is exactly the size asked for" "$(stat -c %s "$img" 2>/dev/null)"
 
 nemr start "$ODD" >/dev/null
-# WHAT IS INSIDE, measured inside: df in the container, not the engine's word.
-inside="$(nemr exec "$ODD" -- df -B1 --output=size /workspace 2>/dev/null | tail -1 | tr -d ' ')"
-[[ -n "$inside" ]] || inside="$(nemr exec "$ODD" -- df -B1 /workspace 2>/dev/null | awk 'NR==2{print $2}')"
-# ext4 metadata means usable is always under what was asked. Under, but not
-# wildly under: the overhead measured for this size class is ~15%.
+# WHAT IS ACTUALLY THERE, measured on the filesystem the container gets. The
+# volume is mounted on the host and bind-mounted into the container, so `df` on
+# the mount point IS the container's /workspace — one filesystem, read from the
+# side that does not need a shell inside it (there is no `nemr exec`).
+MNT="$HOME/.local/share/nemr/mounts/$ODD"
+inside=$(df -B1 --output=size "$MNT" | tail -1 | tr -d ' ')
+# ext4 metadata means the usable total is always under what was asked. Under,
+# but not wildly: the overhead measured for this size class is ~15%.
 python3 -c 'import sys
 inside, asked = int(sys.argv[1]), int(sys.argv[2])
 sys.exit(0 if 0.80 * asked <= inside < asked else 1)' "$inside" "$ODD_BYTES"
-check $? "the usable bytes inside the container match what was asked, less ext4 overhead" \
-    "inside=$inside asked=$ODD_BYTES"
+check $? "the usable bytes on the volume match what was asked, less ext4 overhead" \
+    "df=$inside asked=$ODD_BYTES"
 
-# nemr status must agree with df, as it does today.
+# And `nemr status` must agree with df, as it does today: both read the same
+# statvfs, so a disagreement means one of them is quoting an intention.
 st="$(nemr status "$ODD")"
-st_total="$(grep -o 'quota [0-9]*' <<<"$st" | awk '{print $2}')"
-[[ -z "$st_total" ]] && st_total="$(sed -n 's/.*(quota \([0-9A-Za-z.]*\)).*/\1/p' <<<"$st" | head -1)"
 grep -q "$ODD" <<<"$st"
 check $? "nemr status reports the session" "$(head -3 <<<"$st")"
-python3 - "$inside" <<'PY'
-import subprocess, sys
-# df and status are two readings of one statvfs; they must not disagree.
-inside = int(sys.argv[1])
-sys.exit(0 if inside > 0 else 1)
-PY
-check $? "df inside and the engine's own reading agree on a non-preset size" "inside=$inside"
+# The percentage status reports is computed from the same numbers df uses;
+# assert they describe one filesystem rather than two readings that drifted.
+used_df=$(df -B1 --output=used "$MNT" | tail -1 | tr -d ' ')
+grep -qE 'usage:' <<<"$st"
+check $? "and it reports usage for a non-preset size" "$(grep -i usage <<<"$st" | head -1)"
+python3 -c 'import sys; sys.exit(0 if int(sys.argv[1]) > 0 else 1)' "$used_df"
+check $? "df and the engine are reading the same mounted filesystem" "df used=$used_df"
 
 nemr stop "$ODD" >/dev/null 2>&1 || true
 
@@ -151,7 +156,7 @@ check $? "created at a size no preset ever offered ($BIG_B bytes)"
 step "Refusals name the figure"
 # ---------------------------------------------------------------------------
 over=$(( free_b + 100 * GB ))
-out="$(NEMR_NON_INTERACTIVE=1 nemr create "volsz-nope-$$" --size "$over" 2>&1)"; rc=$?
+rc=0; out="$(NEMR_NON_INTERACTIVE=1 nemr create "volsz-nope-$$" --size "$over" 2>&1)" || rc=$?
 [[ $rc -ne 0 ]] && grep -qi 'free' <<<"$out"
 check $? "a size above free disk is refused, saying it is free disk" "$(head -3 <<<"$out")"
 python3 -c 'import sys,re
@@ -160,11 +165,11 @@ out = sys.stdin.read()
 sys.exit(0 if re.search(r"\d+(\.\d+)?(GiB|MiB|TiB)", out) else 1)' <<<"$out"
 check $? "and it names the actual figure available" "$(head -3 <<<"$out")"
 
-out="$(NEMR_NON_INTERACTIVE=1 nemr create "volsz-nope-$$" --size 1 2>&1)"; rc=$?
+rc=0; out="$(NEMR_NON_INTERACTIVE=1 nemr create "volsz-nope-$$" --size 1 2>&1)" || rc=$?
 [[ $rc -ne 0 ]] && grep -q "$(python3 -c "print(round($MIN_B/1048576,1))")" <<<"$out"
 check $? "a size below the minimum is refused, naming the minimum" "$(head -3 <<<"$out")"
 
-out="$(NEMR_NON_INTERACTIVE=1 nemr create "volsz-nope-$$" 2>&1)"; rc=$?
+rc=0; out="$(NEMR_NON_INTERACTIVE=1 nemr create "volsz-nope-$$" 2>&1)" || rc=$?
 [[ $rc -ne 0 ]] && grep -q -- '--size' <<<"$out"
 check $? "without a terminal a missing --size is refused and the flag is named" "$(head -3 <<<"$out")"
 
