@@ -36,13 +36,15 @@
 #   NEMR_REGION_MIN_ROWS rows, the run falls back to append-only printing
 #   exactly as it did before there was a screen, and the log says why.
 #
-#   A RESIZE MID-RUN IS EXPLICITLY NOT SUPPORTED. The width is measured once,
-#   when the region opens, and the block keeps it for the whole run. Redrawing
-#   at a new width means rewriting rows already written at the old one, and a
-#   region that tears while a window is dragged is worse than one that keeps
-#   its shape. Resizing mid-run therefore leaves the live block at its original
-#   width — narrowing below it wraps those rows until the run ends. The result
-#   printed after the region is ordinary text and reflows like any other.
+#   A RESIZE MID-RUN IS HANDLED (SPEC 1.150). The width is measured when the
+#   screen opens, and again on SIGWINCH: the block is erased, the widths are
+#   re-fitted and it is redrawn at the new size. If the new window is under the
+#   thresholds above, the screen stops instead — erased, one line saying which
+#   size it has and which it needs, and the rest of the run printed plainly.
+#
+#   It used to be ruled out of scope, and the cost of that was a screen stacked
+#   twenty deep: every frame ends by moving the cursor up by the rows it wrote,
+#   and a terminal that has rewrapped those rows has moved them.
 #
 #   Pane content has a FIXED BUDGET and is truncated to the pane's inner width;
 #   the full text goes to the log. A column sized to whatever a step decides to
@@ -147,6 +149,7 @@ _nemr_region_fit() {   # <cols>
 _NEMR_REGION_RULE=""
 
 
+_NEMR_REGION_TOP=""     # the row the block starts on, when the terminal said
 _NEMR_EMOJI_ON=0        # icons go exactly when colour goes (decided at start)
 _NEMR_REGION_CYAN=""
 _NEMR_REGION_PID=""
@@ -201,12 +204,18 @@ _nemr_region_take_screen() {
     # answers; a captured pty does not, which is what the seam above is for.
     here="$(_nemr_cursor_row)" || return 0
     scroll=$((here - 2))
-    (( scroll <= 0 )) && return 0
+    if (( scroll <= 0 )); then
+        _NEMR_REGION_TOP="$here"                # already there; this is the row
+        return 0
+    fi
     (( scroll > rows )) && scroll=$rows
     printf '\033[%d;1H' "$rows"                # to the bottom row
     local i
     for (( i = 0; i < scroll; i++ )); do printf '\r\n'; done
     printf '\033[2;1H'                         # under the command line
+    # THE ROW THE BLOCK STARTS ON. Only the resize handler uses it, and only
+    # because relative movement cannot survive a reflow: see the comment there.
+    _NEMR_REGION_TOP=2
 }
 
 # The bar, in characters every font has.
@@ -345,12 +354,76 @@ _nemr_region_loop() {
 
     # shellcheck disable=SC2064
     trap 'if (( written > 0 )); then printf "\033[%dA\r\033[J" "$written"; else printf "\r\033[J"; fi; exit 0' TERM INT
+    # A RESIZE (SPEC 1.150). Noted here and acted on at the top of the next
+    # frame, where the block can be erased from its anchor and redrawn at the
+    # new size. It is only a flag because a trap that drew would draw into the
+    # middle of a half-written frame.
+    local winch=0
+    trap 'winch=1' WINCH
 
     exec 9<>"$_NEMR_REGION_STOP"
     _nemr_region_take_screen "$rows"
 
-    local reserved=0
+    local reserved=0 gave_up=""
     while :; do
+        # THE RESIZE, handled before anything is drawn.
+        #
+        # Why the block's anchor ROW and not cursor arithmetic: when a terminal
+        # narrows, the rows already on screen are rewrapped, so each of our
+        # full-width rows becomes two — and the `\033[<h-1>A` that ends every
+        # frame then lands half a block too low. That is the whole defect: the
+        # block walks down the screen, a copy per frame, twenty copies by the
+        # time the drag ends. No relative movement can be trusted across a
+        # reflow, and no arithmetic can be either, because terminals do not
+        # agree on whether they reflow at all. An absolute row does not care.
+        if (( winch )); then
+            winch=0
+            # ERASE FROM THE BLOCK'S OWN FIRST ROW.
+            #
+            # Not from the cursor. Between frames the cursor is *meant* to be
+            # on the block's first line, but a resize that lands while a frame
+            # is being written leaves it lower: the rows already on screen get
+            # rewrapped, so the `\033[<h-1>A` that ends the frame walks up
+            # through rows that are now taller and stops short. Measured under
+            # a drag: exactly the two widest rows had wrapped, the walk-back
+            # stopped two rows low, and erasing from there left those two rows
+            # — the title and the step line — above the redraw.
+            #
+            # The row the block starts on does not move: nothing above it is
+            # ever redrawn, and the block is the bottom of the screen's
+            # content. Where the terminal would not say what that row is, the
+            # cursor is the only handle there is, and it is right whenever the
+            # resize lands between frames — which is most of the time.
+            #
+            # Two ways to be wrong, so both are covered. If a frame was being
+            # written when the resize landed, the walk-back at its end stopped
+            # SHORT and the cursor is below the block's first row — then the
+            # recorded row is right. If the terminal scrolled its top away to
+            # make room for rewrapped lines, the block moved UP and the
+            # recorded row is too low — then the cursor is right, because it
+            # travelled with its own line. Whichever is higher on the screen is
+            # the one that covers the whole block, so ask, and take it.
+            local top="$_NEMR_REGION_TOP" here
+            here="$(_nemr_cursor_row)" || here=""
+            if [[ -n "$here" && "$here" =~ ^[0-9]+$ ]]; then
+                if [[ -z "$top" ]] || (( here < top )); then top="$here"; fi
+            fi
+            if [[ -n "$top" ]]; then
+                printf '\033[%d;1H\033[J' "$top"
+            else
+                printf '\r\033[J'
+            fi
+            written=0
+            reserved=0
+            size="$(nemr_term_size)" || size="24 80"
+            rows="${size% *}"; cols="${size#* }"
+            if (( cols < NEMR_REGION_MIN_COLS || rows < NEMR_REGION_MIN_ROWS )); then
+                gave_up="the window is now ${cols}x${rows}; this screen needs ${NEMR_REGION_MIN_COLS}x${NEMR_REGION_MIN_ROWS}"
+                break
+            fi
+            _nemr_region_fit "$cols"
+        fi
+
         local phrase="" done=0 total=1 icon="" line2
         if [[ -r "$_NEMR_REGION_STATE" ]]; then
             IFS=$'\t' read -r phrase done total icon < "$_NEMR_REGION_STATE"
@@ -378,21 +451,24 @@ _nemr_region_loop() {
 
         _nemr_region_pane_refresh
 
-        local r left right
+        local r left right frame_out="" gap
+        printf -v gap '%*s' "$NEMR_REGION_GAP" ""
         for (( r = 0; r < height; r++ )); do
             _nemr_region_left "$r" "$phrase" "$done" "$total" "$pane" "$icon"
             left="$_NEMR_LEFT_TEXT"
             right=""
             (( r < fr_h )) && right="${fr_rows[$((base + r))]}"
-            printf '\033[2K%s%*s%s' "$left" "$NEMR_REGION_GAP" "" "$right"
+            frame_out+=$'\033[2K'"${left}${gap}${right}"
             if (( r < height - 1 )); then
-                printf '\r\n'      # never a bare \n: a step can leave the tty raw
-                written=$((written + 1))
+                frame_out+=$'\r\n'   # never a bare \n: a step can leave the tty raw
             fi
         done
-
-        (( height > 1 )) && printf '\033[%dA' "$((height - 1))"
-        printf '\r'
+        (( height > 1 )) && frame_out+=$'\033['"$((height - 1))"'A'
+        frame_out+=$'\r'
+        # One write. A resize that lands between two halves of a drawn block
+        # reflows the half that is already there, and every relative move after
+        # it is then wrong by however much that half grew.
+        printf '%s' "$frame_out"
         written=0
         i=$((i + 1))
         if read -r -t "$NEMR_CAT_DELAY" -u 9 _; then
@@ -403,6 +479,16 @@ _nemr_region_loop() {
             break
         fi
     done
+
+    # Gave up on a resize: the block is already erased (from its anchor), so
+    # say why, once, and leave a flag the main shell reads before its next
+    # step — from here on the run prints one plain line per step, which is
+    # what it does on any terminal too small for a live screen.
+    if [[ -n "$gave_up" ]]; then
+        printf '  %s.\r\n' "$gave_up"
+        printf '  The rest of this run prints plainly.\r\n'
+        : >"${_NEMR_REGION_STATE}.off" 2>/dev/null || true
+    fi
 }
 
 nemr_region_start() {   # <state file> [<the current step's output file>]
@@ -436,6 +522,25 @@ nemr_region_start() {   # <state file> [<the current step's output file>]
     _nemr_region_loop &
     _NEMR_REGION_PID=$!
     exec 7<>"$_NEMR_REGION_STOP"
+    return 0
+}
+
+# Did the renderer stop by itself? It does that when the window is resized to
+# something it cannot draw in, or when it cannot know where it is drawn. The
+# main shell asks before every step and, once it is told, prints plainly for
+# the rest of the run rather than publishing to a file nobody is reading.
+nemr_region_gave_up() {
+    [[ -n "$_NEMR_REGION_STATE" && -e "${_NEMR_REGION_STATE}.off" ]] || return 1
+    rm -f "${_NEMR_REGION_STATE}.off" 2>/dev/null || true
+    if [[ -n "$_NEMR_REGION_PID" ]]; then
+        wait "$_NEMR_REGION_PID" 2>/dev/null || true
+        _NEMR_REGION_PID=""
+    fi
+    # The cursor is ours to give back whether or not the block is gone.
+    if [[ -n "$_NEMR_REGION_HID" ]]; then
+        printf '\033[?25h'
+        _NEMR_REGION_HID=""
+    fi
     return 0
 }
 

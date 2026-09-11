@@ -28,7 +28,7 @@ PASS=0; FAIL=0
 # Asserted, not merely printed: a run that skipped a case would otherwise say
 # PASS with fewer assertions — the green-over-nothing shape this project keeps
 # guarding against. Raise this when a case is added.
-EXPECTED_ASSERTIONS=141
+EXPECTED_ASSERTIONS=154
 
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS + 1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
@@ -690,8 +690,8 @@ narrow_log="$(ls -t "$STATE_DIR"/install-*.log | head -1)"
 grep -q 'live:      NO — 78 columns, the screen needs 79' "$narrow_log"
 check $? "78 columns: the region is refused by name and the run falls back to plain printing" \
     "$(grep -A2 'install screen' "$narrow_log" | tail -2)"
-grep -q 'resize:    not supported mid-run' "$narrow_log"
-check $? "the log states the resize policy rather than leaving it to be discovered"
+grep -q 'resize:    handled' "$narrow_log"
+check $? "the log states what happens on a resize rather than leaving it to be discovered"
 grep -qE '^  \[[#-]{18}\]' "$WORK/narrow.raw" && r=1 || r=0
 check $r "78 columns: no live block was drawn"
 
@@ -934,6 +934,100 @@ check $? "an exit inside a redirected block still prints the outcome to the real
     "stdout: $(head -c 120 "$WORK/redirected.out")"
 grep -q 'a step inside a redirect' "$WORK/log" && r=1 || r=0
 check $r "and it does NOT go into the file that block was writing to"
+
+# ---------------------------------------------------------------------------
+step "Resizing the window mid-run leaves ONE region, never a stack of them (F-36)"
+# ---------------------------------------------------------------------------
+# THE FINDING. Dragging the terminal's edge during a two-minute build stacked
+# the region down the screen — twenty copies of the step line, the bar, the
+# pane and the cat. Every frame ends by moving the cursor UP by the number of
+# rows it wrote, and a terminal that has rewrapped those rows has moved them,
+# so the next frame drew below the last instead of over it.
+#
+# The invariant, in the Product Owner's words: the region occupies exactly one
+# block on screen at all times, and anything it drew before is erased before
+# anything is drawn again.
+#
+# `resize_pty.py` is what makes this testable — `script(1)` gives a pty but
+# never resizes it. It opens one, makes it the child's controlling terminal so
+# SIGWINCH is really delivered, TRACKS THE SCREEN so the cursor-position query
+# is answered with the row the cursor is really on, and calls TIOCSWINSZ at the
+# given times. The truthful answer matters: with a canned one, code that
+# re-anchors itself on that query passes a test it should fail.
+#
+# Terminals disagree about what happens to lines that no longer fit, so every
+# claim is made under all three readings: `wrap` (rewrap, filling the blank
+# space below), `wrap-scroll` (rewrap, scrolling the top away instead — the
+# harsh reading, where a block can end up ABOVE where it was drawn), and
+# `truncate` (clip in place).
+resize_capture() {   # <out> <reflow> <dsr-row|-1> <at...>
+    local out="$1" model="$2" dsr="$3"; shift 3
+    local -a ats=()
+    local spec; for spec in "$@"; do ats+=(--at "$spec"); done
+    ./scripts/lib/resize_pty.py --out "$out" --cols 100 --rows 44 \
+        --reflow "$model" --dsr-row "$dsr" \
+        "${ats[@]}" -- env NEMR_TEST_STEP_STUB=1 ./scripts/install.sh --yes >/dev/null 2>&1
+}
+one_region() { python3 scripts/lib/region_single.py "$1" 100 44 --resizes "$1.resizes" --reflow "$2"; }
+# A DRAG: twelve resizes in four seconds, in and then out, which is what a
+# person actually does to a window. This is the case the fix is for.
+drag_ats=(); t=5
+for w in 98 96 94 92 90 88 90 94 98 102 106 110; do
+    drag_ats+=("$t:${w}x44"); t="$(awk -v t="$t" 'BEGIN{printf "%.2f", t+0.35}')"
+done
+
+for model in wrap wrap-scroll truncate; do
+    resize_capture "$WORK/drag-$model.raw" "$model" 0 "${drag_ats[@]}"
+    verdict="$(one_region "$WORK/drag-$model.raw" "$model")"
+    grep -q '^worst 1 region' <<<"$verdict"
+    check $? "dragged through twelve sizes ($model): one region on screen at every frame" \
+        "$(grep '^worst' <<<"$verdict")"
+done
+verdict="$(one_region "$WORK/drag-wrap.raw" wrap)"
+grep -q '^fitted yes' <<<"$verdict"
+check $? "and the block ends up drawn at the width now in force, not the old one" \
+    "$(grep -E '^widest|^fitted' <<<"$verdict")"
+
+# Three deliberate resizes: narrower, narrower again, then wider.
+resize_capture "$WORK/resize.raw" wrap 0 6:96x44 9:92x44 12:110x44
+for model in wrap truncate; do
+    verdict="$(one_region "$WORK/resize.raw" "$model")"
+    grep -q '^worst 1 region' <<<"$verdict"
+    check $? "narrower twice then wider ($model): one region at every frame" \
+        "$(grep '^worst' <<<"$verdict")"
+done
+grep -q '^fitted yes' <<<"$verdict"
+check $? "and it re-fitted to the last size it was given" "$(grep '^fitted' <<<"$verdict")"
+resize_screen="$(python3 scripts/lib/render_pty.py "$WORK/resize.raw" --cols 100 --rows 44 \
+    --resizes "$WORK/resize.raw.resizes" --reflow wrap)"
+grep -qE '(✓|OK) nemr is installed' <<<"$resize_screen"
+check $? "and the run still ends in its result block" "$(tail -3 <<<"$resize_screen")"
+
+# Resized to something too small to draw in: it stops, says so once, and the
+# rest of the run prints plainly — which is what a window under the minimum
+# has always got, now reached from the other direction.
+resize_capture "$WORK/toosmall.raw" wrap 0 6:70x44
+verdict="$(one_region "$WORK/toosmall.raw" wrap)"
+grep -q '^worst 1 region' <<<"$verdict"
+check $? "resized below the minimum: still one region, never two" "$(grep '^worst' <<<"$verdict")"
+LC_ALL=C grep -aq 'the window is now 70x44; this screen needs 79x18' "$WORK/toosmall.raw"
+check $? "and it says the size it has and the size it needs"
+small_screen="$(python3 scripts/lib/render_pty.py "$WORK/toosmall.raw" --cols 100 --rows 44 \
+    --resizes "$WORK/toosmall.raw.resizes" --reflow wrap)"
+grep -qE '(✓|OK) nemr is installed' <<<"$small_screen" && grep -q 'running the smoke test' <<<"$small_screen"
+check $? "and the rest of the run prints plainly, down to the result" "$(tail -4 <<<"$small_screen")"
+
+# A terminal that never answers the cursor query draws the block where it
+# stands. It has neither of the two handles the resize handler prefers, so it
+# falls back to erasing from the cursor — right whenever the resize lands
+# between frames, which is nearly always.
+resize_capture "$WORK/noanchor.raw" wrap -1 6:92x44 10:110x44
+verdict="$(one_region "$WORK/noanchor.raw" wrap)"
+grep -q '^worst 1 region' <<<"$verdict"
+check $? "a screen drawn in place (no cursor report) holds one region through a resize too" \
+    "$(grep '^worst' <<<"$verdict")"
+grep -q '^fitted yes' <<<"$verdict"
+check $? "and re-fits to the new width as well" "$(grep '^fitted' <<<"$verdict")"
 
 # ---------------------------------------------------------------------------
 printf '\n'

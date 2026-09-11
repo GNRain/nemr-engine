@@ -751,7 +751,7 @@ if steps_redirect_begin "$LOG"; then
     printf '    needs:     %s cols x %s rows\n' "$NEMR_REGION_MIN_COLS" "$NEMR_REGION_MIN_ROWS"
     printf '    fitted:    left %s + gap %s + cat %s (right edge)   pane inner %s\n' \
         "$NEMR_REGION_LEFT_COLS" "$NEMR_REGION_GAP" "$NEMR_REGION_CAT_COLS" "$_nemr_pane_inner"
-    printf '    resize:    not supported mid-run — the width is read once, at the start\n'
+    printf '    resize:    handled — re-fitted on SIGWINCH, or plainly if the window gets too small\n'
     printf '    icons:     %s  (%s cells each, counted not measured)\n' \
         "$_screen_icons" "$NEMR_REGION_ICON_CELLS"
     printf '    terminal:  TERM=%s  tty=%s  NO_COLOR=%s  NEMR_CAT=%s\n' \

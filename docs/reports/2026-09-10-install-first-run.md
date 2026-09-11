@@ -167,7 +167,10 @@ before there was a screen, and the log records the refusal by name:
     live:      NO — 78 columns, the screen needs 79
 ```
 
-**A resize mid-run is explicitly NOT supported.** The width is read once, when
+**A resize mid-run is explicitly NOT supported.** *(Superseded on 2026-09-11:
+the Product Owner revisited this ruling, and a resize is now handled — see
+`2026-09-11-install-resize.md`. The rest of this section stands as it was
+measured.)* The width is read once, when
 the region opens, and the block keeps it until the run ends. Redrawing at a new
 width means rewriting rows already written at the old one, and a region that
 tears while a window is dragged is worse than one that keeps its shape.

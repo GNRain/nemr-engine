@@ -41,6 +41,12 @@ _S_TOKENS=()
 # replaced — never a list that grows (the Product Owner, 2026-09-10).
 _s_republish() {
     (( _S_REGION )) || return 0
+    # The live screen can stop on its own — a window resized to something it
+    # cannot draw in. From then on this is an append-only run.
+    if nemr_region_gave_up 2>/dev/null; then
+        _S_REGION=0
+        return 0
+    fi
     local done=0 i
     for i in "${!_S_STATES[@]}"; do
         case "${_S_STATES[$i]}" in done|warn|fail) done=$((done + 1)) ;; esac
