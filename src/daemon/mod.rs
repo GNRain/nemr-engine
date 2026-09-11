@@ -87,6 +87,19 @@ fn status_from_typed(e: crate::error::Error) -> Status {
 }
 
 #[tonic::async_trait]
+/// A size from the wire, with empty meaning the default.
+///
+/// Empty is the page's "the user did not touch the slider" and the CLI never
+/// sends it. The default belongs here rather than in either caller: two
+/// callers filling in their own default is two defaults.
+fn parse_size(size: &str) -> Result<crate::engine::volume::VolumeSize, Status> {
+    if size.trim().is_empty() {
+        return Ok(crate::engine::volume::VolumeSize::DEFAULT);
+    }
+    size.parse::<crate::engine::volume::VolumeSize>()
+        .map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
 impl Nemr for NemrService {
     async fn handshake(
         &self,
@@ -124,10 +137,7 @@ impl Nemr for NemrService {
         request: Request<CreateRequest>,
     ) -> Result<Response<CreateResponse>, Status> {
         let req = request.into_inner();
-        let size = req
-            .size
-            .parse::<crate::engine::volume::VolumeSize>()
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let size = parse_size(&req.size)?;
         let agent = req
             .agent
             .parse::<crate::engine::agent::Agent>()
@@ -172,10 +182,7 @@ impl Nemr for NemrService {
                 git_dir_external: plan.git_dir_external,
             }));
         }
-        let size = req
-            .size
-            .parse::<crate::engine::volume::VolumeSize>()
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let size = parse_size(&req.size)?;
         let agent = req
             .agent
             .parse::<crate::engine::agent::Agent>()
