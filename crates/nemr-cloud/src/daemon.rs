@@ -76,6 +76,7 @@ impl DaemonEngine {
                 running: p.running,
                 usage_known: p.usage_known,
                 used_bytes: p.used_bytes,
+                quota_bytes: (p.quota_bytes > 0).then_some(p.quota_bytes),
                 credential_present,
             })
             .collect())

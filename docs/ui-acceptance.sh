@@ -45,10 +45,15 @@ PASS=0; FAIL=0
 # caller's environment the sync server stores in that bucket and the run
 # reads the bucket back independently (six more assertions); otherwise a
 # directory under the work dir.
+# 100 -> 107. SIX of those seven are SPEC 1.153's, added to the page-driving
+# half and to the picker control when the quota became a range — and never
+# counted, because that suite could not run until a protocol-3 helper was
+# installed. The seventh is 1.154's: the page references nothing off this
+# origin. This is the first run that could count any of them.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=104
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=111
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=100
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=107
 fi
 # The human arm (E-21) adds its own assertions when it runs.
 [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]] && EXPECTED_ASSERTIONS=$((EXPECTED_ASSERTIONS + 4))
@@ -240,6 +245,18 @@ for asset in /assets/xterm.js /assets/xterm.css /assets/addon-fit.js; do
     [[ "$code" == 200 ]] || die "the page's $asset was not served ($code)"
 done
 pass "the page and its terminal are served from the binary (no external resource)"
+# AND THE PAGE ASKS FOR NOTHING ELSE. Serving the three assets proves they are
+# there, not that the HTML wants only them — a stylesheet <link> to Google
+# Fonts would have sailed past the check above. SPEC 1.154 restyles this page
+# to a design whose prototype loads three families from fonts.googleapis.com,
+# so the claim is now asserted against the served HTML itself.
+page_html=$(curl -s "http://127.0.0.1:$UI_PORT/")
+# Anything with a scheme, or protocol-relative. A same-page "#" anchor and a
+# "/assets/..." path are this origin by construction; "https://..." is not.
+offsite=$(grep -oE '(src|href)="[^"]*"' <<<"$page_html" | grep -E '="([a-z]+:)?//' || true)
+[[ -z "$offsite" ]] || die "the page references something off this origin: $offsite"
+grep -qi 'fonts.googleapis.com\|fonts.gstatic.com\|@import' <<<"$page_html" && die "the page pulls a font from the network"
+pass "and the page itself references nothing off this origin (no webfont, no CDN)"
 
 step "Register through the browser (recovery code shown once, typed back)"
 COOKIE=""

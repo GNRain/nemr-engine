@@ -233,6 +233,11 @@ pub struct SessionRow {
     pub location: Where,
     pub running: bool,
     pub size_bytes: Option<i64>,
+    /// What the volume was ALLOCATED, against which `size_bytes` is the usage.
+    /// Local only: a session that is not on this machine has no volume here,
+    /// and quoting the quota it had somewhere else would be quoting a fact
+    /// about another machine.
+    pub quota_bytes: Option<i64>,
     pub updated_at_unix: Option<i64>,
     pub last_machine: Option<String>,
     pub has_bundle: bool,
@@ -289,6 +294,7 @@ pub fn merge_rows(remote: &[SessionEntry], local: Option<&[LocalProject]>) -> Ve
                     .map(|p| p.used_bytes as i64)
                     .or_else(|| r.and_then(|s| s.ciphertext_bytes))
                     .or_else(|| r.map(|s| s.size_bytes).filter(|n| *n > 0)),
+                quota_bytes: l.and_then(|p| p.quota_bytes).map(|b| b as i64),
                 updated_at_unix: r.map(|s| s.updated_at_unix),
                 last_machine: r.and_then(|s| s.last_machine.clone()),
                 has_bundle: r.is_some_and(|s| s.has_bundle),
@@ -889,6 +895,7 @@ mod tests {
             running,
             usage_known: true,
             used_bytes: 500,
+            quota_bytes: Some(2 * 1024 * 1024 * 1024),
             credential_present: None,
         }
     }
