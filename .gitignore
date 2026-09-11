@@ -2,3 +2,4 @@
 # deploy/nemr-volume/ is a separate crate with its own target/.
 target/
 **/*.rs.bk
+__pycache__/

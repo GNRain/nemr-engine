@@ -140,11 +140,24 @@ NEMR_CAT_DELAY="${NEMR_CAT_DELAY:-0.16}"
 # answer there, so an unset ioctl falls through to tput rather than to nothing.
 nemr_term_size() {
     local size rows cols
+    # The ioctl first, through the controlling terminal: it is the kernel's own
+    # record of the window, it is correct the instant after a resize, and it is
+    # right under `script(1)` too (there /dev/tty is script's pty).
     size="$(stty size 2>/dev/null </dev/tty)" || size="$(stty size 2>/dev/null)" || size=""
     rows="${size%% *}"; cols="${size##* }"
     if ! [[ "$rows" =~ ^[1-9][0-9]*$ && "$cols" =~ ^[1-9][0-9]*$ ]]; then
-        rows="$(tput lines 2>/dev/null || echo 0)"
-        cols="$(tput cols 2>/dev/null || echo 0)"
+        # tput, but ONLY where it can see a terminal. ncurses looks at stdout
+        # and then stderr; when NEITHER is a terminal it does not fail — it
+        # answers from the static terminfo entry, which for xterm-256color is
+        # 80x24. Measured on a 132x40 terminal with both redirected: it says
+        # 80x24, a plausible wrong answer that would draw the screen at the
+        # wrong width, or refuse a window that is plenty big. Better no answer.
+        if [[ -t 1 || -t 2 ]]; then
+            rows="$(tput lines 2>/dev/null || echo 0)"
+            cols="$(tput cols 2>/dev/null || echo 0)"
+        else
+            rows=0; cols=0
+        fi
     fi
     [[ "$rows" =~ ^[1-9][0-9]*$ && "$cols" =~ ^[1-9][0-9]*$ ]] || return 1
     printf '%s %s' "$rows" "$cols"
