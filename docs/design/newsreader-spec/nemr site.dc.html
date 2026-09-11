@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=IBM+Plex+Sans:wght@400;450;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  html, body { margin:0; padding:0; background:var(--paper); scroll-behavior:smooth; }
+  * { box-sizing:border-box; }
+  a { color:var(--eye); text-decoration:underline; text-underline-offset:3px; text-decoration-thickness:1px; }
+  a:hover { color:var(--eyeDeep); }
+  button, input { font:inherit; color:inherit; }
+  ::selection { background:var(--eyeTint); }
+  @keyframes caret { 0%,49% { opacity:1 } 50%,100% { opacity:0 } }
+  @keyframes lineIn { from { opacity:0 } to { opacity:1 } }
+  @keyframes riseIn { from { opacity:0; transform:translateY(10px) } to { opacity:1; transform:none } }
+  @media (prefers-reduced-motion: reduce) { * { animation:none !important } }
+</style>
+</helmet>
+
+<div style="{{ rootStyle }}">
+
+  <header style="position:sticky;top:0;z-index:20;background:var(--headerBg);backdrop-filter:blur(6px);border-bottom:1px solid var(--rule)">
+    <nav style="max-width:1120px;margin:0 auto;padding:14px 28px;display:flex;align-items:center;gap:22px;flex-wrap:wrap">
+      <button type="button" onClick="{{ goHome }}" aria-label="nemr home" style="display:flex;align-items:center;gap:9px;background:none;border:0;padding:0;cursor:pointer" style-focus="outline:2px solid var(--eye);outline-offset:3px">
+        <span style="display:flex;width:19px;height:19px;flex:none">
+          <span style="width:9px;background:var(--ink);border-radius:2px 0 0 2px"></span>
+          <span style="width:4px;background:var(--ink);opacity:.6"></span>
+          <span style="width:3px;background:var(--ink);opacity:.3"></span>
+          <span style="width:3px;background:var(--ink);opacity:.12"></span>
+        </span>
+        <span style="font-family:'Newsreader',Georgia,serif;font-size:21px;font-weight:500;letter-spacing:-.015em;color:var(--ink)">nemr</span>
+      </button>
+      <div style="flex:1;min-width:12px"></div>
+      <sc-for list="{{ navLinks }}" as="l" hint-placeholder-count="4">
+        <button type="button" onClick="{{ l.go }}" style="{{ l.style }}" style-focus="outline:2px solid var(--eye);outline-offset:3px">{{ l.label }}</button>
+      </sc-for>
+      <button type="button" onClick="{{ toggleTheme }}" aria-label="Switch colour theme" style="display:flex;align-items:center;gap:7px;padding:6px 11px;background:transparent;border:1px solid var(--rule2);border-radius:2px;font-size:12.5px;color:var(--coat);cursor:pointer" style-hover="background:var(--well)" style-focus="outline:2px solid var(--eye);outline-offset:3px">
+        <span style="{{ themeMarkStyle }}"></span>
+        <span>{{ themeLabel }}</span>
+      </button>
+      <button type="button" onClick="{{ goAccount }}" style="padding:7px 14px;background:var(--eye);color:var(--paper);border:1px solid var(--eye);border-radius:2px;font-size:13.5px;font-weight:500;cursor:pointer" style-hover="background:var(--eyeDeep);border-color:var(--eyeDeep)" style-focus="outline:2px solid var(--eye);outline-offset:3px">Create an account</button>
+    </nav>
+  </header>
+
+  <sc-if value="{{ isHome }}" hint-placeholder-val="{{ true }}">
+    <main>
+      <section ref="{{ setTrackRef }}" style="position:relative;height:820vh">
+        <div style="position:sticky;top:66px;height:calc(100vh - 66px);min-height:480px;display:flex;align-items:center;justify-content:center;overflow:hidden">
+          <div style="{{ stageScaleStyle }}">
+
+            <div style="{{ lineStyle }}"></div>
+
+            <div style="{{ desktopGroupStyle }}">
+              <div style="position:absolute;left:160px;top:70px;width:720px;height:484px;border-radius:18px;background:var(--metal);box-shadow:inset 0 1px 0 rgba(255,255,255,.45),inset 0 -1px 0 rgba(0,0,0,.10)"></div>
+              <div style="position:absolute;left:171px;top:81px;width:698px;height:424px;border-radius:9px;background:#0F1213"></div>
+              <div style="position:absolute;left:176px;top:86px;width:688px;height:414px;border-radius:6px;background:#1B1F20;overflow:hidden">
+                <div style="{{ desktopScreenStyle }}">
+                  <div style="display:flex;align-items:center;gap:12px;padding-bottom:12px;margin-bottom:14px;border-bottom:1px solid #2E3335">
+                    <span style="font-family:'Newsreader',Georgia,serif;font-size:17px;color:#F2F4F1">my-project</span>
+                    <span style="background:#38503A;color:#DCE7DC;font-size:11.5px;padding:2px 8px;border-radius:2px">Running</span>
+                  </div>
+                  <sc-for list="{{ desktopLines }}" as="line" hint-placeholder-count="0">
+                    <div style="{{ line.style }}">{{ line.text }}</div>
+                  </sc-for>
+                  <div style="display:flex;align-items:center;margin-top:8px"><span style="color:#8FAE8F">&gt;&nbsp;</span><span style="display:inline-block;width:8px;height:15px;background:#8FAE8F;animation:caret 1.1s steps(1) infinite"></span></div>
+                </div>
+              </div>
+              <div style="position:absolute;left:515px;top:527px;width:10px;height:10px;border-radius:50%;background:var(--metalEdge);opacity:.5"></div>
+              <div style="position:absolute;left:478px;top:554px;width:84px;height:64px;background:var(--metalEdge);border-radius:0 0 3px 3px"></div>
+              <div style="position:absolute;left:396px;top:614px;width:248px;height:12px;border-radius:6px;background:var(--metal);box-shadow:inset 0 1px 0 rgba(255,255,255,.4)"></div>
+              <div style="position:absolute;left:400px;top:624px;width:240px;height:4px;border-radius:0 0 6px 6px;background:var(--metalEdge)"></div>
+            </div>
+
+            <div style="{{ packetCardStyle }}">
+              <div style="font-family:'Newsreader',Georgia,serif;font-size:22px;letter-spacing:-.01em;color:var(--ink);margin-bottom:10px">my-project</div>
+              <div style="display:flex;gap:6px">
+                <span style="background:var(--eyeTint);color:var(--eyeDeep);font-size:12px;font-weight:500;padding:2px 9px;border-radius:2px">Saved</span>
+                <span style="background:var(--well);color:var(--coat);font-size:12px;padding:2px 9px;border-radius:2px">Locked with your password</span>
+              </div>
+              <div style="margin-top:14px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--soft)">41 messages, 512 MB</div>
+            </div>
+            <sc-for list="{{ packetSlices }}" as="s" hint-placeholder-count="0">
+              <div style="{{ s.style }}"></div>
+            </sc-for>
+
+            <div style="{{ laptopGroupStyle }}">
+              <div style="position:absolute;left:160px;top:90px;width:720px;height:450px;perspective:4200px;perspective-origin:50% 100%">
+                <div style="{{ lidStyle }}">
+                  <div style="position:absolute;inset:0;border-radius:16px 16px 4px 4px;background:var(--metal);transform:rotateX(180deg);backface-visibility:hidden;box-shadow:inset 0 -1px 0 rgba(255,255,255,.35)"></div>
+                  <div style="position:absolute;inset:0;border-radius:16px 16px 4px 4px;background:var(--metal);backface-visibility:hidden;box-shadow:inset 0 1px 0 rgba(255,255,255,.45),inset 0 -1px 0 rgba(0,0,0,.10)"></div>
+                  <div style="position:absolute;left:11px;right:11px;top:11px;bottom:12px;border-radius:9px;background:#0F1213;backface-visibility:hidden"></div>
+                  <div style="position:absolute;left:356px;top:16px;width:6px;height:6px;border-radius:50%;background:#2A2F31;backface-visibility:hidden"></div>
+                  <div style="position:absolute;left:17px;right:17px;top:28px;bottom:18px;border-radius:5px;background:#1B1F20;overflow:hidden;backface-visibility:hidden">
+                    <div style="{{ laptopScreenStyle }}">
+                      <div style="display:flex;align-items:center;gap:12px;padding-bottom:12px;margin-bottom:14px;border-bottom:1px solid #2E3335">
+                        <span style="font-family:'Newsreader',Georgia,serif;font-size:17px;color:#F2F4F1">my-project</span>
+                        <span style="background:#38503A;color:#DCE7DC;font-size:11.5px;padding:2px 8px;border-radius:2px">Running</span>
+                      </div>
+                      <div style="color:#8FAE8F">$ claude</div>
+                      <div style="color:#9AA09C">Reading the project — 212 files</div>
+                      <div style="color:#DCE0DD;margin-top:10px">● I've read the whole project. The retry logic lives in</div>
+                      <div style="color:#DCE0DD">&nbsp;&nbsp;three places. Want me to pull it into one?</div>
+                      <div style="color:#8FAE8F;margin-top:10px">&gt; yes, start with the streaming one</div>
+                      <div style="color:#DCE0DD;margin-top:10px">● Starting there. Two of the three call sites are</div>
+                      <div style="color:#DCE0DD">&nbsp;&nbsp;straightforward; the third needs a decision about —</div>
+                      <div style="display:flex;align-items:center;margin-top:10px"><span style="color:#8FAE8F">&gt;&nbsp;</span><span style="display:inline-block;width:8px;height:15px;background:#8FAE8F;animation:caret 1.1s steps(1) infinite"></span></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div style="position:absolute;left:130px;top:540px;width:780px;height:20px;border-radius:3px 3px 10px 10px;background:var(--metal);box-shadow:inset 0 1px 0 rgba(255,255,255,.45)"></div>
+              <div style="position:absolute;left:130px;top:556px;width:780px;height:5px;border-radius:0 0 10px 10px;background:var(--metalEdge)"></div>
+              <div style="position:absolute;left:478px;top:540px;width:84px;height:4px;border-radius:0 0 4px 4px;background:var(--metalEdge)"></div>
+              <div style="position:absolute;left:200px;top:561px;width:26px;height:4px;border-radius:0 0 2px 2px;background:#3A4043"></div>
+              <div style="position:absolute;left:814px;top:561px;width:26px;height:4px;border-radius:0 0 2px 2px;background:#3A4043"></div>
+            </div>
+
+            <div style="{{ headlineStyle }}">
+              <h1 style="margin:0 auto 16px;max-width:19ch;font-family:'Newsreader',Georgia,serif;font-size:50px;line-height:1.04;letter-spacing:-.026em;font-weight:500;text-wrap:balance">Your agent keeps its memory when you change machines</h1>
+              <p style="margin:0 auto 22px;max-width:46ch;font-size:17px;color:var(--coat);text-wrap:pretty">Close the laptop, sit down at another computer, pick up the same conversation. Nothing to explain again.</p>
+              <div style="display:flex;align-items:stretch;justify-content:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+                <code style="display:flex;align-items:center;background:var(--card);border:1px solid var(--rule2);border-radius:2px;padding:11px 14px;font-family:'IBM Plex Mono',monospace;font-size:14px;color:var(--ink)">curl -fsSL nemr.io/install | sh</code>
+                <button type="button" onClick="{{ copyInstall }}" style="padding:11px 15px;background:var(--eye);color:var(--paper);border:1px solid var(--eye);border-radius:2px;font-size:13.5px;font-weight:500;cursor:pointer" style-hover="background:var(--eyeDeep);border-color:var(--eyeDeep)" style-focus="outline:2px solid var(--eye);outline-offset:2px">{{ copyLabel }}</button>
+              </div>
+              <p style="margin:0;font-size:13px;color:var(--soft)">Free. No account needed to start.</p>
+            </div>
+
+            <div style="{{ captionStyle }}">
+              <div key="{{ captionKey }}" style="font-family:'Newsreader',Georgia,serif;font-size:25px;letter-spacing:-.015em;animation:lineIn 200ms ease-out both;text-wrap:balance">{{ caption }}</div>
+              <div style="{{ hintStyle }}">Scroll</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section style="border-top:1px solid var(--rule)">
+        <div style="max-width:1120px;margin:0 auto;padding:64px 28px">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:44px;align-items:start">
+            <h2 style="margin:0;font-family:'Newsreader',Georgia,serif;font-size:38px;line-height:1.12;letter-spacing:-.022em;font-weight:500;max-width:16ch;text-wrap:balance">What you lose when you switch computers</h2>
+            <div style="max-width:56ch">
+              <p style="margin:0 0 16px;font-size:16px;text-wrap:pretty">Most of what makes an AI assistant useful is what it has learned about your project. That lives in one conversation, on one computer.</p>
+              <p style="margin:0;font-size:16px;color:var(--coat);text-wrap:pretty">Move to another computer and you start over: same files, same explanations, same half hour. nemr moves the whole thing instead.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section style="border-top:1px solid var(--rule)">
+        <div style="max-width:1120px;margin:0 auto;padding:64px 28px">
+          <h2 style="margin:0 0 8px;font-family:'Newsreader',Georgia,serif;font-size:34px;letter-spacing:-.02em;font-weight:500">Three steps</h2>
+          <p style="margin:0 0 32px;font-size:15px;color:var(--coat);max-width:56ch">Start it somewhere, save it when you stop, open it wherever you are next.</p>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:16px">
+            <sc-for list="{{ steps }}" as="s" hint-placeholder-count="3">
+              <div style="border:1px solid var(--rule);background:var(--card);border-radius:3px;padding:20px">
+                <div style="font-family:'Newsreader',Georgia,serif;font-size:19px;margin-bottom:10px">{{ s.title }}</div>
+                <pre style="margin:0 0 12px;font-family:'IBM Plex Mono',monospace;font-size:13px;color:var(--ink);background:var(--well);border-radius:2px;padding:11px 12px;overflow:auto">{{ s.cmd }}</pre>
+                <p style="margin:0;font-size:13.5px;color:var(--coat);text-wrap:pretty">{{ s.body }}</p>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </section>
+
+      <section ref="{{ setTermRef }}" style="background:#1F2325;color:#DCE0DD">
+        <div style="max-width:1120px;margin:0 auto;padding:76px 28px">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:44px;align-items:start;margin-bottom:34px">
+            <h2 style="margin:0;font-family:'Newsreader',Georgia,serif;font-size:38px;line-height:1.12;letter-spacing:-.022em;font-weight:500;color:#F2F4F1;max-width:15ch;text-wrap:balance">It resumes mid-thought</h2>
+            <p style="margin:0;font-size:16px;color:#B9BEBA;max-width:54ch;text-wrap:pretty">This session was started on another computer. Nothing was re-explained — the assistant is answering the question it was already working on.</p>
+          </div>
+          <div style="border:1px solid #3A4043;border-radius:3px;background:#23272A;overflow:hidden">
+            <div style="display:flex;align-items:center;gap:12px;padding:11px 15px;border-bottom:1px solid #3A4043;background:#2E3335">
+              <span style="font-family:'Newsreader',Georgia,serif;font-size:16px;color:#F2F4F1">orbit-refactor</span>
+              <span style="background:#38503A;color:#DCE7DC;font-size:11.5px;padding:2px 8px;border-radius:2px">Running</span>
+              <span style="font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:#9AA09C">512 MB of 2 GB</span>
+            </div>
+            <div style="padding:18px 20px;min-height:300px;font-family:'IBM Plex Mono',monospace;font-size:13px;line-height:1.75">
+              <sc-for list="{{ termLines }}" as="line" hint-placeholder-count="12">
+                <div style="{{ line.style }}">{{ line.text }}</div>
+              </sc-for>
+              <div style="display:flex;align-items:center"><span style="color:#8FAE8F">&gt;&nbsp;</span><span style="display:inline-block;width:8px;height:15px;background:#8FAE8F;animation:caret 1.1s steps(1) infinite"></span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section style="border-bottom:1px solid var(--rule)">
+        <div style="max-width:1120px;margin:0 auto;padding:64px 28px">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:44px;align-items:start">
+            <div>
+              <h2 style="margin:0 0 12px;font-family:'Newsreader',Georgia,serif;font-size:34px;letter-spacing:-.02em;font-weight:500">Good to know</h2>
+              <p style="margin:0;font-size:15px;color:var(--coat);max-width:46ch;text-wrap:pretty">Four things people usually ask before they install it.</p>
+            </div>
+            <div style="border-top:1px solid var(--rule)">
+              <sc-for list="{{ stack }}" as="r" hint-placeholder-count="5">
+                <div style="display:grid;grid-template-columns:200px minmax(0,1fr);gap:20px;padding:13px 0;border-bottom:1px solid var(--rule)">
+                  <div style="font-size:14px;color:var(--ink)">{{ r.k }}</div>
+                  <div style="font-size:14px;color:var(--coat);text-wrap:pretty">{{ r.v }}</div>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div style="max-width:1120px;margin:0 auto;padding:64px 28px">
+          <h2 style="margin:0 0 8px;font-family:'Newsreader',Georgia,serif;font-size:34px;letter-spacing:-.02em;font-weight:500">Your work stays yours</h2>
+          <p style="margin:0 0 30px;font-size:15px;color:var(--coat);max-width:60ch">Three things worth knowing before you trust anyone with your work.</p>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(258px,1fr));gap:1px;background:var(--rule);border:1px solid var(--rule);border-radius:3px;overflow:hidden">
+            <sc-for list="{{ security }}" as="s" hint-placeholder-count="4">
+              <div style="background:var(--card);padding:22px 20px">
+                <div style="font-family:'Newsreader',Georgia,serif;font-size:19px;margin-bottom:8px;text-wrap:balance">{{ s.title }}</div>
+                <div style="font-size:13.5px;color:var(--coat);text-wrap:pretty">{{ s.body }}</div>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </section>
+
+      <section style="border-top:1px solid var(--rule)">
+        <div style="max-width:1120px;margin:0 auto;padding:64px 28px">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:44px;align-items:start">
+            <div>
+              <h2 style="margin:0 0 14px;font-family:'Newsreader',Georgia,serif;font-size:34px;letter-spacing:-.02em;font-weight:500">Open engine, paid cloud</h2>
+              <p style="margin:0 0 14px;font-size:15.5px;text-wrap:pretty">The part that runs on your computer is free and open, and stays that way. Everything one person needs across their own machines is in it.</p>
+              <p style="margin:0;font-size:15.5px;color:var(--coat);text-wrap:pretty">You pay only if you want us to keep your saved sessions for you.</p>
+            </div>
+            <div style="border:1px solid var(--rule);background:var(--card);border-radius:3px;padding:24px">
+              <div style="display:flex;align-items:baseline;justify-content:space-between;gap:14px;margin-bottom:16px">
+                <span style="font-family:'Newsreader',Georgia,serif;font-size:20px">Free</span>
+                <span style="font-family:'IBM Plex Mono',monospace;font-size:14px">$0</span>
+              </div>
+              <p style="margin:0 0 18px;font-size:13.5px;color:var(--coat)">The whole engine, unlimited local sessions, 2 GB of cloud storage and 3 synced sessions.</p>
+              <div style="display:flex;align-items:baseline;justify-content:space-between;gap:14px;margin-bottom:16px;padding-top:16px;border-top:1px solid var(--rule)">
+                <span style="font-family:'Newsreader',Georgia,serif;font-size:20px">Pro</span>
+                <span style="font-family:'IBM Plex Mono',monospace;font-size:14px">$8 / month</span>
+              </div>
+              <p style="margin:0 0 20px;font-size:13.5px;color:var(--coat)">50 GB of storage and unlimited synced sessions.</p>
+              <button type="button" onClick="{{ goPricing }}" style="padding:8px 14px;background:var(--card);border:1px solid var(--rule2);border-radius:2px;font-size:13.5px;cursor:pointer" style-hover="background:var(--well)" style-focus="outline:2px solid var(--eye);outline-offset:2px">See what is in each</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section style="border-top:1px solid var(--rule)">
+        <div style="max-width:1120px;margin:0 auto;padding:64px 28px 76px">
+          <h2 style="margin:0 0 20px;font-family:'Newsreader',Georgia,serif;font-size:40px;letter-spacing:-.022em;font-weight:500;max-width:20ch;text-wrap:balance">Install the engine and keep your sessions</h2>
+          <div style="display:flex;align-items:stretch;gap:8px;flex-wrap:wrap">
+            <code style="display:flex;align-items:center;background:var(--card);border:1px solid var(--rule2);border-radius:2px;padding:12px 15px;font-family:'IBM Plex Mono',monospace;font-size:14.5px">curl -fsSL nemr.io/install | sh</code>
+            <button type="button" onClick="{{ copyInstall }}" style="padding:12px 16px;background:var(--eye);color:var(--paper);border:1px solid var(--eye);border-radius:2px;font-size:13.5px;font-weight:500;cursor:pointer" style-hover="background:var(--eyeDeep);border-color:var(--eyeDeep)" style-focus="outline:2px solid var(--eye);outline-offset:2px">{{ copyLabel }}</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </sc-if>
+
+  <sc-if value="{{ isPricing }}" hint-placeholder-val="{{ false }}">
+    <main style="max-width:1120px;margin:0 auto;padding:64px 28px 80px">
+      <h1 style="margin:0 0 12px;font-family:'Newsreader',Georgia,serif;font-size:52px;letter-spacing:-.025em;font-weight:500;line-height:1.06;max-width:18ch;text-wrap:balance">The engine is free. Storage is not</h1>
+      <p style="margin:0 0 42px;font-size:16.5px;color:var(--coat);max-width:58ch;text-wrap:pretty">Everything that runs on your own machines costs nothing and will keep costing nothing. You pay when you want encrypted bundles kept somewhere other than the machine that made them.</p>
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin-bottom:16px">
+        <div style="border:1px solid var(--rule);background:var(--card);border-radius:3px;padding:26px">
+          <div style="font-family:'Newsreader',Georgia,serif;font-size:24px;margin-bottom:4px">Free</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:15px;color:var(--ink);margin-bottom:18px">$0</div>
+          <p style="margin:0 0 18px;font-size:14px;color:var(--coat)">For one developer keeping a few sessions in step across their own machines.</p>
+          <sc-for list="{{ freeRows }}" as="r" hint-placeholder-count="6">
+            <div style="display:flex;gap:10px;padding:7px 0;border-top:1px solid var(--well);font-size:13.5px"><span style="{{ r.mark }}"></span><span>{{ r.text }}</span></div>
+          </sc-for>
+          <button type="button" onClick="{{ copyInstall }}" style="width:100%;margin-top:20px;padding:10px;background:var(--card);border:1px solid var(--rule2);border-radius:2px;font-size:13.5px;cursor:pointer" style-hover="background:var(--well)" style-focus="outline:2px solid var(--eye);outline-offset:2px">{{ copyLabel }}</button>
+        </div>
+
+        <div style="border:1px solid var(--eye);background:var(--card);border-radius:3px;padding:26px">
+          <div style="font-family:'Newsreader',Georgia,serif;font-size:24px;margin-bottom:4px">Pro</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:15px;color:var(--ink);margin-bottom:18px">$8 / month</div>
+          <p style="margin:0 0 18px;font-size:14px;color:var(--coat)">For working across machines every day, with everything you own kept in sync.</p>
+          <sc-for list="{{ proRows }}" as="r" hint-placeholder-count="6">
+            <div style="display:flex;gap:10px;padding:7px 0;border-top:1px solid var(--well);font-size:13.5px"><span style="{{ r.mark }}"></span><span>{{ r.text }}</span></div>
+          </sc-for>
+          <button type="button" onClick="{{ goAccount }}" style="width:100%;margin-top:20px;padding:10px;background:var(--eye);color:var(--paper);border:1px solid var(--eye);border-radius:2px;font-size:13.5px;font-weight:500;cursor:pointer" style-hover="background:var(--eyeDeep);border-color:var(--eyeDeep)" style-focus="outline:2px solid var(--eye);outline-offset:2px">Create an account</button>
+        </div>
+      </div>
+
+      <div style="border:1px dashed var(--rule2);border-radius:3px;padding:22px 24px;display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px;align-items:center;margin-bottom:44px">
+        <div>
+          <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:6px">
+            <span style="font-family:'Newsreader',Georgia,serif;font-size:22px">Team</span>
+            <span style="font-size:12px;color:var(--ochre);background:var(--ochreSurf);border-radius:2px;padding:2px 8px">Not built yet</span>
+          </div>
+          <p style="margin:0;font-size:14px;color:var(--coat);max-width:52ch;text-wrap:pretty">Shared buckets, per-seat storage, and handing a session to a colleague with its history. Around $15 per seat when it exists. Nothing to buy today.</p>
+        </div>
+        <div style="justify-self:end">
+          <button type="button" onClick="{{ notifyTeam }}" style="padding:9px 15px;background:var(--card);border:1px solid var(--rule2);border-radius:2px;font-size:13.5px;cursor:pointer" style-hover="background:var(--well)" style-focus="outline:2px solid var(--eye);outline-offset:2px">{{ notifyLabel }}</button>
+        </div>
+      </div>
+
+      <h2 style="margin:0 0 16px;font-family:'Newsreader',Georgia,serif;font-size:26px;letter-spacing:-.018em;font-weight:500">Questions people actually ask</h2>
+      <div style="border-top:1px solid var(--rule)">
+        <sc-for list="{{ faq }}" as="f" hint-placeholder-count="5">
+          <div style="display:grid;grid-template-columns:minmax(0,260px) minmax(0,1fr);gap:24px;padding:16px 0;border-bottom:1px solid var(--rule)">
+            <div style="font-size:14.5px;color:var(--ink);text-wrap:pretty">{{ f.q }}</div>
+            <div style="font-size:14.5px;color:var(--coat);text-wrap:pretty">{{ f.a }}</div>
+          </div>
+        </sc-for>
+      </div>
+    </main>
+  </sc-if>
+
+  <sc-if value="{{ isAbout }}" hint-placeholder-val="{{ false }}">
+    <main style="max-width:1120px;margin:0 auto;padding:64px 28px 80px">
+      <h1 style="margin:0 0 12px;font-family:'Newsreader',Georgia,serif;font-size:52px;letter-spacing:-.025em;font-weight:500;line-height:1.06;max-width:16ch;text-wrap:balance">About</h1>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:52px;align-items:start;max-width:960px">
+        <div>
+          <p style="margin:0 0 16px;font-size:16.5px;text-wrap:pretty">nemr is a container engine for AI coding sessions. It started because the same problem kept happening: a long, productive session with an agent on one machine, and nothing to do about it when the work had to move.</p>
+          <p style="margin:0 0 16px;font-size:16px;color:var(--coat);text-wrap:pretty">It is built in Rust on containerd and runc, rootless, with no Docker in the stack. The engine is MIT licensed. The cloud storage and sync layer is the commercial side, and it is what pays for the engine to keep being free.</p>
+          <p style="margin:0;font-size:16px;color:var(--coat);text-wrap:pretty">It is a small project. There is no team page because there is not yet a team.</p>
+        </div>
+        <div style="border-left:1px solid var(--rule);padding-left:28px">
+          <h2 style="margin:0 0 12px;font-family:'Newsreader',Georgia,serif;font-size:22px;font-weight:500">The name</h2>
+          <p style="margin:0 0 14px;font-size:15px;text-wrap:pretty">Nemr was my cat. He was a Nebelung — a blue-grey breed whose name comes from <span style="font-style:italic">Nebel</span>, the German for mist, for the way the silver tips of the coat sit over the grey.</p>
+          <p style="margin:0 0 14px;font-size:15px;color:var(--coat);text-wrap:pretty">He died. The project is named after him, and the two colours it is built from are his coat and his eyes. That is the whole of it — there is no metaphor being stretched here, and nothing about the software is a tribute.</p>
+          <p style="margin:0;font-size:15px;color:var(--coat);text-wrap:pretty">The mark going from solid to mist is the one place it shows, and it is there because it is also what the product does.</p>
+          <div style="display:flex;gap:20px;margin-top:22px;align-items:center">
+            <div style="display:flex;width:44px;height:44px;flex:none">
+              <div style="width:20px;background:var(--coat);border-radius:5px 0 0 5px"></div>
+              <div style="width:8px;background:var(--coat);opacity:.6"></div>
+              <div style="width:7px;background:var(--coat);opacity:.32"></div>
+              <div style="width:9px;background:var(--coat);opacity:.12"></div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <span style="width:22px;height:22px;border-radius:3px;background:var(--coat)"></span>
+              <span style="width:22px;height:22px;border-radius:3px;background:var(--eye)"></span>
+              <span style="font-size:12.5px;color:var(--soft)">coat and eyes</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+  </sc-if>
+
+  <sc-if value="{{ isDoc }}" hint-placeholder-val="{{ false }}">
+    <main style="max-width:1120px;margin:0 auto;padding:56px 28px 80px">
+      <h1 style="margin:0 0 12px;font-family:'Newsreader',Georgia,serif;font-size:46px;letter-spacing:-.024em;font-weight:500;line-height:1.08;max-width:16em">{{ doc.title }}</h1>
+      <p style="margin:0 0 44px;font-size:16.5px;color:var(--coat);max-width:58ch;text-wrap:pretty">{{ doc.intro }}</p>
+      <sc-for list="{{ doc.sections }}" as="sec" hint-placeholder-count="4">
+        <section style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:36px;align-items:start;padding:26px 0;border-top:1px solid var(--rule)">
+          <h2 style="margin:0;font-family:'Newsreader',Georgia,serif;font-size:24px;letter-spacing:-.018em;font-weight:500;max-width:14em">{{ sec.h }}</h2>
+          <div style="min-width:0;max-width:60ch">
+            <sc-for list="{{ sec.paras }}" as="p" hint-placeholder-count="2">
+              <p style="margin:0 0 14px;font-size:15px;color:var(--coat);text-wrap:pretty">{{ p }}</p>
+            </sc-for>
+            <sc-if value="{{ sec.code }}" hint-placeholder-val="{{ false }}">
+              <pre style="margin:2px 0 14px;font-family:'IBM Plex Mono',monospace;font-size:13px;color:var(--ink);background:var(--well);border:1px solid var(--rule);border-radius:2px;padding:13px 14px;overflow:auto">{{ sec.code }}</pre>
+            </sc-if>
+            <sc-for list="{{ sec.rows }}" as="r" hint-placeholder-count="0">
+              <div style="display:grid;grid-template-columns:minmax(0,190px) minmax(0,1fr);gap:16px;padding:9px 0;border-bottom:1px solid var(--rule)">
+                <span style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--ink)">{{ r.k }}</span>
+                <span style="font-size:13.5px;color:var(--coat);text-wrap:pretty">{{ r.v }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </section>
+      </sc-for>
+    </main>
+  </sc-if>
+
+  <sc-if value="{{ isNotFound }}" hint-placeholder-val="{{ false }}">
+    <main style="max-width:1120px;margin:0 auto;padding:110px 28px 140px">
+      <div style="display:flex;gap:10px;margin-bottom:26px">
+        <sc-for list="{{ lostSlices }}" as="s" hint-placeholder-count="5">
+          <div style="{{ s.style }}"></div>
+        </sc-for>
+      </div>
+      <h1 style="margin:0 0 14px;font-family:'Newsreader',Georgia,serif;font-size:46px;letter-spacing:-.024em;font-weight:500;max-width:18ch">This page is not here</h1>
+      <p style="margin:0 0 26px;font-size:16px;color:var(--coat);max-width:48ch;text-wrap:pretty">Nothing is wrong with your sessions. The address is wrong, or the page moved.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button type="button" onClick="{{ goHome }}" style="padding:9px 15px;background:var(--eye);color:var(--paper);border:1px solid var(--eye);border-radius:2px;font-size:13.5px;font-weight:500;cursor:pointer" style-hover="background:var(--eyeDeep);border-color:var(--eyeDeep)" style-focus="outline:2px solid var(--eye);outline-offset:2px">Home</button>
+        <button type="button" onClick="{{ goDocs }}" style="padding:9px 15px;background:var(--card);border:1px solid var(--rule2);border-radius:2px;font-size:13.5px;cursor:pointer" style-hover="background:var(--well)" style-focus="outline:2px solid var(--eye);outline-offset:2px">Docs</button>
+      </div>
+    </main>
+  </sc-if>
+
+  <footer style="border-top:1px solid var(--rule);background:var(--card)">
+    <div style="max-width:1120px;margin:0 auto;padding:44px 28px 34px">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:32px;margin-bottom:34px">
+        <div>
+          <div style="display:flex;align-items:center;gap:9px;margin-bottom:12px">
+            <span style="display:flex;width:17px;height:17px;flex:none">
+              <span style="width:8px;background:var(--ink);border-radius:2px 0 0 2px"></span>
+              <span style="width:4px;background:var(--ink);opacity:.6"></span>
+              <span style="width:3px;background:var(--ink);opacity:.3"></span>
+              <span style="width:2px;background:var(--ink);opacity:.12"></span>
+            </span>
+            <span style="font-family:'Newsreader',Georgia,serif;font-size:19px;font-weight:500;letter-spacing:-.015em">nemr</span>
+          </div>
+          <p style="margin:0;font-size:13px;color:var(--soft);max-width:30ch">Portable coding sessions. Engine MIT licensed, version 0.4.1.</p>
+        </div>
+        <sc-for list="{{ footerCols }}" as="col" hint-placeholder-count="3">
+          <div>
+            <div style="font-size:13px;color:var(--ink);margin-bottom:10px">{{ col.title }}</div>
+            <sc-for list="{{ col.links }}" as="fl" hint-placeholder-count="4">
+              <div style="padding:3px 0"><button type="button" onClick="{{ fl.go }}" style="background:none;border:0;padding:0;font-size:13px;color:var(--coat);text-decoration:underline;text-underline-offset:3px;cursor:pointer" style-hover="color:var(--ink)" style-focus="outline:2px solid var(--eye);outline-offset:2px">{{ fl.label }}</button></div>
+            </sc-for>
+          </div>
+        </sc-for>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center;padding-top:18px;border-top:1px solid var(--rule);font-size:12.5px;color:var(--soft)">
+        <span>Engine: open source, MIT.</span>
+        <span>Cloud storage and sync: commercial.</span>
+        <span>Team features: not built yet.</span>
+        <div style="flex:1"></div>
+        <button type="button" onClick="{{ go404 }}" style="background:none;border:0;padding:0;font-size:12.5px;color:var(--soft);text-decoration:underline;text-underline-offset:3px;cursor:pointer" style-focus="outline:2px solid var(--eye);outline-offset:2px">404</button>
+      </div>
+    </div>
+  </footer>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1200,&quot;height&quot;:900}}">
+class Component extends DCLogic {
+  state = { page: 'home', carryKey: 1, copied: false, notified: false, termShown: 0, dark: false };
+
+  themes = {
+    light: {
+      paper: '#F4F5F3', card: '#FBFCFB', well: '#EDEFEC', rule: '#E4E7E4', rule2: '#CFD4D0',
+      ink: '#2A2D2E', coat: '#5E6265', soft: '#676C6A', mute: '#8D9291',
+      eye: '#567057', eyeDeep: '#3D523E', eyeTint: '#E8EEE7',
+      ochre: '#7A6229', ochreSurf: '#F2ECDC',
+      headerBg: 'rgba(244,245,243,.92)', mist: 'rgba(94,98,101,',
+      metal: '#C3C8C5', metalEdge: '#A2A8A4'
+    },
+    dark: {
+      paper: '#191C1D', card: '#212527', well: '#262A2C', rule: '#31373A', rule2: '#3E4548',
+      ink: '#EDEFEC', coat: '#B9BEBA', soft: '#9AA09C', mute: '#767C79',
+      eye: '#8FAE8F', eyeDeep: '#A6C4A6', eyeTint: '#28352A',
+      ochre: '#C6AE73', ochreSurf: '#33301F',
+      headerBg: 'rgba(25,28,29,.92)', mist: 'rgba(185,190,186,',
+      metal: '#6B7173', metalEdge: '#565C5E'
+    }
+  };
+
+  componentDidMount() {
+    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduced) { this.setState({ reduced: true, p: 0.76, scale: Math.min(1, (window.innerWidth - 40) / 1040, (window.innerHeight - 70 - 32) / 720) }); return; }
+    this.lastTop = null;
+    this.update = () => {
+      const el = this.trackEl;
+      const navH = (document.querySelector('header') || { offsetHeight: 66 }).offsetHeight;
+      const scale = Math.min(1, (window.innerWidth - 40) / 1040, (window.innerHeight - navH - 32) / 720);
+      let p = this.state.p || 0;
+      if (el) {
+        const r = el.getBoundingClientRect();
+        const span = Math.max(1, r.height - window.innerHeight);
+        const sp = Math.min(1, Math.max(0, -r.top / span));
+        this.lastTop = r.top;
+        p = sp;
+      }
+      if (Math.abs(p - (this.state.p || 0)) > 0.002 || Math.abs(scale - (this.state.scale || 1)) > 0.002) this.setState({ p: p, scale: scale });
+    };
+    const tick = () => { this.raf = requestAnimationFrame(tick); this.update(); };
+    this.raf = requestAnimationFrame(tick);
+    window.addEventListener('scroll', this.update, { passive: true });
+    window.addEventListener('resize', this.update);
+  }
+  componentWillUnmount() {
+    if (this.raf) cancelAnimationFrame(this.raf);
+    window.removeEventListener('scroll', this.update);
+    window.removeEventListener('resize', this.update);
+  }
+
+
+  nav(page) {
+    this.setState({ page: page, carryKey: this.state.carryKey + 1 });
+    window.scrollTo(0, 0);
+  }
+
+  renderVals() {
+    const page = this.state.page;
+    const p = this.state.p || 0;
+    const cl = x => Math.min(1, Math.max(0, x));
+    const ease = x => x * x * (3 - 2 * x);
+    const closeP = cl((p - 0.06) / 0.16), emergeP = cl((p - 0.22) / 0.10), vanishP = cl((p - 0.32) / 0.08);
+    const travelP = cl((p - 0.42) / 0.30), riseP = cl((p - 0.68) / 0.12), landP = cl((p - 0.80) / 0.05);
+    const lineP = cl((p - 0.84) / 0.08), shrinkP = cl((p - 0.92) / 0.04), finalP = cl((p - 0.96) / 0.04);
+    const packW = 240, packH = 132, packX = 400, yStart = 122, yEnd = 432;
+    const packY = travelP > 0 ? yStart + (yEnd - yStart) * ease(travelP) : 452 + (yStart - 452) * ease(emergeP);
+    const cardOp = emergeP > 0 ? (1 - cl(travelP * 3)) * (1 - landP) : 0;
+    const sliceN = 8, sh = packH / sliceN;
+    const packetSlices = [];
+    if (travelP > 0 && landP < 1) {
+      for (let i = 0; i < sliceN; i++) {
+        const pi = cl(travelP * 1.35 - i * 0.045);
+        const y = yStart + (yEnd - yStart) * ease(pi) + i * sh;
+        const arc = Math.sin(Math.PI * pi);
+        const op = cl(travelP * 3) * (1 - 0.82 * arc) * (1 - landP);
+        packetSlices.push({ style: 'position:absolute;left:' + packX + 'px;top:' + y + 'px;width:' + packW + 'px;height:' + (sh + 0.6) + 'px;background:var(--coat);opacity:' + op + ';'
+          + (i === 0 ? 'border-radius:6px 6px 0 0;' : i === sliceN - 1 ? 'border-radius:0 0 6px 6px;' : '') });
+      }
+    }
+    const deskLinesAll = [
+      { t: '41 messages restored', c: '#9AA09C' },
+      { t: '\u00a0', c: '' },
+      { t: '\u2022 Picking up where we stopped \u2014 the third call site.', c: '#DCE0DD' },
+      { t: '\u00a0\u00a0Partial responses make retries unsafe there unless we', c: '#DCE0DD' },
+      { t: '\u00a0\u00a0buffer first. I\u2019d buffer. Shall I?', c: '#DCE0DD' }
+    ];
+    const desktopLines = deskLinesAll.slice(0, Math.round(lineP * deskLinesAll.length)).map(l => ({ text: l.t, style: 'color:' + (l.c || '#DCE0DD') + ';' }));
+    const captions = p < 0.06 ? ['You are working on your laptop.', 0]
+      : p < 0.22 ? ['Close it. The session is saved and locked with your password.', 1]
+      : p < 0.42 ? ['The session leaves the laptop.', 2]
+      : p < 0.80 ? ['It travels as scrambled data. Nobody in between can read it.', 3]
+      : ['Your desktop wakes up. Same conversation, still mid-sentence.', 4];
+
+    const allLines = [
+      { t: '$ nemr pull orbit-refactor', c: '#8FAE8F' },
+      { t: 'Downloading bundle  512 MB', c: '#9AA09C' },
+      { t: 'Decrypting locally  done', c: '#9AA09C' },
+      { t: 'Session restored    41 messages', c: '#9AA09C' },
+      { t: '', c: '' },
+      { t: '$ nemr open orbit-refactor', c: '#8FAE8F' },
+      { t: '', c: '' },
+      { t: '● Picking up where we stopped: I was extracting the retry policy', c: '#DCE0DD' },
+      { t: '  out of client.rs. Two of the three call sites are converted.', c: '#DCE0DD' },
+      { t: '', c: '' },
+      { t: '  Read src/net/streaming.rs (412 lines)', c: '#9AA09C' },
+      { t: '  Edited src/net/retry.rs (+64 -12)', c: '#9AA09C' },
+      { t: '  cargo test net::  41 passed, 0 failed', c: '#8FAE8F' },
+      { t: '', c: '' },
+      { t: '● The third call site is in the streaming path. Partial responses', c: '#DCE0DD' },
+      { t: '  make retries unsafe there unless we buffer. Which do you want?', c: '#DCE0DD' }
+    ];
+    const termLines = allLines.map((l, i) => ({
+      text: l.t === '' ? '\u00a0' : l.t,
+      style: 'color:' + (l.c || '#DCE0DD') + ';animation:lineIn 160ms ease-out ' + (i * 42) + 'ms both;'
+    }));
+
+    const link = (label, go, active) => ({
+      label: label, go: go,
+      style: 'background:none;border:0;padding:4px 2px;cursor:pointer;font-size:14px;color:' + (active ? 'var(--ink)' : 'var(--coat)') + ';'
+        + (active ? 'box-shadow:inset 0 -1px 0 var(--eye);' : '')
+    });
+
+    const tick = 'display:inline-block;width:7px;height:7px;border-radius:1px;background:var(--eye);margin-top:7px;flex:none;';
+    const dash = 'display:inline-block;width:7px;height:1px;background:var(--mute);margin-top:10px;flex:none;';
+
+    const t = this.themes[this.state.dark ? 'dark' : 'light'];
+    const rootStyle = Object.keys(t).map(k => '--' + k + ':' + t[k] + ';').join('')
+      + 'background-color:var(--paper);background-image:repeating-linear-gradient(0deg,' + t.mist + '.022) 0 1px,' + t.mist + '0) 1px 3px),repeating-linear-gradient(90deg,' + t.mist + '.018) 0 1px,' + t.mist + '0) 1px 4px);'
+      + 'color:var(--ink);font-family:\'IBM Plex Sans\',system-ui,sans-serif;font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased;';
+
+    const docs = {
+      docs: {
+        title: 'Docs', intro: 'Everything the engine does from a shell. If a page here disagrees with nemr --help, the binary is right.',
+        sections: [
+          { h: 'Install', paras: ['One script, Linux and macOS, no account. It drops a single binary in /usr/local/bin and nothing else on your system.'], code: 'curl -fsSL nemr.io/install | sh\nnemr --version' },
+          { h: 'The commands you will use', paras: [], rows: [
+            { k: 'nemr new NAME', v: 'Create a session. Takes --agent and --size. Size is fixed at creation.' },
+            { k: 'nemr ls', v: 'List sessions with state, disk and where the bytes are.' },
+            { k: 'nemr open NAME', v: 'Attach a terminal to a running session, starting it if stopped.' },
+            { k: 'nemr push NAME', v: 'Snapshot, encrypt locally, upload the bundle.' },
+            { k: 'nemr pull NAME', v: 'Download and decrypt onto this machine. Takes --take-lock.' },
+            { k: 'nemr rm NAME', v: 'Remove from this machine only. Refuses without --force if there is no cloud copy.' },
+            { k: 'nemr web', v: 'Serve the local interface on 127.0.0.1:7801.' }
+          ] },
+          { h: 'Sizes', paras: ['A session gets a fixed volume at creation: 500 MB, 1 GB, 2 GB or 5 GB. It cannot be resized later, because the snapshot format records the volume geometry. To grow, create a new session and copy the work across.'] },
+          { h: 'Your own storage', paras: ['Point the engine at any S3-compatible endpoint and it will never talk to nemr.io. Bundles are encrypted the same way; the endpoint only ever sees ciphertext.'], code: 'nemr remote add mine \\\n  --endpoint https://s3.example.com \\\n  --bucket nemr-sessions\nnemr push orbit-refactor --remote mine' },
+          { h: 'Locks', paras: ['One machine holds a session at a time. If another machine has it, a pull will refuse and name the holder. Passing --take-lock claims it; the other machine keeps its files but loses the right to push.'] }
+        ]
+      },
+      security: {
+        title: 'Security', intro: 'What is encrypted, what is stored, and what happens if you lose the key. Written to be checked against the source, not to be reassuring.',
+        sections: [
+          { h: 'Encryption', paras: ['Bundles are sealed on your machine before upload. The key is derived from your password with Argon2id and never leaves the device. The storage layer holds ciphertext and a session id, and can read neither the conversation nor the files.'] },
+          { h: 'Recovery', paras: ['A one-time recovery code is generated at registration and shown once. It is the only path back if you forget your password. There is no escrow, no support-side reset, and no other copy of it. Lose both and the bundles are unreadable — by you and by us equally.'] },
+          { h: 'Credentials', paras: ['API keys and tokens living inside a session stay on the machine that runs it. They are excluded from the snapshot, so pulling a session onto a second machine does not carry them across. You provide them again on that machine, once.'] },
+          { h: 'Locks and concurrency', paras: ['A session is held by one machine at a time. Taking the lock is explicit and the previous holder is told it lost it on its next contact. Two machines never write to the same session, so there is no merge and no silent overwrite.'] },
+          { h: 'Reporting something', paras: ['Send it to security@nemr.io before filing publicly. Anything affecting bundle confidentiality gets a same-week response and a public write-up once it is fixed.'] }
+        ]
+      },
+      install: {
+        title: 'Install', intro: 'One binary. No daemon, no root, nothing running in the background when you are not using it.',
+        sections: [
+          { h: 'Linux and macOS', paras: ['The script detects your platform, downloads the matching binary and verifies its checksum before moving it into place.'], code: 'curl -fsSL nemr.io/install | sh' },
+          { h: 'Verify it yourself', paras: ['If piping a script into a shell makes you uncomfortable — it should — download and check it first.'], code: 'curl -fsSLO nemr.io/dl/nemr-0.4.1-x86_64-linux\ncurl -fsSLO nemr.io/dl/nemr-0.4.1-x86_64-linux.sha256\nsha256sum -c nemr-0.4.1-x86_64-linux.sha256' },
+          { h: 'Requirements', paras: [], rows: [
+            { k: 'Linux', v: 'Kernel 5.11 or newer, cgroups v2, user namespaces enabled.' },
+            { k: 'macOS', v: '13 or newer on Apple silicon or Intel. Containers run in a managed lightweight VM.' },
+            { k: 'Windows', v: 'Not supported yet. WSL2 works but is not tested against.' }
+          ] },
+          { h: 'Uninstall', paras: ['Removes the binary and leaves your sessions alone. Delete the state directory as a second, deliberate step.'], code: 'nemr uninstall\nrm -rf ~/.local/share/nemr' }
+        ]
+      },
+      changelog: {
+        title: 'Changelog', intro: 'Engine releases. Cloud changes ship continuously and are noted here only when they change the CLI.',
+        sections: [
+          { h: '0.4.1', paras: ['Pull refuses more clearly when another machine holds the lock, and names it. Fixed a case where a failed decrypt left a partial volume on disk.'] },
+          { h: '0.4.0', paras: ['Local web interface at nemr web, served from the binary. Push reports its stage instead of a percentage-only bar. Recovery codes are now confirmed at registration rather than shown and forgotten.'] },
+          { h: '0.3.2', paras: ['Rootless by default on Linux. Removed the last privileged helper. Sessions created before this release keep working.'] },
+          { h: '0.3.0', paras: ['S3-compatible remotes. Fixed volume sizes at creation, replacing the growable volumes that made snapshots unpredictable.'] }
+        ]
+      },
+      licence: {
+        title: 'Licence', intro: 'The engine is MIT. The hosted side is not open, and this page says exactly where the line is.',
+        sections: [
+          { h: 'MIT, and staying MIT', paras: ['The engine — the container runtime, the snapshot format, the encryption, the CLI and the local web interface — is MIT licensed. Fork it, ship it inside something else, run it forever without an account. Relicensing it later is not a lever available to us: the released versions stay MIT regardless of what happens to the company.'] },
+          { h: 'What is not open', paras: ['The cloud storage service, the sync coordinator and the lock service are closed. They are also replaceable: the engine speaks to any S3-compatible endpoint, so nothing about the open part depends on the closed part.'] },
+          { h: 'The bundle format', paras: ['The snapshot and encryption format is documented and part of the open engine. Anything nemr can read, a tool you write can read, with your key.'] }
+        ]
+      },
+      contact: {
+        title: 'Contact', intro: 'Three addresses and one issue tracker. There is no support portal and no chat widget.',
+        sections: [
+          { h: 'Bugs and features', paras: ['File an issue on GitHub. That is where the work happens and where you will get the fastest answer.'], rows: [{ k: 'github.com/nemr/engine', v: 'Issues, discussions, pull requests.' }] },
+          { h: 'Security', paras: ['Anything touching bundle confidentiality goes here first, not to the issue tracker.'], rows: [{ k: 'security@nemr.io', v: 'Disclosure. Same-week response.' }] },
+          { h: 'Accounts and billing', paras: ['Storage, invoices, deleting your account and everything in it.'], rows: [{ k: 'accounts@nemr.io', v: 'Replies within two working days.' }] },
+          { h: 'Anything else', paras: ['Questions about the project, the licence, or whether it fits what you are doing.'], rows: [{ k: 'hello@nemr.io', v: 'Read by a person, answered when there is something useful to say.' }] }
+        ]
+      }
+    };
+
+    const docKeys = ['docs', 'security', 'install', 'changelog', 'licence', 'contact'];
+
+    return {
+      rootStyle: rootStyle,
+      toggleTheme: () => this.setState(s => ({ dark: !s.dark })),
+      themeLabel: this.state.dark ? 'Light' : 'Dark',
+      themeMarkStyle: 'display:inline-block;width:11px;height:11px;border-radius:2px;'
+        + (this.state.dark ? 'background:var(--coat);' : 'background:var(--ink);'),
+      isDoc: docKeys.indexOf(page) >= 0,
+      doc: docs[page] || docs.docs,
+      isHome: page === 'home', isPricing: page === 'pricing', isAbout: page === 'about', isNotFound: page === 'notfound',
+      goHome: () => this.nav('home'),
+      goPricing: () => this.nav('pricing'),
+      goAccount: () => this.nav('pricing'),
+      goDocs: () => this.nav('docs'),
+      go404: () => this.nav('notfound'),
+      navLinks: [
+        link('Home', () => this.nav('home'), page === 'home'),
+        link('Pricing', () => this.nav('pricing'), page === 'pricing'),
+        link('About', () => this.nav('about'), page === 'about'),
+        link('Docs', () => this.nav('docs'), page === 'docs'),
+        link('Security', () => this.nav('security'), page === 'security')
+      ],
+
+      setTrackRef: el => { this.trackEl = el; },
+      stageScaleStyle: 'position:relative;width:1040px;height:720px;flex:none;transform:scale(' + (this.state.scale || 1) + ');transform-origin:center center;',
+      lineStyle: 'position:absolute;left:519px;top:120px;width:2px;height:470px;background:var(--rule2);transform-origin:top;transform:scaleY(' + ease(travelP) + ');opacity:' + (cl(travelP * 4) * (1 - landP)) + ';',
+      laptopGroupStyle: 'position:absolute;inset:0;transform-origin:520px 560px;transform:translateY(' + (vanishP * 46) + 'px) scale(' + (1 - 0.04 * vanishP) + ');opacity:' + (1 - vanishP) + ';' + (vanishP >= 1 ? 'visibility:hidden;' : ''),
+      lidStyle: 'position:absolute;left:0;top:0;width:720px;height:450px;transform-style:preserve-3d;transform-origin:bottom center;transform:rotateX(' + (-92 * closeP) + 'deg);',
+      laptopScreenStyle: 'padding:20px 24px;font-family:"IBM Plex Mono",monospace;font-size:14px;line-height:1.7;opacity:' + (1 - cl(closeP / 0.45)) + ';',
+      desktopGroupStyle: 'position:absolute;inset:0;transform-origin:520px 70px;transform:translateY(' + ((1 - ease(riseP)) * 440) + 'px) scale(' + (1 - 0.38 * ease(shrinkP)) + ');opacity:' + riseP + ';' + (riseP <= 0 ? 'visibility:hidden;' : ''),
+      desktopScreenStyle: 'padding:20px 24px;font-family:"IBM Plex Mono",monospace;font-size:14px;line-height:1.7;opacity:' + landP + ';',
+      desktopLines: desktopLines,
+      packetCardStyle: 'position:absolute;left:' + packX + 'px;top:' + packY + 'px;width:' + packW + 'px;height:' + packH + 'px;background:var(--card);border:1px solid var(--rule2);border-radius:6px;padding:18px 20px;opacity:' + cardOp + ';' + (cardOp <= 0 ? 'visibility:hidden;' : ''),
+      packetSlices: packetSlices,
+      headlineStyle: 'position:absolute;left:0;right:0;top:474px;text-align:center;padding:0 40px;opacity:' + finalP + ';transform:translateY(' + ((1 - finalP) * 24) + 'px);' + (finalP < 0.5 ? 'pointer-events:none;' : ''),
+      captionStyle: 'position:absolute;left:0;right:0;top:648px;text-align:center;padding:0 40px;opacity:' + (1 - cl(shrinkP * 3)) + ';',
+      caption: captions[0],
+      captionKey: captions[1],
+      hintStyle: 'margin-top:8px;font-size:12.5px;color:var(--soft);opacity:' + (1 - cl(p * 14)) + ';',
+
+      copyLabel: this.state.copied ? 'Copied' : 'Copy',
+      copyInstall: () => { this.setState({ copied: true }); setTimeout(() => this.setState({ copied: false }), 1600); },
+      notifyLabel: this.state.notified ? 'On the list' : 'Tell me when it ships',
+      notifyTeam: () => this.setState({ notified: true }),
+
+      setTermRef: el => { this.termEl = el; },
+      termLines: termLines,
+
+      steps: [
+        { title: 'Start a session', cmd: 'nemr new my-project', body: 'Your assistant gets its own private workspace on this computer.' },
+        { title: 'Save it when you stop', cmd: 'nemr push my-project', body: 'The whole conversation is locked with your password and stored.' },
+        { title: 'Open it anywhere', cmd: 'nemr pull my-project', body: 'Same conversation, same files, on whatever computer you are at.' }
+      ],
+
+      stack: [
+        { k: 'It runs on your computer', v: 'Your files stay where they are. Nothing is sent anywhere to be processed.' },
+        { k: 'Nothing to set up', v: 'One small program. No Docker, no admin rights, nothing running in the background.' },
+        { k: 'Private to you', v: 'There is no public library of other people\u2019s sessions, and there never will be.' },
+        { k: 'Free part is open', v: 'Anyone can read the code that runs on your machine. It is MIT licensed.' }
+      ],
+
+      security: [
+        { title: 'Locked before it leaves', body: 'Your work is scrambled on your own computer, with your password. We only ever hold the scrambled version.' },
+        { title: 'We cannot open it', body: 'Only you hold the key. Keep the recovery code you get when you sign up — without it, a lost password means lost work, for us too.' },
+        { title: 'Open in one place at a time', body: 'A session is only live on one computer. Pick it up somewhere else and the first one is told it handed over.' }
+      ],
+
+      freeRows: [
+        { text: 'The whole engine, forever', mark: tick },
+        { text: 'Unlimited local sessions', mark: tick },
+        { text: 'Unlimited machines', mark: tick },
+        { text: '2 GB of cloud storage', mark: tick },
+        { text: '3 sessions synced at a time', mark: tick },
+        { text: 'Shared team buckets', mark: dash }
+      ],
+      proRows: [
+        { text: 'The whole engine, forever', mark: tick },
+        { text: 'Unlimited local sessions', mark: tick },
+        { text: 'Unlimited machines', mark: tick },
+        { text: '50 GB of cloud storage', mark: tick },
+        { text: 'Unlimited synced sessions', mark: tick },
+        { text: 'Shared team buckets', mark: dash }
+      ],
+
+      faq: [
+        { q: 'What happens to my sessions if I stop paying?', a: 'Local sessions keep working — they are on your machine and the engine is free. Cloud bundles over the free limit stay readable for 30 days so you can pull them down, then they are deleted.' },
+        { q: 'Can I use my own storage instead?', a: 'Yes. The engine takes an S3-compatible endpoint. That path is free and always will be; you are then paying your storage provider instead of us.' },
+        { q: 'What counts as a synced session?', a: 'One session with a bundle in the cloud. Local sessions are never counted, on any tier.' },
+        { q: 'Is the free tier going to shrink?', a: 'The engine will not. Storage limits are a business decision and could change for new accounts, but not retroactively for an existing one.' },
+        { q: 'When is Team?', a: 'No date. It needs shared buckets and a permission model, and neither is built. The strip above is a signal of intent, not a roadmap commitment.' }
+      ],
+
+      lostSlices: [1, 0.55, 0.32, 0.16, 0.07].map((o, i) => ({
+        style: 'width:' + (34 - i * 4) + 'px;height:34px;background:var(--coat);opacity:' + o + ';' + (i === 0 ? 'border-radius:4px 0 0 4px;' : '')
+      })),
+
+      footerCols: [
+        { title: 'Project', links: [
+          { label: 'Docs', go: () => this.nav('docs') },
+          { label: 'Changelog', go: () => this.nav('changelog') },
+          { label: 'MIT licence', go: () => this.nav('licence') }
+        ] },
+        { title: 'Product', links: [
+          { label: 'Pricing', go: () => this.nav('pricing') },
+          { label: 'Security', go: () => this.nav('security') },
+          { label: 'Install', go: () => this.nav('install') }
+        ] },
+        { title: 'More', links: [
+          { label: 'About', go: () => this.nav('about') },
+          { label: 'Contact', go: () => this.nav('contact') }
+        ] }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

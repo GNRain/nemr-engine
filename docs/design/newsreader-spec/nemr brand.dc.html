@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=IBM+Plex+Sans:wght@400;450;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  html, body { margin:0; padding:0; background:#F4F5F3; }
+  * { box-sizing:border-box; }
+  a { color:#567057; text-decoration:underline; text-underline-offset:2px; }
+  a:hover { color:#3D523E; }
+  input, button, select { font:inherit; color:inherit; }
+  @keyframes carry {
+    0%   { transform:translateX(0) translateY(0); opacity:1 }
+    18%  { transform:translateX(0) translateY(-3px); opacity:.18 }
+    52%  { transform:translateX(370px) translateY(-3px); opacity:.18 }
+    76%  { transform:translateX(370px) translateY(0); opacity:1 }
+    100% { transform:translateX(370px) translateY(0); opacity:1 }
+  }
+  @keyframes arrive { 0%,60% { opacity:0 } 100% { opacity:1 } }
+  @keyframes departLeave { 0%,14% { opacity:1 } 30%,100% { opacity:0 } }
+  @keyframes caret { 0%,49% { opacity:1 } 50%,100% { opacity:0 } }
+</style>
+</helmet>
+
+<div style="min-height:100vh;background-color:#F4F5F3;background-image:repeating-linear-gradient(0deg,rgba(94,98,101,.022) 0 1px,rgba(94,98,101,0) 1px 3px),repeating-linear-gradient(90deg,rgba(94,98,101,.018) 0 1px,rgba(94,98,101,0) 1px 4px);color:#2A2D2E;font-family:'IBM Plex Sans',system-ui,sans-serif;font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased">
+  <div style="max-width:1080px;margin:0 auto;padding:56px 32px 96px">
+
+    <div style="display:flex;align-items:baseline;gap:14px;margin-bottom:8px">
+      <span style="display:inline-flex;align-items:baseline;gap:5px">
+        <span style="font-family:'Newsreader',Georgia,serif;font-size:26px;font-weight:500;letter-spacing:-.015em">nemr</span>
+        <span style="display:inline-block;width:8px;height:17px;background:#567057;animation:caret 1s steps(1) 3"></span>
+      </span>
+      <span style="font-size:12.5px;color:#676C6A">Brand sheet — marks, type, palette, motion signature</span>
+    </div>
+    <h1 style="margin:0 0 10px;font-family:'Newsreader',Georgia,serif;font-size:44px;font-weight:500;letter-spacing:-.02em;line-height:1.1;max-width:20ch">Something leaves one machine intact and arrives at another</h1>
+    <p style="margin:0 0 52px;max-width:62ch;font-size:15px;color:#5E6265;text-wrap:pretty">That sentence is the brand. The mark, the motion and the copy all say it, and nothing on the site says anything else. Three mark candidates below — pick one and the rest of the identity follows from it.</p>
+
+    <h2 style="margin:0 0 4px;font-family:'Newsreader',Georgia,serif;font-size:22px;font-weight:500">Marks</h2>
+    <p style="margin:0 0 20px;font-size:13.5px;color:#5E6265;max-width:62ch">Each drawn from squares and hairlines only, so it survives one colour, 16 px, and a terminal. Shown at 120 px, 32 px and 16 px on the ground it will actually sit on.</p>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin-bottom:20px">
+
+      <div style="border:1px solid #E4E7E4;background:#FBFCFB;border-radius:3px;padding:22px">
+        <div style="display:flex;align-items:baseline;gap:9px;margin-bottom:18px">
+          <span style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#567057">A</span>
+          <span style="font-family:'Newsreader',Georgia,serif;font-size:17px">The prompt</span>
+        </div>
+        <div style="display:flex;align-items:flex-end;gap:18px;margin-bottom:18px">
+          <div style="position:relative;width:120px;height:120px;border-radius:14px;background:#5E6265;flex:none">
+            <div style="position:absolute;left:26px;top:44px;width:15px;height:32px;background:#8FAE8F"></div>
+            <div style="position:absolute;left:50px;top:70px;width:44px;height:6px;background:#9AA09C"></div>
+          </div>
+          <div style="position:relative;width:32px;height:32px;border-radius:4px;background:#5E6265;flex:none">
+            <div style="position:absolute;left:7px;top:12px;width:4px;height:9px;background:#8FAE8F"></div>
+            <div style="position:absolute;left:13px;top:19px;width:12px;height:2px;background:#9AA09C"></div>
+          </div>
+          <div style="position:relative;width:16px;height:16px;border-radius:2px;background:#5E6265;flex:none">
+            <div style="position:absolute;left:3.5px;top:5px;width:2.5px;height:6px;background:#8FAE8F"></div>
+            <div style="position:absolute;left:8px;top:9px;width:5px;height:2px;background:#9AA09C"></div>
+          </div>
+        </div>
+        <p style="margin:0;font-size:12.5px;color:#5E6265;text-wrap:pretty">A container holding a live prompt. Most legible of the three at 16 px, most terminal-native, least about mist. ASCII form is a single character.</p>
+      </div>
+
+      <div style="border:1px solid #E4E7E4;background:#FBFCFB;border-radius:3px;padding:22px">
+        <div style="display:flex;align-items:baseline;gap:9px;margin-bottom:18px">
+          <span style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#567057">B</span>
+          <span style="font-family:'Newsreader',Georgia,serif;font-size:17px">The dissolve</span>
+        </div>
+        <div style="display:flex;align-items:flex-end;gap:18px;margin-bottom:18px">
+          <div style="display:flex;align-items:stretch;gap:0;width:120px;height:120px;flex:none">
+            <div style="width:54px;background:#5E6265;border-radius:14px 0 0 14px"></div>
+            <div style="width:16px;background:#5E6265;opacity:.62"></div>
+            <div style="width:14px;background:#5E6265;opacity:.36"></div>
+            <div style="width:12px;background:#5E6265;opacity:.18"></div>
+            <div style="width:10px;background:#5E6265;opacity:.08"></div>
+          </div>
+          <div style="display:flex;width:32px;height:32px;flex:none">
+            <div style="width:15px;background:#5E6265;border-radius:4px 0 0 4px"></div>
+            <div style="width:5px;background:#5E6265;opacity:.6"></div>
+            <div style="width:5px;background:#5E6265;opacity:.32"></div>
+            <div style="width:7px;background:#5E6265;opacity:.13"></div>
+          </div>
+          <div style="display:flex;width:16px;height:16px;flex:none">
+            <div style="width:8px;background:#5E6265;border-radius:2px 0 0 2px"></div>
+            <div style="width:3px;background:#5E6265;opacity:.55"></div>
+            <div style="width:5px;background:#5E6265;opacity:.22"></div>
+          </div>
+        </div>
+        <p style="margin:0;font-size:12.5px;color:#5E6265;text-wrap:pretty">A solid block going to mist — the breed's name and the product's behaviour in one shape. The most conceptual, and it holds at 16 px because the steps are only three.</p>
+      </div>
+
+      <div style="border:1px solid #E4E7E4;background:#FBFCFB;border-radius:3px;padding:22px">
+        <div style="display:flex;align-items:baseline;gap:9px;margin-bottom:18px">
+          <span style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#567057">C</span>
+          <span style="font-family:'Newsreader',Georgia,serif;font-size:17px">Here and there</span>
+        </div>
+        <div style="display:flex;align-items:flex-end;gap:18px;margin-bottom:18px">
+          <div style="position:relative;width:120px;height:120px;flex:none">
+            <div style="position:absolute;left:0;top:14px;width:74px;height:74px;border-radius:10px;background:#5E6265"></div>
+            <div style="position:absolute;left:46px;top:32px;width:74px;height:74px;border-radius:10px;border:5px solid #5E6265;background:#F4F5F3"></div>
+            <div style="position:absolute;left:70px;top:56px;width:26px;height:26px;border-radius:3px;background:#567057"></div>
+          </div>
+          <div style="position:relative;width:32px;height:32px;flex:none">
+            <div style="position:absolute;left:0;top:4px;width:20px;height:20px;border-radius:3px;background:#5E6265"></div>
+            <div style="position:absolute;left:12px;top:9px;width:20px;height:20px;border-radius:3px;border:2px solid #5E6265;background:#FBFCFB"></div>
+            <div style="position:absolute;left:18px;top:15px;width:8px;height:8px;border-radius:1px;background:#567057"></div>
+          </div>
+          <div style="position:relative;width:16px;height:16px;flex:none">
+            <div style="position:absolute;left:0;top:2px;width:10px;height:10px;border-radius:2px;background:#5E6265"></div>
+            <div style="position:absolute;left:6px;top:5px;width:10px;height:10px;border-radius:2px;border:1.5px solid #5E6265;background:#FBFCFB"></div>
+            <div style="position:absolute;left:9px;top:8px;width:4px;height:4px;background:#567057"></div>
+          </div>
+        </div>
+        <p style="margin:0;font-size:12.5px;color:#5E6265;text-wrap:pretty">Two machines holding one session, the green marking which one is live. Reads fastest as a product idea, but it is the busiest at favicon size.</p>
+      </div>
+    </div>
+
+    <div style="border:1px solid #E4E7E4;background:#FBFCFB;border-radius:3px;padding:22px;margin-bottom:52px">
+      <div style="font-size:11.5px;color:#676C6A;margin-bottom:14px">Lockups, one colour, and the terminal variant — shown with B</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:22px;align-items:center">
+        <div style="display:flex;align-items:center;gap:11px">
+          <div style="display:flex;width:26px;height:26px;flex:none">
+            <div style="width:12px;background:#2A2D2E;border-radius:3px 0 0 3px"></div>
+            <div style="width:5px;background:#2A2D2E;opacity:.6"></div>
+            <div style="width:4px;background:#2A2D2E;opacity:.3"></div>
+            <div style="width:5px;background:#2A2D2E;opacity:.12"></div>
+          </div>
+          <span style="font-family:'Newsreader',Georgia,serif;font-size:27px;font-weight:500;letter-spacing:-.015em">nemr</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:9px;background:#2A2D2E;padding:12px 14px;border-radius:3px">
+          <div style="display:flex;width:20px;height:20px;flex:none">
+            <div style="width:9px;background:#F4F5F3;border-radius:2px 0 0 2px"></div>
+            <div style="width:4px;background:#F4F5F3;opacity:.6"></div>
+            <div style="width:3px;background:#F4F5F3;opacity:.3"></div>
+            <div style="width:4px;background:#F4F5F3;opacity:.12"></div>
+          </div>
+          <span style="font-family:'Newsreader',Georgia,serif;font-size:21px;font-weight:500;color:#F4F5F3;letter-spacing:-.015em">nemr</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:11px">
+          <div style="display:flex;width:15px;height:15px;flex:none">
+            <div style="width:7px;background:#5E6265;border-radius:2px 0 0 2px"></div>
+            <div style="width:3px;background:#5E6265;opacity:.6"></div>
+            <div style="width:5px;background:#5E6265;opacity:.25"></div>
+          </div>
+          <span style="font-family:'Newsreader',Georgia,serif;font-size:15px;font-weight:500">nemr</span>
+          <span style="font-size:11.5px;color:#8D9291">at 15 px</span>
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:#2A2D2E;background:#EDEFEC;border:1px solid #E4E7E4;border-radius:2px;padding:10px 12px;white-space:pre">▛▚  nemr 0.4.1</div>
+      </div>
+    </div>
+
+    <h2 style="margin:0 0 4px;font-family:'Newsreader',Georgia,serif;font-size:22px;font-weight:500">Motion signature</h2>
+    <p style="margin:0 0 16px;font-size:13.5px;color:#5E6265;max-width:62ch">One movement, used everywhere: the carry. A session goes to mist on one machine, travels as mist, and re-forms whole on another. It is the hero, it is the push in the product, it is the favicon animation, and it is the only ornament the brand owns.</p>
+    <div style="display:flex;gap:10px;margin-bottom:16px">
+      <button type="button" onClick="{{ runCarry }}" style="padding:8px 14px;background:#567057;color:#F4F5F3;border:1px solid #567057;border-radius:2px;font-size:13px;font-weight:500;cursor:pointer" style-hover="background:#3D523E;border-color:#3D523E" style-focus="outline:2px solid #567057;outline-offset:2px">Run the carry</button>
+      <button type="button" onClick="{{ toggleReduced }}" style="{{ reducedBtnStyle }}" style-focus="outline:2px solid #567057;outline-offset:2px">{{ reducedLabel }}</button>
+    </div>
+
+    <div style="border:1px solid #E4E7E4;background:#FBFCFB;border-radius:3px;padding:34px 30px;margin-bottom:12px;overflow:hidden">
+      <div style="position:relative;height:150px;max-width:520px;margin:0 auto">
+        <div style="position:absolute;left:0;top:24px;width:150px;height:104px;border:1px solid #CFD4D0;border-radius:3px;background:#F4F5F3"></div>
+        <div style="position:absolute;left:0;top:134px;width:150px;text-align:center;font-size:11.5px;color:#676C6A">desktop</div>
+        <div style="position:absolute;right:0;top:24px;width:150px;height:104px;border:1px solid #CFD4D0;border-radius:3px;background:#F4F5F3"></div>
+        <div style="position:absolute;right:0;top:134px;width:150px;text-align:center;font-size:11.5px;color:#676C6A">laptop</div>
+        <div style="position:absolute;left:158px;right:158px;top:76px;border-top:1px dashed #CFD4D0"></div>
+
+        <div key="{{ carryKey }}" style="position:absolute;left:19px;top:44px;width:112px;height:64px">
+          <sc-for list="{{ slices }}" as="slice" hint-placeholder-count="8">
+            <div style="{{ slice.style }}"></div>
+          </sc-for>
+          <div style="{{ labelDepart }}">orbit-refactor</div>
+          <div style="{{ labelArrive }}">orbit-refactor</div>
+        </div>
+      </div>
+    </div>
+    <p style="margin:0 0 52px;font-size:12.5px;color:#676C6A;max-width:66ch">Eight slices, each delayed 26 ms behind the last, 1.6 s end to end. Transform and opacity only. With reduced motion the same frame is drawn statically: the card whole on the left, its mist trail crossing the gap, the card whole on the right — one image that states the idea without moving.</p>
+
+    <h2 style="margin:0 0 4px;font-family:'Newsreader',Georgia,serif;font-size:22px;font-weight:500">Palette, extended</h2>
+    <p style="margin:0 0 16px;font-size:13.5px;color:#5E6265;max-width:62ch">The product's tokens, plus a deep ground and a guard-hair silver so the site can carry one dark section. Everything is coat or eye moved in lightness. No new hue enters the story.</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:52px">
+      <sc-for list="{{ palette }}" as="c" hint-placeholder-count="10">
+        <div style="border:1px solid #E4E7E4;border-radius:3px;overflow:hidden;background:#FBFCFB">
+          <div style="{{ c.chip }}"></div>
+          <div style="padding:9px 11px">
+            <div style="font-size:12.5px;color:#2A2D2E">{{ c.name }}</div>
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:#676C6A">{{ c.hex }}</div>
+            <div style="font-size:11.5px;color:#676C6A;margin-top:3px">{{ c.use }}</div>
+          </div>
+        </div>
+      </sc-for>
+    </div>
+
+    <h2 style="margin:0 0 4px;font-family:'Newsreader',Georgia,serif;font-size:22px;font-weight:500">Type</h2>
+    <p style="margin:0 0 16px;font-size:13.5px;color:#5E6265;max-width:62ch">Same three faces as the product, given more range. Newsreader gets to be large here — its optical size axis means the display cuts sharpen as they grow rather than just scaling up.</p>
+    <div style="border:1px solid #E4E7E4;background:#FBFCFB;border-radius:3px;overflow:hidden;margin-bottom:52px">
+      <sc-for list="{{ typeScale }}" as="t" hint-placeholder-count="7">
+        <div style="display:grid;grid-template-columns:minmax(0,1fr) 210px;gap:20px;align-items:baseline;padding:14px 18px;border-bottom:1px solid #EDEFEC">
+          <div style="{{ t.sample }}">{{ t.text }}</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:#676C6A">{{ t.spec }}</div>
+        </div>
+      </sc-for>
+    </div>
+
+    <h2 style="margin:0 0 4px;font-family:'Newsreader',Georgia,serif;font-size:22px;font-weight:500">Social card</h2>
+    <p style="margin:0 0 16px;font-size:13.5px;color:#5E6265;max-width:62ch">1200 × 630, shown at half size. Deep ground, the mark, one sentence, the install line. No screenshot — the sentence does more work in a timeline than a shrunk dashboard does.</p>
+    <div style="width:600px;max-width:100%;height:315px;background:#1F2325;border-radius:4px;padding:44px 46px;display:flex;flex-direction:column;justify-content:space-between;margin-bottom:52px">
+      <div style="display:flex;align-items:center;gap:11px">
+        <div style="display:flex;width:24px;height:24px;flex:none">
+          <div style="width:11px;background:#F4F5F3;border-radius:3px 0 0 3px"></div>
+          <div style="width:5px;background:#F4F5F3;opacity:.6"></div>
+          <div style="width:4px;background:#F4F5F3;opacity:.3"></div>
+          <div style="width:4px;background:#F4F5F3;opacity:.12"></div>
+        </div>
+        <span style="font-family:'Newsreader',Georgia,serif;font-size:23px;font-weight:500;color:#F4F5F3;letter-spacing:-.015em">nemr</span>
+      </div>
+      <div>
+        <div style="font-family:'Newsreader',Georgia,serif;font-size:34px;line-height:1.15;color:#F4F5F3;letter-spacing:-.02em;max-width:19ch;text-wrap:pretty">Your coding agent keeps its memory when you change machines</div>
+      </div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:#8FAE8F">curl -fsSL nemr.io/install | sh</div>
+    </div>
+
+    <h2 style="margin:0 0 12px;font-family:'Newsreader',Georgia,serif;font-size:22px;font-weight:500">Favicon in place</h2>
+    <div style="max-width:420px;border:1px solid #CFD4D0;border-radius:6px 6px 0 0;overflow:hidden;background:#EDEFEC;margin-bottom:52px">
+      <div style="display:flex;gap:6px;padding:8px 10px 0">
+        <div style="display:flex;align-items:center;gap:7px;background:#FBFCFB;border-radius:4px 4px 0 0;padding:7px 11px;font-size:12px;border:1px solid #E4E7E4;border-bottom:0">
+          <div style="display:flex;width:14px;height:14px;flex:none">
+            <div style="width:7px;background:#5E6265;border-radius:2px 0 0 2px"></div>
+            <div style="width:3px;background:#5E6265;opacity:.6"></div>
+            <div style="width:4px;background:#5E6265;opacity:.25"></div>
+          </div>
+          <span>nemr — portable coding sessions</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:7px;padding:7px 11px;font-size:12px;color:#676C6A">
+          <div style="width:14px;height:14px;border-radius:2px;background:#D6DAD7;flex:none"></div>
+          <span>docs</span>
+        </div>
+      </div>
+    </div>
+
+    <h2 style="margin:0 0 12px;font-family:'Newsreader',Georgia,serif;font-size:22px;font-weight:500">Principles</h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px">
+      <sc-for list="{{ principles }}" as="p" hint-placeholder-count="4">
+        <div style="border:1px solid #E4E7E4;background:#FBFCFB;border-radius:3px;padding:18px">
+          <div style="font-family:'Newsreader',Georgia,serif;font-size:17px;margin-bottom:6px">{{ p.title }}</div>
+          <div style="font-size:12.5px;color:#5E6265;text-wrap:pretty">{{ p.body }}</div>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1120,&quot;height&quot;:900}}">
+class Component extends DCLogic {
+  state = { carryKey: 0, reduced: false };
+
+  renderVals() {
+    const R = this.state.reduced;
+    const n = 8, w = 112 / n;
+    const slices = [];
+    for (let i = 0; i < n; i++) {
+      const base = 'position:absolute;top:0;height:64px;left:' + (i * w) + 'px;width:' + (w + 0.5) + 'px;background:#5E6265;'
+        + (i === 0 ? 'border-radius:3px 0 0 3px;' : i === n - 1 ? 'border-radius:0 3px 3px 0;' : '');
+      slices.push({
+        style: R
+          ? base + 'opacity:' + (1 - i * 0.055) + ';'
+          : base + 'animation:carry 1600ms cubic-bezier(.4,0,.2,1) ' + (i * 26) + 'ms both;'
+      });
+    }
+    if (R) {
+      for (let i = 0; i < 8; i++) {
+        slices.push({ style: 'position:absolute;top:6px;height:52px;left:' + (139 + i * 31) + 'px;width:5px;background:#5E6265;opacity:' + (0.26 - i * 0.02) + ';' });
+      }
+      for (let i = 0; i < n; i++) {
+        slices.push({
+          style: 'position:absolute;top:0;height:64px;left:' + (370 + i * w) + 'px;width:' + (w + 0.5) + 'px;background:#5E6265;opacity:' + (0.5 + i * 0.06) + ';'
+            + (i === 0 ? 'border-radius:3px 0 0 3px;' : i === n - 1 ? 'border-radius:0 3px 3px 0;' : '')
+        });
+      }
+    }
+    const labelBase = 'position:absolute;top:22px;width:112px;text-align:center;font-family:"Newsreader",Georgia,serif;font-size:14px;color:#F4F5F3;pointer-events:none;';
+    return {
+      carryKey: this.state.carryKey,
+      runCarry: () => this.setState(s => ({ carryKey: s.carryKey + 1 })),
+      toggleReduced: () => this.setState(s => ({ reduced: !s.reduced, carryKey: s.carryKey + 1 })),
+      reducedLabel: R ? 'prefers-reduced-motion: reduce' : 'prefers-reduced-motion: no-preference',
+      reducedBtnStyle: 'padding:8px 14px;border-radius:2px;font-size:13px;cursor:pointer;'
+        + (R ? 'background:#E8EEE7;border:1px solid #567057;color:#3D523E;' : 'background:#FBFCFB;border:1px solid #CFD4D0;color:#2A2D2E;'),
+      slices: slices,
+      labelDepart: R ? labelBase + 'left:0;' : labelBase + 'left:0;animation:departLeave 1600ms linear both;',
+      labelArrive: R ? labelBase + 'left:370px;opacity:.9;' : labelBase + 'left:370px;animation:arrive 1600ms linear both;',
+      palette: [
+        ['Paper', '#F4F5F3', 'Page ground, carries the mist texture'],
+        ['Card', '#FBFCFB', 'Raised surfaces'],
+        ['Rule', '#E4E7E4', 'Hairlines'],
+        ['Ink', '#2A2D2E', 'Headlines and body'],
+        ['Coat', '#5E6265', 'Secondary text, the mark'],
+        ['Coat soft', '#676C6A', 'Metadata (darkened from #8D9291 to pass 4.5:1)'],
+        ['Deep', '#1F2325', 'The one dark section, OG card, terminal'],
+        ['Deep raised', '#2E3335', 'Cards inside the dark section'],
+        ['Silver', '#B9BEBA', 'Guard hair — body text on deep'],
+        ['Eye', '#567057', 'Actions, links, the live state'],
+        ['Eye deep', '#3D523E', 'Hover, text on tints'],
+        ['Eye tint', '#E8EEE7', 'Quiet green surfaces'],
+        ['Eye light', '#8FAE8F', 'Eye on deep grounds — commands, prompts']
+      ].map(c => ({ name: c[0], hex: c[1], use: c[2], chip: 'height:52px;background:' + c[1] + ';border-bottom:1px solid rgba(42,45,46,.10);' })),
+      typeScale: [
+        { text: 'Sessions that move', sample: 'font-family:"Newsreader",Georgia,serif;font-size:52px;font-weight:500;letter-spacing:-.025em;line-height:1.05;', spec: 'Newsreader 500 / 52–76px / -2.5%' },
+        { text: 'What is actually running', sample: 'font-family:"Newsreader",Georgia,serif;font-size:30px;font-weight:500;letter-spacing:-.02em;', spec: 'Newsreader 500 / 30px / -2%' },
+        { text: 'Keys never leave the machine', sample: 'font-family:"Newsreader",Georgia,serif;font-size:20px;font-weight:500;', spec: 'Newsreader 500 / 20px' },
+        { text: 'The engine snapshots the container, encrypts it locally, and uploads the bundle.', sample: 'font-size:16px;color:#2A2D2E;', spec: 'Plex Sans 400 / 16px / 1.6' },
+        { text: 'Free tier includes 2 GB of cloud storage.', sample: 'font-size:13.5px;color:#5E6265;', spec: 'Plex Sans 400 / 13.5px' },
+        { text: 'nemr push orbit-refactor', sample: 'font-family:"IBM Plex Mono",monospace;font-size:15px;color:#2A2D2E;', spec: 'Plex Mono 400 / 15px — commands only' },
+        { text: 'sha256:9f2c…  512 MB  0.4.1', sample: 'font-family:"IBM Plex Mono",monospace;font-size:12.5px;color:#676C6A;', spec: 'Plex Mono 400 / 12.5px — machine output' }
+      ],
+      principles: [
+        { title: 'Show it running', body: 'Every claim on the page is demonstrated by a command, a real terminal state, or the product interface itself. No illustrated abstractions of containers to people who ship containers.' },
+        { title: 'Commands are the copy', body: 'Three lines of shell explain create, push and pull faster than three paragraphs. Prose exists to say what the commands cannot: what is encrypted, what is free, who holds the key.' },
+        { title: 'Mist is the only ornament', body: 'The dissolve-and-reform is the brand\u2019s single move. No gradients, no glows, no icon sets. If something needs decorating, it needs deleting.' },
+        { title: 'Quiet page, one loud room', body: 'Paper throughout, with a single deep section where the terminal moment lives. Contrast is spent once, on the thing that sells the product.' }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>
