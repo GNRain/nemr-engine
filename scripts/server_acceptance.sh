@@ -38,9 +38,9 @@ PASS=0; FAIL=0
 # Asserted, not merely printed: a run that skipped a case would otherwise say
 # PASS with fewer assertions.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=81
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=82
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=71
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=72
 fi
 step() { printf '\n%s== %s%s\n' "$BOLD" "$1" "$RESET"; }
 pass() { PASS=$((PASS+1)); printf '   %sok%s   %s\n' "$GREEN" "$RESET" "$1"; }
@@ -110,8 +110,13 @@ grep -q DATABASE_URL <<<"$out" && grep -q NEMR_AUTH_PEPPER <<<"$out" &&
 check $? "the template names every setting, both backends included"
 grep -q "$WORK/home/.config/nemr/sync.env" <<<"$out"
 check $? "and names the file it wants, by path"
-grep -qi 'NOTHING GENERATES ONE FOR YOU' <<<"$out"
-check $? "it says plainly that no pepper is generated for you (E-19)"
+grep -qi 'THE SERVER NEVER GENERATES ONE FOR YOU' <<<"$out"
+check $? "it says plainly that the server invents no pepper (E-19)"
+# WORDING CHANGED DELIBERATELY (SPEC 1.152): it used to read "NOTHING generates
+# one for you", which stopped being true the moment `configure` shipped — that
+# command generates one. E-19's rule is about the SERVER, and it still holds.
+grep -qi 'nemr server configure' <<<"$out"
+check $? "and the template names the command that writes the file for you"
 grep -q 'NEMR_AUTH_PEPPER=ephemeral' <<<"$out" && grep -qi 'throwaway' <<<"$out"
 check $? "and the escape hatch stays explicit: the literal value, marked throwaway"
 check "$([[ ! -e "$WORK/home/.config/nemr/sync.env" ]] && echo 0 || echo 1)" \

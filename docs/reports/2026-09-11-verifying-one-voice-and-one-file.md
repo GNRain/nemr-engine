@@ -202,16 +202,48 @@ nemr-cloud` and installs only `nemr-sync`. That is not touched here.
 
 ---
 
+## 3b. And the page that first run prints never mentioned `configure`
+
+Found by fixing §3: `nemr server start`, with nothing configured, prints a full
+page of settings and told the reader to make a pepper by hand —
+
+```
+  # The auth pepper. THERE IS NO DEFAULT AND NOTHING GENERATES ONE FOR YOU:
+  …
+  #   umask 077; mkdir -p "$(dirname …)"
+  #   printf 'NEMR_AUTH_PEPPER=%s\n' "$(head -c 32 /dev/urandom | base64 -w0)" >> …
+```
+
+— without once naming the command that had just been built to do exactly that.
+A page of instructions that does not mention the one-line alternative wastes
+the reader's afternoon. It now opens with it:
+
+```
+The server reads one file — …/sync.env — mode 0600.
+
+To be asked for what goes in it and have it written for you: nemr server configure
+
+To write it yourself, the settings are below. …
+```
+
+The pepper paragraph now reads **THE SERVER NEVER GENERATES ONE FOR YOU**
+instead of **NOTHING GENERATES ONE FOR YOU**, because the second stopped being
+true the day `configure` shipped. E-19's rule is about the server — it never
+invents a pepper, and `start` still refuses without one — and that is unchanged.
+The hand-rolled recipe stays, for anyone who wants it.
+
+---
+
 ## Assertions
 
 `scripts/server_acceptance.sh`, both arms run on this machine:
 
 | Arm | Before | After |
 |---|---|---|
-| directory storage | 63 → 68 (1.151) | **71** |
-| object storage (real bucket) | 68 → 78 (1.151) | **81** |
+| directory storage | 63 → 68 (1.151) | **72** |
+| object storage (real bucket) | 68 → 78 (1.151) | **82** |
 
-Eight new assertions:
+Nine new assertions:
 
 1. the value stays short and the reason goes underneath
 2. no escaped newline reaches the reader
@@ -221,6 +253,8 @@ Eight new assertions:
 6. and the storage it was missing is now in the file
 7. the completed file is still 0600
 8. and the completed file starts a server with nothing exported
+9. and the template names the command that writes the file for you (replacing
+   *"it says plainly that no pepper is generated for you"*, reworded below)
 
 plus, in the object-store arm only: it completes a file with a real object
 store; the secret access key / the access key id / the endpoint never appear in
@@ -235,6 +269,7 @@ empty file.
 | `NEMR_S3_ENDPOINT` dropped from the redacted set | *nor the endpoint, which carries the account id* |
 | `say_state` restored to the single-line value | 1, 3 |
 | `unescape` removed from `describe_state` | 2, 3 |
+| the template's pointer to `configure` removed | 9 |
 
 **Two neuters came back green the first time, and the assertions were wrong,
 not the guard.** "Every line already there is byte-identical" and "still 0600"
@@ -246,7 +281,13 @@ produces. Each now asserts the file **grew** as well, and both go red.
 - *"a second run refuses rather than overwriting, and names the file"* now
   matches `already has everything a server needs` instead of `already exists`.
   The old wording was also what an incomplete file was told, so the assertion
-  could not tell the two cases apart. This is the only parser change.
+  could not tell the two cases apart.
+- *"it says plainly that no pepper is generated for you (E-19)"* now matches
+  `THE SERVER NEVER GENERATES ONE FOR YOU` instead of `NOTHING GENERATES ONE FOR
+  YOU`. The old text stopped being true when `configure` shipped; the rule it
+  was guarding — the server invents no pepper — is unchanged and still asserted.
+
+Those are the only two parser changes.
 
 `nemr list` and `nemr status` are untouched by this revision.
 

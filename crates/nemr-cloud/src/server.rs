@@ -307,8 +307,11 @@ fn write_pid_file(pid: i32, addr: &str, backend: &str) -> Result<()> {
 }
 
 /// The file the first run asks for, with every setting named and explained.
-/// Printed, never written: the pepper is the one value this command must not
-/// invent (E-19), and a file it wrote for you would be a file you never read.
+/// Printed, never written: `start` is not the command that writes settings,
+/// and a file it wrote for you would be a file you never read. It opens by
+/// naming the command that DOES write it — a page of instructions that does
+/// not mention the one-line alternative is a page that wastes the reader's
+/// afternoon.
 fn print_template(path: &str, file_reading_disabled: bool) {
     if file_reading_disabled {
         eprintln!(
@@ -320,19 +323,23 @@ either way, and they are listed below."
     }
     eprintln!(
         "
-The server reads one file — {path} — mode 0600. Create it with the settings
-below, then run this again. Every line is KEY=VALUE; anything already in your
-environment wins over the file, key by key.
+The server reads one file — {path} — mode 0600.
+
+To be asked for what goes in it and have it written for you: nemr server configure
+
+To write it yourself, the settings are below. Every line is KEY=VALUE; anything
+already in your environment wins over the file, key by key.
 
   # ---- required ------------------------------------------------------------
 
   # Postgres. This command does not install or start one; see below.
   DATABASE_URL=postgres://nemr:<password>@127.0.0.1:5433/nemr
 
-  # The auth pepper. THERE IS NO DEFAULT AND NOTHING GENERATES ONE FOR YOU:
-  # an unset pepper makes /v1/auth/params an account-enumeration oracle that
-  # resets on every restart (F-89), so a server without one refuses to bind.
-  # Generate it once, into the file, so it never reaches your shell history:
+  # The auth pepper. THE SERVER NEVER GENERATES ONE FOR YOU, and there is no
+  # default: an unset pepper makes /v1/auth/params an account-enumeration
+  # oracle that resets on every restart (F-89), so a server without one
+  # refuses to bind. `nemr server configure` generates it into the file;
+  # by hand, once, so it never reaches your shell history:
   #
   #   umask 077; mkdir -p \"$(dirname {path})\"
   #   printf 'NEMR_AUTH_PEPPER=%s\\n' \"$(head -c 32 /dev/urandom | base64 -w0)\" >> {path}
