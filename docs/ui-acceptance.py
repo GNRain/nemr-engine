@@ -403,10 +403,53 @@ async def _page_flow(launch_url, email, password, server, remote_name, local_nam
         await b.eval("document.getElementById('create').click()")
         await b.wait_for(VISIBLE + "('createform')", 10, "the create panel")
         agents = await b.eval("[...document.getElementById('createagent').options].map(o => o.value)")
-        sizes = await b.eval("[...document.getElementById('createsize').options].map(o => o.value)")
+        # SPEC 1.153: a slider, not a three-item select. The default is 2GB in
+        # bytes, and the hidden field the form submits carries the byte count.
         chosen = await b.eval("document.getElementById('createsize').value")
-        check("F-11 the panel offers the agents and a quota picker, Claude Code and 2GB by default",
-              agents and agents[0] == "claude-code" and len(sizes) >= 3 and chosen == "2GB", f"agents={agents} sizes={sizes} default={chosen}")
+        check("F-11 the panel offers the agents and a quota slider, Claude Code and 2GB by default",
+              agents and agents[0] == "claude-code" and chosen == str(2 * 1024 ** 3), f"agents={agents} default={chosen}")
+        # THE BOUNDS, driven at both ends. Dragging the range to 0 must land on
+        # exactly the helper's minimum and to the end on exactly its maximum —
+        # not near them, on them, because the page computes the mapping and an
+        # off-by-one there is a create that the engine refuses.
+        limits = await b.eval("(async () => (await (await fetch('/api/sessions')).json()).create_options)()")
+        drag = ("(v => { const r = document.getElementById('createsizerange');"
+                " r.value = v; r.dispatchEvent(new Event('input'));"
+                " return document.getElementById('createsize').value; })")
+        at_min = await b.eval(drag + "('0')")
+        at_max = await b.eval(drag + "(document.getElementById('createsizerange').max)")
+        check("SPEC 1.153 the slider's ends are exactly the helper's bounds",
+              int(at_min) == limits["min_bytes"] and int(at_max) == limits["max_bytes"],
+              f"min={at_min} vs {limits['min_bytes']}, max={at_max} vs {limits['max_bytes']}")
+        # Every value it can produce is a whole block and inside the bounds —
+        # walked, not sampled at the ends where rounding is easiest to get right.
+        walk = await b.eval(
+            "(() => { const r = document.getElementById('createsizerange'), h = document.getElementById('createsize'), out = [];"
+            " for (let v = 0; v <= Number(r.max); v += 7) { r.value = String(v); r.dispatchEvent(new Event('input')); out.push(Number(h.value)); }"
+            " return out; })()")
+        bad = [v for v in walk if v % limits["block_bytes"] or v < limits["min_bytes"] or v > limits["max_bytes"]]
+        check(f"SPEC 1.153 every value the slider can produce is a whole block in range ({len(walk)} positions)",
+              not bad, f"bad={bad[:5]}")
+        # The typed field is the precision half: a number the slider's steps
+        # would never land on must survive exactly.
+        typed = await b.eval(
+            "(() => { const n = document.getElementById('createsizenum'), u = document.getElementById('createsizeunit');"
+            " u.value = String(1024*1024); u.dispatchEvent(new Event('change'));"
+            " n.value = '1537'; n.dispatchEvent(new Event('input'));"
+            " return document.getElementById('createsize').value; })()")
+        check("SPEC 1.153 a typed size is taken exactly, not snapped to a slider step",
+              int(typed) == 1537 * 1024 * 1024, typed)
+        # Free disk is marked, and asking for more than it says so.
+        marks = await b.eval("[...document.querySelectorAll('#createsizemarks button')].map(b => b.textContent)")
+        check("SPEC 1.153 free disk is marked on the slider", any(m.startswith("free (") for m in marks), marks)
+        over = await b.eval(
+            "(() => { const n = document.getElementById('createsizenum'), u = document.getElementById('createsizeunit');"
+            " u.value = String(1024*1024*1024); u.dispatchEvent(new Event('change'));"
+            " n.value = String(Math.ceil(%d / (1024*1024*1024)) + 1); n.dispatchEvent(new Event('input'));"
+            " return [document.getElementById('createsizenote').textContent,"
+            "  document.querySelector('#createform button[type=submit]').disabled]; })()" % limits["free_bytes"])
+        check("SPEC 1.153 a size beyond free disk names the figure and blocks the submit",
+              "free on this disk" in over[0] and over[1] is True, over)
         await b.eval(f"(f => {{ f.name.value = {json.dumps(local_name)}; f.size.value = '500MB'; f.agent.value = 'claude-code'; f.requestSubmit(); }})(document.getElementById('createform'))")
         await b.wait_for(f"!!document.querySelector('button[data-start={json.dumps(local_name)}]')", 120, "the new row, stopped, after create")
         check("F-11 on success the row appears (stopped) and the panel is closed", not await b.eval(VISIBLE + "('job')"))

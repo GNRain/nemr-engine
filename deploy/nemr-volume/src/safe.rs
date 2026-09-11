@@ -243,6 +243,24 @@ pub fn fstat(fd: &impl AsRawFd) -> Result<libc::stat, String> {
     Ok(st)
 }
 
+/// `fstatvfs` a descriptor: the filesystem the descriptor lives on.
+///
+/// On the descriptor, never on a path, for the same reason as everything else
+/// here — the caller owns every directory this program touches, so a name
+/// resolved twice is a name that can change between the two.
+pub fn fstatvfs(fd: &impl AsRawFd) -> Result<libc::statvfs, String> {
+    // SAFETY: zeroed statvfs is a valid target; fd is valid for the call.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatvfs(fd.as_raw_fd(), &mut st) };
+    if rc != 0 {
+        return Err(format!(
+            "fstatvfs failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(st)
+}
+
 /// `fchown` a descriptor. Used instead of `chown(path)` so the ownership change
 /// cannot be redirected to a symlink target.
 pub fn fchown(fd: &impl AsRawFd, uid: u32, gid: u32) -> Result<(), String> {

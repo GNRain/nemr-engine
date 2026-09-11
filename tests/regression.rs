@@ -97,7 +97,7 @@ fn proc_06_stop_terminates_gracefully_without_escalating_to_sigkill() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "proc06", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "proc06", VolumeSize::SMALL).await;
 
         nemr_engine::engine::project::start(&client, &project.name)
             .await
@@ -194,7 +194,7 @@ fn vol_provision_mount_and_ownership_success_path() {
 
     let paths = VolumePaths::from_env().expect("HOME set");
     let volume =
-        Volume::create(&name, VolumeSize::Small, paths, HelperOps::new()).unwrap_or_else(|e| {
+        Volume::create(&name, VolumeSize::SMALL, paths, HelperOps::new()).unwrap_or_else(|e| {
             panic!("provisioning must succeed against the installed helper: {e:#}")
         });
     let mount_point = volume.mount_point();
@@ -222,7 +222,7 @@ fn vol_provision_mount_and_ownership_success_path() {
     // 3. The quota is real: the filesystem's total does not exceed the request.
     let usage = volume::usage(&mount_point).expect("a mounted volume reports usage");
     assert!(
-        usage.total <= VolumeSize::Small.bytes(),
+        usage.total <= VolumeSize::SMALL.bytes(),
         "quota must cap the filesystem at <= 500MB; got {} bytes",
         usage.total
     );
@@ -259,7 +259,7 @@ fn vol_06_start_remounts_a_volume_lost_to_reboot() {
     common::purge(&name);
 
     let paths = VolumePaths::from_env().expect("HOME set");
-    let volume = Volume::create(&name, VolumeSize::Small, paths.clone(), HelperOps::new())
+    let volume = Volume::create(&name, VolumeSize::SMALL, paths.clone(), HelperOps::new())
         .unwrap_or_else(|e| panic!("setup: provisioning must succeed: {e:#}"));
     let mount_point = volume.mount_point();
 
@@ -299,7 +299,7 @@ fn vol_06_start_remounts_a_volume_lost_to_reboot() {
     );
     let usage = volume::usage(&mount_point).expect("mounted volume reports usage");
     assert!(
-        usage.total <= VolumeSize::Small.bytes(),
+        usage.total <= VolumeSize::SMALL.bytes(),
         "VOL-06: quota must be back in force; got {} bytes",
         usage.total
     );
@@ -359,7 +359,7 @@ fn m8_session_state_lives_on_the_volume_and_vanishes_when_unmounted() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "m8", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "m8", VolumeSize::SMALL).await;
         project::start(&client, &project.name).await.expect("start");
 
         let token = format!("history-token-{}", std::process::id());
@@ -474,7 +474,7 @@ fn vol_write_past_quota_fails_with_enospc() {
     let name = common::unique_name("enospc");
     common::purge(&name);
     let paths = VolumePaths::from_env().unwrap();
-    let volume = Volume::create(&name, VolumeSize::Small, paths, HelperOps::new())
+    let volume = Volume::create(&name, VolumeSize::SMALL, paths, HelperOps::new())
         .unwrap_or_else(|e| panic!("provision: {e:#}"));
 
     let target = volume.mount_point().join("filler.bin");
@@ -486,10 +486,10 @@ fn vol_write_past_quota_fails_with_enospc() {
             Ok(()) => {
                 written += chunk.len() as u64;
                 assert!(
-                    written < VolumeSize::Small.bytes() * 2,
+                    written < VolumeSize::SMALL.bytes() * 2,
                     "wrote {written} bytes into a {}-byte volume without hitting a limit — the \
                      quota is not enforced",
-                    VolumeSize::Small.bytes()
+                    VolumeSize::SMALL.bytes()
                 );
             }
             Err(e) => break e,
@@ -501,7 +501,7 @@ fn vol_write_past_quota_fails_with_enospc() {
         "expected ENOSPC (28) at the quota, got {error:?}"
     );
     assert!(
-        written < VolumeSize::Small.bytes(),
+        written < VolumeSize::SMALL.bytes(),
         "must not exceed the volume size"
     );
     drop(volume);
@@ -530,6 +530,9 @@ fn vol_fault_injection_leaves_no_orphans() {
         fn unmount_and_detach(&self, name: &str) -> anyhow::Result<()> {
             self.inner.unmount_and_detach(name)
         }
+        fn size_bounds(&self) -> anyhow::Result<nemr_engine::engine::volume::SizeBounds> {
+            self.inner.size_bounds()
+        }
     }
 
     let name = common::unique_name("faultinj");
@@ -538,7 +541,7 @@ fn vol_fault_injection_leaves_no_orphans() {
 
     let result = Volume::create(
         &name,
-        VS::Small,
+        VS::SMALL,
         paths.clone(),
         FailAfterMount {
             inner: HelperOps::new(),
@@ -582,7 +585,7 @@ fn vol_remount_is_idempotent() {
     let name = common::unique_name("idem");
     common::purge(&name);
     let paths = VolumePaths::from_env().unwrap();
-    let volume = Volume::create(&name, VolumeSize::Small, paths.clone(), HelperOps::new())
+    let volume = Volume::create(&name, VolumeSize::SMALL, paths.clone(), HelperOps::new())
         .unwrap_or_else(|e| panic!("provision: {e:#}"));
     let mount_point = volume.mount_point();
     let _ = volume.persist();
@@ -631,8 +634,8 @@ fn m10_bundle_round_trip_carries_the_session_to_another_project() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let source = TestProject::create(&client, "m10src", VolumeSize::Small).await;
-        let destination = TestProject::create(&client, "m10dst", VolumeSize::Small).await;
+        let source = TestProject::create(&client, "m10src", VolumeSize::SMALL).await;
+        let destination = TestProject::create(&client, "m10dst", VolumeSize::SMALL).await;
 
         let paths = VolumePaths::from_env().unwrap();
         let source_root = paths.mount_point(&source.name);
@@ -714,7 +717,7 @@ fn m9_a_real_bundle_contains_no_credential() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "m9cred", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "m9cred", VolumeSize::SMALL).await;
 
         let bundle = std::env::temp_dir().join(format!("m9cred-{}.nemr", std::process::id()));
         let _ = std::fs::remove_file(&bundle);
@@ -789,7 +792,7 @@ fn f55_mcp_config_travels_and_identity_does_not() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "f55", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "f55", VolumeSize::SMALL).await;
 
         let mount = VolumePaths::from_env().unwrap().mount_point(&project.name);
         // Project-scoped MCP configuration, exactly where Claude Code reads it.
@@ -874,7 +877,7 @@ fn m11_a_hostile_bundle_cannot_escape_the_destination() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "m11esc", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "m11esc", VolumeSize::SMALL).await;
 
         // A canary outside the destination volume. If traversal succeeds it is
         // overwritten; the assertion is on its contents, not merely its absence,
@@ -930,7 +933,7 @@ fn m9_export_does_not_swallow_bundles_in_the_workspace() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "m9swal", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "m9swal", VolumeSize::SMALL).await;
         let mount = VolumePaths::from_env().unwrap().mount_point(&project.name);
         std::fs::write(mount.join("notes.md"), "content").expect("seed a project file");
 
@@ -1022,8 +1025,8 @@ fn e11_export_and_import_work_with_no_network_and_no_credentials() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let (source, destination) = runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let source = TestProject::create(&client, "e11src", VolumeSize::Small).await;
-        let destination = TestProject::create(&client, "e11dst", VolumeSize::Small).await;
+        let source = TestProject::create(&client, "e11src", VolumeSize::SMALL).await;
+        let destination = TestProject::create(&client, "e11dst", VolumeSize::SMALL).await;
         (source, destination)
     });
 
@@ -1855,7 +1858,7 @@ fn import_creates_the_project_from_the_bundle_with_no_guessed_quota() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let source = TestProject::create(&client, "impsrc", VolumeSize::Small).await;
+        let source = TestProject::create(&client, "impsrc", VolumeSize::SMALL).await;
         let paths = VolumePaths::from_env().unwrap();
 
         let token = format!("restore-token-{}", std::process::id());
@@ -1923,7 +1926,7 @@ fn import_creates_the_project_from_the_bundle_with_no_guessed_quota() {
             .expect("the restored project must be listed");
         assert_eq!(
             entry.quota,
-            VolumeSize::Small.to_string(),
+            VolumeSize::SMALL.to_string(),
             "the quota must come from the bundle's manifest, not a guess or a default"
         );
 
@@ -1945,7 +1948,7 @@ fn import_refuses_to_clobber_an_existing_project() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let occupant = TestProject::create(&client, "impclob", VolumeSize::Small).await;
+        let occupant = TestProject::create(&client, "impclob", VolumeSize::SMALL).await;
         let paths = VolumePaths::from_env().unwrap();
 
         let keep = format!("must-survive-{}", std::process::id());
@@ -2475,7 +2478,7 @@ fn status_reports_the_facts_that_took_three_commands_to_gather() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "status", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "status", VolumeSize::SMALL).await;
 
         let detail = project::status(&client, &project.name)
             .await
@@ -2493,7 +2496,7 @@ fn status_reports_the_facts_that_took_three_commands_to_gather() {
             detail.usage.is_some(),
             "a mounted volume must report usage against its quota"
         );
-        assert_eq!(detail.quota, VolumeSize::Small.to_string());
+        assert_eq!(detail.quota, VolumeSize::SMALL.to_string());
 
         // The F-28 answer, which no command could give before.
         assert_eq!(
@@ -2766,7 +2769,7 @@ fn f83_project_volumes_are_mounted_nosuid_and_nodev() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, &name, VolumeSize::Small).await;
+        let project = TestProject::create(&client, &name, VolumeSize::SMALL).await;
 
         let mount_point = VolumePaths::from_env()
             .expect("paths")
@@ -2916,7 +2919,7 @@ fn e15_a_project_records_reports_and_switches_its_agent() {
         // Created as Codex — not the default, so a pass proves the value was
         // recorded rather than defaulted.
         let project =
-            TestProject::create_with_agent(&client, "e15", VolumeSize::Small, Agent::Codex).await;
+            TestProject::create_with_agent(&client, "e15", VolumeSize::SMALL, Agent::Codex).await;
 
         let detail = project::status(&client, &project.name)
             .await
@@ -3137,7 +3140,7 @@ fn net02_a_session_has_its_own_network_namespace() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "net02ns", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "net02ns", VolumeSize::SMALL).await;
         let pid = project::start(&client, &project.name).await.expect("start");
 
         let netns_of = |pid: u32| {
@@ -3262,7 +3265,7 @@ fn net02_a_started_session_is_wired_not_merely_isolated() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "net02wire", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "net02wire", VolumeSize::SMALL).await;
         let pid = project::start(&client, &project.name).await.expect("start");
 
         let alloc = recorded_allocation(&client, &project.name)
@@ -3295,7 +3298,7 @@ fn net02_a_project_with_no_recorded_network_is_allocated_one_on_first_start() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "net02old", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "net02old", VolumeSize::SMALL).await;
 
         // Make it look like a project created before NET-02.
         let id = nemr_engine::config::container_id(&project.name);
@@ -3361,7 +3364,7 @@ fn net02_a_restore_allocates_a_network_here_rather_than_inheriting_one() {
             std::env::temp_dir().join(format!("net02-restore-{}.nemr", std::process::id()));
         let _ = std::fs::remove_file(&bundle);
 
-        let source = TestProject::create(&client, "net02src", VolumeSize::Small).await;
+        let source = TestProject::create(&client, "net02src", VolumeSize::SMALL).await;
         let source_index = recorded_allocation(&client, &source.name)
             .await
             .expect("the source must have an allocation")
@@ -3384,7 +3387,7 @@ fn net02_a_restore_allocates_a_network_here_rather_than_inheriting_one() {
 
         // Something else takes the index the source used to hold. Allocation
         // reuses the lowest free index, so this is deterministic.
-        let squatter = TestProject::create(&client, "net02sq", VolumeSize::Small).await;
+        let squatter = TestProject::create(&client, "net02sq", VolumeSize::SMALL).await;
         let squatter_index = recorded_allocation(&client, &squatter.name)
             .await
             .expect("the squatter must have an allocation")
@@ -3513,7 +3516,7 @@ fn net02_a_project_created_before_net02_is_migrated_and_starts_wired() {
         let client = ContainerdClient::connect().await.expect("connect");
 
         std::env::set_var("NEMR_TEST_PRE_NET02", "1");
-        let project = TestProject::create(&client, "net02pre", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "net02pre", VolumeSize::SMALL).await;
         std::env::remove_var("NEMR_TEST_PRE_NET02");
 
         // Control: the subject really has the shape under test. READ-ONLY — the
@@ -3581,7 +3584,7 @@ fn f14_a_project_created_before_f14_is_migrated_to_a_directory_bind_at_start() {
         let client = ContainerdClient::connect().await.expect("connect");
 
         std::env::set_var("NEMR_TEST_PRE_F14", "1");
-        let project = TestProject::create(&client, "f14pre", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "f14pre", VolumeSize::SMALL).await;
         std::env::remove_var("NEMR_TEST_PRE_F14");
 
         let id = nemr_engine::config::container_id(&project.name);
@@ -3628,7 +3631,7 @@ fn f14_a_fresh_project_binds_the_credential_directory() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "f14new", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "f14new", VolumeSize::SMALL).await;
         let id = nemr_engine::config::container_id(&project.name);
         assert!(
             client
@@ -3700,7 +3703,7 @@ fn f14_a_login_write_by_rename_lands_on_the_host_through_the_directory_bind() {
             } else {
                 "f14login-dir"
             };
-            let project = TestProject::create(&client, name, VolumeSize::Small).await;
+            let project = TestProject::create(&client, name, VolumeSize::SMALL).await;
             std::env::remove_var("NEMR_TEST_PRE_F14");
             project::start(&client, &project.name).await.expect("start");
             std::env::remove_var("NEMR_TEST_SKIP_F14_MIGRATION");
@@ -3803,7 +3806,7 @@ fn f14_a_host_rename_reaches_a_running_session_without_a_rebind() {
         let scratch = temp.join("claude").join(".credentials.json");
         std::env::set_var("NEMR_HOST_CREDENTIALS", &scratch);
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "f14live", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "f14live", VolumeSize::SMALL).await;
         let pid = project::start(&client, &project.name).await.expect("start");
         let container = std::path::Path::new(nemr_engine::config::CONTAINER_CREDENTIALS);
         let seen_by_task = |pid: u32| {
@@ -3857,7 +3860,7 @@ fn f131_first_start_seeds_claude_config_by_allowlist_and_only_once() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "f131seed", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "f131seed", VolumeSize::SMALL).await;
         project::start(&client, &project.name).await.expect("start");
 
         let (exit, json) =
@@ -3947,7 +3950,7 @@ fn e21_a_host_with_no_login_gets_a_placeholder_and_the_sessions_writes_land_on_i
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
         assert!(!scratch.exists(), "the seam names a file that does not exist yet");
-        let project = TestProject::create(&client, "e21nologin", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "e21nologin", VolumeSize::SMALL).await;
         // Created: the placeholder is there, private, in the engine's shape.
         assert!(scratch.exists(), "create wrote the placeholder");
         assert_eq!(std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777, 0o600);
@@ -4090,7 +4093,7 @@ fn f24_a_blank_credential_becomes_no_login_yet_and_create_succeeds() {
         project::create(
             &client,
             "f24blank",
-            VolumeSize::Small,
+            VolumeSize::SMALL,
             nemr_engine::engine::agent::Agent::ClaudeCode,
         )
         .await
@@ -4167,7 +4170,7 @@ fn net02_sharing_rootlesskits_namespace_is_detected() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "net02own", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "net02own", VolumeSize::SMALL).await;
         let pid = project::start(&client, &project.name).await.expect("start");
 
         assert!(
@@ -4201,7 +4204,7 @@ fn net02_wiring_a_live_session_again_reconciles_rather_than_colliding() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "net02idem", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "net02idem", VolumeSize::SMALL).await;
         let pid = project::start(&client, &project.name).await.expect("start");
         let alloc = recorded_allocation(&client, &project.name)
             .await
@@ -4282,8 +4285,8 @@ fn net05_a_session_cannot_reach_another_session() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let a = TestProject::create(&client, "net05a", VolumeSize::Small).await;
-        let b = TestProject::create(&client, "net05b", VolumeSize::Small).await;
+        let a = TestProject::create(&client, "net05a", VolumeSize::SMALL).await;
+        let b = TestProject::create(&client, "net05b", VolumeSize::SMALL).await;
         let pid_a = project::start(&client, &a.name).await.expect("start A");
         let pid_b = project::start(&client, &b.name).await.expect("start B");
 
@@ -4360,7 +4363,7 @@ fn f115_a_bundle_records_the_base_image_the_container_actually_runs_on() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "f115", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "f115", VolumeSize::SMALL).await;
         let id = nemr_engine::config::container_id(&project.name);
 
         // The truth, read from the snapshot rather than from any constant.
@@ -4600,7 +4603,7 @@ fn f115_export_reads_the_container_not_the_engine_constant() {
         );
 
         std::env::set_var("NEMR_TEST_BASE_IMAGE", &older);
-        let project = TestProject::create(&client, "f115old", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "f115old", VolumeSize::SMALL).await;
         std::env::remove_var("NEMR_TEST_BASE_IMAGE");
 
         let id = nemr_engine::config::container_id(&project.name);
@@ -4665,7 +4668,7 @@ fn f123_purge_refuses_a_protected_subject_and_destroys_without_protection() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let client = ContainerdClient::connect().await.expect("connect");
-        let project = TestProject::create(&client, "f123prot", VolumeSize::Small).await;
+        let project = TestProject::create(&client, "f123prot", VolumeSize::SMALL).await;
         let name = project.name.clone();
         let id = nemr_engine::config::container_id(&name);
 
@@ -5222,7 +5225,7 @@ fn e23_adopt_copies_the_tree_and_history_excludes_the_derived_and_leaves_the_sou
         project::adopt(
             &client,
             "e23adopt",
-            nemr_engine::engine::volume::VolumeSize::Small,
+            nemr_engine::engine::volume::VolumeSize::SMALL,
             nemr_engine::engine::agent::Agent::ClaudeCode,
             &source,
         )
@@ -5298,7 +5301,7 @@ fn e23_adopt_copies_the_tree_and_history_excludes_the_derived_and_leaves_the_sou
         project::adopt(
             &client,
             "e23toobig",
-            nemr_engine::engine::volume::VolumeSize::Small, // 500MB
+            nemr_engine::engine::volume::VolumeSize::SMALL, // 500MB
             nemr_engine::engine::agent::Agent::ClaudeCode,
             &source,
         )
@@ -5393,7 +5396,7 @@ fn e23_a_copy_failure_after_provisioning_leaves_no_half_created_session() {
         project::adopt(
             &client,
             "e23rollback",
-            nemr_engine::engine::volume::VolumeSize::Small,
+            nemr_engine::engine::volume::VolumeSize::SMALL,
             nemr_engine::engine::agent::Agent::ClaudeCode,
             &source,
         )
@@ -5646,7 +5649,7 @@ fn f20_the_resume_lists_order_survives_adopt_push_and_pull() {
         project::adopt(
             &client,
             "f20adopt",
-            nemr_engine::engine::volume::VolumeSize::Small,
+            nemr_engine::engine::volume::VolumeSize::SMALL,
             nemr_engine::engine::agent::Agent::ClaudeCode,
             &source,
         )
@@ -5679,7 +5682,7 @@ fn f20_the_resume_lists_order_survives_adopt_push_and_pull() {
             &client,
             &bundle,
             Some("f20pulled"),
-            Some(nemr_engine::engine::volume::VolumeSize::Small),
+            Some(nemr_engine::engine::volume::VolumeSize::SMALL),
         )
         .await
         .expect("import");

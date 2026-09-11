@@ -121,6 +121,14 @@ pub trait UiEngine: EngineOps {
     /// F-21: add an existing host directory as a session.
     fn add(&self, name: &str, size: &str, agent: &str, source_dir: &str)
         -> Result<(u64, u64, u64)>;
+    /// What a volume size may be on this host (SPEC 1.153).
+    ///
+    /// From the daemon, which asks the privileged helper and `statvfs`. The
+    /// page holds no copy of any of it — the slider's ends, its step and the
+    /// mark for free disk are all drawn from this reply, so the page cannot
+    /// offer a size the engine would refuse.
+    fn size_limits(&self) -> Result<SizeLimits>;
+
     /// Open an attach stream: the daemon's, or a fake's in the tests.
     fn attach(
         &self,
@@ -605,11 +613,15 @@ async fn sessions(State(state): State<Arc<UiState>>) -> Response {
             Ok(list) => (Some(list), None),
             Err(e) => (None, Some(format!("{e:#}"))),
         };
-        core::sessions(local.as_deref()).map(|rows| (rows, local_error))
+        // Asked alongside the list, in the same blocking hop: the panel is
+        // rendered from this one reply, so a second round trip would be a
+        // second chance for the two to disagree.
+        let limits = engine.size_limits().ok();
+        core::sessions(local.as_deref()).map(|rows| (rows, local_error, limits))
     })
     .await;
     match rows {
-        Ok(Ok((rows, local_error))) => {
+        Ok(Ok((rows, local_error, limits))) => {
             let rows: Vec<Value> = rows
                 .iter()
                 .map(|r| {
@@ -630,7 +642,7 @@ async fn sessions(State(state): State<Arc<UiState>>) -> Response {
                 .collect();
             Json(json!({
                 "rows": rows,
-                "create_options": create_options(),
+                "create_options": create_options(limits),
                 "local_available": local_error.is_none(),
                 "local_error": local_error,
                 "this_machine": crate::state::holder_identity(),
@@ -799,22 +811,90 @@ async fn stop(State(state): State<Arc<UiState>>, UrlPath(name): UrlPath<String>)
     Json(json!({ "job": id })).into_response()
 }
 
+/// A size the fake engine will not take, if there is one.
+///
+/// Mirrors the daemon: empty is the default, a unit or a byte count parses,
+/// and the bounds are the ones the fake reports through `size_limits`.
+#[cfg(test)]
+fn fake_size_refusal(size: &str) -> Option<String> {
+    if size.trim().is_empty() {
+        return None;
+    }
+    let upper = size.trim().to_ascii_uppercase();
+    let (digits, unit) = match upper.strip_suffix("GB") {
+        Some(d) => (d, 1024u64 * 1024 * 1024),
+        None => match upper.strip_suffix("MB") {
+            Some(d) => (d, 1024 * 1024),
+            None => (upper.strip_suffix('B').unwrap_or(&upper), 1),
+        },
+    };
+    // A size that does not parse is REFUSED, not waved through: `?` on the
+    // Option here would have returned "no refusal" for "banana".
+    let Some(bytes) = digits.parse::<u64>().ok().and_then(|n| n.checked_mul(unit)) else {
+        return Some(format!("unrecognised volume size {size:?}"));
+    };
+    if !(67_108_864..=1_099_511_627_776).contains(&bytes) {
+        return Some(format!("volume size {size:?} is out of range"));
+    }
+    None
+}
+
+/// The daemon's answer to what a volume size may be here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeLimits {
+    pub min_bytes: u64,
+    pub max_bytes: u64,
+    pub block_bytes: u64,
+    pub default_bytes: u64,
+    pub free_bytes: u64,
+}
+
 /// F-11: what the create panel offers. The wire vocabulary of the daemon's
 /// `CreateRequest`, stated here because the commercial half never links
 /// the engine (E-11); the browser acceptance holds it to what `nemr create`
 /// accepts, so the two cannot drift apart unnoticed.
-pub const CREATE_SIZES: [&str; 3] = ["500MB", "2GB", "10GB"];
-pub const CREATE_DEFAULT_SIZE: &str = "2GB";
 pub const CREATE_AGENTS: [(&str, &str); 2] = [
     ("claude-code", "Claude Code"),
     ("codex", "Codex CLI (implemented but unverified — F-84)"),
 ];
-fn create_options() -> Value {
-    json!({
-        "sizes": CREATE_SIZES,
-        "default_size": CREATE_DEFAULT_SIZE,
+
+/// Marks on the slider: the three sizes that used to be the only ones.
+///
+/// Suggestions, nothing more — any value between the ends is allowed. They are
+/// here because they are the sizes people already think in, and a slider with
+/// no landmarks is a slider nobody can aim.
+pub const CREATE_MARKS: [(&str, u64); 3] = [
+    ("500MB", 500 * 1024 * 1024),
+    ("2GB", 2 * 1024 * 1024 * 1024),
+    ("10GB", 10 * 1024 * 1024 * 1024),
+];
+
+/// What the create panel offers, with every number from the daemon.
+///
+/// NOTHING HERE IS A CONSTANT OF THE PAGE'S OWN. It used to be three strings
+/// in this file kept in step with the engine by a browser assertion; a range
+/// cannot be kept in step by enumeration, so the assertion now checks that
+/// these numbers ARE the engine's, which is a stronger thing to check.
+fn create_options(limits: Option<SizeLimits>) -> Value {
+    let marks: Vec<Value> = CREATE_MARKS
+        .iter()
+        .map(|(label, bytes)| json!({"label": label, "bytes": bytes}))
+        .collect();
+    let mut v = json!({
+        "marks": marks,
         "agents": CREATE_AGENTS.iter().map(|(id, label)| json!({"id": id, "label": label})).collect::<Vec<_>>(),
-    })
+    });
+    // A daemon that cannot answer leaves the size fields out entirely rather
+    // than filling in a guess: the panel says it cannot offer sizes, which is
+    // true, instead of offering a range nothing agreed to.
+    if let Some(l) = limits {
+        v["min_bytes"] = json!(l.min_bytes);
+        v["max_bytes"] = json!(l.max_bytes);
+        v["block_bytes"] = json!(l.block_bytes);
+        v["default_bytes"] = json!(l.default_bytes);
+        v["free_bytes"] = json!(l.free_bytes);
+    }
+    v
 }
 
 #[derive(Deserialize)]
@@ -840,11 +920,9 @@ async fn create(State(state): State<Arc<UiState>>, Json(body): Json<CreateBody>)
         )
             .into_response();
     }
-    let size = if body.size.is_empty() {
-        CREATE_DEFAULT_SIZE.to_string()
-    } else {
-        body.size
-    };
+    // An empty size travels as an empty size: the daemon owns the default, and
+    // a default filled in here would be a second opinion about it.
+    let size = body.size;
     let agent = if body.agent.is_empty() {
         CREATE_AGENTS[0].0.to_string()
     } else {
@@ -986,11 +1064,9 @@ async fn add_folder(State(state): State<Arc<UiState>>, Json(body): Json<AddBody>
         )
             .into_response();
     }
-    let size = if body.size.is_empty() {
-        CREATE_DEFAULT_SIZE.to_string()
-    } else {
-        body.size
-    };
+    // An empty size travels as an empty size: the daemon owns the default, and
+    // a default filled in here would be a second opinion about it.
+    let size = body.size;
     let agent = if body.agent.is_empty() {
         CREATE_AGENTS[0].0.to_string()
     } else {
@@ -1409,6 +1485,19 @@ async fn index() -> Response {
   #job, #attach { margin-top: 1rem; background: var(--panel); border: 1px solid var(--line-strong);
                   border-left: 3px solid var(--accent); border-radius: var(--radius); padding: .9rem 1rem; }
   #job form, #removeform, #createform, #pullform, #pushform { display: grid; gap: .6rem; max-width: 34rem; }
+  /* SPEC 1.153: the quota picker. A range for reach, a number for precision,
+     and marks for the sizes people actually think in. */
+  .sizepick { display: grid; gap: .35rem; }
+  .sizepick .top { display: flex; gap: .5rem; align-items: center; color: var(--muted); font-size: var(--s0); }
+  .sizepick .top .spacer { flex: 1; }
+  .sizepick input[type=range] { width: 100%; margin: 0; }
+  .sizepick .num { width: 7rem; }
+  .sizepick .marks { position: relative; height: 1.4rem; }
+  .sizepick .marks button { position: absolute; transform: translateX(-50%); white-space: nowrap;
+     padding: .08rem .3rem; font-size: .78em; border: 1px solid var(--line); background: transparent;
+     color: var(--muted); }
+  .sizepick .marks button.free { color: var(--warn); border-color: var(--warn); }
+  .sizepick .over { color: var(--bad); }
   #jobtitle, #attachtitle { font-size: var(--s2); font-weight: 600; }
   #joblog { margin: .3rem 0 0; white-space: pre-wrap; font-size: var(--s0); color: var(--muted); max-height: 12rem; overflow: auto; }
   .checkline { display: flex; gap: .45rem; align-items: center; color: var(--muted); font-size: var(--s0); }
@@ -1477,15 +1566,15 @@ async fn index() -> Response {
       <form id="createform" style="display:grid;gap:.6rem" hidden>
         <label>name <input name="name" autocomplete="off" required maxlength="32" pattern="[a-z0-9][a-z0-9-]*" placeholder="lowercase letters, digits and -"></label>
         <label>agent <select name="agent" id="createagent"></select></label>
-        <label>quota (fixed at creation) <select name="size" id="createsize"></select></label>
+        <div class="sizepick" id="createsizepick"></div><input type="hidden" name="size" id="createsize">
         <div style="display:flex;gap:.6rem"><button class="primary" type="submit">create</button><button type="button" id="createcancel">cancel</button></div>
       </form>
       <form id="addform" style="display:grid;gap:.6rem" hidden>
         <label>folder on this machine <input name="folder" autocomplete="off" placeholder="/home/you/projects/thing" required></label>
         <div style="display:flex;gap:.6rem;align-items:end">
           <label style="flex:1">name <input name="sessionname" autocomplete="off" maxlength="32" pattern="[a-z0-9][a-z0-9-]*" placeholder="from the folder's name"></label>
-          <label>quota (fixed at creation) <select name="size" id="addsize"></select></label>
         </div>
+        <div class="sizepick" id="addsizepick"></div><input type="hidden" name="size" id="addsize">
         <div id="addplan" class="muted">Give a folder and this says what would travel before anything is copied.</div>
         <div style="display:flex;gap:.6rem"><button class="primary" type="submit" id="addconfirm" disabled>add this folder</button><button type="button" id="addcancel">cancel</button></div>
       </form>
@@ -1664,10 +1753,88 @@ async fn index() -> Response {
   // vocabulary, stated by the binary); filled once per list.
   function fillCreateOptions(o) {
     if (!o) return;
-    const a = $('createagent'), z = $('createsize'), z2 = $('addsize');
-    if (z2) z2.innerHTML = o.sizes.map(x => '<option value="' + esc(x) + '"' + (x === o.default_size ? ' selected' : '') + '>' + esc(x) + '</option>').join('');
-    a.innerHTML = o.agents.map(x => '<option value="' + esc(x.id) + '">' + esc(x.label) + '</option>').join('');
-    z.innerHTML = o.sizes.map(x => '<option value="' + esc(x) + '"' + (x === o.default_size ? ' selected' : '') + '>' + esc(x) + '</option>').join('');
+    $('createagent').innerHTML = o.agents.map(x => '<option value="' + esc(x.id) + '">' + esc(x.label) + '</option>').join('');
+    sizePicker('createsize', o);
+    sizePicker('addsize', o);
+  }
+
+  // SPEC 1.153: the quota picker. Every number in it — the ends, the step, the
+  // marks, the free-disk line — comes from the reply above, which the daemon
+  // filled from the privileged helper and statvfs. The page holds no copy of
+  // any of them, so it cannot offer a size the engine would refuse.
+  const MB = 1024 * 1024, GB = 1024 * 1024 * 1024;
+  function sizePicker(id, o) {
+    const wrap = $(id + 'pick'), hidden = $(id);
+    if (!wrap || !hidden) return;
+    // A daemon that could not answer says so. It does NOT fall back to a
+    // range of the page's own: a slider nothing agreed to is worse than no
+    // slider, because it looks like it works.
+    if (!o.max_bytes) {
+      wrap.innerHTML = '<div class="muted">This machine cannot say what sizes it allows — the local daemon did not answer, so a session cannot be created here right now.</div>';
+      hidden.value = '';
+      return;
+    }
+    const min = o.min_bytes, max = o.max_bytes, block = o.block_bytes || 4096;
+    const free = o.free_bytes, STEPS = 1000, span = Math.log(max / min);
+    // Logarithmic, because the range spans four orders of magnitude: linear
+    // would put every size anybody picks inside the first two pixels.
+    const posOf = b => Math.max(0, Math.min(STEPS, Math.round(STEPS * Math.log(b / min) / span)));
+    const snap = b => Math.max(min, Math.min(max, Math.floor(b / block) * block));
+    const bytesOf = p => snap(min * Math.exp(span * p / STEPS));
+
+    wrap.innerHTML =
+      '<div class="top"><span>quota (fixed at creation)</span><span class="spacer"></span>' +
+      '<input class="num" type="number" min="1" step="1" id="' + id + 'num">' +
+      '<select id="' + id + 'unit"><option value="' + MB + '">MB</option><option value="' + GB + '">GB</option></select></div>' +
+      '<input type="range" min="0" max="' + STEPS + '" step="1" id="' + id + 'range">' +
+      '<div class="marks" id="' + id + 'marks"></div>' +
+      '<div class="muted" id="' + id + 'note"></div>';
+
+    const range = $(id + 'range'), num = $(id + 'num'), unit = $(id + 'unit'), note = $(id + 'note');
+
+    // The value is bytes, always. What the two fields show is a rendering of
+    // it; what the form submits is the number itself, so nothing is re-parsed
+    // from a rounded display.
+    function show(bytes, moveNum) {
+      bytes = snap(bytes);
+      hidden.value = String(bytes);
+      range.value = String(posOf(bytes));
+      if (moveNum !== false) {
+        const u = bytes >= GB ? GB : MB;
+        unit.value = String(u);
+        const n = bytes / u;
+        num.value = String(u === GB ? Math.round(n * 100) / 100 : Math.round(n));
+      }
+      const over = bytes > free;
+      note.className = over ? 'over' : 'muted';
+      note.textContent = over
+        ? human(bytes) + ' is more than the ' + human(free) + ' free on this disk'
+        : human(bytes) + ' — ' + human(free) + ' free on this disk';
+      const submit = wrap.closest('form') && wrap.closest('form').querySelector('button[type=submit]');
+      if (submit && id === 'createsize') submit.disabled = over;
+    }
+
+    const marks = (o.marks || []).map(m => ({ label: m.label, bytes: m.bytes }))
+      .filter(m => m.bytes >= min && m.bytes <= max);
+    marks.push({ label: 'free (' + human(free) + ')', bytes: Math.min(Math.max(free, min), max), free: true });
+    $(id + 'marks').innerHTML = marks.map((m, i) =>
+      '<button type="button" class="' + (m.free ? 'free' : '') + '" data-bytes="' + m.bytes +
+      '" style="left:' + (posOf(m.bytes) / STEPS * 100) + '%">' + esc(m.label) + '</button>').join('');
+    $(id + 'marks').querySelectorAll('button').forEach(b =>
+      b.addEventListener('click', () => show(Number(b.dataset.bytes))));
+
+    range.addEventListener('input', () => show(bytesOf(Number(range.value))));
+    // Typed: exact, and never snapped out from under the typing. The value is
+    // read as the unit beside it, which is the same two questions the CLI
+    // asks in the same order.
+    const typed = () => {
+      const n = Number(num.value);
+      if (!isFinite(n) || n <= 0) return;
+      show(n * Number(unit.value), false);
+    };
+    num.addEventListener('input', typed);
+    unit.addEventListener('change', typed);
+    show(o.default_bytes || min);
   }
 
   // --- step 3: pull-and-start, and start, as jobs the page watches ---
@@ -2135,14 +2302,25 @@ mod tests {
             }
             Ok("graceful".into())
         }
+        fn size_limits(&self) -> Result<SizeLimits> {
+            Ok(SizeLimits {
+                min_bytes: 67_108_864,
+                max_bytes: 1_099_511_627_776,
+                block_bytes: 4096,
+                default_bytes: 2 * 1024 * 1024 * 1024,
+                free_bytes: 40 * 1024 * 1024 * 1024,
+            })
+        }
         /// The daemon's refusals, in the fake: a name in use, a size or an
         /// agent the engine does not allow.
         fn create(&self, name: &str, size: &str, agent: &str) -> Result<()> {
             if self.projects.lock().unwrap().iter().any(|p| p.name == name) {
                 anyhow::bail!("project {name:?} already exists");
             }
-            if !CREATE_SIZES.contains(&size) {
-                anyhow::bail!("unrecognised volume size {size:?}. Valid sizes: 500MB, 2GB, 10GB.");
+            // The daemon's own rule, in the fake: empty means the default, and
+            // anything else must be a size in range (SPEC 1.153).
+            if let Some(why) = fake_size_refusal(size) {
+                anyhow::bail!("{why}");
             }
             if !CREATE_AGENTS.iter().any(|(id, _)| *id == agent) {
                 anyhow::bail!("unknown agent {agent:?}");
@@ -2186,8 +2364,10 @@ mod tests {
             if self.projects.lock().unwrap().iter().any(|p| p.name == name) {
                 anyhow::bail!("project {name:?} already exists");
             }
-            if !CREATE_SIZES.contains(&size) {
-                anyhow::bail!("unrecognised volume size {size:?}. Valid sizes: 500MB, 2GB, 10GB.");
+            // The daemon's own rule, in the fake: empty means the default, and
+            // anything else must be a size in range (SPEC 1.153).
+            if let Some(why) = fake_size_refusal(size) {
+                anyhow::bail!("{why}");
             }
             self.added
                 .lock()
@@ -3384,15 +3564,39 @@ mod tests {
                     "POST",
                     "/api/sessions",
                     c,
-                    Some(json!({"name": "fresh", "size": "7GB", "agent": "claude-code"})),
+                    // CHANGED DELIBERATELY (SPEC 1.153): this used to be
+                    // "7GB", refused because it was not one of three presets.
+                    // 7GB is an ordinary size now. What is still refused is a
+                    // size out of the helper's range, and that is what this
+                    // asserts.
+                    Some(json!({"name": "fresh", "size": "5000GB", "agent": "claude-code"})),
                 ),
             )
             .await,
         )
         .await;
         assert_eq!(j["ok"], false, "{j}");
-        assert!(j["error"].as_str().unwrap().contains("Valid sizes"), "{j}");
+        assert!(j["error"].as_str().unwrap().contains("out of range"), "{j}");
         assert!(engine.created.lock().unwrap().is_empty());
+        // And the size that used to be refused for being unusual goes through.
+        let j = finish(
+            &app,
+            &cookie,
+            send(
+                &app,
+                api_req(
+                    "POST",
+                    "/api/sessions",
+                    c,
+                    Some(json!({"name": "odd", "size": "7GB", "agent": "claude-code"})),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "{j}");
+        engine.created.lock().unwrap().clear();
+        engine.projects.lock().unwrap().retain(|p| p.name != "odd");
         // A name in use.
         let j = finish(
             &app,
@@ -3441,7 +3645,9 @@ mod tests {
             *engine.created.lock().unwrap(),
             vec![(
                 "fresh".to_string(),
-                "2GB".to_string(),
+                // Empty travels as empty: the daemon owns the default now, so
+                // the page no longer fills one in (SPEC 1.153).
+                String::new(),
                 "claude-code".to_string()
             )]
         );
@@ -3455,12 +3661,30 @@ mod tests {
             "created stopped; start is the row's own button"
         );
 
-        // What the create panel offers is a constant of this binary, carried
-        // in every sessions reply (asserted end to end by the acceptance).
-        let o = create_options();
-        assert_eq!(o["default_size"], "2GB");
-        assert_eq!(o["sizes"].as_array().unwrap().len(), CREATE_SIZES.len());
+        // What the create panel offers. The sizes are no longer a constant of
+        // this binary: every number is the daemon's, and the panel says so
+        // rather than inventing a range when the daemon cannot answer.
+        let limits = SizeLimits {
+            min_bytes: 67_108_864,
+            max_bytes: 1_099_511_627_776,
+            block_bytes: 4096,
+            default_bytes: 2 * 1024 * 1024 * 1024,
+            free_bytes: 40 * 1024 * 1024 * 1024,
+        };
+        let o = create_options(Some(limits));
+        assert_eq!(o["min_bytes"], 67_108_864u64);
+        assert_eq!(o["max_bytes"], 1_099_511_627_776u64);
+        assert_eq!(o["block_bytes"], 4096u64);
+        assert_eq!(o["default_bytes"], 2u64 * 1024 * 1024 * 1024);
+        assert_eq!(o["free_bytes"], 40u64 * 1024 * 1024 * 1024);
+        assert_eq!(o["marks"].as_array().unwrap().len(), CREATE_MARKS.len());
         assert_eq!(o["agents"][0]["id"], "claude-code");
+        // A daemon that did not answer leaves them out entirely — the page
+        // renders "cannot say" rather than a range nothing agreed to.
+        let blind = create_options(None);
+        assert!(blind["min_bytes"].is_null());
+        assert!(blind["max_bytes"].is_null());
+        assert!(blind["agents"].is_array());
 
         // Remove: the running one is stopped first, then deleted; the stopped
         // one just goes. Neither touches the exported list (nothing is pushed).
