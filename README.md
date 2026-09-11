@@ -1,315 +1,174 @@
-# Nemr
+# nemr
 
-**Nemr gives each of your projects its own isolated Claude Code workspace on
-one machine — and lets you pack a project into a single file and move it to
-another machine, with the conversation intact.**
+Your Claude Code sessions live on one machine. The conversation, the files, the
+history — all of it is on the laptop you started on, and moving to another
+machine means starting again.
 
-You keep several projects running side by side, each with its own files and its
-own private disk. When you switch computers, you export a project to a file,
-carry it across, and import it. Claude picks the conversation back up.
+nemr puts each session in its own isolated container with its own disk, and
+lets you push that session to object storage you control and pull it down on
+another machine with the conversation intact. Sessions are encrypted on your
+machine before they are uploaded, so the server stores bytes it cannot read.
+There is no Docker at any layer.
 
-> **Status: private preview.** Nemr is not publicly released and has no open-source
-> license yet — the source is shared for evaluation only. It runs on Linux, it
-> has no graphical interface, and it is driven entirely from the terminal. The
-> engine does its whole job end to end, but it is early software: see
-> [Known limitations](#known-limitations) before relying on it.
-
----
-
-## Contents
-
-- [What it does](#what-it-does)
-- [Getting started](#getting-started)
-- [The commands](#the-commands)
-- [Moving a project to another machine](#moving-a-project-to-another-machine)
-- [What you need](#what-you-need)
-- [How it works](#how-it-works)
-- [Where the project is today](#where-the-project-is-today)
-- [Known limitations](#known-limitations)
-- [Uninstalling](#uninstalling)
-- [Getting help](#getting-help)
-- [For engineers](#for-engineers)
+> **Private preview.** The source is here for evaluation. It has no
+> open-source licence yet, and it is early software — read what works and what
+> does not before relying on it.
 
 ---
 
-## What it does
+## What works today
 
-**Keeps projects in separate boxes.** Each project gets its own private disk —
-one file on your computer that the project sees as a separate drive, with a size
-limit you choose. A project only ever sees its own disk, so your projects don't
-get tangled together.
+- **Sessions.** `nemr create` gives you a container with its own ext4 volume
+  and a size limit you choose. Start it, attach to it, stop it, delete it.
+  Several run side by side without seeing each other's files.
+- **Existing directories.** `nemr add ~/work/thing` copies a directory you
+  already have into a session, with its Claude Code history, so it can be moved
+  like any other session. The original is copied, never moved.
+- **A browser interface.** `nemr ui` opens a page on a loopback port that
+  exists only while the command runs. Create sessions, attach to a terminal,
+  push, pull, and remove them from the page. The whole flow is exercised
+  through the page's own HTTP and WebSocket surface by an acceptance script
+  that drives a real Firefox.
+- **Cloud sync.** `nemr push` encrypts a session on your machine and uploads
+  it; `nemr pull` brings it down on another machine and imports it. The
+  encryption key is derived from your password locally and never leaves the
+  machine, so a server holds ciphertext it cannot open.
+- **One command to install.** `./scripts/install.sh` shows a plan of every file
+  it will write and every `sudo` it will run, asks once, then does it.
+- **A login per machine.** nemr keeps its own Claude Code credential in its own
+  directory. It never copies your `~/.claude`, and a credential never travels
+  inside a session.
+- **One machine at a time.** A session you push is leased. Another machine that
+  tries to push the same session is refused and told which machine holds it,
+  and can take over deliberately; after that the first machine's next upload is
+  refused by the server, not merely discouraged.
 
-**Remembers the conversation.** Claude Code's history lives inside the project.
-Stop a project today, start it next week, and the conversation is still there.
+Two things have been measured rather than asserted:
 
-**Travels.** A project can be packed into one file and unpacked on a different
-computer — as long as that computer has Nemr set up too. This has been done end
-to end once, by hand, between two separately built machines: the conversation
-continued on the far side, in order, with nothing re-typed.
+- A session of **107 MiB** exported to a **31 MiB** encrypted bundle.
+- On 2026-08-22, a session created on one Ubuntu virtual machine was resumed on
+  a second, independently built one: exported, uploaded to object storage,
+  downloaded, checksum-verified, imported — and Claude Code then answered a
+  question about the order of two earlier instructions, which existed nowhere
+  but the transcript. That was one run, by hand, and it has not been repeated.
 
-**Runs as you.** Nemr uses the same permissions as any app you run. It needs
-your password once during setup, and briefly each time it sets up a disk — and
-it prints a line telling you whenever that happens. It does not need Docker.
+## What does not work
 
----
+- **Linux only.** Ubuntu 22.04 or newer, x86_64, kernel 5.8+, cgroup v2,
+  systemd, and unprivileged user namespaces. The reference host is a VirtualBox
+  guest running Ubuntu 22.04.
+- **WSL2 is the answer for Windows, and is not finished.** The engine-level
+  blocker is fixed and the installer has been run on a fresh WSL2 distribution,
+  but the acceptance that would let it be called supported — a session moved
+  between Linux and WSL2 in both directions — has not been run. Treat it as
+  unverified.
+- **No native Windows build, and none planned. No macOS.** macOS would need a
+  virtual machine underneath, which is not in this phase.
+- **Claude Code is the agent.** A session can be told to run OpenAI's Codex CLI
+  instead, and it launches, but moving a Codex session between machines is
+  unverified.
+- **One machine at a time, by design.** Two machines cannot work on the same
+  session at once. A forced takeover does not yet have a defined answer for
+  work the loser had not uploaded.
+- **Logging in on a second machine logs the first one out.** Claude Code's
+  account has a single refresh token, so using it on another machine spends it.
+  nemr warns before you do it; it cannot prevent it.
+- **A local `nemr export` / `nemr import` pair has no lease.** Two imported
+  copies of one session drift apart silently. The lease exists only when a sync
+  server is involved.
 
 ## Getting started
 
-Setup is a one-time thing: one command, mostly unattended, with **one reboot**
-in the middle. After that, working with projects takes seconds.
+nemr does not install these for you:
 
-Nemr is private preview, so you first need access to the source. If you have it:
+- **Node.js and Claude Code.** `npm install -g @anthropic-ai/claude-code`, then
+  log in once. nemr checks for it and tells you if it is missing.
+- **The Rust toolchain.** nemr is built from source:
+  `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`.
 
-**1. Install it** — one command, safe to run twice:
+Then:
 
-```bash
-./scripts/install.sh
+```sh
+git clone <this repository> && cd nemr-engine
+./scripts/install.sh          # shows the whole plan, asks once, then installs
 ```
 
-It checks your machine can run Nemr and **stops without changing anything** if it
-can't, saying exactly what is missing and how to get it. Then it shows you the
-whole plan — every file it will write, every command it runs with `sudo`, and
-everything it downloads — and asks once before doing any of it. Part-way through
-it asks you to reboot; run it again afterwards and it continues where it left
-off, skipping everything already done. It finishes by testing the machine it
-just set up.
+It refuses before changing anything if the host cannot run nemr, and names what
+is missing. On a fresh machine it installs packages, sets up rootless
+containerd, builds the engine and pulls the base image; a cgroup setting needs
+one reboot, and it tells you when.
 
-**2. Log in to Claude Code** — inside your first project, not on your machine.
-Nemr keeps its own login, separate from any `claude` you run on the host, so
-`/login` inside a session is the one that counts. Step 3 makes that session;
-run `/login` in it the first time.
-
-Note: an Anthropic login is one machine at a time. Logging in here signs this
-account out on any other machine using it — that is Anthropic's OAuth model,
-not something Nemr can work around.
-
-**3. Make a project and open it.** Run `nemr create` on its own to be walked
-through the name, size and agent (Claude Code or Codex), or give them directly:
-
-```bash
-nemr create myproject --size 2GB --agent claude-code
-nemr start myproject
-nemr attach myproject
+```sh
+nemr create myproject         # a session with its own volume
+nemr attach myproject         # a shell inside it; run `claude` there
+nemr ui                       # or drive it from a browser
 ```
-
-You're now inside your project — an ordinary terminal prompt. Run `claude` and
-work normally. Press `Ctrl-D` to leave; the project keeps running until you
-`nemr stop` it.
-
----
 
 ## The commands
 
 | Command | What it does |
 |---|---|
-| `nemr create <name> --size 2GB` | Make a new project. Pick one of three sizes: `500MB`, `2GB`, `10GB` (permanent — see [limitations](#known-limitations)), and which coding agent it runs. |
-| `nemr switch-agent <name> <agent>` | Change which agent a stopped project runs. |
-| `nemr start <name>` | Start it up. |
-| `nemr attach <name>` | Open a terminal prompt inside it. |
-| `nemr stop <name>` | Shut it down. Your files stay. |
-| `nemr list` | Show every project, whether it's running, and how much space it uses. |
-| `nemr status <name>` | Everything about one project in one place. |
-| `nemr export <name>` | Pack a project into a single file (`<name>.nemr` in the current folder) to carry elsewhere. |
-| `nemr import <file>` | Unpack one, creating the project automatically. |
-| `nemr delete <name>` | Remove a project and everything in it. |
-| `nemr reconcile` | Clean up leftovers after a crash or power cut. `nemr list` warns you when it's needed. |
+| `nemr create <name>` | Create a session: a size-limited volume and a container ready to start |
+| `nemr add <dir>` | Copy an existing directory in as a session, with its Claude Code history |
+| `nemr start <name>` | Start the session's container |
+| `nemr attach <name>` | Open an interactive shell inside a running session |
+| `nemr stop <name>` | Stop the container |
+| `nemr list` | Every session, with status and disk used |
+| `nemr status <name>` | One session in full: state, volume, base image, credential |
+| `nemr delete <name>` | Delete a session and release everything it held |
+| `nemr reconcile` | Reclaim mounts, loop devices and snapshots left behind by a crash |
+| `nemr export <name>` | Write a stopped session to a portable bundle file |
+| `nemr import <bundle>` | Restore a bundle into a session |
+| `nemr port add <name> <port>` | Forward a port from the host into a running session |
+| `nemr switch-agent <name>` | Change which coding agent the session runs |
+| `nemr ui` | Open the browser interface on a loopback port, for as long as it runs |
 
-Add `--verbose` to any command to see exactly what it's doing under the hood.
+With a sync server:
 
-### What `status` tells you
+| Command | What it does |
+|---|---|
+| `nemr register` | Create an account, generate the master key, and confirm the recovery code |
+| `nemr login` | Log in and store the token and key envelope for this machine |
+| `nemr logout` | Revoke the token and remove local state |
+| `nemr sessions` | What the server holds, alongside what is local |
+| `nemr push <name>` | Encrypt and upload a session; takes the lease |
+| `nemr pull <name>` | Download, decrypt and import a session |
+| `nemr release <name>` | Give up the lease |
 
-```
-myproject
-  state:        running          (running, or stopped)
-  usage:        76.0KiB of 500MB (0%)
-  loop device:  /dev/loop19      (the technical handle for this project's disk)
-  mount check:  ok               (confirms the right disk is attached, not a stray one)
-  credential:   present at ~/.claude/.credentials.json, last written 0 days ago
-```
+Self-hosting only, and a normal user never runs these:
 
-The last two lines exist because "is the right disk attached?" and "do I have a
-valid login?" were the two questions that used to take several commands and a
-lot of guessing to answer.
+| Command | What it does |
+|---|---|
+| `nemr server start` | Check the settings, Postgres and the object store, then run the sync server in the foreground |
+| `nemr server stop` | Stop the server this command started |
+| `nemr server status` | Whether it is running, on what address, on which storage, and whether Postgres and that storage answer |
 
----
+## Running your own sync server
 
-## Moving a project to another machine
+`nemr server start` reads one file — `~/.config/nemr/sync.env` — and starts the
+server. It does not install or start Postgres: it checks that one answers and
+refuses, naming the connection it tried. Run it with no settings and it prints
+the file it wants, with every setting explained.
 
-On the machine you're leaving:
-
-```bash
-nemr stop myproject
-nemr export myproject          # writes myproject.nemr in the current folder
-```
-
-Copy that one file across however you like — a USB stick, `scp`, cloud storage.
-**Nemr doesn't do the copying for you**, and the file is not encrypted, so treat
-it like any other file that holds your work.
-
-On the machine you're arriving at (it must have Nemr set up, and the same starter
-image — import will tell you clearly if it doesn't):
-
-```bash
-nemr import ~/Downloads/myproject.nemr
-claude                          # log in first — the file never carries your login
-nemr start myproject
-nemr attach myproject
-```
-
-The file remembers the project's name and size, so you don't have to.
-
-**Two things worth knowing before you rely on this:**
-
-- **Your Claude login never travels with the file** — by design, so a file you
-  might email yourself can't leak your credentials. Log in on the new machine.
-- **Import makes an independent copy.** If you keep working on *both* machines,
-  the two copies drift apart and nothing merges or warns you. Treat a project as
-  living on one machine at a time.
-
----
-
-## What you need
-
-- **Recent Ubuntu Linux** — 22.04 or newer. Not sure? The setup script checks
-  for you and explains if anything's missing.
-  - **On Windows, Nemr's answer is WSL2** — you install Ubuntu under WSL2, run
-    setup inside it, and work from that terminal. There is **no native Windows
-    `.exe` and none planned**; that is a deliberate platform decision, the same
-    one Docker Desktop and Podman Desktop made. Fair warning: Nemr has not yet
-    been verified inside WSL2 — that work is in progress, so today the tested
-    claim is a real Linux install only.
-  - **No macOS**, and no current plan date for it.
-- **Your password (sudo) for setup only** — to install system pieces and one
-  small helper. Day-to-day use doesn't need it.
-- **Claude Code installed, and a subscription** — you log in on each machine you
-  use, with `/login` inside a project
-  ([Claude Code install guide](https://docs.anthropic.com/en/docs/claude-code)).
-  Nemr detects Claude Code; it never installs it for you.
-- **The Rust toolchain** ([rustup](https://rustup.rs)) — Nemr is built from
-  source on your machine. The installer refuses, and says so, without it.
-- **About 5 GB of free disk for the install**, plus whatever you give your
-  projects. Note that project disks are thin — a `2GB` project doesn't take 2 GB
-  until you fill it (see [limitations](#known-limitations)).
-
-Nemr costs nothing to use; you only need your existing Claude Code subscription.
-
----
+`scripts/install_server.sh` sets up a host from scratch. The details, including
+the storage backends and what the server may and may not see, are in
+[`docs/DECISIONS.md`](docs/DECISIONS.md) (E-19, E-20) and
+[`docs/reports/2026-09-11-server-one-command.md`](docs/reports/2026-09-11-server-one-command.md).
 
 ## How it works
 
-Each project is three things:
-
-1. **A private disk** — think of it as a virtual USB stick: one ordinary file on
-   your computer that the project sees as a separate drive with a fixed size
-   limit. This is what keeps projects apart.
-2. **A container** — a lightweight sandbox holding Claude Code and its tools,
-   with the project's disk attached, and your Claude login attached read-only.
-3. **A record** — Nemr keeps no list of its own. It relies on the underlying
-   Linux plumbing (a standard component called `containerd`) and the machine
-   itself as the only sources of truth, so there's no private database to drift
-   out of sync with reality.
-
-**A background service does the work.** `nemr` commands talk to a small
-background service (`nemrd`) that manages your projects; it starts automatically
-the first time you run a command. Keeping one service in charge means two
-commands can never trip over each other. If it isn't running, the next command
-starts it — you never have to.
-
-**On the isolation:** a project can only see its own disk — no other project's
-files are attached to it — and it has its own network. Sessions reach the
-internet and the ports you forward; **they cannot reach each other.** Two
-sessions can both run a dev server on port 8000 without colliding, and neither
-can call the other's. (A port you publish with `--expose` is published to the
-network, and that includes other sessions — which is what publishing means.)
-
-This is ordinary container separation, good for keeping work tidy and
-independent. It has **not** been hardened or reviewed as a security boundary, so
-don't rely on it to contain untrusted code (see
-[limitations](#known-limitations)).
-
----
-
-## Where the project is today
-
-**The engine does the whole job, end to end.** Every command in the table above
-works and is covered by 152 automated tests that run on every pull request and
-every merge, on a clean machine built from scratch each time.
-
-It is **early software, not finished** — the [conformance
-ledger](docs/CONFORMANCE.md) lists what's still open, and the
-[limitations](#known-limitations) below cover what you'd actually run into.
-
-### What's coming next
-
-- **A background service** — so a session stays recoverable while nothing is
-  attached, and as the foundation for anything with a window and buttons.
-- **A security review, then open source** — the core is intended to become open
-  source, after a proper review rather than before.
-- **A website for your projects** — log in, see your projects across your
-  machines, pull one down and open it. This is the part that turns the tool into
-  a product.
-
----
-
-## Known limitations
-
-Written plainly, because finding these out by surprise is worse than reading
-them here.
-
-- **Codex support is unverified.** You can create a Codex project and Codex
-  runs, but whether a Codex conversation survives a stop/restart or travels in
-  an export has **not been tested** — only Claude Code has. Nemr warns you when
-  you pick Codex. Treat a Codex project's history as not yet safe to rely on.
-- **No external security review yet.** Setup installs a passwordless `sudo` rule
-  for one small root-owned helper. The project separation above is not a security
-  boundary — don't run code you don't trust inside a project.
-- **Linux only, today.** No macOS. On Windows the intended path is WSL2 —
-  Nemr inside a WSL2 Ubuntu, no native binary, none planned — but that has not
-  been verified yet, so don't rely on it until this list says otherwise.
-- **One machine at a time.** In the one case observed, logging in to Claude Code
-  on a second machine revoked the login on the first. We don't yet know how
-  general that is; treat a project as living on one machine at a time.
-- **A login that expires while a project is running** isn't picked up inside the
-  running project. Today the only fix is to delete and recreate the project —
-  which loses the container (your files in it survive; export first if unsure).
-  A better fix is planned.
-- **Project size is permanent.** You pick `500MB`, `2GB` or `10GB` at creation
-  and can't change it later.
-- **Project disks are thin-provisioned, and Nemr won't stop you overcommitting.**
-  A `2GB` project only takes space as you use it, but nothing prevents you
-  creating more project space than your disk holds. If your disk fills, projects
-  can fail to write.
-- **Only your project files and conversation travel.** Anything you install
-  *inside* a project (system packages, global tools) does not go in the export —
-  only the project's own disk does. And a git repository is exported without its
-  full history (its object store is left out to keep the file small).
-- **`nemr stop` occasionally fails on a busy machine** (seen once in twenty
-  runs), leaving a project that reports an error instead of stopping. Undiagnosed.
-- **A bundle doesn't carry the starter image.** The machine you import onto must
-  already have it; Nemr won't download it for you (import says so plainly if it's
-  missing).
-- **Nemr never copies files between machines for you.** Export gives you a file;
-  moving it is up to you.
-
----
-
-## Uninstalling
-
-There's no uninstall command yet. To remove Nemr by hand:
-
-```bash
-nemr list                            # note your projects
-nemr delete <name>                   # for each, to release its disk (export first to keep anything)
-rm ~/.local/bin/nemr ~/.local/bin/nemrd ~/.local/bin/nemr-*   # the commands
-sudo rm /usr/local/libexec/nemr-volume /etc/sudoers.d/nemr-volume   # the helper and its grant
-```
-
-The installer also added system packages, a user service and a cgroup setting;
-those are standard components and are left in place. `./scripts/install.sh`
-lists every one of them in the plan it shows before it does anything, and
-`PREREQUISITES.md` explains why each exists.
-
----
+- **Rootless containerd and runc.** Sessions are OCI containers run by a
+  containerd that belongs to your user, in a user namespace. No Docker, no
+  daemon running as root.
+- **A loopback ext4 volume per session.** Each session's files live in a file
+  on your disk, formatted ext4 and mounted. That is where the size limit comes
+  from: it is the filesystem's, not a quota anyone has to enforce.
+- **A narrow privileged helper.** Mounting a filesystem needs root. One small
+  root-owned program does mount and unmount and nothing else; everything else
+  runs as you.
+- **Client-side encryption.** A session is compressed and encrypted before it
+  leaves your machine, under a key derived from your password. A sync server
+  stores objects it cannot read and never sees the key.
 
 ## Credits
 
@@ -318,45 +177,3 @@ with one on screen while the installer works. That drawing follows an ASCII-art
 cat by **Samamine** — same pose, same sparse dotted-outline style. It is redrawn
 rather than copied, but the likeness is deliberate, and the credit is theirs.
 See `scripts/lib/cat.sh`, or run `./scripts/lib/cat.sh --show`.
-
----
-
-## Getting help
-
-Something wrong? `nemr status <name>` and `nemr --verbose <command>` show what's
-happening, and `nemr reconcile` clears leftovers after a crash. Beyond that,
-this is private-preview software — report issues to the person who gave you
-access.
-
----
-
-## For engineers
-
-| Document | What's in it |
-|---|---|
-| [`docs/ENGINEERING.md`](docs/ENGINEERING.md) | How every part was built, measured and verified. |
-| [`PREREQUISITES.md`](PREREQUISITES.md) | What each setup step does and why. Read when a check refuses. |
-| [`SPEC.md`](SPEC.md) | The specification and its full revision history. |
-| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Every significant decision, its reasoning, and what it cost. |
-| [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) | Every defect found, how it was proven, and its disposition — fixed, open, or refuted. |
-| [`docs/bundle-format.md`](docs/bundle-format.md) | The file format used to move a project. |
-
-```bash
-cargo test --workspace --lib                        # host-free unit tests
-cargo test --test regression -- --test-threads=1    # full suite (needs a set-up host)
-./scripts/e2e_smoke_test.sh                         # end-to-end
-./scripts/verify_wp_a.sh                            # acceptance
-```
-
-[![publish base image](https://github.com/GNRain/nemr-engine/actions/workflows/publish-base-image.yml/badge.svg)](https://github.com/GNRain/nemr-engine/actions/workflows/publish-base-image.yml)
-
-The base image is pushed to `ghcr.io/gnrain/nemr-base:0.2.0`. It builds
-reproducibly — the same source produces the same image, byte for byte, given the
-same package snapshots — and that condition is load-bearing: the apt layer is
-deliberately not snapshotted, so a rebuild after the Debian archive moves yields
-a different digest by design (measured across two kernels on the same day:
-identical digests, both differing from the recorded one — F-127). The published
-digest, not a local rebuild, is the authoritative artifact; provisioning pulls
-it and builds only as a fallback (F-126). It is **not yet anonymously pullable** (the GHCR package
-is private pending a one-time visibility change); `scripts/check_base_image_published.sh`
-checks and explains.
