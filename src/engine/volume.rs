@@ -95,9 +95,9 @@ impl VolumeSize {
     /// A size that printed as `1GB` when it was 1 GB minus one block would
     /// come back as a different volume on import.
     pub fn as_str(self) -> String {
-        if self.0 >= GB && self.0 % GB == 0 {
+        if self.0 >= GB && self.0.is_multiple_of(GB) {
             format!("{}GB", self.0 / GB)
-        } else if self.0 >= MB && self.0 % MB == 0 {
+        } else if self.0 >= MB && self.0.is_multiple_of(MB) {
             format!("{}MB", self.0 / MB)
         } else {
             format!("{}B", self.0)

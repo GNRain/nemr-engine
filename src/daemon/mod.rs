@@ -86,7 +86,6 @@ fn status_from_typed(e: crate::error::Error) -> Status {
     status_from_anyhow(e.into())
 }
 
-#[tonic::async_trait]
 /// A size from the wire, with empty meaning the default.
 ///
 /// Empty is the page's "the user did not touch the slider" and the CLI never
@@ -100,6 +99,7 @@ fn parse_size(size: &str) -> Result<crate::engine::volume::VolumeSize, Status> {
         .map_err(|e| Status::invalid_argument(e.to_string()))
 }
 
+#[tonic::async_trait]
 impl Nemr for NemrService {
     async fn handshake(
         &self,

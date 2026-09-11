@@ -142,9 +142,11 @@ fn run() -> Result<(), String> {
             cmd_unmount(&invoker, name)
         }
         Some("normalize") => {
-            let size = require_arg(&args, 1, "size")?;
+            // The size is OPTIONAL: without one this is "what do you accept?",
+            // which is the question the engine asks before it has a size to
+            // ask about.
             reject_extra_args(&args, 2)?;
-            cmd_normalize(&invoker, size)
+            cmd_normalize(&invoker, args.get(1).map(String::as_str))
         }
         Some(other) => Err(format!(
             "unknown subcommand {other:?}; expected 'mount', 'unmount', 'normalize' or 'version'"
@@ -411,26 +413,59 @@ fn audit(message: &str) {
 /// Touches nothing: it opens the volumes directory read-only to ask `statvfs`
 /// for its block size, and prints. Output is `key=value` lines so a caller
 /// parses it without a format to keep in step either.
-fn cmd_normalize(invoker: &Invoker, size: &str) -> Result<(), String> {
-    let requested = parse_size_bytes(size)?;
+fn cmd_normalize(invoker: &Invoker, size: Option<&str>) -> Result<(), String> {
+    // Parsed FIRST, before the filesystem is touched, so a bad size is refused
+    // having done nothing at all.
+    let requested = size.map(parse_size_bytes).transpose()?;
 
     // Through the same symlink-refusing resolver as everything else. It is
     // read-only and unprivileged in effect, but a resolver that is only used
     // on the dangerous paths is a resolver somebody will forget to use on the
     // next one.
-    let dir_fd = safe::open_beneath(&invoker.volumes_dir(), libc::O_RDONLY)?;
+    //
+    // ON A FRESH HOST THE VOLUMES DIRECTORY DOES NOT EXIST YET — the engine
+    // creates it when it allocates the first backing file, which is after it
+    // has asked this question. So walk up to the first directory that does
+    // exist. A block size is a property of the filesystem, not of a directory
+    // on it, and every one of these is on the same filesystem; if they are
+    // not, the one nearest the volumes directory is still the right answer.
+    // This helper does NOT create the directory: making a user's directories
+    // is not something a root program should be doing on the way to answering
+    // a question.
+    let candidates = [
+        invoker.volumes_dir(),
+        invoker.managed_root(),
+        invoker.home.clone(),
+    ];
+    let dir_fd = candidates
+        .iter()
+        .find_map(|p| safe::open_beneath(p, libc::O_RDONLY).ok())
+        .ok_or_else(|| {
+            format!(
+                "none of {} exists and is reachable without crossing a symlink",
+                candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
     let vfs = safe::fstatvfs(&dir_fd)?;
     // f_frsize is the fragment size — the unit f_blocks/f_bavail count in, and
     // the one that matters for how much of a file is a whole block. f_bsize is
     // a preferred I/O size and on some filesystems is not the allocation unit.
-    let block = vfs.f_frsize as u64;
-    let rounded = round_down_to_block(requested, block)?;
+    // `f_frsize` is `c_ulong`, which is u64 on every target this helper is
+    // built for; the annotation is here so a narrower one is a compile error
+    // rather than a silent truncation.
+    let block: u64 = vfs.f_frsize;
 
     println!("min={MIN_BYTES}");
     println!("max={MAX_BYTES}");
     println!("block={block}");
-    println!("requested={requested}");
-    println!("bytes={rounded}");
+    if let Some(requested) = requested {
+        println!("requested={requested}");
+        println!("bytes={}", round_down_to_block(requested, block)?);
+    }
     Ok(())
 }
 
@@ -774,6 +809,9 @@ mod tests {
 
     /// The bounds themselves, asserted rather than described — MIN was
     /// measured and MAX was chosen, and both are load-bearing.
+    // Comparing constants is the point: this test exists so the two measured
+    // numbers cannot be edited without someone deciding to.
+    #[allow(clippy::assertions_on_constants)]
     #[test]
     fn the_bounds_are_what_was_measured() {
         assert_eq!(MIN_BYTES, 67_108_864, "64 MiB");
