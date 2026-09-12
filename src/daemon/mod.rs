@@ -86,6 +86,19 @@ fn status_from_typed(e: crate::error::Error) -> Status {
     status_from_anyhow(e.into())
 }
 
+/// A size from the wire, with empty meaning the default.
+///
+/// Empty is the page's "the user did not touch the slider" and the CLI never
+/// sends it. The default belongs here rather than in either caller: two
+/// callers filling in their own default is two defaults.
+fn parse_size(size: &str) -> Result<crate::engine::volume::VolumeSize, Status> {
+    if size.trim().is_empty() {
+        return Ok(crate::engine::volume::VolumeSize::DEFAULT);
+    }
+    size.parse::<crate::engine::volume::VolumeSize>()
+        .map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
 #[tonic::async_trait]
 impl Nemr for NemrService {
     async fn handshake(
@@ -124,10 +137,7 @@ impl Nemr for NemrService {
         request: Request<CreateRequest>,
     ) -> Result<Response<CreateResponse>, Status> {
         let req = request.into_inner();
-        let size = req
-            .size
-            .parse::<crate::engine::volume::VolumeSize>()
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let size = parse_size(&req.size)?;
         let agent = req
             .agent
             .parse::<crate::engine::agent::Agent>()
@@ -172,10 +182,7 @@ impl Nemr for NemrService {
                 git_dir_external: plan.git_dir_external,
             }));
         }
-        let size = req
-            .size
-            .parse::<crate::engine::volume::VolumeSize>()
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let size = parse_size(&req.size)?;
         let agent = req
             .agent
             .parse::<crate::engine::agent::Agent>()
@@ -254,6 +261,30 @@ impl Nemr for NemrService {
         Ok(Response::new(DeleteResponse {}))
     }
 
+    /// What a volume size may be here (SPEC 1.153).
+    ///
+    /// Asks the privileged helper, which is where the bounds are enforced,
+    /// rather than answering from a constant this program keeps — the CLI
+    /// prompt and the page's slider both come through here, so a copy kept in
+    /// the daemon would be a third opinion to keep in step.
+    async fn size_limits(
+        &self,
+        _request: Request<SizeLimitsRequest>,
+    ) -> Result<Response<SizeLimitsResponse>, Status> {
+        let paths = crate::engine::volume::VolumePaths::from_env().map_err(status_from_anyhow)?;
+        let ops = crate::engine::volume::HelperOps::new();
+        let limits =
+            crate::engine::volume::size_limits(&ops, &paths).map_err(status_from_anyhow)?;
+        Ok(Response::new(SizeLimitsResponse {
+            min_bytes: limits.min,
+            max_bytes: limits.max,
+            block_bytes: limits.block,
+            default_bytes: crate::engine::volume::VolumeSize::DEFAULT.bytes(),
+            free_bytes: limits.free,
+            volumes_path: paths.image_dir().display().to_string(),
+        }))
+    }
+
     async fn list(&self, _request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         let projects = crate::engine::project::list(&self.client)
             .await
@@ -267,6 +298,11 @@ impl Nemr for NemrService {
                 .map(|p| ProjectStatus {
                     name: p.name,
                     container_id: p.container_id,
+                    quota_bytes: p
+                        .quota
+                        .parse::<crate::engine::volume::VolumeSize>()
+                        .map(|s| s.bytes())
+                        .unwrap_or(0),
                     quota: p.quota,
                     running: p.running,
                     volume_path: p.volume_path,

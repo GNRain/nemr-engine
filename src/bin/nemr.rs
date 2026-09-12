@@ -307,26 +307,155 @@ fn resolve_name(provided: Option<String>, interactive: bool) -> Result<String> {
     }
 }
 
-fn resolve_size(provided: Option<VolumeSize>, interactive: bool) -> Result<VolumeSize> {
+/// Ask the daemon what a size may be here.
+///
+/// One round trip, one source: the helper's bounds and the filesystem's free
+/// space. The CLI holds no copy of either.
+async fn fetch_size_limits(session: &mut daemon::Session) -> Result<volume::SizeLimits> {
+    let __req = session.req(proto::SizeLimitsRequest {});
+    let r = session
+        .client()
+        .size_limits(__req)
+        .await
+        .map_err(status_err)?
+        .into_inner();
+    Ok(volume::SizeLimits {
+        min: r.min_bytes,
+        max: r.max_bytes,
+        block: r.block_bytes,
+        free: r.free_bytes,
+    })
+}
+
+/// Resolve the volume size (SPEC 1.153).
+///
+/// `limits` comes from the daemon, which asks the privileged helper — the one
+/// program that enforces the bounds — and `statvfs`, the same call `nemr
+/// status` uses. So every figure printed here is a figure something will act
+/// on, not an estimate this binary keeps.
+///
+/// NO DEFAULT IS PASSED TO `decide`. Without a terminal a missing `--size`
+/// used to become 2GB silently; a scripted create that quietly picks a quota
+/// is exactly the invisible default this project refuses elsewhere, so it is
+/// now a refusal that names the flag (F-15's predicate, unchanged).
+fn resolve_size(
+    provided: Option<VolumeSize>,
+    interactive: bool,
+    limits: &volume::SizeLimits,
+) -> Result<VolumeSize> {
     let default = VolumeSize::default_size();
-    match decide(provided, interactive, Some(default), "--size") {
-        Resolution::Provided(v) | Resolution::UseDefault(v) => Ok(v),
+    let chosen = match decide(provided, interactive, None, "--size") {
+        Resolution::Provided(v) | Resolution::UseDefault(v) => v,
         Resolution::MustFail { required_flag } => {
-            anyhow::bail!("{required_flag} is required when stdin is not a terminal")
+            anyhow::bail!(
+                "{required_flag} is required when stdin is not a terminal.\n\
+                 Sizes run from {} to {} here, and {} is free.\n\
+                 Try: nemr create <name> --size {}",
+                volume::human_size(limits.min),
+                volume::human_size(limits.max),
+                volume::human_size(limits.free),
+                default,
+            )
         }
-        Resolution::Prompt { default } => {
-            let options = VolumeSize::all();
-            let start = options
-                .iter()
-                .position(|s| Some(*s) == default)
-                .unwrap_or(0);
-            let labels: Vec<String> = options.iter().map(|s| s.to_string()).collect();
-            let choice = dialoguer::Select::new()
-                .with_prompt("Storage size (fixed for the life of the project)")
-                .items(&labels)
-                .default(start)
-                .interact()?;
-            Ok(options[choice])
+        Resolution::Prompt { .. } => ask_size(limits, default)?,
+    };
+
+    // CHECKED WHICHEVER WAY IT ARRIVED. The prompt checks as it asks so it can
+    // ask again; a `--size` flag has nobody to ask, so it is checked here and
+    // refused with the same figure.
+    if let Some(why) = limits.refuse(chosen) {
+        let v = nemr_style::Voice::for_stderr();
+        eprint!(
+            "{}",
+            v.refusal(
+                &format!("{chosen} is not a size this host can make."),
+                &why,
+                &format!(
+                    "pick something between {} and {}:  nemr create <name> --size {}",
+                    volume::human_size(limits.min),
+                    volume::human_size(limits.max),
+                    default
+                ),
+            )
+        );
+        std::process::exit(1);
+    }
+
+    // ROUNDED, AND SAID SO. The helper rounds down to a whole filesystem
+    // block; a create that silently differs from what was typed is the thing
+    // the round trip exists to prevent. Whole MB and GB are already block
+    // multiples, so this only speaks up for a byte count.
+    let rounded = limits.round(chosen);
+    if rounded != chosen {
+        let v = nemr_style::Voice::for_stdout();
+        println!(
+            "{}",
+            v.note(&format!(
+                "{chosen} rounds down to {rounded} — volumes are whole {}-byte blocks.",
+                limits.block
+            ))
+        );
+    }
+    Ok(rounded)
+}
+
+/// The two questions, in the order the Product Owner asked for them: the unit,
+/// then the amount.
+///
+/// Split in two rather than asking for "2GB" in one box because the unit is a
+/// choice between two things and the amount is a number — a single free-text
+/// field makes the user guess the spelling, and every guess is a refusal.
+fn ask_size(limits: &volume::SizeLimits, default: VolumeSize) -> Result<VolumeSize> {
+    let v = nemr_style::Voice::for_stdout();
+    let units: [(&str, u64); 2] = [("MB", volume::MB), ("GB", volume::GB)];
+
+    let picked = dialoguer::Select::new()
+        .with_prompt("You'll choose how much storage this session gets. Pick a unit")
+        .items(&units.iter().map(|(n, _)| *n).collect::<Vec<_>>())
+        .default(1)
+        .interact()?;
+    let (unit_name, unit) = units[picked];
+
+    // The room there is, in the unit just chosen, before the number is asked
+    // for — so the answer is informed rather than corrected.
+    let lo = limits.min.div_ceil(unit).max(1);
+    let hi = (limits.max.min(limits.free)) / unit;
+    println!(
+        "{}",
+        v.note(&format!(
+            "{lo} to {hi} {unit_name} — {} free on this disk",
+            volume::human_size(limits.free)
+        ))
+    );
+
+    let start = (default.bytes() / unit).clamp(lo, hi.max(lo));
+    loop {
+        let typed: String = dialoguer::Input::new()
+            .with_prompt("How much?")
+            .default(start.to_string())
+            .interact_text()?;
+        let typed = typed.trim();
+        // Digits only: the unit was already chosen, so "2GB" here would mean
+        // 2GB of GB. Say that rather than parsing it into a surprise.
+        let Ok(amount) = typed.parse::<u64>() else {
+            println!(
+                "{}",
+                v.failed(&format!("{typed:?} is not a whole number of {unit_name}"))
+            );
+            continue;
+        };
+        let Some(size) = amount.checked_mul(unit).map(VolumeSize::from_bytes) else {
+            println!(
+                "{}",
+                v.failed(&format!("{amount} {unit_name} is too large"))
+            );
+            continue;
+        };
+        match limits.refuse(size) {
+            // NAMES THE FIGURE, not "invalid size": the number the user has to
+            // stay under is the only part of this that helps.
+            Some(why) => println!("{}", v.failed(&why)),
+            None => return Ok(size),
         }
     }
 }
@@ -710,11 +839,17 @@ async fn run() -> Result<()> {
             // logic is in nemr_engine::interactive; this only renders prompts in
             // the branch it blesses.
             let interactive = nemr_engine::interactive::is_interactive();
+            // THE DAEMON FIRST, before any question. The bounds come from the
+            // privileged helper and the free space from statvfs, both behind
+            // the daemon (E-09: the CLI has no path into the engine). Asking
+            // "how much?" before those figures are in hand is asking a
+            // question whose answer cannot be checked.
+            let mut session = daemon::connect().await?;
+            let limits = fetch_size_limits(&mut session).await?;
             let name = resolve_name(name, interactive)?;
-            let size = resolve_size(size, interactive)?;
+            let size = resolve_size(size, interactive, &limits)?;
             let agent = resolve_agent(agent, interactive)?;
 
-            let mut session = daemon::connect().await?;
             let project = {
                 let __req = session.req(proto::CreateRequest {
                     name,
@@ -806,14 +941,15 @@ async fn run() -> Result<()> {
                     resolve_name(usable, interactive)?
                 }
             };
-            let size = resolve_size(size, interactive)?;
+            let mut session = daemon::connect().await?;
+            let limits = fetch_size_limits(&mut session).await?;
+            let size = resolve_size(size, interactive, &limits)?;
             let agent = resolve_agent(agent, interactive)?;
 
             // F-15: add copies a whole tree, so it says what and how big and
             // asks — on a terminal. Without one it REFUSES and names the flag;
             // it never proceeds silently, and it never tries to prompt where a
             // prompt cannot be drawn.
-            let mut session = daemon::connect().await?;
             if !yes {
                 // The plan comes from the daemon: the CLI has no path into the
                 // engine (E-09), and the daemon is the one that would do the
@@ -1098,6 +1234,7 @@ async fn run() -> Result<()> {
                         "name": p.name,
                         "agent": p.agent,
                         "quota": p.quota,
+                        "quota_bytes": p.quota_bytes,
                         "running": p.running,
                         "volume_path": p.volume_path,
                         "usage_known": p.usage_known,

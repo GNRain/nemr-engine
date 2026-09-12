@@ -121,6 +121,14 @@ pub trait UiEngine: EngineOps {
     /// F-21: add an existing host directory as a session.
     fn add(&self, name: &str, size: &str, agent: &str, source_dir: &str)
         -> Result<(u64, u64, u64)>;
+    /// What a volume size may be on this host (SPEC 1.153).
+    ///
+    /// From the daemon, which asks the privileged helper and `statvfs`. The
+    /// page holds no copy of any of it — the slider's ends, its step and the
+    /// mark for free disk are all drawn from this reply, so the page cannot
+    /// offer a size the engine would refuse.
+    fn size_limits(&self) -> Result<SizeLimits>;
+
     /// Open an attach stream: the daemon's, or a fake's in the tests.
     fn attach(
         &self,
@@ -605,11 +613,15 @@ async fn sessions(State(state): State<Arc<UiState>>) -> Response {
             Ok(list) => (Some(list), None),
             Err(e) => (None, Some(format!("{e:#}"))),
         };
-        core::sessions(local.as_deref()).map(|rows| (rows, local_error))
+        // Asked alongside the list, in the same blocking hop: the panel is
+        // rendered from this one reply, so a second round trip would be a
+        // second chance for the two to disagree.
+        let limits = engine.size_limits().ok();
+        core::sessions(local.as_deref()).map(|rows| (rows, local_error, limits))
     })
     .await;
     match rows {
-        Ok(Ok((rows, local_error))) => {
+        Ok(Ok((rows, local_error, limits))) => {
             let rows: Vec<Value> = rows
                 .iter()
                 .map(|r| {
@@ -619,6 +631,7 @@ async fn sessions(State(state): State<Arc<UiState>>) -> Response {
                         "where": r.location.as_str(),
                         "running": r.running,
                         "size_bytes": r.size_bytes,
+                        "quota_bytes": r.quota_bytes,
                         "updated_at_unix": r.updated_at_unix,
                         "last_machine": r.last_machine,
                         "has_bundle": r.has_bundle,
@@ -630,7 +643,7 @@ async fn sessions(State(state): State<Arc<UiState>>) -> Response {
                 .collect();
             Json(json!({
                 "rows": rows,
-                "create_options": create_options(),
+                "create_options": create_options(limits),
                 "local_available": local_error.is_none(),
                 "local_error": local_error,
                 "this_machine": crate::state::holder_identity(),
@@ -799,22 +812,90 @@ async fn stop(State(state): State<Arc<UiState>>, UrlPath(name): UrlPath<String>)
     Json(json!({ "job": id })).into_response()
 }
 
+/// A size the fake engine will not take, if there is one.
+///
+/// Mirrors the daemon: empty is the default, a unit or a byte count parses,
+/// and the bounds are the ones the fake reports through `size_limits`.
+#[cfg(test)]
+fn fake_size_refusal(size: &str) -> Option<String> {
+    if size.trim().is_empty() {
+        return None;
+    }
+    let upper = size.trim().to_ascii_uppercase();
+    let (digits, unit) = match upper.strip_suffix("GB") {
+        Some(d) => (d, 1024u64 * 1024 * 1024),
+        None => match upper.strip_suffix("MB") {
+            Some(d) => (d, 1024 * 1024),
+            None => (upper.strip_suffix('B').unwrap_or(&upper), 1),
+        },
+    };
+    // A size that does not parse is REFUSED, not waved through: `?` on the
+    // Option here would have returned "no refusal" for "banana".
+    let Some(bytes) = digits.parse::<u64>().ok().and_then(|n| n.checked_mul(unit)) else {
+        return Some(format!("unrecognised volume size {size:?}"));
+    };
+    if !(67_108_864..=1_099_511_627_776).contains(&bytes) {
+        return Some(format!("volume size {size:?} is out of range"));
+    }
+    None
+}
+
+/// The daemon's answer to what a volume size may be here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeLimits {
+    pub min_bytes: u64,
+    pub max_bytes: u64,
+    pub block_bytes: u64,
+    pub default_bytes: u64,
+    pub free_bytes: u64,
+}
+
 /// F-11: what the create panel offers. The wire vocabulary of the daemon's
 /// `CreateRequest`, stated here because the commercial half never links
 /// the engine (E-11); the browser acceptance holds it to what `nemr create`
 /// accepts, so the two cannot drift apart unnoticed.
-pub const CREATE_SIZES: [&str; 3] = ["500MB", "2GB", "10GB"];
-pub const CREATE_DEFAULT_SIZE: &str = "2GB";
 pub const CREATE_AGENTS: [(&str, &str); 2] = [
     ("claude-code", "Claude Code"),
     ("codex", "Codex CLI (implemented but unverified — F-84)"),
 ];
-fn create_options() -> Value {
-    json!({
-        "sizes": CREATE_SIZES,
-        "default_size": CREATE_DEFAULT_SIZE,
+
+/// Marks on the slider: the three sizes that used to be the only ones.
+///
+/// Suggestions, nothing more — any value between the ends is allowed. They are
+/// here because they are the sizes people already think in, and a slider with
+/// no landmarks is a slider nobody can aim.
+pub const CREATE_MARKS: [(&str, u64); 3] = [
+    ("500MB", 500 * 1024 * 1024),
+    ("2GB", 2 * 1024 * 1024 * 1024),
+    ("10GB", 10 * 1024 * 1024 * 1024),
+];
+
+/// What the create panel offers, with every number from the daemon.
+///
+/// NOTHING HERE IS A CONSTANT OF THE PAGE'S OWN. It used to be three strings
+/// in this file kept in step with the engine by a browser assertion; a range
+/// cannot be kept in step by enumeration, so the assertion now checks that
+/// these numbers ARE the engine's, which is a stronger thing to check.
+fn create_options(limits: Option<SizeLimits>) -> Value {
+    let marks: Vec<Value> = CREATE_MARKS
+        .iter()
+        .map(|(label, bytes)| json!({"label": label, "bytes": bytes}))
+        .collect();
+    let mut v = json!({
+        "marks": marks,
         "agents": CREATE_AGENTS.iter().map(|(id, label)| json!({"id": id, "label": label})).collect::<Vec<_>>(),
-    })
+    });
+    // A daemon that cannot answer leaves the size fields out entirely rather
+    // than filling in a guess: the panel says it cannot offer sizes, which is
+    // true, instead of offering a range nothing agreed to.
+    if let Some(l) = limits {
+        v["min_bytes"] = json!(l.min_bytes);
+        v["max_bytes"] = json!(l.max_bytes);
+        v["block_bytes"] = json!(l.block_bytes);
+        v["default_bytes"] = json!(l.default_bytes);
+        v["free_bytes"] = json!(l.free_bytes);
+    }
+    v
 }
 
 #[derive(Deserialize)]
@@ -840,11 +921,9 @@ async fn create(State(state): State<Arc<UiState>>, Json(body): Json<CreateBody>)
         )
             .into_response();
     }
-    let size = if body.size.is_empty() {
-        CREATE_DEFAULT_SIZE.to_string()
-    } else {
-        body.size
-    };
+    // An empty size travels as an empty size: the daemon owns the default, and
+    // a default filled in here would be a second opinion about it.
+    let size = body.size;
     let agent = if body.agent.is_empty() {
         CREATE_AGENTS[0].0.to_string()
     } else {
@@ -986,11 +1065,9 @@ async fn add_folder(State(state): State<Arc<UiState>>, Json(body): Json<AddBody>
         )
             .into_response();
     }
-    let size = if body.size.is_empty() {
-        CREATE_DEFAULT_SIZE.to_string()
-    } else {
-        body.size
-    };
+    // An empty size travels as an empty size: the daemon owns the default, and
+    // a default filled in here would be a second opinion about it.
+    let size = body.size;
     let agent = if body.agent.is_empty() {
         CREATE_AGENTS[0].0.to_string()
     } else {
@@ -1308,123 +1385,271 @@ async fn index() -> Response {
 <script src="/assets/addon-fit.js"></script>
 <script src="/assets/addon-web-links.js"></script>
 <style>
-  /* F-13 design pass. One page, three regions (header, the session list as the
-     centrepiece, one bounded panel region), dense and calm. One type scale, one
-     grey ramp, two accents (green for running, amber for a warning or a lease
-     held elsewhere, red only for errors). Everything is served from the binary;
-     nothing is fetched.
+  /* The Newsreader design system (docs/design/newsreader-spec), applied to the
+     page we already had. The spec is the system; the prototype in
+     docs/design/nemr.dc.html is one application of it, and where they differ
+     the spec wins — said at each point below.
+
+     FONTS: the design names Newsreader, IBM Plex Sans and IBM Plex Mono, loaded
+     from Google Fonts in the prototype. THIS PAGE FETCHES NOTHING, and the font
+     files are not in this repository or on the build host, so they are NOT
+     embedded — the stacks name the design's faces first (a machine that has
+     them installed gets them) and fall back to the system serif/sans/mono the
+     prototype's own font-family declarations already list. Embedding is a
+     contained follow-up: three woff2 subsets as data: URIs in @font-face here,
+     and nothing else moves.
 
      [hidden] must win over any author `display` (F-1/F-3: `hidden` works only
      through the UA `display:none`, and an author rule outranks it). */
   [hidden] { display: none !important; }
   :root {
-    --fg: #16181d; --muted: #6b7280; --faint: #9aa1ab;
-    --line: #e3e6ea; --line-strong: #cfd4da;
-    --bg: #f4f5f7; --panel: #ffffff; --raise: #fafbfc;
-    --ink: #16181d; --run: #1a7f4b; --warn: #9a5b00; --bad: #b3261e;
-    --accent: #16181d;
-    --s0: 12px; --s1: 13px; --s2: 15px; --s3: 19px;
-    --radius: 7px;
+    /* Tokens, verbatim from the system's `cssTokens`. */
+    --paper: #F4F5F3;      --paper-well: #EDEFEC;
+    --card: #FBFCFB;       --rule: #E4E7E4;
+    --rule-strong: #CFD4D0;
+    --ink: #2A2D2E;        --coat: #5E6265;
+    --coat-soft: #676C6A;  --coat-mute: #8D9291;
+    --meter: #A8ADAA;
+    --eye: #567057;        --eye-deep: #3D523E;
+    --eye-tint: #E8EEE7;
+    --ochre: #7A6229;      --ochre-surface: #F2ECDC;
+    --ochre-rule: #E4D9BE;
+    --brick: #8C4A3E;      --brick-surface: #F5E7E3;
+    --brick-rule: #DFBCB2;
+    --term-ground: #23272A; --term-ink: #DCE0DD;
+    --term-accent: #8FAE8F;
+
+    --serif: "Newsreader", Georgia, "Times New Roman", serif;
+    --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+    --radius: 3px;
+    --step-1: 4px;  --step-2: 8px;  --step-3: 12px;
+    --step-4: 16px; --step-5: 24px; --step-6: 40px;
+
+    --dur-fast: 160ms; --dur: 210ms; --dur-slow: 320ms;
+    --ease-out: cubic-bezier(.2,.8,.2,1);
+
+    /* The names the rest of this page already used, pointed at the tokens
+       above. Kept as aliases rather than renamed at every use: a rename is a
+       diff nobody can read beside a restyle, and these are the same roles. */
+    --fg: var(--ink); --muted: var(--coat-soft); --faint: var(--coat-mute);
+    --line: var(--rule); --line-strong: var(--rule-strong);
+    --bg: var(--paper); --panel: var(--card); --raise: var(--paper-well);
+    --run: var(--eye); --warn: var(--ochre); --bad: var(--brick);
+    --accent: var(--eye);
+    --s0: 12.5px; --s1: 13.5px; --s2: 15px; --s3: 20px;
   }
   * { box-sizing: border-box; }
-  body { font: var(--s1)/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: var(--bg); color: var(--fg); }
-  code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  body {
+    font: var(--s1)/1.55 var(--sans); margin: 0; color: var(--ink);
+    background-color: var(--paper);
+    /* The mist: the one ornament the brand sheet allows. */
+    background-image:
+      repeating-linear-gradient(0deg, rgba(94,98,101,.022) 0 1px, transparent 1px 3px),
+      repeating-linear-gradient(90deg, rgba(94,98,101,.018) 0 1px, transparent 1px 4px);
+    -webkit-font-smoothing: antialiased;
+  }
+  code, pre, .mono { font-family: var(--mono); }
+  a { color: var(--eye); text-decoration: underline; text-underline-offset: 2px; }
+  a:hover { color: var(--eye-deep); }
+
+  /* 2px accent focus outlines throughout — the system's, on everything that
+     takes focus, not only on buttons. */
+  a:focus-visible, input:focus, select:focus, textarea:focus,
+  button:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid var(--eye); outline-offset: 2px;
+  }
+  input:focus, select:focus { outline-offset: 1px; border-color: var(--eye); }
 
   header {
-    display: flex; align-items: center; gap: .9rem;
-    padding: .6rem 1.1rem; background: var(--panel); border-bottom: 1px solid var(--line-strong);
-    position: sticky; top: 0; z-index: 5;
+    display: flex; align-items: center; gap: var(--step-3);
+    max-width: 72rem; margin: 0 auto; padding: 22px var(--step-5) 14px;
   }
-  header h1 { font-size: var(--s2); font-weight: 650; letter-spacing: .02em; margin: 0; }
-  header .who { margin-left: auto; color: var(--muted); font-size: var(--s0); text-align: right; line-height: 1.25; }
-  header .who .acct { color: var(--fg); }
-  header .who .srv { color: var(--faint); }
+  header h1 {
+    margin: 0; font-family: var(--serif); font-size: 22px; font-weight: 500;
+    letter-spacing: -.01em;
+  }
+  /* The caret: the brand's mark, three blinks then still. */
+  header h1::after {
+    content: ""; display: inline-block; width: 7px; height: 15px;
+    margin-left: 4px; background: var(--eye); vertical-align: baseline;
+    animation: caret 1s steps(1) 3;
+  }
+  @keyframes caret { 0%,49% { opacity: 1 } 50%,100% { opacity: 0 } }
+  @media (prefers-reduced-motion: reduce) { header h1::after { animation: none } }
+  header .who { margin-left: auto; color: var(--coat-soft); font-size: var(--s0); text-align: right; line-height: 1.3; }
+  header .who .acct { color: var(--ink); }
+  header .who .srv { font-family: var(--mono); font-size: 11.5px; color: var(--coat-soft); }
 
-  main { max-width: 68rem; margin: 1.1rem auto; padding: 0 1.1rem 3rem; }
+  main { max-width: 72rem; margin: 0 auto; padding: 0 var(--step-5) var(--step-6); }
 
-  /* The status line: always the same place, a slim bar under the header. */
-  #status { min-height: 1.5em; margin: 0 0 1rem; padding: .45rem .7rem; font-size: var(--s0);
-            color: var(--muted); background: var(--raise); border: 1px solid var(--line); border-radius: var(--radius); }
-  #status.bad { color: var(--bad); border-color: #ecccc9; background: #fdf3f2; }
-  #status.warn { color: var(--warn); border-color: #eaddc2; background: #fdf8ef; }
+  /* The status line: between two hairlines, always the same place. */
+  #status {
+    min-height: 38px; display: flex; align-items: center; gap: 9px;
+    margin: 0 0 var(--step-5); padding: 9px 0; font-size: var(--s1);
+    color: var(--ink); border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule);
+  }
+  #status::before {
+    content: ""; width: 7px; height: 7px; border-radius: 50%; flex: none;
+    background: var(--coat-mute);
+  }
+  #status.bad { color: var(--brick); }
+  #status.bad::before { background: var(--brick); }
+  #status.warn { color: var(--ochre); }
+  #status.warn::before { background: var(--ochre); }
   #status:empty { visibility: hidden; }
 
-  /* The logged-out page: one centred card. */
-  .login { max-width: 23rem; margin: 3.5rem auto; display: grid; gap: .65rem;
-           background: var(--panel); border: 1px solid var(--line-strong); padding: 1.4rem; border-radius: var(--radius);
-           box-shadow: 0 1px 2px rgba(16,24,40,.04); }
-  .login h2 { font-size: var(--s3); font-weight: 600; margin: 0 0 .2rem; }
-  label { display: grid; gap: .25rem; color: var(--muted); font-size: var(--s0); }
-  input, select { font: inherit; font-size: var(--s1); padding: .42rem .55rem; border: 1px solid var(--line-strong);
-                  border-radius: 5px; background: #fff; color: var(--fg); }
-  input:focus, select:focus, button:focus-visible { outline: 2px solid #b9c2cf; outline-offset: 1px; }
+  /* The logged-out page: one card, centred, on the paper. */
+  .login { max-width: 25rem; margin: var(--step-6) auto; display: grid; gap: var(--step-2);
+           background: var(--card); border: 1px solid var(--rule-strong); padding: var(--step-5);
+           border-radius: var(--radius); }
+  .login h2 { font-family: var(--serif); font-size: 24px; font-weight: 500; letter-spacing: -.01em; margin: 0 0 2px; }
+  label { display: grid; gap: var(--step-1); color: var(--coat-soft); font-size: var(--s0); }
+  input, select { font: inherit; font-size: var(--s1); padding: 8px 10px; border: 1px solid var(--rule-strong);
+                  border-radius: 2px; background: #FFFFFF; color: var(--ink); }
 
-  button { font: inherit; font-size: var(--s0); padding: .38rem .7rem; border: 1px solid var(--line-strong);
-           border-radius: 5px; background: #fff; color: var(--fg); cursor: pointer; }
-  button:hover { background: var(--raise); }
-  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-  button.primary:hover { background: #000; }
+  button { font: inherit; font-size: var(--s0); padding: 5px 10px; border: 1px solid var(--rule-strong);
+           border-radius: 2px; background: transparent; color: var(--ink); cursor: pointer;
+           white-space: nowrap; }
+  button:hover:not(:disabled) { background: var(--paper-well); }
+  button:disabled { color: var(--coat-mute); border-color: var(--rule); cursor: not-allowed; }
+  button.primary { background: var(--eye); color: var(--paper); border-color: var(--eye); font-weight: 500; }
+  button.primary:hover:not(:disabled) { background: var(--eye-deep); border-color: var(--eye-deep); }
+  button.primary:disabled { background: var(--paper-well); color: var(--coat-mute); border-color: var(--rule); }
   /* A subdued, text-only button — for remove, which names its own case. */
-  button.linkish { border-color: transparent; background: transparent; color: var(--muted); padding: .38rem .4rem; }
-  button.linkish:hover { color: var(--bad); background: transparent; text-decoration: underline; }
+  button.linkish { border-color: transparent; background: transparent; color: var(--coat-soft); padding: 5px 4px; }
+  button.linkish:hover { color: var(--brick); background: transparent; text-decoration: underline; }
 
-  .toolbar { display: flex; gap: .55rem; align-items: center; margin: 0 0 .7rem; }
-  .toolbar h2 { font-size: var(--s2); font-weight: 600; margin: 0; }
+  .toolbar { display: flex; gap: var(--step-3); align-items: baseline; margin: 0 0 var(--step-4); }
+  .toolbar h2 { font-family: var(--serif); font-size: 24px; font-weight: 500; margin: 0; letter-spacing: -.01em; }
   .toolbar .spacer { margin-left: auto; }
-  .toolbar .note { color: var(--faint); font-size: var(--s0); }
+  .toolbar .note { color: var(--coat-soft); font-size: var(--s0); }
+  /* :not(.primary) — the toolbar sets the quiet buttons' surface, and a rule
+     of equal specificity later in the file would otherwise paint the primary
+     button's own ground over it and leave its label invisible. */
+  .toolbar button:not(.primary) { padding: 7px 13px; font-size: var(--s1); background: var(--card); }
+  .toolbar button.primary { padding: 7px 13px; font-size: var(--s1); }
 
-  /* The E-21 machine-state line: amber, like a lease held elsewhere, and the
+  /* The E-21 machine-state line: ochre, like a lease held elsewhere, and the
      one place that says the remedy. Not a result — those go to #status. */
-  #loginline { margin: 0 0 .7rem; padding: .5rem .7rem; font-size: var(--s0);
-               color: var(--warn); background: #fdf8ef; border: 1px solid #eaddc2; border-radius: var(--radius); }
+  #loginline { margin: 0 0 var(--step-3); padding: 10px 13px; font-size: var(--s0);
+               color: var(--ochre); background: var(--ochre-surface);
+               border: 1px solid var(--ochre-rule); border-radius: var(--radius); }
 
-  .tablewrap { overflow-x: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--panel); }
-  table { width: 100%; border-collapse: collapse; font-size: var(--s1); }
-  th, td { text-align: left; padding: .5rem .65rem; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: middle; }
-  td.wrap, th.wrap { white-space: normal; }
-  tr:last-child td { border-bottom: 0; }
-  th { font-size: var(--s0); font-weight: 600; color: var(--muted); background: var(--raise); text-transform: uppercase; letter-spacing: .03em; }
-  tr.srow td { border-bottom: 0; padding-bottom: .2rem; }
-  tr.arow td { padding: .2rem .65rem .6rem 1.3rem; white-space: normal; }
-  tr.arow td.actions { text-align: left; }
-  td.actions button { margin: .1rem .4rem .1rem 0; }
-  tr.srow:not(:first-child) td { border-top: 1px solid var(--line); padding-top: .55rem; }
-  .muted { color: var(--muted); }
-  .warn { color: var(--warn); }
-  .bad { color: var(--bad); }
-  /* State as a dot + word: green running, grey stopped, blue not-here. */
-  .state { display: inline-flex; align-items: center; gap: .4rem; }
-  .dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--faint); flex: none; }
-  .dot.run { background: var(--run); }
-  .dot.stop { background: var(--faint); }
-  .dot.remote { background: #3b74c4; }
-  .pill { display: inline-block; padding: .02rem .45rem; border-radius: 999px; border: 1px solid var(--line-strong);
-          font-size: var(--s0); color: var(--muted); }
-  .pill.both { border-color: #9fd6bb; color: var(--run); }
-  .pill.remote { border-color: #b7cdec; color: #2c5aa0; }
-  .pill.local { border-color: var(--line-strong); color: var(--muted); }
+  /* THE LIST, AS CARDS. Taken from the prototype: one card per session, the
+     name in the serif, a state badge beside it, its actions on the right, and
+     the facts in a row beneath — agent, disk used of allocated, last pushed,
+     where it is stored. A 2px quota meter closes the card. */
+  .grid { display: grid; grid-template-columns: minmax(0,1fr) 348px; gap: 28px; align-items: start; }
+  @media (max-width: 60rem) { .grid { grid-template-columns: minmax(0,1fr); } }
+  #rows { display: flex; flex-direction: column; gap: 10px; }
+  .card { position: relative; border-radius: var(--radius); overflow: hidden;
+          border: 1px solid var(--rule); background: transparent; }
+  /* Raised when it is doing something here; dashed when the bytes are elsewhere. */
+  .card.live { background: var(--card); border-color: var(--rule-strong); }
+  .card.elsewhere { border-style: dashed; border-color: var(--rule-strong); }
+  .card .cardtop { display: flex; align-items: center; gap: 10px; padding: 15px 17px 0; flex-wrap: wrap; }
+  .card .cname { font-family: var(--serif); font-size: 18px; font-weight: 500;
+                 letter-spacing: -.005em; margin: 0; }
+  .card .spacer { flex: 1; min-width: 8px; }
+  .card .acts { display: flex; gap: 6px; flex-wrap: wrap; }
+  .card .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(146px, 1fr));
+                 gap: 12px 18px; align-items: start; padding: 12px 17px 13px; }
+  .card .facts .k { font-size: 11px; color: var(--coat-soft); margin-bottom: 2px; }
+  .card .facts .v { font-size: var(--s1); color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .facts .v.mono { font-family: var(--mono); font-size: var(--s0); }
+  .card .facts .v .sub { color: var(--coat-soft); }
+  .card .meter { position: relative; height: 2px; background: var(--rule); }
+  .card .meter .fill { position: absolute; inset: 0; transform-origin: left; background: var(--meter); }
+  @media (prefers-reduced-motion: no-preference) {
+    .card .meter .fill { transition: transform var(--dur-slow) var(--ease-out); }
+  }
+  /* State, as a badge. Green running, quiet grey stopped, dashed-grey not here. */
+  .badge { font-size: 11.5px; font-weight: 500; padding: 2px 8px; border-radius: 2px; flex: none;
+           background: var(--paper-well); color: var(--coat); }
+  .badge.run { background: var(--eye-tint); color: var(--eye-deep); }
+  .badge.remote { background: transparent; color: var(--coat-soft); border: 1px dashed var(--rule-strong); }
+  .badge.held { background: var(--ochre-surface); color: var(--ochre); }
+  /* The two marks: this machine, and the cloud. Filled where the bytes are.
+     Nothing about where a session lives is signalled by colour. */
+  .mark { display: inline-block; width: 8px; height: 8px; border-radius: 1px; flex: none;
+          border: 1px solid var(--coat-mute); }
+  .mark.on { background: var(--coat); border-color: var(--coat); }
+  .where { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+  .muted { color: var(--coat-soft); }
+  .warn { color: var(--ochre); }
+  .bad { color: var(--brick); }
+  .empty { border: 1px solid var(--rule); background: var(--card); border-radius: var(--radius);
+           padding: var(--step-6); color: var(--coat); }
 
-  /* One bounded panel region below the list: the job/forms, or the terminal.
-     A left rule marks it as "the thing you are doing". At most one is open. */
-  #job, #attach { margin-top: 1rem; background: var(--panel); border: 1px solid var(--line-strong);
-                  border-left: 3px solid var(--accent); border-radius: var(--radius); padding: .9rem 1rem; }
-  #job form, #removeform, #createform, #pullform, #pushform { display: grid; gap: .6rem; max-width: 34rem; }
-  #jobtitle, #attachtitle { font-size: var(--s2); font-weight: 600; }
-  #joblog { margin: .3rem 0 0; white-space: pre-wrap; font-size: var(--s0); color: var(--muted); max-height: 12rem; overflow: auto; }
-  .checkline { display: flex; gap: .45rem; align-items: center; color: var(--muted); font-size: var(--s0); }
+  /* The right column: whatever you are doing, or — when you are doing nothing
+     — what this machine holds. Sticky, so it stays put while the list scrolls. */
+  .side { position: sticky; top: var(--step-4); display: grid; gap: var(--step-3); }
+  #machine { border: 1px dashed var(--rule); border-radius: var(--radius); padding: 16px 17px; }
+  #machine .t { font-family: var(--serif); font-size: 15px; color: var(--coat); margin-bottom: var(--step-2); }
+  #machine .r { display: flex; justify-content: space-between; font-size: var(--s0);
+                color: var(--coat-soft); margin-bottom: 5px; }
+  #machine .r b { font-family: var(--mono); font-weight: 400; color: var(--ink); }
+
+  /* One bounded panel: the job and its forms. At most one is open. */
+  #job { background: var(--card); border: 1px solid var(--rule-strong); border-radius: var(--radius);
+         padding: var(--step-4) 17px; display: grid; gap: var(--step-3); }
+  #job form, #removeform, #createform, #pullform, #pushform { display: grid; gap: var(--step-3); }
+  #jobtitle { font-family: var(--serif); font-size: 17px; font-weight: 500; }
+  #joblog { margin: 0; white-space: pre-wrap; font-family: var(--mono); font-size: 11.5px;
+            color: var(--coat-soft); max-height: 12rem; overflow: auto; }
+  .checkline { display: flex; gap: var(--step-1); align-items: center; color: var(--coat-soft); font-size: var(--s0); }
   .checkline input { width: auto; }
-  .cardform { display: grid; gap: .6rem; }
-  #signin { margin: 0 0 .6rem; padding: .5rem .7rem; font-size: var(--s0); color: var(--warn);
-            background: #fdf8ef; border: 1px solid #eaddc2; border-radius: var(--radius); }
+  .cardform { display: grid; gap: var(--step-3); }
+  #signin { margin: 0 0 var(--step-2); padding: 10px 13px; font-size: var(--s0); color: var(--ochre);
+            background: var(--ochre-surface); border: 1px solid var(--ochre-rule); border-radius: var(--radius); }
   #signinurl { word-break: break-all; }
+  /* Destructive confirmation wears the system's brick, not red. */
+  #removeform.hard, #cloudform.hard { background: var(--brick-surface); border: 1px solid var(--brick-rule);
+            border-radius: var(--radius); padding: var(--step-3); margin: 0 -4px; }
+  #removeform.hard #removeconfirm, #cloudform.hard #cloudconfirm {
+            background: var(--brick); border-color: var(--brick); color: var(--brick-surface); }
 
-  /* The terminal fills the viewport height (never fewer than ~24 rows); a form
-     or the job log sizes to content, and the list scrolls under it. */
-  #attach .bar { display: flex; align-items: center; gap: .7rem; margin: 0 0 .5rem; }
-  #attach .bar .note { color: var(--faint); font-size: var(--s0); }
+  /* SPEC 1.153: the quota picker, in the system's clothes. A range for reach,
+     a number for precision, marks for the sizes people think in and for free
+     disk. Accent track, #CFD4D0 rail, mono readout. */
+  .sizepick { display: grid; gap: 6px; }
+  .sizepick .top { display: flex; gap: var(--step-2); align-items: center; color: var(--coat-soft); font-size: var(--s0); }
+  .sizepick .top .spacer { flex: 1; }
+  .sizepick .read { font-family: var(--mono); font-size: var(--s0); color: var(--ink); }
+  .sizepick .num { width: 5.5rem; font-family: var(--mono); }
+  .sizepick input[type=range] { width: 100%; margin: 0; height: 18px; background: transparent;
+                                -webkit-appearance: none; appearance: none; }
+  .sizepick input[type=range]::-webkit-slider-runnable-track {
+    height: 3px; border-radius: 2px; background: var(--rule-strong); }
+  .sizepick input[type=range]::-moz-range-track {
+    height: 3px; border-radius: 2px; background: var(--rule-strong); }
+  .sizepick input[type=range]::-moz-range-progress {
+    height: 3px; border-radius: 2px; background: var(--eye); }
+  .sizepick input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none; width: 13px; height: 13px; margin-top: -5px;
+    border-radius: 2px; background: var(--eye); border: 0; }
+  .sizepick input[type=range]::-moz-range-thumb {
+    width: 13px; height: 13px; border-radius: 2px; background: var(--eye); border: 0; }
+  .sizepick .marks { position: relative; height: 1.5rem; }
+  .sizepick .marks button { position: absolute; transform: translateX(-50%); white-space: nowrap;
+     padding: 1px 5px; font-size: 11px; border: 1px solid var(--rule); background: transparent;
+     color: var(--coat-soft); border-radius: 2px; }
+  .sizepick .marks button.free { color: var(--ochre); border-color: var(--ochre-rule); background: var(--ochre-surface); }
+  .sizepick .over { color: var(--brick); }
+
+  /* The terminal: the system's deep ground, its own bar above it. */
+  #attach { margin-top: var(--step-5); border: 1px solid var(--rule-strong); border-radius: var(--radius);
+            overflow: hidden; background: var(--term-ground); }
+  #attach .bar { display: flex; align-items: center; gap: var(--step-3); padding: 12px 16px;
+                 background: var(--card); border-bottom: 1px solid var(--rule-strong); }
+  #attachtitle { font-family: var(--serif); font-size: 18px; font-weight: 500; }
+  #attach .bar .note { color: var(--coat-soft); font-size: var(--s0); }
   #attach .bar .spacer { margin-left: auto; }
-  #termwrap { background: #0b0d10; padding: .55rem; border-radius: 6px; }
-  #term { height: max(26rem, calc(100vh - 15rem)); }
+  #attach #signin { margin: var(--step-3) 16px 0; }
+  #termwrap { background: var(--term-ground); padding: 10px 12px; }
+  #term { height: max(26rem, calc(100vh - 18rem)); }
 </style>
 <header><h1>nemr</h1><span class="who" id="who"></span><button id="logout" hidden>log out</button></header>
 <main>
@@ -1460,49 +1685,62 @@ async fn index() -> Response {
   <section id="list" hidden>
     <div class="toolbar"><h2>Sessions</h2><span class="spacer"></span><button id="create" class="primary">create session</button><button id="addfolder">add existing folder</button><button id="refresh">refresh</button><span class="note" id="localnote"></span></div>
     <div id="loginline" hidden>No Claude login on this machine yet — attach a session and run <code>/login</code> in it; the login is written to this machine and stays here. Logging in spends the account's refresh token, so this account's other machines are logged out by it (upstream, unavoidable).</div>
-    <div class="tablewrap"><table><thead><tr><th>session</th><th>agent</th><th>where</th><th>state</th><th>size</th><th>updated</th><th>last machine</th><th>held by</th></tr></thead><tbody id="rows"></tbody></table></div>
-    <section id="job" class="login" style="max-width:40rem;margin-top:1rem" hidden>
+    <div class="grid">
+      <div id="rows"></div>
+      <div class="side">
+    <section id="job" hidden>
       <div><strong id="jobtitle"></strong></div>
-      <form id="pullform" style="display:grid;gap:.6rem" hidden>
+      <form id="pullform" hidden>
         <label>password (to decrypt the bundle on this machine) <input name="password" type="password" autocomplete="current-password" required></label>
         <label style="display:flex;gap:.4rem;align-items:center"><input name="take_over" type="checkbox" style="width:auto"> take over the lease if another machine holds it (it will be locked out of writing)</label>
         <div style="display:flex;gap:.6rem"><button class="primary" type="submit">pull &amp; start</button><button type="button" id="jobcancel">cancel</button></div>
       </form>
-      <form id="pushform" style="display:grid;gap:.6rem" hidden>
+      <form id="pushform" hidden>
         <label>password (to encrypt the bundle on this machine) <input name="password" type="password" autocomplete="current-password" required></label>
         <label style="display:flex;gap:.4rem;align-items:center"><input name="release" type="checkbox" style="width:auto" checked> release the lease afterwards, so another machine can take it</label>
         <label style="display:flex;gap:.4rem;align-items:center"><input name="take_over" type="checkbox" style="width:auto"> take over the lease if another machine holds it</label>
         <div style="display:flex;gap:.6rem"><button class="primary" type="submit">push</button><button type="button" id="pushcancel">cancel</button></div>
       </form>
-      <form id="createform" style="display:grid;gap:.6rem" hidden>
+      <form id="createform" hidden>
         <label>name <input name="name" autocomplete="off" required maxlength="32" pattern="[a-z0-9][a-z0-9-]*" placeholder="lowercase letters, digits and -"></label>
         <label>agent <select name="agent" id="createagent"></select></label>
-        <label>quota (fixed at creation) <select name="size" id="createsize"></select></label>
+        <div class="sizepick" id="createsizepick"></div><input type="hidden" name="size" id="createsize">
         <div style="display:flex;gap:.6rem"><button class="primary" type="submit">create</button><button type="button" id="createcancel">cancel</button></div>
       </form>
-      <form id="addform" style="display:grid;gap:.6rem" hidden>
+      <form id="addform" hidden>
         <label>folder on this machine <input name="folder" autocomplete="off" placeholder="/home/you/projects/thing" required></label>
         <div style="display:flex;gap:.6rem;align-items:end">
           <label style="flex:1">name <input name="sessionname" autocomplete="off" maxlength="32" pattern="[a-z0-9][a-z0-9-]*" placeholder="from the folder's name"></label>
-          <label>quota (fixed at creation) <select name="size" id="addsize"></select></label>
         </div>
+        <div class="sizepick" id="addsizepick"></div><input type="hidden" name="size" id="addsize">
         <div id="addplan" class="muted">Give a folder and this says what would travel before anything is copied.</div>
         <div style="display:flex;gap:.6rem"><button class="primary" type="submit" id="addconfirm" disabled>add this folder</button><button type="button" id="addcancel">cancel</button></div>
       </form>
-      <form id="removeform" style="display:grid;gap:.6rem" hidden>
+      <form id="removeform" hidden>
         <div id="removecase"></div>
         <label id="removetypeit" hidden>type the session's name to confirm <input name="typed" autocomplete="off"></label>
         <div style="display:flex;gap:.6rem"><button class="primary" type="submit" id="removeconfirm">remove from this machine</button><button type="button" id="removecancel">cancel</button></div>
       </form>
-      <form id="cloudform" style="display:grid;gap:.6rem" hidden>
+      <form id="cloudform" hidden>
         <div id="cloudcase"></div>
         <label id="cloudtypeit" hidden>type the session's name to confirm <input name="typed" autocomplete="off"></label>
         <label class="checkline"><input name="take_over" type="checkbox" style="width:auto"> take over the lease if another machine holds it</label>
         <div style="display:flex;gap:.6rem"><button class="primary" type="submit" id="cloudconfirm">delete from cloud</button><button type="button" id="cloudcancel">cancel</button></div>
       </form>
-      <pre id="joblog" style="margin:0;white-space:pre-wrap"></pre>
+      <pre id="joblog"></pre>
       <div id="jobresult"></div>
     </section>
+        <!-- What this machine holds, when you are not doing anything with it.
+             The prototype puts a keyboard-shortcut legend here as well; this
+             page has no shortcuts, so it does not say it has. -->
+        <div id="machine" hidden>
+          <div class="t">This machine</div>
+          <div class="r"><span>Sessions here</span><b id="mLocal">-</b></div>
+          <div class="r"><span>Disk allocated</span><b id="mDisk">-</b></div>
+          <div class="r"><span>Waiting in cloud</span><b id="mCloud">-</b></div>
+        </div>
+      </div>
+    </div>
     <section id="attach" hidden>
       <div class="bar"><strong id="attachtitle"></strong><span class="note" id="attachnote"></span><span class="spacer"></span><button id="detach">detach</button></div>
       <div id="signin" hidden>Sign in: open <a id="signinlink" href="#" target="_blank" rel="noopener"></a> in your browser, then paste the code it shows into the terminal. <span class="muted">The URL as Claude Code printed it:</span> <code id="signinurl" style="user-select:all">&nbsp;</code></div>
@@ -1532,7 +1770,14 @@ async fn index() -> Response {
     return true;
   }
 
+  // Which screen the page is meant to be on. Bumped whenever the user moves
+  // between the auth forms and the list, and carried by every list refresh —
+  // a `/sessions` reply that lands after the user has logged out or opened
+  // the register form must not put the list back or hide the form they are
+  // looking at. The same rule `panelGen` applies to panels.
+  let authGen = 0;
   function showLogin(defaultServer) {
+    authGen++;
     closePanels(); // nothing from before the log out (or the refusal) comes back with the next login
     $('list').hidden = true; $('logout').hidden = true; $('register').hidden = true; $('recovery').hidden = true;
     $('who').textContent = 'not logged in';
@@ -1542,6 +1787,7 @@ async fn index() -> Response {
     f.email.focus();
   }
   function showRegister() {
+    authGen++;
     const l = $('login'), f = $('register');
     l.hidden = true; f.hidden = false; $('recovery').hidden = true;
     if (!f.server.value) f.server.value = l.server.value;
@@ -1553,6 +1799,7 @@ async fn index() -> Response {
     // Authenticated: every auth form goes; the header carries the account
     // and the log-out control. The forms come back only through showLogin
     // (log out, or an auth refusal on the list).
+    authGen++;
     $('login').hidden = true; $('register').hidden = true; $('recovery').hidden = true;
     $('logout').hidden = false;
     $('who').textContent = me.email + ' · ' + me.server;
@@ -1561,39 +1808,75 @@ async fn index() -> Response {
   }
 
   async function refresh() {
+    const gen = authGen;
     status('loading sessions…');
     const r = await api('/sessions');
+    if (gen !== authGen) return;   // the user left this screen while we asked
     if (r.status === 401) { const w = await api('/whoami').then(x => x.json()); showLogin(w.default_server); return; }
     if (!r.ok) { const e = await r.json().catch(() => ({})); status('could not list sessions: ' + (e.error || r.status), 'bad'); return; }
     const d = await r.json();
-    const rows = $('rows'); rows.innerHTML = '';
-    if (!d.rows.length) rows.innerHTML = '<tr><td colspan="8" class="muted">no sessions anywhere. Create one with the button above.</td></tr>';
+    if (gen !== authGen) return;
     fillCreateOptions(d.create_options);
+    const rows = $('rows'); rows.innerHTML = '';
+    if (!d.rows.length) rows.innerHTML = '<div class="empty">No sessions anywhere. Create one with the button above.</div>';
     for (const s of d.rows) {
-      const state = s.where === 'remote'
-        ? '<span class="state"><span class="dot remote"></span>not here</span>'
-        : s.running ? '<span class="state"><span class="dot run"></span>running</span>'
-                    : '<span class="state"><span class="dot stop"></span>stopped</span>';
-      let open = '<span class="muted">-</span>';
-      if (s.held_by) open = s.held_by === d.this_machine ? 'this machine' : '<span class="warn">' + esc(s.held_by) + '</span>';
+      // The state badge. Ours, not the prototype's: it has a "Locked" life,
+      // we have a lease HOLDER, which is a different fact and gets its own
+      // cell below so nothing is lost by the restyle.
+      const state = s.where === 'remote' ? ['remote', 'not here']
+                  : s.running ? ['run', 'running'] : ['stop', 'stopped'];
       let action = '';
-      if (s.where === 'remote' && s.has_bundle) action = '<button data-pull="' + esc(s.name) + '">pull &amp; start</button>';
+      if (s.where === 'remote' && s.has_bundle) action = '<button class="primary" data-pull="' + esc(s.name) + '">pull &amp; start</button>';
       else if (s.where === 'remote') action = '<span class="muted">no bundle yet</span>';
-      else if (!s.running) action = '<button data-start="' + esc(s.name) + '">start</button> <button data-push="' + esc(s.name) + '">push</button>';
-      else action = '<button data-attach="' + esc(s.name) + '">attach</button> <button data-push="' + esc(s.name) + '">stop &amp; push</button>';
+      else if (!s.running) action = '<button class="primary" data-start="' + esc(s.name) + '">start</button> <button data-push="' + esc(s.name) + '">push</button>';
+      else action = '<button class="primary" data-attach="' + esc(s.name) + '">attach</button> <button data-push="' + esc(s.name) + '">stop &amp; push</button>';
       // F-12: remove from THIS machine; the button says which case it is.
       if (s.where !== 'remote') action += ' <button class="linkish" data-remove="' + esc(s.name) + '" data-bundle="' + (s.has_bundle ? '1' : '0') + '" data-running="' + (s.running ? '1' : '0') + '">' + (s.has_bundle ? 'remove from this machine' : 'remove the only copy') + '</button>';
       // E-22: delete the CLOUD copy, whenever one exists. The label and confirm
       // say which case it is: a local copy survives (both) → one click; the
       // cloud is the only copy (remote) → the typed name (F-12's rule).
       if (s.has_bundle) { const localToo = s.where !== 'remote'; action += ' <button class="linkish" data-cloud="' + esc(s.name) + '" data-localtoo="' + (localToo ? '1' : '0') + '">' + (localToo ? 'delete from cloud' : 'delete the only copy') + '</button>'; }
-      // The session's data on one row, then its actions on their own row
-      // beneath (grouped, fixed order) — so a long remove label never widens
-      // the table (F-13). The data row carries data-name so the acceptance can
-      // read a session's state from its own row regardless of the actions row.
+
+      // Disk: used OF ALLOCATED, which is what the card is for. The quota is
+      // a fact about THIS machine's volume, so a session that is not here
+      // shows what is stored instead of inventing an allocation.
+      const here = s.where !== 'remote';
+      // The allocation is known even when the usage is not (an unmounted
+      // volume): say so as "— of 500.0 MiB" rather than a bare dash, because
+      // the allocation is the fact the card is about.
+      const disk = here && s.quota_bytes
+        ? (s.size_bytes == null ? '—' : human(s.size_bytes)) + ' of ' + human(s.quota_bytes)
+        : s.size_bytes == null ? '-' : human(s.size_bytes) + (here ? '' : ' stored');
+      const pct = here && s.quota_bytes ? Math.min(1, (s.size_bytes || 0) / s.quota_bytes) : 0;
+      const whereLabel = s.where === 'both' ? 'Here and cloud' : s.where === 'local' ? 'This machine' : 'Cloud only';
+      const lastPushed = s.updated_at_unix == null ? 'Never pushed' : ago(s.updated_at_unix);
+      const lastMachine = s.last_machine ? ' <span class="sub">· ' + esc(s.last_machine) + '</span>' : '';
+      // The lease holder, kept and kept legible: ochre when another machine
+      // holds it, which is the same meaning the old column had.
+      let held = '';
+      if (s.held_by) held = s.held_by === d.this_machine
+        ? '<div><div class="k">Held by</div><div class="v">this machine</div></div>'
+        : '<div><div class="k">Held by</div><div class="v warn">' + esc(s.held_by) + '</div></div>';
+
       rows.insertAdjacentHTML('beforeend',
-        '<tr class="srow" data-name="' + esc(s.name) + '"><td>' + esc(s.name) + '</td><td>' + esc(s.agent) + '</td><td><span class="pill ' + esc(s.where) + '">' + esc(s.where) + '</span></td><td>' + state + '</td><td>' + human(s.size_bytes) + '</td><td class="wrap">' + ago(s.updated_at_unix) + '</td><td class="wrap">' + esc(s.last_machine || '-') + '</td><td class="wrap">' + open + '</td></tr>' +
-        '<tr class="arow"><td colspan="8" class="actions">' + action + '</td></tr>');
+        '<article class="card ' + (s.where === 'remote' ? 'elsewhere' : (s.running ? 'live' : '')) + '" data-name="' + esc(s.name) + '">' +
+          '<div class="cardtop">' +
+            '<h3 class="cname">' + esc(s.name) + '</h3>' +
+            '<span class="badge ' + state[0] + '" data-state="' + esc(s.name) + '">' + state[1] + '</span>' +
+            '<span class="spacer"></span><div class="acts">' + action + '</div>' +
+          '</div>' +
+          '<div class="facts">' +
+            '<div><div class="k">Agent</div><div class="v">' + esc(s.agent) + '</div></div>' +
+            '<div><div class="k">Disk</div><div class="v mono">' + esc(disk) + '</div></div>' +
+            '<div><div class="k">Last pushed</div><div class="v">' + esc(lastPushed) + lastMachine + '</div></div>' +
+            '<div><div class="k">Stored</div><div class="v"><span class="where">' +
+              '<span class="mark' + (s.where !== 'remote' ? ' on' : '') + '" title="this machine"></span>' +
+              '<span class="mark' + (s.has_bundle ? ' on' : '') + '" title="cloud"></span>' +
+              esc(whereLabel) + '</span></div></div>' +
+            held +
+          '</div>' +
+          '<div class="meter"><div class="fill" style="transform:scaleX(' + pct + ')"></div></div>' +
+        '</article>');
     }
     // E-21: the credential is a fact about this machine; any local row carries it.
     window.nemrRows = d.rows; // read by the acceptance as evidence when a check fails
@@ -1601,6 +1884,13 @@ async fn index() -> Response {
     $('loginline').hidden = !noLogin;
     $('localnote').textContent = d.local_available ? '' : 'daemon unreachable: showing the server index only (' + d.local_error + ')';
     $('localnote').className = 'note' + (d.local_available ? '' : ' warn');
+    // What this machine holds — counted from the same rows, so it cannot
+    // disagree with the list above it.
+    const localRows = d.rows.filter(r => r.where !== 'remote');
+    $('mLocal').textContent = String(localRows.length);
+    $('mDisk').textContent = human(localRows.reduce((n, r) => n + (r.quota_bytes || 0), 0));
+    $('mCloud').textContent = String(d.rows.filter(r => r.where === 'remote' && r.has_bundle).length);
+    sideView();
     status(d.rows.length + ' session' + (d.rows.length === 1 ? '' : 's'));
   }
 
@@ -1664,10 +1954,114 @@ async fn index() -> Response {
   // vocabulary, stated by the binary); filled once per list.
   function fillCreateOptions(o) {
     if (!o) return;
-    const a = $('createagent'), z = $('createsize'), z2 = $('addsize');
-    if (z2) z2.innerHTML = o.sizes.map(x => '<option value="' + esc(x) + '"' + (x === o.default_size ? ' selected' : '') + '>' + esc(x) + '</option>').join('');
-    a.innerHTML = o.agents.map(x => '<option value="' + esc(x.id) + '">' + esc(x.label) + '</option>').join('');
-    z.innerHTML = o.sizes.map(x => '<option value="' + esc(x) + '"' + (x === o.default_size ? ' selected' : '') + '>' + esc(x) + '</option>').join('');
+    $('createagent').innerHTML = o.agents.map(x => '<option value="' + esc(x.id) + '">' + esc(x.label) + '</option>').join('');
+    sizePicker('createsize', o);
+    sizePicker('addsize', o);
+  }
+
+  // SPEC 1.153: the quota picker. Every number in it — the ends, the step, the
+  // marks, the free-disk line — comes from the reply above, which the daemon
+  // filled from the privileged helper and statvfs. The page holds no copy of
+  // any of them, so it cannot offer a size the engine would refuse.
+  const MB = 1024 * 1024, GB = 1024 * 1024 * 1024;
+  function sizePicker(id, o) {
+    const wrap = $(id + 'pick'), hidden = $(id);
+    if (!wrap || !hidden) return;
+    // A daemon that could not answer says so. It does NOT fall back to a
+    // range of the page's own: a slider nothing agreed to is worse than no
+    // slider, because it looks like it works.
+    if (!o.max_bytes) {
+      wrap.innerHTML = '<div class="muted">This machine cannot say what sizes it allows — the local daemon did not answer, so a session cannot be created here right now.</div>';
+      hidden.value = '';
+      return;
+    }
+    const min = o.min_bytes, max = o.max_bytes, block = o.block_bytes || 4096;
+    const free = o.free_bytes, STEPS = 1000, span = Math.log(max / min);
+    // Logarithmic, because the range spans four orders of magnitude: linear
+    // would put every size anybody picks inside the first two pixels.
+    const posOf = b => Math.max(0, Math.min(STEPS, Math.round(STEPS * Math.log(b / min) / span)));
+    const snap = b => Math.max(min, Math.min(max, Math.floor(b / block) * block));
+    // THE ENDS ARE THE BOUNDS, EXACTLY. `min * exp(ln(max/min))` lands a hair
+    // under max in floating point, and snapping down then loses a whole block
+    // — so the slider's top offered 1099511623680 where the helper's maximum
+    // is 1099511627776. A bound is not a place to be approximately right.
+    const bytesOf = p => p <= 0 ? min : p >= STEPS ? max : snap(min * Math.exp(span * p / STEPS));
+
+    wrap.innerHTML =
+      '<div class="top"><span>disk</span><span class="read" id="' + id + 'read"></span>' +
+      '<span class="spacer"></span>' +
+      '<input class="num" type="number" min="1" step="1" id="' + id + 'num" aria-label="how much">' +
+      '<select id="' + id + 'unit" aria-label="unit"><option value="' + MB + '">MB</option><option value="' + GB + '">GB</option></select></div>' +
+      '<input type="range" min="0" max="' + STEPS + '" step="1" id="' + id + 'range" aria-label="disk">' +
+      '<div class="marks" id="' + id + 'marks"></div>' +
+      '<div class="muted" id="' + id + 'note"></div>' +
+      '<div class="muted">Disk is fixed when the session is created. To change it later you have to create a new session and move the work across.</div>';
+
+    const range = $(id + 'range'), num = $(id + 'num'), unit = $(id + 'unit'), note = $(id + 'note');
+
+    // The value is bytes, always. What the two fields show is a rendering of
+    // it; what the form submits is the number itself, so nothing is re-parsed
+    // from a rounded display.
+    function show(bytes, moveNum) {
+      bytes = snap(bytes);
+      hidden.value = String(bytes);
+      range.value = String(posOf(bytes));
+      if (moveNum !== false) {
+        const u = bytes >= GB ? GB : MB;
+        unit.value = String(u);
+        const n = bytes / u;
+        num.value = String(u === GB ? Math.round(n * 100) / 100 : Math.round(n));
+      }
+      // The readout, in mono, beside the label — the machine's number, which
+      // is what the mono face is for in this system.
+      const read = $(id + 'read');
+      if (read) read.textContent = human(bytes);
+      const over = bytes > free;
+      note.className = over ? 'over' : 'muted';
+      note.textContent = over
+        ? human(bytes) + ' is more than the ' + human(free) + ' free on this disk'
+        : human(bytes) + ' — ' + human(free) + ' free on this disk';
+      const submit = wrap.closest('form') && wrap.closest('form').querySelector('button[type=submit]');
+      if (submit && id === 'createsize') submit.disabled = over;
+    }
+
+    // Free disk first, then the suggestions — and a suggestion that would sit
+    // on top of one already placed is dropped rather than drawn under it. The
+    // marks are absolutely positioned, so two that collide render as one
+    // unreadable label (500MB/2GB/10GB are close together on a log scale, and
+    // free disk lands wherever the disk says).
+    const placed = [{ label: 'free (' + human(free) + ')', bytes: Math.min(Math.max(free, min), max), free: true }];
+    for (const m of (o.marks || [])) {
+      if (m.bytes < min || m.bytes > max) continue;
+      const at = posOf(m.bytes) / STEPS * 100;
+      // 14% of the track: enough that two labels cannot touch at the widths
+      // these actually take ("free (26.2 GiB)" is the long one).
+      if (placed.some(q => Math.abs(posOf(q.bytes) / STEPS * 100 - at) < 14)) continue;
+      placed.push({ label: m.label, bytes: m.bytes });
+    }
+    $(id + 'marks').innerHTML = placed.map(m => {
+      const at = posOf(m.bytes) / STEPS * 100;
+      // A mark at either end would hang off the track if it were centred on
+      // its own position, so the outermost 12% aligns to the inside instead.
+      const shift = at < 12 ? '0' : at > 88 ? '-100%' : '-50%';
+      return '<button type="button" class="' + (m.free ? 'free' : '') + '" data-bytes="' + m.bytes +
+        '" style="left:' + at + '%;transform:translateX(' + shift + ')">' + esc(m.label) + '</button>';
+    }).join('');
+    $(id + 'marks').querySelectorAll('button').forEach(b =>
+      b.addEventListener('click', () => show(Number(b.dataset.bytes))));
+
+    range.addEventListener('input', () => show(bytesOf(Number(range.value))));
+    // Typed: exact, and never snapped out from under the typing. The value is
+    // read as the unit beside it, which is the same two questions the CLI
+    // asks in the same order.
+    const typed = () => {
+      const n = Number(num.value);
+      if (!isFinite(n) || n <= 0) return;
+      show(n * Number(unit.value), false);
+    };
+    num.addEventListener('input', typed);
+    unit.addEventListener('change', typed);
+    show(o.default_bytes || min);
   }
 
   // --- step 3: pull-and-start, and start, as jobs the page watches ---
@@ -1682,6 +2076,13 @@ async fn index() -> Response {
   // and do nothing once it has moved on — so an action the user superseded
   // can neither write into the panel that replaced it nor close it.
   let panelGen = 0;
+  // The right column holds exactly one thing: what you are doing, or — when
+  // you are doing nothing — what this machine holds. Called wherever the job
+  // panel opens or closes, so the two can never both be there or both be gone.
+  function sideView() {
+    const busy = !$('job').hidden;
+    $('machine').hidden = busy || $('list').hidden;
+  }
   function closePanels() {
     panelGen++;
     $('job').hidden = true; $('pullform').hidden = true; $('pushform').hidden = true;
@@ -1689,11 +2090,13 @@ async fn index() -> Response {
     if (ws) { const w = ws; ws = null; w.close(); }
     $('attach').hidden = true;
     pulling = null; pushing = null; removing = null;
+    sideView();
   }
   function openJob(title) {
     closePanels();
     $('job').hidden = false; $('jobtitle').textContent = title;
     $('joblog').textContent = ''; $('jobresult').textContent = ''; $('jobresult').className = '';
+    sideView();
     return panelGen;
   }
   async function watch(id, gen) {
@@ -1765,7 +2168,21 @@ async fn index() -> Response {
     status(''); // a previous exit's status is cleared by the next attach
     $('attach').hidden = false; $('attachtitle').textContent = name; $('attachnote').textContent = 'connecting…';
     if (!term) {
-      term = new Terminal({ cursorBlink: true, fontSize: 14, scrollback: 5000 });
+      // The design system's terminal theme, as the spec hands it over.
+      term = new Terminal({ cursorBlink: true, fontSize: 14, scrollback: 5000,
+        fontFamily: '"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+        theme: {
+          background: '#23272A', foreground: '#DCE0DD',
+          cursor: '#8FAE8F', cursorAccent: '#23272A', selectionBackground: '#3D523E',
+          black: '#23272A', brightBlack: '#5E6265',
+          red: '#C08375', brightRed: '#D39B8D',
+          green: '#8FAE8F', brightGreen: '#A6C4A6',
+          yellow: '#C6AE73', brightYellow: '#D8C48D',
+          blue: '#8AA0AC', brightBlue: '#A2B6C1',
+          magenta: '#9C8AA0', brightMagenta: '#B3A2B6',
+          cyan: '#7FA69B', brightCyan: '#9BBCB1',
+          white: '#C9CEC9', brightWhite: '#F4F5F3'
+        } });
       fit = new FitAddon.FitAddon(); term.loadAddon(fit);
       // URLs in the terminal are clickable (E-21: Claude Code's own sign-in URL).
       term.loadAddon(new WebLinksAddon.WebLinksAddon((ev, uri) => window.open(uri, '_blank', 'noopener')));
@@ -2108,6 +2525,7 @@ mod tests {
                 running: false,
                 usage_known: false,
                 used_bytes: 0,
+                quota_bytes: Some(2 * 1024 * 1024 * 1024),
                 credential_present: None,
             });
             Ok(name.to_string())
@@ -2135,14 +2553,25 @@ mod tests {
             }
             Ok("graceful".into())
         }
+        fn size_limits(&self) -> Result<SizeLimits> {
+            Ok(SizeLimits {
+                min_bytes: 67_108_864,
+                max_bytes: 1_099_511_627_776,
+                block_bytes: 4096,
+                default_bytes: 2 * 1024 * 1024 * 1024,
+                free_bytes: 40 * 1024 * 1024 * 1024,
+            })
+        }
         /// The daemon's refusals, in the fake: a name in use, a size or an
         /// agent the engine does not allow.
         fn create(&self, name: &str, size: &str, agent: &str) -> Result<()> {
             if self.projects.lock().unwrap().iter().any(|p| p.name == name) {
                 anyhow::bail!("project {name:?} already exists");
             }
-            if !CREATE_SIZES.contains(&size) {
-                anyhow::bail!("unrecognised volume size {size:?}. Valid sizes: 500MB, 2GB, 10GB.");
+            // The daemon's own rule, in the fake: empty means the default, and
+            // anything else must be a size in range (SPEC 1.153).
+            if let Some(why) = fake_size_refusal(size) {
+                anyhow::bail!("{why}");
             }
             if !CREATE_AGENTS.iter().any(|(id, _)| *id == agent) {
                 anyhow::bail!("unknown agent {agent:?}");
@@ -2158,6 +2587,7 @@ mod tests {
                 running: false,
                 usage_known: false,
                 used_bytes: 0,
+                quota_bytes: Some(2 * 1024 * 1024 * 1024),
                 credential_present: None,
             });
             Ok(())
@@ -2186,8 +2616,10 @@ mod tests {
             if self.projects.lock().unwrap().iter().any(|p| p.name == name) {
                 anyhow::bail!("project {name:?} already exists");
             }
-            if !CREATE_SIZES.contains(&size) {
-                anyhow::bail!("unrecognised volume size {size:?}. Valid sizes: 500MB, 2GB, 10GB.");
+            // The daemon's own rule, in the fake: empty means the default, and
+            // anything else must be a size in range (SPEC 1.153).
+            if let Some(why) = fake_size_refusal(size) {
+                anyhow::bail!("{why}");
             }
             self.added
                 .lock()
@@ -2199,6 +2631,7 @@ mod tests {
                 running: false,
                 usage_known: true,
                 used_bytes: 24_300,
+                quota_bytes: Some(2 * 1024 * 1024 * 1024),
                 credential_present: None,
             });
             Ok((31, 24_300, 2))
@@ -2697,6 +3130,7 @@ mod tests {
             running: true,
             usage_known: true,
             used_bytes: 700,
+            quota_bytes: Some(2 * 1024 * 1024 * 1024),
             credential_present: None,
         }]);
         let (app, _) = app_with(engine);
@@ -2963,6 +3397,7 @@ mod tests {
             running: false,
             usage_known: true,
             used_bytes: 700,
+            quota_bytes: Some(2 * 1024 * 1024 * 1024),
             credential_present: None,
         }]);
         let (app, _) = app_with(engine.clone());
@@ -3360,6 +3795,7 @@ mod tests {
             running: true,
             usage_known: true,
             used_bytes: 4096,
+            quota_bytes: Some(2 * 1024 * 1024 * 1024),
             credential_present: None,
         }]);
         let (app, _) = app_with(engine.clone());
@@ -3384,15 +3820,39 @@ mod tests {
                     "POST",
                     "/api/sessions",
                     c,
-                    Some(json!({"name": "fresh", "size": "7GB", "agent": "claude-code"})),
+                    // CHANGED DELIBERATELY (SPEC 1.153): this used to be
+                    // "7GB", refused because it was not one of three presets.
+                    // 7GB is an ordinary size now. What is still refused is a
+                    // size out of the helper's range, and that is what this
+                    // asserts.
+                    Some(json!({"name": "fresh", "size": "5000GB", "agent": "claude-code"})),
                 ),
             )
             .await,
         )
         .await;
         assert_eq!(j["ok"], false, "{j}");
-        assert!(j["error"].as_str().unwrap().contains("Valid sizes"), "{j}");
+        assert!(j["error"].as_str().unwrap().contains("out of range"), "{j}");
         assert!(engine.created.lock().unwrap().is_empty());
+        // And the size that used to be refused for being unusual goes through.
+        let j = finish(
+            &app,
+            &cookie,
+            send(
+                &app,
+                api_req(
+                    "POST",
+                    "/api/sessions",
+                    c,
+                    Some(json!({"name": "odd", "size": "7GB", "agent": "claude-code"})),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(j["ok"], true, "{j}");
+        engine.created.lock().unwrap().clear();
+        engine.projects.lock().unwrap().retain(|p| p.name != "odd");
         // A name in use.
         let j = finish(
             &app,
@@ -3441,7 +3901,9 @@ mod tests {
             *engine.created.lock().unwrap(),
             vec![(
                 "fresh".to_string(),
-                "2GB".to_string(),
+                // Empty travels as empty: the daemon owns the default now, so
+                // the page no longer fills one in (SPEC 1.153).
+                String::new(),
                 "claude-code".to_string()
             )]
         );
@@ -3455,12 +3917,30 @@ mod tests {
             "created stopped; start is the row's own button"
         );
 
-        // What the create panel offers is a constant of this binary, carried
-        // in every sessions reply (asserted end to end by the acceptance).
-        let o = create_options();
-        assert_eq!(o["default_size"], "2GB");
-        assert_eq!(o["sizes"].as_array().unwrap().len(), CREATE_SIZES.len());
+        // What the create panel offers. The sizes are no longer a constant of
+        // this binary: every number is the daemon's, and the panel says so
+        // rather than inventing a range when the daemon cannot answer.
+        let limits = SizeLimits {
+            min_bytes: 67_108_864,
+            max_bytes: 1_099_511_627_776,
+            block_bytes: 4096,
+            default_bytes: 2 * 1024 * 1024 * 1024,
+            free_bytes: 40 * 1024 * 1024 * 1024,
+        };
+        let o = create_options(Some(limits));
+        assert_eq!(o["min_bytes"], 67_108_864u64);
+        assert_eq!(o["max_bytes"], 1_099_511_627_776u64);
+        assert_eq!(o["block_bytes"], 4096u64);
+        assert_eq!(o["default_bytes"], 2u64 * 1024 * 1024 * 1024);
+        assert_eq!(o["free_bytes"], 40u64 * 1024 * 1024 * 1024);
+        assert_eq!(o["marks"].as_array().unwrap().len(), CREATE_MARKS.len());
         assert_eq!(o["agents"][0]["id"], "claude-code");
+        // A daemon that did not answer leaves them out entirely — the page
+        // renders "cannot say" rather than a range nothing agreed to.
+        let blind = create_options(None);
+        assert!(blind["min_bytes"].is_null());
+        assert!(blind["max_bytes"].is_null());
+        assert!(blind["agents"].is_array());
 
         // Remove: the running one is stopped first, then deleted; the stopped
         // one just goes. Neither touches the exported list (nothing is pushed).
@@ -3547,6 +4027,7 @@ mod tests {
             running: false,
             usage_known: true,
             used_bytes: 0,
+            quota_bytes: Some(2 * 1024 * 1024 * 1024),
             credential_present: None,
         }]);
         // Six megabytes of plaintext: three times axum's old default, and the
@@ -3617,6 +4098,7 @@ mod tests {
             running: false,
             usage_known: true,
             used_bytes: 10,
+            quota_bytes: Some(2 * 1024 * 1024 * 1024),
             credential_present: None,
         }]);
         let (app, _) = app_with(engine.clone());
@@ -3761,6 +4243,7 @@ mod tests {
             running: true,
             usage_known: true,
             used_bytes: 4096,
+            quota_bytes: Some(2 * 1024 * 1024 * 1024),
             credential_present: None,
         }]);
         let (app, _) = app_with(engine.clone());

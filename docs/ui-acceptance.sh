@@ -45,10 +45,15 @@ PASS=0; FAIL=0
 # caller's environment the sync server stores in that bucket and the run
 # reads the bucket back independently (six more assertions); otherwise a
 # directory under the work dir.
+# 100 -> 107. SIX of those seven are SPEC 1.153's, added to the page-driving
+# half and to the picker control when the quota became a range — and never
+# counted, because that suite could not run until a protocol-3 helper was
+# installed. The seventh is 1.154's: the page references nothing off this
+# origin. This is the first run that could count any of them.
 if [[ -n "${NEMR_S3_BUCKET:-}" ]]; then
-    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=104
+    STORAGE_MODE=s3; EXPECTED_ASSERTIONS=111
 else
-    STORAGE_MODE=local; EXPECTED_ASSERTIONS=100
+    STORAGE_MODE=local; EXPECTED_ASSERTIONS=107
 fi
 # The human arm (E-21) adds its own assertions when it runs.
 [[ "${NEMR_HUMAN_LOGIN:-0}" == 1 ]] && EXPECTED_ASSERTIONS=$((EXPECTED_ASSERTIONS + 4))
@@ -240,6 +245,18 @@ for asset in /assets/xterm.js /assets/xterm.css /assets/addon-fit.js; do
     [[ "$code" == 200 ]] || die "the page's $asset was not served ($code)"
 done
 pass "the page and its terminal are served from the binary (no external resource)"
+# AND THE PAGE ASKS FOR NOTHING ELSE. Serving the three assets proves they are
+# there, not that the HTML wants only them — a stylesheet <link> to Google
+# Fonts would have sailed past the check above. SPEC 1.154 restyles this page
+# to a design whose prototype loads three families from fonts.googleapis.com,
+# so the claim is now asserted against the served HTML itself.
+page_html=$(curl -s "http://127.0.0.1:$UI_PORT/")
+# Anything with a scheme, or protocol-relative. A same-page "#" anchor and a
+# "/assets/..." path are this origin by construction; "https://..." is not.
+offsite=$(grep -oE '(src|href)="[^"]*"' <<<"$page_html" | grep -E '="([a-z]+:)?//' || true)
+[[ -z "$offsite" ]] || die "the page references something off this origin: $offsite"
+grep -qi 'fonts.googleapis.com\|fonts.gstatic.com\|@import' <<<"$page_html" && die "the page pulls a font from the network"
+pass "and the page itself references nothing off this origin (no webfont, no CDN)"
 
 step "Register through the browser (recovery code shown once, typed back)"
 COOKIE=""
@@ -272,13 +289,27 @@ python3 -c 'import json,sys; d=json.loads(sys.argv[1]); [print("   |",l["text"])
     || die "create through the page failed"
 output_has "^$PROJECT " -- nemr list || die "the page created nothing: $_LAST_OUTPUT"
 pass "created $PROJECT through the page's own route"
-# F-11's control: what the picker offers is what the engine accepts — the
-# CLI names its valid sizes when refused one, and the page's list must be
-# exactly that list, or the two have drifted.
-cli_sizes=$(NEMR_NON_INTERACTIVE=1 nemr create "uiacc-$$-bogus" --size 7GB 2>&1 | grep -o 'Valid sizes: [^.]*' | sed 's/Valid sizes: //; s/, / /g')
-page_sizes=$(UI sessions | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["create_options"]["sizes"]))')
-[[ -n "$cli_sizes" && "$cli_sizes" == "$page_sizes" ]] || die "the page's quota picker ($page_sizes) is not what the engine accepts ($cli_sizes)"
-pass "CONTROL: the page's quota picker offers exactly the engine's sizes ($page_sizes)"
+# F-11's control, now that the picker is a range (SPEC 1.153). It used to
+# compare two lists of three strings. A range cannot be kept in step by
+# enumeration, so the control got STRONGER rather than weaker: the page's
+# numbers must be the PRIVILEGED HELPER'S OWN, asked of the helper directly.
+# That is the program that refuses an out-of-range size, so anything else is
+# a picker offering sizes something downstream would reject.
+helper_bounds=$(sudo -n /usr/local/libexec/nemr-volume normalize 2>/dev/null)
+[[ -n "$helper_bounds" ]] || die "the privileged helper did not answer 'normalize' — is it protocol 3? sudo ./scripts/setup_test_host.sh"
+h_min=$(sed -n 's/^min=//p' <<<"$helper_bounds")
+h_max=$(sed -n 's/^max=//p' <<<"$helper_bounds")
+h_block=$(sed -n 's/^block=//p' <<<"$helper_bounds")
+read -r p_min p_max p_block p_free < <(UI sessions | python3 -c 'import json,sys
+o = json.load(sys.stdin)["create_options"]
+print(o.get("min_bytes"), o.get("max_bytes"), o.get("block_bytes"), o.get("free_bytes"))')
+[[ "$h_min" == "$p_min" && "$h_max" == "$p_max" && "$h_block" == "$p_block" ]]     || die "the page's quota range ($p_min..$p_max step $p_block) is not the helper's ($h_min..$h_max step $h_block)"
+pass "CONTROL: the page's quota range is the privileged helper's own ($p_min..$p_max, whole $p_block-byte blocks)"
+# And the free-disk figure is the filesystem's, not an estimate: within one
+# block of what statvfs says for the volumes directory right now.
+fs_free=$(python3 -c 'import os,sys; s=os.statvfs(os.path.expanduser("~/.local/share/nemr/volumes")); print(s.f_bavail*s.f_frsize)')
+python3 -c 'import sys; a,b,blk=int(sys.argv[1]),int(sys.argv[2]),int(sys.argv[3]); sys.exit(0 if abs(a-b) <= 64*blk else 1)' "$p_free" "$fs_free" "$p_block"     || die "the page says $p_free free, statvfs says $fs_free"
+pass "CONTROL: the free-disk figure on the page is the filesystem's own"
 out=$(UI start "$PROJECT") || die "the start call failed: $out"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d["ok"] else 1)' "$out" || die "start through the page failed: $out"
 pass "started $PROJECT through the page"

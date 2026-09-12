@@ -103,6 +103,18 @@ rm -f "$tmp"
 echo "==> Verifying"
 installed_version="$("$HELPER_DEST" version 2>/dev/null || true)"
 echo "    helper protocol: ${installed_version:-<none>}"
+# The engine refuses a helper whose protocol it does not speak (SPEC 1.153),
+# so a mismatch here is the whole install having failed quietly. Read the
+# number the engine expects out of its own source rather than repeating it.
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+want="$(sed -n 's/.*pub const PROTOCOL: u32 = \([0-9]*\);.*/\1/p' "$repo_root/src/engine/volume.rs" | head -1)"
+got="$(awk '{print $NF}' <<<"$installed_version")"
+if [[ -n "$want" && "$got" != "$want" ]]; then
+    echo "    REFUSING: the installed helper speaks ${got:-<none>}, this source speaks $want." >&2
+    echo "    The binary at $HELPER_DEST is not the one built here." >&2
+    exit 1
+fi
+echo "    matches the engine's expected protocol ($want)"
 echo "    grant: $(grep -E "ALL=\(root\) NOPASSWD" "$SUDOERS_DEST")"
 echo
 echo "Done. The hardened helper is installed. Re-run the regression suite:"

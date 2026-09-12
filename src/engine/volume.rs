@@ -30,74 +30,248 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-/// Volume size presets (VOL-01).
+/// A volume's size, in bytes (VOL-01).
 ///
-/// A closed set rather than an arbitrary byte count: VOL-01 specifies presets,
-/// and a fixed set keeps the privileged helper's input space small — it
-/// accepts a preset name, never a caller-computed byte count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VolumeSize {
-    Small,
-    Medium,
-    Large,
-}
+/// WAS a closed set of three presets. The reason given for the closed set was
+/// that it "keeps the privileged helper's input space small — it accepts a
+/// preset name, never a caller-computed byte count". That reason was sound and
+/// it is now paid for differently: the helper parses the byte count itself,
+/// under a grammar of nothing but ASCII digits, and bounds it before anything
+/// is derived from the value (`deploy/nemr-volume`, protocol 3). The input
+/// space is no smaller, so the parser is the thing that had to get stricter.
+///
+/// This type deliberately does NOT enforce the bounds. Parsing and policy are
+/// separate: the bounds live in the helper, the one program that has to be
+/// right about them, and reach the rest of the system through
+/// [`PrivilegedOps::size_limits`]. A second copy here is a second copy to keep
+/// in step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VolumeSize(u64);
+
+/// A kibibyte-based megabyte, which is what `500MB` has always meant here.
+///
+/// `500MB` was 500 × 1024 × 1024 from the first preset onwards. Switching to
+/// SI megabytes now would silently change what an existing `--size 500MB`
+/// means and what an existing project's recorded quota parses back to, so the
+/// spelling keeps its meaning and the code says which one it is.
+pub const MB: u64 = 1024 * 1024;
+pub const GB: u64 = 1024 * 1024 * 1024;
 
 impl VolumeSize {
-    pub const DEFAULT: Self = Self::Medium;
+    pub const DEFAULT: Self = Self(2 * GB);
+
+    /// The three sizes that used to be the only ones.
+    ///
+    /// Kept as names because a great deal of the test suite says "the small
+    /// one" and reads better for it, and because the page offers them as
+    /// marks on its slider. They are not special to the engine any more: a
+    /// volume may be any size between the helper's bounds, and nothing
+    /// branches on these.
+    pub const SMALL: Self = Self(500 * MB);
+    pub const MEDIUM: Self = Self(2 * GB);
+    pub const LARGE: Self = Self(10 * GB);
+
+    pub const fn from_bytes(bytes: u64) -> Self {
+        Self(bytes)
+    }
 
     /// Size in bytes.
     pub fn bytes(self) -> u64 {
-        match self {
-            Self::Small => 500 * 1024 * 1024,
-            Self::Medium => 2 * 1024 * 1024 * 1024,
-            Self::Large => 10 * 1024 * 1024 * 1024,
-        }
-    }
-
-    /// Canonical CLI spelling, e.g. `2GB`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Small => "500MB",
-            Self::Medium => "2GB",
-            Self::Large => "10GB",
-        }
+        self.0
     }
 
     /// The default size for a new project — the old clap default (2GB), now
     /// applied by the resolution layer so a missing `--size` and an explicit
     /// `--size 2GB` are distinguishable (WP-H).
     pub fn default_size() -> VolumeSize {
-        VolumeSize::Medium
+        Self::DEFAULT
     }
 
-    pub fn all() -> [Self; 3] {
-        [Self::Small, Self::Medium, Self::Large]
+    /// The canonical spelling: whole gigabytes, else whole megabytes, else the
+    /// exact byte count.
+    ///
+    /// MUST ROUND-TRIP through [`FromStr`] for every value, because this is
+    /// what the bundle manifest records and what the daemon puts on the wire.
+    /// A size that printed as `1GB` when it was 1 GB minus one block would
+    /// come back as a different volume on import.
+    pub fn as_str(self) -> String {
+        if self.0 >= GB && self.0.is_multiple_of(GB) {
+            format!("{}GB", self.0 / GB)
+        } else if self.0 >= MB && self.0.is_multiple_of(MB) {
+            format!("{}MB", self.0 / MB)
+        } else {
+            format!("{}B", self.0)
+        }
     }
 }
 
 impl std::str::FromStr for VolumeSize {
     type Err = anyhow::Error;
 
-    /// Parse the `--size` flag. Case-insensitive; accepts `500MB`/`2GB`/`10GB`.
+    /// Parse a size. Case-insensitive, with an optional unit:
+    ///
+    /// - `2GB`, `1536MB` — kibibyte-based, as the presets always were
+    /// - `67108864B`, `67108864` — an exact byte count
+    ///
+    /// NO BOUNDS ARE APPLIED. A number this refuses is a number that is not a
+    /// size at all; a number that is out of range is refused by the helper,
+    /// with the actual bound in the message. Two places that both refuse give
+    /// two different messages for the same mistake.
     fn from_str(s: &str) -> Result<Self> {
-        let normalised = s.trim().to_ascii_uppercase();
-        Self::all()
-            .into_iter()
-            .find(|size| size.as_str() == normalised)
-            .with_context(|| {
-                let valid: Vec<&str> = Self::all().iter().map(|s| s.as_str()).collect();
-                format!(
-                    "unrecognised volume size {s:?}. Valid sizes: {}. \
-                     Auto-expanding quotas are out of scope for Phase 1.",
-                    valid.join(", ")
-                )
-            })
+        let t = s.trim();
+        if t.is_empty() {
+            bail!("a volume size is required, e.g. 2GB, 1536MB or a byte count");
+        }
+        let upper = t.to_ascii_uppercase();
+        let (digits, unit) = match upper.strip_suffix("GB") {
+            Some(d) => (d, GB),
+            None => match upper.strip_suffix("MB") {
+                Some(d) => (d, MB),
+                None => (upper.strip_suffix('B').unwrap_or(&upper), 1),
+            },
+        };
+        let digits = digits.trim();
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            bail!(
+                "unrecognised volume size {s:?}. Give a whole number with an optional \
+                 unit: 2GB, 1536MB, or a byte count like 2147483648."
+            );
+        }
+        let n: u64 = digits
+            .parse()
+            .with_context(|| format!("volume size {s:?} does not fit in 64 bits"))?;
+        n.checked_mul(unit)
+            .map(VolumeSize)
+            .with_context(|| format!("volume size {s:?} does not fit in 64 bits"))
     }
 }
 
 impl std::fmt::Display for VolumeSize {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(&self.as_str())
+    }
+}
+
+/// The helper's own answer to "what will you accept, and how do you round?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeBounds {
+    pub min: u64,
+    pub max: u64,
+    pub block: u64,
+}
+
+/// What the privileged helper will accept, and what it rounds to.
+///
+/// Carried rather than duplicated: every number here comes from the helper's
+/// `normalize`, which is the program that enforces them. `free` comes from
+/// `statvfs` on the volumes directory — the same call `nemr status` uses for a
+/// mounted volume, so the two agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeLimits {
+    pub min: u64,
+    pub max: u64,
+    pub block: u64,
+    pub free: u64,
+}
+
+impl SizeLimits {
+    pub fn new(bounds: SizeBounds, free: u64) -> Self {
+        Self {
+            min: bounds.min,
+            max: bounds.max,
+            block: bounds.block,
+            free,
+        }
+    }
+
+    /// Round a requested size the way the helper will, so a caller can show
+    /// the real figure before it asks for confirmation.
+    pub fn round(&self, size: VolumeSize) -> VolumeSize {
+        if self.block == 0 {
+            return size;
+        }
+        VolumeSize(size.bytes() - (size.bytes() % self.block))
+    }
+
+    /// Why this size cannot be used, if it cannot. Free disk is checked here
+    /// too: the helper cannot check it (the engine allocates the backing file,
+    /// not the helper) and a refusal at `mkfs` time is a refusal after the
+    /// question was answered.
+    pub fn refuse(&self, size: VolumeSize) -> Option<String> {
+        let b = size.bytes();
+        if b < self.min {
+            return Some(format!(
+                "{} is below the smallest volume nemr will make, {}",
+                human_size(b),
+                human_size(self.min)
+            ));
+        }
+        if b > self.max {
+            return Some(format!(
+                "{} is above the largest volume nemr will make, {}",
+                human_size(b),
+                human_size(self.max)
+            ));
+        }
+        if b > self.free {
+            return Some(format!(
+                "{} is more than the {} free on this disk",
+                human_size(b),
+                human_size(self.free)
+            ));
+        }
+        None
+    }
+}
+
+/// What a volume size may be on this host, and how much room there is.
+///
+/// Three facts from three owners, assembled in one place so nobody assembles
+/// them twice: the bounds and the rounding from the helper, the free space
+/// from `statvfs` on the volumes directory, and the default from the engine.
+pub fn size_limits(ops: &impl PrivilegedOps, paths: &VolumePaths) -> Result<SizeLimits> {
+    let bounds = ops.size_bounds()?;
+    Ok(SizeLimits::new(bounds, free_bytes(&paths.image_dir())?))
+}
+
+/// Free space on the filesystem holding `path`, for an ordinary user.
+///
+/// `f_bavail`, not `f_bfree`: the difference is ext4's root-reserved blocks,
+/// which the engine cannot allocate into. Quoting `f_bfree` would offer space
+/// that `fallocate` then refuses.
+pub fn free_bytes(path: &Path) -> Result<u64> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .with_context(|| format!("{} is not a usable path", path.display()))?;
+    // SAFETY: a zeroed statvfs is a valid target and the pointer is a valid
+    // NUL-terminated path for the duration of the call.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
+    if rc != 0 {
+        bail!(
+            "cannot measure free space on {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+/// A byte count as a person reads it.
+///
+/// Lives here rather than in `project` because sizes are this module's
+/// vocabulary and three places now need to print one.
+pub fn human_size(bytes: u64) -> String {
+    const G: u64 = 1024 * 1024 * 1024;
+    const M: u64 = 1024 * 1024;
+    const K: u64 = 1024;
+    if bytes >= G {
+        format!("{:.1}GiB", bytes as f64 / G as f64)
+    } else if bytes >= M {
+        format!("{:.1}MiB", bytes as f64 / M as f64)
+    } else if bytes >= K {
+        format!("{:.1}KiB", bytes as f64 / K as f64)
+    } else {
+        format!("{bytes}B")
     }
 }
 
@@ -226,6 +400,14 @@ pub trait PrivilegedOps {
     /// Unmount and detach. Must be idempotent: [`Volume::drop`] calls it on
     /// error paths where the mount may never have been established.
     fn unmount_and_detach(&self, name: &str) -> Result<()>;
+
+    /// What the helper will accept, asked of the helper.
+    ///
+    /// On the privileged trait because the helper is where the bounds are
+    /// enforced, and a bound the engine keeps its own copy of is a bound that
+    /// drifts. Nothing here is privileged — the helper answers it without
+    /// touching anything — but the answer must come from that program.
+    fn size_bounds(&self) -> Result<SizeBounds>;
 }
 
 /// Production implementation: shells out to the root-owned helper (PRIV-03).
@@ -240,6 +422,18 @@ pub struct HelperOps {
 impl HelperOps {
     pub const DEFAULT_HELPER: &'static str = "/usr/local/libexec/nemr-volume";
 
+    /// The helper protocol this engine speaks.
+    ///
+    /// The helper's own source has said since protocol 2 that "the engine
+    /// checks this before invoking a privileged operation". IT DID NOT — the
+    /// only thing that ever read the number was `setup_test_host.sh`, which
+    /// prints it for a human. Nothing enforced it, so a host running a stale
+    /// helper found out through whatever the first mismatched argument
+    /// happened to do. Protocol 3 changes the size argument from a word to a
+    /// number, which is exactly the kind of change that must not be discovered
+    /// that way, so the claim is now true.
+    pub const PROTOCOL: u32 = 3;
+
     pub fn new() -> Self {
         Self {
             helper_path: PathBuf::from(Self::DEFAULT_HELPER),
@@ -247,6 +441,61 @@ impl HelperOps {
     }
 
     fn run(&self, args: &[&str]) -> Result<()> {
+        self.run_capturing(args).map(|_| ())
+    }
+
+    /// Refuse a helper this engine does not speak to, ONCE per process.
+    ///
+    /// Once because it costs a `sudo` round trip and the installed binary
+    /// cannot change under a running command; before the first privileged
+    /// call because the alternative is a mismatch surfacing as whatever the
+    /// stale helper made of an argument it did not understand.
+    fn check_protocol(&self) -> Result<()> {
+        static CHECKED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+        CHECKED
+            .get_or_init(|| self.read_protocol().map_err(|e| e.to_string()))
+            .clone()
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn read_protocol(&self) -> Result<()> {
+        let output = Command::new("sudo")
+            .arg("-n")
+            .arg(&self.helper_path)
+            .arg("version")
+            .output()
+            .with_context(|| {
+                format!(
+                    "failed to execute {} via sudo. Is the helper installed? \
+                     See deploy/README for installation.",
+                    self.helper_path.display()
+                )
+            })?;
+        let line = String::from_utf8_lossy(&output.stdout);
+        let found: Option<u32> = line
+            .split_whitespace()
+            .last()
+            .and_then(|n| n.parse::<u32>().ok())
+            .filter(|_| output.status.success());
+        match found {
+            Some(v) if v == Self::PROTOCOL => Ok(()),
+            Some(v) => bail!(
+                "the privileged helper speaks protocol {v}; this nemr speaks {}.\n\
+                 The helper is root-owned and is not updated by installing nemr.\n\
+                 Reinstall it: sudo ./scripts/setup_test_host.sh",
+                Self::PROTOCOL
+            ),
+            None => bail!(
+                "the privileged helper at {} did not report a protocol version.\n\
+                 It predates the version handshake, or it is not the helper.\n\
+                 Reinstall it: sudo ./scripts/setup_test_host.sh",
+                self.helper_path.display()
+            ),
+        }
+    }
+
+    fn run_capturing(&self, args: &[&str]) -> Result<String> {
+        self.check_protocol()?;
         // VOL-03 / NFR-04: every privileged invocation is logged in full,
         // before it runs, with the fact of elevation stated explicitly.
         audit_elevated(
@@ -298,7 +547,7 @@ impl HelperOps {
                 self.helper_path.display(),
             );
         }
-        Ok(())
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 }
 
@@ -310,12 +559,45 @@ impl Default for HelperOps {
 
 impl PrivilegedOps for HelperOps {
     fn attach_and_mount(&self, name: &str, size: VolumeSize) -> Result<()> {
-        self.run(&["mount", name, size.as_str()])
+        // The byte count, not a preset word — and the helper checks it against
+        // the backing file's real length before it mounts anything.
+        self.run(&["mount", name, &size.bytes().to_string()])
     }
 
     fn unmount_and_detach(&self, name: &str) -> Result<()> {
         self.run(&["unmount", name])
     }
+
+    fn size_bounds(&self) -> Result<SizeBounds> {
+        parse_bounds(&self.run_capturing(&["normalize"])?)
+    }
+}
+
+/// Read `key=value` lines from the helper's `normalize`.
+///
+/// Strict: a missing key is an error, never a default. A default here would be
+/// this program quietly deciding a bound the helper is supposed to own, which
+/// is the whole thing the round trip exists to prevent.
+fn parse_bounds(stdout: &str) -> Result<SizeBounds> {
+    let get = |key: &str| -> Result<u64> {
+        stdout
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(&format!("{key}=")))
+            .with_context(|| {
+                format!(
+                    "the privileged helper did not report {key:?}. It is probably older than \
+                     protocol 3 — reinstall: sudo ./scripts/setup_test_host.sh"
+                )
+            })?
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("the helper reported a {key} that is not a number"))
+    };
+    Ok(SizeBounds {
+        min: get("min")?,
+        max: get("max")?,
+        block: get("block")?,
+    })
 }
 
 /// Bytes used and total capacity of a mounted volume.
@@ -944,31 +1226,154 @@ fn format_ext4(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The three named sizes keep the meanings they always had. `500MB` has
+    /// been 500 MiB since the first preset; an SI megabyte here would quietly
+    /// resize every existing project's recorded quota on the next parse.
     #[test]
-    fn size_presets_match_vol_01() {
-        assert_eq!(VolumeSize::Small.bytes(), 500 * 1024 * 1024);
-        assert_eq!(VolumeSize::Medium.bytes(), 2 * 1024 * 1024 * 1024);
-        assert_eq!(VolumeSize::Large.bytes(), 10 * 1024 * 1024 * 1024);
+    fn the_named_sizes_keep_their_old_meanings() {
+        assert_eq!(VolumeSize::SMALL.bytes(), 500 * 1024 * 1024);
+        assert_eq!(VolumeSize::MEDIUM.bytes(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(VolumeSize::LARGE.bytes(), 10 * 1024 * 1024 * 1024);
+        assert_eq!(VolumeSize::DEFAULT, VolumeSize::MEDIUM);
     }
 
     #[test]
     fn size_parses_case_insensitively() {
-        assert_eq!("2GB".parse::<VolumeSize>().unwrap(), VolumeSize::Medium);
-        assert_eq!("2gb".parse::<VolumeSize>().unwrap(), VolumeSize::Medium);
-        assert_eq!(" 500mb ".parse::<VolumeSize>().unwrap(), VolumeSize::Small);
+        assert_eq!("2GB".parse::<VolumeSize>().unwrap(), VolumeSize::MEDIUM);
+        assert_eq!("2gb".parse::<VolumeSize>().unwrap(), VolumeSize::MEDIUM);
+        assert_eq!(" 500mb ".parse::<VolumeSize>().unwrap(), VolumeSize::SMALL);
+    }
+
+    /// The point of SPEC 1.153: a size that is none of the three.
+    #[test]
+    fn any_size_parses_not_only_the_three() {
+        assert_eq!("7GB".parse::<VolumeSize>().unwrap().bytes(), 7 * GB);
+        assert_eq!("1536MB".parse::<VolumeSize>().unwrap().bytes(), 1536 * MB);
+        assert_eq!("64MB".parse::<VolumeSize>().unwrap().bytes(), 64 * MB);
+        // A bare byte count, which is what the helper speaks and what a
+        // volume's own file length reports back.
+        assert_eq!(
+            "67108864".parse::<VolumeSize>().unwrap().bytes(),
+            67_108_864
+        );
+        assert_eq!(
+            "67108864B".parse::<VolumeSize>().unwrap().bytes(),
+            67_108_864
+        );
+    }
+
+    /// EVERY size must survive a round trip through its own spelling: this is
+    /// what the bundle manifest records and what the daemon puts on the wire,
+    /// so a value that prints as something else is a volume that comes back a
+    /// different size on import.
+    #[test]
+    fn every_size_round_trips_through_its_own_spelling() {
+        for bytes in [
+            64 * MB,
+            500 * MB,
+            1536 * MB,
+            2 * GB,
+            7 * GB,
+            10 * GB,
+            // Not a whole MB: the case that forces the byte spelling.
+            2 * GB + 4096,
+            67_108_864 + 1,
+            1,
+        ] {
+            let size = VolumeSize::from_bytes(bytes);
+            let back: VolumeSize = size.as_str().parse().unwrap_or_else(|e| {
+                panic!(
+                    "{bytes} printed as {:?} and did not parse back: {e}",
+                    size.as_str()
+                )
+            });
+            assert_eq!(back, size, "{bytes} printed as {:?}", size.as_str());
+        }
     }
 
     #[test]
-    fn unknown_size_is_rejected_with_valid_options() {
-        let error = "7GB".parse::<VolumeSize>().unwrap_err().to_string();
+    fn something_that_is_not_a_size_is_rejected() {
+        for bad in [
+            "", "  ", "GB", "MB", "-1GB", "2.5GB", "2 GB x", "two GB", "0x10",
+        ] {
+            assert!(
+                bad.parse::<VolumeSize>().is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        let error = "two GB".parse::<VolumeSize>().unwrap_err().to_string();
         assert!(
-            error.contains("500MB"),
-            "error should list valid sizes: {error}"
+            error.contains("2GB") && error.contains("byte count"),
+            "the refusal must show the shape it wants: {error}"
         );
-        assert!(
-            error.contains("10GB"),
-            "error should list valid sizes: {error}"
+    }
+
+    /// The bounds are the helper's, and the engine applies them without
+    /// keeping a copy: these are all built from a `SizeLimits` handed in.
+    #[test]
+    fn a_size_out_of_range_is_refused_naming_the_figure() {
+        let limits = SizeLimits {
+            min: 64 * MB,
+            max: 1024 * GB,
+            block: 4096,
+            free: 100 * GB,
+        };
+        assert_eq!(limits.refuse(VolumeSize::from_bytes(2 * GB)), None);
+        let below = limits.refuse(VolumeSize::from_bytes(MB)).unwrap();
+        assert!(below.contains("64.0MiB"), "{below}");
+        let above = limits.refuse(VolumeSize::from_bytes(2048 * GB)).unwrap();
+        assert!(above.contains("1024.0GiB"), "{above}");
+        // Free disk, which neither bound covers — and the figure is the one
+        // the user has to stay under.
+        let full = limits.refuse(VolumeSize::from_bytes(200 * GB)).unwrap();
+        assert!(full.contains("100.0GiB") && full.contains("free"), "{full}");
+    }
+
+    #[test]
+    fn rounding_matches_the_helper_and_never_rounds_up() {
+        let limits = SizeLimits {
+            min: 64 * MB,
+            max: 1024 * GB,
+            block: 4096,
+            free: 100 * GB,
+        };
+        assert_eq!(limits.round(VolumeSize::from_bytes(4096)).bytes(), 4096);
+        assert_eq!(limits.round(VolumeSize::from_bytes(4097)).bytes(), 4096);
+        assert_eq!(limits.round(VolumeSize::from_bytes(8191)).bytes(), 4096);
+        // Whole MB and GB are already block multiples, so the prompt path
+        // never changes what was typed.
+        for size in [VolumeSize::SMALL, VolumeSize::MEDIUM, VolumeSize::LARGE] {
+            assert_eq!(limits.round(size), size);
+        }
+    }
+
+    /// The bounds must come from the helper's own output, and a helper that
+    /// does not report one is an error rather than a default — a default here
+    /// would be the engine quietly deciding a bound it does not enforce.
+    #[test]
+    fn the_bounds_are_read_from_the_helper_and_never_defaulted() {
+        let good = "min=67108864\nmax=1099511627776\nblock=4096\n";
+        assert_eq!(
+            parse_bounds(good).unwrap(),
+            SizeBounds {
+                min: 67_108_864,
+                max: 1_099_511_627_776,
+                block: 4096
+            }
         );
+        for missing in [
+            "max=1\nblock=4096\n",
+            "min=1\nblock=4096\n",
+            "min=1\nmax=2\n",
+            "",
+            "min=sixty\nmax=2\nblock=4096\n",
+        ] {
+            let error = parse_bounds(missing).unwrap_err().to_string();
+            assert!(
+                error.contains("helper"),
+                "the refusal must point at the helper: {error}"
+            );
+        }
     }
 
     #[test]

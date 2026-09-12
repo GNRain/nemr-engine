@@ -13,8 +13,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use nemr_daemon_api::proto::{
     attach_client, AdoptRequest, AdoptResponse, AttachClient, AttachStart, CreateRequest,
-    DeleteRequest, ExportRequest, ImportRequest, ListRequest, StartRequest, StatusRequest,
-    StopRequest,
+    DeleteRequest, ExportRequest, ImportRequest, ListRequest, SizeLimitsRequest,
+    SizeLimitsResponse, StartRequest, StatusRequest, StopRequest,
 };
 
 use crate::core::EngineOps;
@@ -76,6 +76,7 @@ impl DaemonEngine {
                 running: p.running,
                 usage_known: p.usage_known,
                 used_bytes: p.used_bytes,
+                quota_bytes: (p.quota_bytes > 0).then_some(p.quota_bytes),
                 credential_present,
             })
             .collect())
@@ -141,6 +142,19 @@ impl DaemonEngine {
             .map_err(|st| anyhow::anyhow!("{}", st.message()))
             .context("creating the session")?;
         Ok(())
+    }
+
+    /// SPEC 1.153: what a volume size may be on this host — the helper's
+    /// bounds and the filesystem's free space, through the daemon.
+    pub async fn size_limits() -> Result<SizeLimitsResponse> {
+        let mut s = Self::session().await?;
+        let req = s.req(SizeLimitsRequest {});
+        Ok(s.client()
+            .size_limits(req)
+            .await
+            .map_err(|st| anyhow::anyhow!("{}", st.message()))
+            .context("asking what sizes this host allows")?
+            .into_inner())
     }
 
     /// F-21: what adding a host directory would copy — the daemon's `Adopt`
@@ -243,6 +257,16 @@ impl crate::serve::UiEngine for DaemonEngine {
     }
     fn delete(&self, name: &str) -> Result<()> {
         self.rt.block_on(Self::delete_project(name))
+    }
+    fn size_limits(&self) -> Result<crate::serve::SizeLimits> {
+        let r = self.rt.block_on(Self::size_limits())?;
+        Ok(crate::serve::SizeLimits {
+            min_bytes: r.min_bytes,
+            max_bytes: r.max_bytes,
+            block_bytes: r.block_bytes,
+            default_bytes: r.default_bytes,
+            free_bytes: r.free_bytes,
+        })
     }
     fn add_plan(&self, source_dir: &str) -> Result<crate::serve::AddPlan> {
         let p = self.rt.block_on(Self::add_plan(source_dir))?;
